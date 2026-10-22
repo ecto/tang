@@ -39,6 +39,8 @@ pub fn attn_chunk() -> usize {
         .unwrap_or(64)
 }
 
+pub use super::fa2::{fa2_smem, fa2_splits, FA2_BM, FA2_BN};
+
 /// The shapes the kernels are compiled for.
 #[derive(Clone, Debug)]
 pub struct Shapes {
@@ -1292,5 +1294,220 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
     }
     const float gt = proj[(size_t)c * stride + h * 2 * CX_HD + CX_HD + d];
     out[((size_t)c * CX_NH + h) * CX_HD + d] = (o / L) * sigm_f(gt);
+}
+// ---- FA2-style tensor-core prefill attention (wide windows, `TANG_CODER_ATTN=fa2`) ----
+//
+// Structure after FlashAttention-2 (Tri Dao, arXiv 2307.08691; github.com/Dao-AILab/flash-attention,
+// BSD-3-Clause): Q tile resident in shared memory, K/V tiles streamed through a cp.async double
+// buffer, S = Q K^T and O += P V on bf16 tensor cores (mma.sync m16n8k16, f32 accumulate), online
+// softmax in registers with P reused straight from the S accumulators as the A operand.
+//
+// GQA: the CX_G query heads of a kv group read the same K/V, so the M dimension of a tile is
+// (row, head) pairs: query vector v = row * CX_G + head, FA_BM = 64 of them a block (8 rows × 8
+// heads at G = 8). Wide windows are one slot at consecutive positions, so the tile's last row has
+// its highest position: keys past it are never loaded (fully masked tiles skipped), and only the
+// diagonal key tile masks per vector. Long contexts also split the keys across blockIdx.z (each
+// split writes (m, l, acc) in cx_attn_part's layout, nchunk = nsplit) so a 256-row window still
+// fills the GPU; cx_attn_merge then merges the splits and applies the sigmoid gate.
+// Shared rows are padded by 8 bf16 (FA_LD), which makes the fragment loads and ldmatrix
+// conflict-free (same effect as FA2's XOR swizzle, simpler addressing).
+// Grid (ceil(t * G / FA_BM), NKV, nsplit), block 128 (4 warps × 16 vectors), FA_SMEM dynamic smem.
+// Not split-K's summation order (bf16 Q and P): gated by flash-wide-check's greedy + KL bar.
+#define FA_BM 64
+#define FA_BN 32
+#define FA_LD (CX_HD + 8)
+#define FA_SMEM ((FA_BM + 4 * FA_BN) * FA_LD * 2)
+static_assert(FA_BM % CX_G == 0, "FA2 tile: whole rows of G heads");
+static_assert(CX_HD % 16 == 0, "FA2 tile: head dim a multiple of 16");
+
+__device__ __forceinline__ unsigned fa_pack(float lo, float hi) {
+    return (unsigned)f2bf(lo) | ((unsigned)f2bf(hi) << 16);
+}
+__device__ __forceinline__ void fa_mma(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                       unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+__device__ __forceinline__ void fa_cp16(unsigned short* dst, const unsigned short* src) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
+#else
+    *(uint4*)dst = *(const uint4*)src;
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, const unsigned long long* ktab,
+                                                              const unsigned long long* vtab, const unsigned* rows,
+                                                              int t, float* part, int nsplit) {
+    extern __shared__ __align__(16) unsigned char fa_sm[];
+    unsigned short* sq = (unsigned short*)fa_sm;  // [FA_BM][FA_LD]
+    unsigned short* sk = sq + FA_BM * FA_LD;     // [2][FA_BN][FA_LD]
+    unsigned short* sv = sk + 2 * FA_BN * FA_LD; // [2][FA_BN][FA_LD]
+    const int g = blockIdx.y, j = blockIdx.z, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t4 = lane & 3;
+    const int nv = t * CX_G, v0 = blockIdx.x * FA_BM;
+    const int vlast = min(nv, v0 + FA_BM) - 1;
+    const int hi = (int)rows[vlast / CX_G], top = (int)rows[t - 1];
+    // Split j covers keys [k0, k0 + span) of the window's [0, top]; this tile needs [k0, k1).
+    const int span = ((top + nsplit) / nsplit + FA_BN - 1) / FA_BN * FA_BN;
+    const int k0 = j * span, k1 = min(k0 + span, hi + 1);
+    const size_t vs = (size_t)CX_G * (CX_HD + 2);
+    if (k0 >= k1) {
+        if (tid < FA_BM && v0 + tid < nv) {
+            const int v = v0 + tid;
+            part[(((size_t)(v / CX_G) * CX_NKV + g) * nsplit + j) * vs + (v % CX_G) * (CX_HD + 2) + 1] = 0.f;
+        }
+        return;
+    }
+    const unsigned slot = rows[CX_MAXT];
+    const unsigned short* kc = (const unsigned short*)ktab[slot];
+    const unsigned short* vc = (const unsigned short*)vtab[slot];
+    auto load = [&](int kb, int b) {
+        for (int e = tid; e < FA_BN * (CX_HD / 8); e += 128) {
+            const int p = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8, key = kb + p;
+            unsigned short* dk = sk + (b * FA_BN + p) * FA_LD + d;
+            unsigned short* dv = sv + (b * FA_BN + p) * FA_LD + d;
+            if (key < k1) {
+                const size_t o = ((size_t)key * CX_NKV + g) * CX_HD + d;
+                fa_cp16(dk, kc + o);
+                fa_cp16(dv, vc + o);
+            } else {
+                // Zeros, not stale cache: a masked P is 0, and 0 * NaN would poison O.
+                *(uint4*)dk = make_uint4(0, 0, 0, 0);
+                *(uint4*)dv = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+    load(k0, 0);
+    cx_async_commit();
+    // Q tile, pre-scaled, as bf16 (overlaps the first K/V copy).
+    const float scale = 1.0f / sqrtf((float)CX_HD);
+    for (int e = tid; e < FA_BM * (CX_HD / 4); e += 128) {
+        const int v = e / (CX_HD / 4), d = (e % (CX_HD / 4)) * 4, gv = v0 + v;
+        float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (gv < nv)
+            x = *(const float4*)&q[((size_t)(gv / CX_G) * CX_NH + g * CX_G + gv % CX_G) * CX_HD + d];
+        *(uint2*)&sq[v * FA_LD + d] = make_uint2(fa_pack(x.x * scale, x.y * scale), fa_pack(x.z * scale, x.w * scale));
+    }
+    // This thread's accumulator rows: vectors va (C rows gq) and vb (gq + 8) of the warp's 16.
+    const int va = v0 + warp * 16 + gq, vb = va + 8;
+    const int posa = va < nv ? (int)rows[va / CX_G] : -1, posb = vb < nv ? (int)rows[vb / CX_G] : -1;
+    float o[CX_HD / 8][4];
+    #pragma unroll
+    for (int n = 0; n < CX_HD / 8; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+    float ma = NEG_INF_F, mb = NEG_INF_F, la = 0.f, lb = 0.f;
+    const int nt = (k1 - k0 + FA_BN - 1) / FA_BN;
+    for (int it = 0; it < nt; it++) {
+        const int b = it & 1, kbase = k0 + it * FA_BN;
+        if (it + 1 < nt) load(kbase + FA_BN, b ^ 1);
+        cx_async_commit();
+        cx_async_wait<1>();
+        __syncthreads();
+        // S = Q K^T (16 vectors × FA_BN keys a warp).
+        float s[FA_BN / 8][4];
+        #pragma unroll
+        for (int n = 0; n < FA_BN / 8; n++) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f;
+        const unsigned short* qa = sq + (warp * 16 + gq) * FA_LD + 2 * t4;
+        const unsigned short* kr = sk + (b * FA_BN + gq) * FA_LD + 2 * t4;
+        #pragma unroll
+        for (int kk = 0; kk < CX_HD / 16; kk++) {
+            const unsigned a0 = *(const unsigned*)(qa + kk * 16), a1 = *(const unsigned*)(qa + 8 * FA_LD + kk * 16);
+            const unsigned a2 = *(const unsigned*)(qa + kk * 16 + 8),
+                           a3 = *(const unsigned*)(qa + 8 * FA_LD + kk * 16 + 8);
+            #pragma unroll
+            for (int n = 0; n < FA_BN / 8; n++) {
+                const unsigned short* kp = kr + n * 8 * FA_LD + kk * 16;
+                fa_mma(s[n], a0, a1, a2, a3, *(const unsigned*)kp, *(const unsigned*)(kp + 8));
+            }
+        }
+        // Causal + split mask, then the online softmax (each row is spread over a lane quad).
+        float mxa = NEG_INF_F, mxb = NEG_INF_F;
+        #pragma unroll
+        for (int n = 0; n < FA_BN / 8; n++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int key = kbase + n * 8 + 2 * t4 + (e & 1);
+                if (key >= k1 || key > (e < 2 ? posa : posb)) s[n][e] = NEG_INF_F;
+                if (e < 2) mxa = fmaxf(mxa, s[n][e]);
+                else mxb = fmaxf(mxb, s[n][e]);
+            }
+        for (int x = 1; x < 4; x <<= 1) {
+            mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, x));
+            mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, x));
+        }
+        const float na = fmaxf(ma, mxa), nb = fmaxf(mb, mxb);
+        // A row with no live key yet keeps m = -inf; subtract 0 instead so exp gives 0, not NaN.
+        const float sa = na == NEG_INF_F ? 0.f : na, sb = nb == NEG_INF_F ? 0.f : nb;
+        const float ca = expf(ma - sa), cb = expf(mb - sb);
+        ma = na;
+        mb = nb;
+        float ra = 0.f, rb = 0.f;
+        #pragma unroll
+        for (int n = 0; n < FA_BN / 8; n++) {
+            s[n][0] = expf(s[n][0] - sa);
+            s[n][1] = expf(s[n][1] - sa);
+            s[n][2] = expf(s[n][2] - sb);
+            s[n][3] = expf(s[n][3] - sb);
+            ra += s[n][0] + s[n][1];
+            rb += s[n][2] + s[n][3];
+        }
+        la = la * ca + ra;
+        lb = lb * cb + rb;
+        #pragma unroll
+        for (int n = 0; n < CX_HD / 8; n++) {
+            o[n][0] *= ca;
+            o[n][1] *= ca;
+            o[n][2] *= cb;
+            o[n][3] *= cb;
+        }
+        // O += P V: P's A fragments are the S accumulators of n-tiles 2kk and 2kk + 1; V's B
+        // fragments come from ldmatrix.trans (V is key-major in smem).
+        #pragma unroll
+        for (int kk = 0; kk < FA_BN / 16; kk++) {
+            const unsigned p0 = fa_pack(s[2 * kk][0], s[2 * kk][1]), p1 = fa_pack(s[2 * kk][2], s[2 * kk][3]);
+            const unsigned p2 = fa_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                           p3 = fa_pack(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+            const unsigned short* vr = sv + (b * FA_BN + kk * 16 + (lane & 15)) * FA_LD + (lane >> 4) * 8;
+            #pragma unroll
+            for (int dn = 0; dn < CX_HD / 16; dn++) {
+                unsigned r0, r1, r2, r3;
+#if __CUDA_ARCH__ >= 800
+                const unsigned addr = (unsigned)__cvta_generic_to_shared(vr + dn * 16);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                             : "r"(addr));
+#else
+                r0 = r1 = r2 = r3 = 0;
+#endif
+                fa_mma(o[2 * dn], p0, p1, p2, p3, r0, r1);
+                fa_mma(o[2 * dn + 1], p0, p1, p2, p3, r2, r3);
+            }
+        }
+        __syncthreads();
+    }
+    for (int x = 1; x < 4; x <<= 1) {
+        la += __shfl_xor_sync(0xffffffffu, la, x);
+        lb += __shfl_xor_sync(0xffffffffu, lb, x);
+    }
+    // Partials in cx_attn_part's layout: part[row][g][split][head][m, l, acc[HD]].
+    if (va < nv) {
+        float* out = part + (((size_t)(va / CX_G) * CX_NKV + g) * nsplit + j) * vs + (va % CX_G) * (CX_HD + 2);
+        if (t4 == 0) { out[0] = ma; out[1] = la; }
+        #pragma unroll
+        for (int n = 0; n < CX_HD / 8; n++) { out[2 + n * 8 + 2 * t4] = o[n][0]; out[3 + n * 8 + 2 * t4] = o[n][1]; }
+    }
+    if (vb < nv) {
+        float* out = part + (((size_t)(vb / CX_G) * CX_NKV + g) * nsplit + j) * vs + (vb % CX_G) * (CX_HD + 2);
+        if (t4 == 0) { out[0] = mb; out[1] = lb; }
+        #pragma unroll
+        for (int n = 0; n < CX_HD / 8; n++) { out[2 + n * 8 + 2 * t4] = o[n][2]; out[3 + n * 8 + 2 * t4] = o[n][3]; }
+    }
 }
 "#;

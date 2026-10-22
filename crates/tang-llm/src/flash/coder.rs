@@ -74,6 +74,26 @@ impl Default for CoderOpts {
 
 /// `TANG_CODER_GEMV=v1`: dense GEMVs on `fe_gemv8` (two rows a warp) instead of the K-split
 /// `cx_gemvk` (A/B).
+/// Streaming multiprocessors on device 0 (sizes the FA2 key splits).
+fn sm_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let mut v = 0i32;
+        unsafe {
+            cudarc::driver::sys::cuDeviceGetAttribute(
+                &mut v,
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                0,
+            )
+        };
+        if v > 0 {
+            v as usize
+        } else {
+            132
+        }
+    })
+}
+
 fn env_is(key: &str, val: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v == val)
 }
@@ -111,6 +131,10 @@ struct Variants {
     /// Which GEMMs (`TANG_CODER_WGEMM=gu` / `down`; anything else: both). For localizing.
     wgemm_gu: bool,
     wgemm_down: bool,
+    /// Wide windows run attention as the FA2-style tensor-core kernel (`cx_attn_fa2`, then
+    /// `cx_attn_merge` over its key splits) instead of split-K part/merge;
+    /// `TANG_CODER_ATTN=fa2`. Not bitwise: gated by `flash-wide-check`'s greedy + KL bar.
+    attn_fa2: bool,
 }
 
 impl Default for Variants {
@@ -125,6 +149,7 @@ impl Default for Variants {
             wgemm: true,
             wgemm_gu: true,
             wgemm_down: true,
+            attn_fa2: false,
         }
     }
 }
@@ -143,6 +168,7 @@ impl Variants {
             wgemm: !env_is("TANG_CODER_WGEMM", "0"),
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
+            attn_fa2: env_is("TANG_CODER_ATTN", "fa2"),
         }
     }
 }
@@ -396,6 +422,7 @@ struct Kern {
     prep: Fun,
     part: Fun,
     merge: Fun,
+    fa2: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
     gdn_step_seg: Fun,
@@ -437,6 +464,7 @@ impl Kern {
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
             merge: f("cx_attn_merge")?,
+            fa2: f("cx_attn_fa2")?,
             gdn_step: self.gdn_step,
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
@@ -475,6 +503,7 @@ impl Kern {
             self.moe_down_g,
             self.moe_gu_db,
             self.moe_down_db,
+            self.fa2,
         ] {
             unsafe {
                 gpu::check(
@@ -933,6 +962,7 @@ impl Coder {
             prep: f(&cm, "cx_attn_prep")?,
             part: f(&cm, "cx_attn_part")?,
             merge: f(&cm, "cx_attn_merge")?,
+            fa2: f(&cm, "cx_attn_fa2")?,
             gdn_step: f(&fm, "fl_gdn_conv_step")?,
             gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
@@ -1707,6 +1737,7 @@ impl Coder {
             (k.prep, "attn_prep"),
             (k.part, "attn_part"),
             (k.merge, "attn_merge"),
+            (k.fa2, "attn_fa2"),
             (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
@@ -1986,6 +2017,20 @@ impl Coder {
         bucket.min(self.max_ctx) / ck::attn_chunk()
     }
 
+    /// Key splits for the FA2 attention of a wide window of `t` rows, or `None` for split-K
+    /// (not a wide window, `TANG_CODER_ATTN` not `fa2`, or partials that wouldn't fit).
+    fn fa2_splits(&self, t: usize) -> Option<usize> {
+        if !(self.in_wide.get() && self.var.attn_fa2) {
+            return None;
+        }
+        let hp = &self.hp;
+        // The partials buffer holds WIDE_ATTN_ROWS rows × nchunk_max splits (Scratch::new).
+        let cap = WIDE_ATTN_ROWS * (self.max_ctx / ck::attn_chunk()) / t;
+        let tiles = (t * (hp.n_head / hp.n_head_kv)).div_ceil(ck::FA2_BM) * hp.n_head_kv;
+        let ns = ck::fa2_splits(tiles, self.wide_pos0.get() + t, sm_count(), cap);
+        (ns > 0).then_some(ns)
+    }
+
     // ---- the window
 
     fn enqueue_inputs(&self, t: usize) {
@@ -2076,6 +2121,28 @@ impl Coder {
                 t
             };
             let qrow = (hp.n_head * hp.head_dim * 4) as u64;
+            if let Some(ns) = self.fa2_splits(t) {
+                let g = hp.n_head / hp.n_head_kv;
+                let tiles = (t * g).div_ceil(ck::FA2_BM);
+                unsafe {
+                    self.launch_on(
+                        &self.stream,
+                        self.kn().fa2,
+                        (tiles as u32, hp.n_head_kv as u32, ns as u32),
+                        128,
+                        ck::fa2_smem(hp.head_dim) as u32,
+                        tang_moe::args![q, kt, vt, rows, t as i32, part, ns as i32],
+                    );
+                    self.launch(
+                        self.kn().merge,
+                        (t as u32, hp.n_head as u32, 1),
+                        hp.head_dim as u32,
+                        tang_moe::args![part, ns as i32, proj, st, attn],
+                    );
+                }
+                self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
+                return;
+            }
             for r0 in (0..t).step_by(slice) {
                 let c = slice.min(t - r0);
                 let nc = if self.in_wide.get() {

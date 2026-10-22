@@ -13,6 +13,7 @@ pub mod coder;
 pub mod coder_kernels;
 #[cfg(feature = "cuda")]
 pub mod engine;
+pub mod fa2;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 pub mod mtp;
