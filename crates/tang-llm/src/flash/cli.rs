@@ -318,6 +318,7 @@ fn load_coder(a: &Args) -> Result<Coder> {
         CoderOpts {
             max_ctx: a.opts.max_ctx,
             mtp: a.opts.mtp.clone(),
+            ..Default::default()
         },
     )?;
     e.use_graphs = !a.eager;

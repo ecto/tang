@@ -24,15 +24,16 @@
 //! → int8 → routed gate|up → silu·up → int8 → routed down ‖ shared expert → r += Σ w·y + g·shared
 //! ```
 
+use super::bootcache::{dense_bytes as device_bytes, dense_layout, experts_bytes, experts_layout};
 use super::coder_kernels::{self as ck, Shapes};
 use super::engine::{Probe, WinStats};
 use super::kernels;
 use super::reference::{Arch, Hparams};
-use crate::gguf::{self, GgmlType, Gguf, TensorInfo};
+use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use anyhow::{anyhow, ensure, Context, Result};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tang_compute::cuda::CudaBuffer;
 use tang_compute::flash::{self as fl, Geometry};
@@ -61,6 +62,9 @@ pub struct CoderOpts {
     /// An MTP sidecar GGUF (`scripts/qwen3next_mtp_sidecar.py`): its one MTP layer drafts the
     /// next tokens. Default: `TANG_CODER_MTP`.
     pub mtp: Option<std::path::PathBuf>,
+    /// Skip the weight boot cache (`TANG_WEIGHT_CACHE`, `docs/fast-boot.md`) even when the dir
+    /// is set: measure a cold load with the blob already populated.
+    pub no_weight_cache: bool,
 }
 
 impl Default for CoderOpts {
@@ -68,7 +72,147 @@ impl Default for CoderOpts {
         CoderOpts {
             max_ctx: 8192,
             mtp: None,
+            no_weight_cache: false,
         }
+    }
+}
+
+/// Marker: the warm weight blob didn't match this build's device layout (a buffer length
+/// mismatch). `Coder::load` deletes the blob and retries once, cold.
+#[derive(Debug)]
+struct StaleBlob(PathBuf);
+
+impl std::fmt::Display for StaleBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stale boot cache blob {}", self.0.display())
+    }
+}
+
+impl std::error::Error for StaleBlob {}
+
+/// The weight boot cache of one [`Coder::load`] (`TANG_WEIGHT_CACHE`, `docs/fast-boot.md`): on
+/// a warm boot a reader streams the recorded device bytes straight to VRAM; on a cold one a
+/// writer records them for next time. Every method is a no-op when off (the load code stays
+/// one-shaped). The key covers the model's content and the whole device layout, so a readable
+/// blob is by construction the right bytes; a stale one fails the first `next` and the load
+/// restarts from the GGUF (the caller drops the blob or lets the next cold load rewrite it).
+struct BootCache {
+    reader: Option<super::bootcache::WeightReader>,
+    writer: Option<super::bootcache::WeightWriter>,
+    n: usize,
+}
+
+impl BootCache {
+    fn off() -> Self {
+        BootCache {
+            reader: None,
+            writer: None,
+            n: 0,
+        }
+    }
+
+    /// Warm (reader) when the blob for `key` opens, else cold (writer).
+    fn open(dir: &Path, key: &str) -> Result<Self> {
+        match super::bootcache::WeightReader::open(dir, key) {
+            Ok(r) => Ok(BootCache {
+                reader: Some(r),
+                writer: None,
+                n: 0,
+            }),
+            Err(_) => Ok(BootCache {
+                reader: None,
+                writer: Some(super::bootcache::WeightWriter::create(Some(dir), key)?),
+                n: 0,
+            }),
+        }
+    }
+
+    /// One device weight buffer, in load order: from the blob on a warm boot (one large
+    /// sequential read, none of the GGUF work), built and recorded on a cold one. `want` is
+    /// the length the cold path builds (`bootcache::dense_layout` / `experts_layout`), so a
+    /// mismatch means a stale blob.
+    fn upload<F: FnOnce() -> Vec<u8>>(
+        &mut self,
+        dev: &CudaComputeDevice,
+        want: usize,
+        build: F,
+    ) -> Result<B> {
+        self.n += 1;
+        match &mut self.reader {
+            Some(r) => {
+                // A stale blob (buffer lengths don't match this build's layout): delete it and
+                // fail the load; `Coder::load` retries cold and writes a fresh one.
+                let bytes = match r.next(want) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let p = r.path.clone();
+                        r.remove();
+                        return Err(anyhow::Error::new(StaleBlob(p)).context(e));
+                    }
+                };
+                Ok(dev.upload_bytes(bytes))
+            }
+            None => {
+                let bytes = build();
+                anyhow::ensure!(
+                    bytes.len() == want,
+                    "device weights: {} bytes, want {want}",
+                    bytes.len()
+                );
+                if let Some(w) = &mut self.writer {
+                    w.record(&bytes);
+                }
+                Ok(dev.upload_bytes(&bytes))
+            }
+        }
+    }
+
+    /// `upload` for an f32 tensor (norms, biases): f32 bytes on the device.
+    fn upload_f32<F: FnOnce() -> Vec<f32>>(
+        &mut self,
+        dev: &CudaComputeDevice,
+        len: usize,
+        build: F,
+    ) -> Result<B> {
+        self.n += 1;
+        let f32_to_bytes =
+            |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        match &mut self.reader {
+            Some(r) => {
+                let bytes = match r.next(len * 4) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let p = r.path.clone();
+                        r.remove();
+                        return Err(anyhow::Error::new(StaleBlob(p)).context(e));
+                    }
+                };
+                Ok(dev.upload_bytes(bytes))
+            }
+            None => {
+                let v = build();
+                anyhow::ensure!(
+                    v.len() == len,
+                    "device weights: {} f32, want {len}",
+                    v.len()
+                );
+                let bytes = f32_to_bytes(&v);
+                if let Some(w) = &mut self.writer {
+                    w.record(&bytes);
+                }
+                Ok(dev.upload_bytes(&bytes))
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(w) = self.writer.take() {
+            let _ = w.finish();
+        }
+    }
+
+    fn is_warm(&self) -> bool {
+        self.reader.is_some()
     }
 }
 
@@ -177,45 +321,6 @@ impl Variants {
 fn gemv_v1() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TANG_CODER_GEMV").is_ok_and(|v| v == "v1"))
-}
-
-/// The ggml type id the native GEMV decodes, if it does.
-fn native_id(ty: GgmlType) -> Option<u32> {
-    use GgmlType::*;
-    Some(match ty {
-        F32 => 0,
-        Q4_0 => 2,
-        Q5_0 => 6,
-        Q8_0 => 8,
-        Q3K => 11,
-        Q4K => 12,
-        Q5K => 13,
-        Q6K => 14,
-        Iq4Nl => 20,
-        Iq4Xs => 23,
-        Bf16 => 30,
-        Q2_0 => 42,
-        _ => return None,
-    })
-}
-
-/// Q8_0 blocks (f16 scale, 32 int8 codes) of `v` (`v.len() % 32 == 0`).
-fn quantize_q8_0(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() / 32 * 34);
-    for b in v.chunks(32) {
-        let amax = b.iter().fold(0f32, |m, x| m.max(x.abs()));
-        let d = amax / 127.0;
-        out.extend_from_slice(&gguf::f32_to_f16(d).to_le_bytes());
-        for &x in b {
-            let q = if d == 0.0 {
-                0
-            } else {
-                (x / d).round().clamp(-127.0, 127.0) as i8
-            };
-            out.push(q as u8);
-        }
-    }
-    out
 }
 
 /// A dense weight for the native GEMV: one or more GGUF tensors stacked by rows.
@@ -738,8 +843,23 @@ struct Prof {
 }
 
 impl Coder {
-    /// Load a `qwen3next` GGUF (first shard) onto the GPU.
+    /// Load a `qwen3next` GGUF (first shard) onto the GPU. A stale weight boot cache (the key
+    /// missed a layout change) is deleted by the failing read and the load retried once, cold
+    /// (`docs/fast-boot.md`).
     pub fn load(path: &Path, opts: CoderOpts) -> Result<Self> {
+        // A stale blob (its buffer lengths don't match this build's layout) is deleted by the
+        // failing read and marked [`StaleBlob`]; retry once cold, which rewrites it
+        // (`docs/fast-boot.md`). Any other failure is a real error.
+        match Self::load_inner(path, opts.clone()) {
+            Err(e) if e.downcast_ref::<StaleBlob>().is_some() => {
+                eprintln!("boot cache: {e:#}; reloading cold");
+                Self::load_inner(path, opts)
+            }
+            other => other,
+        }
+    }
+
+    fn load_inner(path: &Path, opts: CoderOpts) -> Result<Self> {
         let t0 = Instant::now();
         let g = Gguf::open(path)?;
         let hp = Hparams::from_gguf(&g)?;
@@ -789,10 +909,49 @@ impl Coder {
         gpu.bind().map_err(|e| anyhow!("{e}"))?;
         let (free0, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
 
-        // ---- weights
+        // ---- weights (boot-cached; `docs/fast-boot.md`)
         let t1 = Instant::now();
+        // The cache key: the GGUF's content, the tang version, and everything that changes the
+        // device layout (arch, max_ctx, the layout env vars, the MTP sidecar). A stale or
+        // missing blob means a cold load, which rewrites it.
+        let wcache_dir = if opts.no_weight_cache {
+            None
+        } else {
+            super::bootcache::weight_cache_dir()?
+        };
+        let cache_key = match &wcache_dir {
+            Some(_) => {
+                let arch = dev.arch();
+                let paths: Vec<std::path::PathBuf> =
+                    g.shard_paths().into_iter().map(Into::into).collect();
+                let paths: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+                let mtp = opts
+                    .mtp
+                    .clone()
+                    .or_else(|| std::env::var_os("TANG_CODER_MTP").map(Into::into));
+                let extra = format!(
+                    "{arch} max_ctx={max_ctx} router16={} q8x={} mtp={}",
+                    env_is("TANG_CODER_ROUTER16", "1"),
+                    !env_is("TANG_CODER_Q8X", "0"),
+                    mtp.is_some(),
+                );
+                super::bootcache::model_key(&paths, &extra)?
+            }
+            None => String::new(),
+        };
+        let mut cache = match &wcache_dir {
+            Some(d) => BootCache::open(d, &cache_key)?,
+            None => BootCache::off(),
+        };
+        let warm = cache.is_warm();
+        if wcache_dir.is_some() {
+            eprintln!(
+                "boot cache: weights {} ({})",
+                if warm { "warm" } else { "cold" },
+                cache_key
+            );
+        }
         let info = |name: &str| -> Result<TensorInfo> { Ok(g.info(name)?.clone()) };
-        let vecf = |name: &str| -> Result<B> { Ok(dev.upload_f32(&g.tensor_f32(name)?)) };
         let mut expert_bytes = 0usize;
         let mut layers = Vec::with_capacity(hp.n_layer);
         let (hk, hv) = (hp.ssm_k_heads, hp.ssm_v_heads);
@@ -816,6 +975,7 @@ impl Coder {
                 hp.is_recurrent[l],
                 &ba_perm,
                 max_ctx,
+                &mut cache,
             )?;
             for e in [&layer.gate, &layer.up, &layer.down] {
                 expert_bytes += e.w.estride as usize * hp.n_expert;
@@ -831,13 +991,18 @@ impl Coder {
             }
         }
         let ff_sh = hp.n_ff_exp;
-        let out_norm = vecf("output_norm.weight")?;
+        let out_norm = {
+            let len = g.info("output_norm.weight")?.n_elements() as usize;
+            cache.upload_f32(&dev, len, || {
+                g.tensor_f32("output_norm.weight").expect("output_norm")
+            })?
+        };
         let head_name = if g.get("output.weight").is_some() {
             "output.weight"
         } else {
             "token_embd.weight"
         };
-        let head = upload_dense(&dev, &g, &[(info(head_name)?, None)])?;
+        let head = upload_dense(&dev, &g, &[(info(head_name)?, None)], &mut cache)?;
         ensure!(head.rows == hp.n_vocab, "head rows {}", head.rows);
         let rope = {
             let (c, s) = fl::rope_table(max_ctx, hp.rope_base as f64);
@@ -850,21 +1015,31 @@ impl Coder {
         let mtp_parts = match &mtp_path {
             Some(p) => {
                 let mg = Gguf::open(p).with_context(|| format!("MTP sidecar {}", p.display()))?;
-                let layer = load_layer(&dev, &mg, &hp, &geo, "mtp.", false, &ba_perm, max_ctx)?;
-                let fc = upload_dense(&dev, &mg, &[(mg.info("mtp.fc.weight")?.clone(), None)])?;
+                let layer = load_layer(
+                    &dev, &mg, &hp, &geo, "mtp.", false, &ba_perm, max_ctx, &mut cache,
+                )?;
+                let fc = upload_dense(
+                    &dev,
+                    &mg,
+                    &[(mg.info("mtp.fc.weight")?.clone(), None)],
+                    &mut cache,
+                )?;
                 ensure!(
                     fc.rows == hp.n_embd && fc.k == 2 * hp.n_embd,
                     "MTP fc {}x{}",
                     fc.rows,
                     fc.k
                 );
-                let v = |name: &str| -> Result<B> { Ok(dev.upload_f32(&mg.tensor_f32(name)?)) };
+                let v = |name: &str, cache: &mut BootCache| -> Result<B> {
+                    let len = mg.info(name)?.n_elements() as usize;
+                    cache.upload_f32(&dev, len, || mg.tensor_f32(name).expect("mtp tensor"))
+                };
                 Some((
                     layer,
                     fc,
-                    v("mtp.enorm.weight")?,
-                    v("mtp.hnorm.weight")?,
-                    v("mtp.norm.weight")?,
+                    v("mtp.enorm.weight", &mut cache)?,
+                    v("mtp.hnorm.weight", &mut cache)?,
+                    v("mtp.norm.weight", &mut cache)?,
                 ))
             }
             None => None,
@@ -878,6 +1053,8 @@ impl Coder {
             .unwrap();
         let s = Scratch::new(&dev, &hp, &geo, kmax, max_ctx, MAX_T, MAX_T);
         dev.sync();
+        let n_cached = cache.n;
+        cache.finish();
         let t_weights = t1.elapsed().as_secs_f64();
         let (free1, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
 
@@ -1014,7 +1191,8 @@ impl Coder {
         let stream = ManuallyDrop::new(Stream(dev.cu_stream()));
         let load_report = format!(
             "coder: {} layers ({} GDN, {} attention), {} experts top-{}, hidden {}, vocab {}; \
-             {:.1} GB VRAM ({:.1} GB experts), weights {:.0} s, kernels {:.0} s, total {:.0} s",
+             {:.1} GB VRAM ({:.1} GB experts), weights {:.0} s ({} buffers, {} boot cache), \
+             kernels {:.0} s, total {:.0} s",
             hp.n_layer,
             hp.is_recurrent.iter().filter(|&&x| x).count(),
             hp.is_recurrent.iter().filter(|&&x| !x).count(),
@@ -1025,6 +1203,14 @@ impl Coder {
             (free0 - free1) as f64 / 1e9,
             expert_bytes as f64 / 1e9,
             t_weights,
+            n_cached,
+            if warm {
+                "warm"
+            } else if wcache_dir.is_some() {
+                "cold"
+            } else {
+                "off"
+            },
             t_kernels,
             t0.elapsed().as_secs_f64()
         );
@@ -3285,8 +3471,9 @@ impl Coder {
     }
 }
 
-/// One decoder layer's weights and state buffers from `g`, its tensors named `{pre}…` (a GDN
-/// layer when `rec`, else gated attention), with a K/V cache of `max_ctx`.
+/// One decoder layer's weights and state buffers from `g`, its tensors named `{pre}...` (a GDN
+/// layer when `rec`, else gated attention), with a K/V cache of `max_ctx`. Device weight bytes
+/// come from (or go to) the boot `cache`; the state buffers are allocated fresh.
 #[allow(clippy::too_many_arguments)]
 fn load_layer(
     dev: &CudaComputeDevice,
@@ -3297,20 +3484,26 @@ fn load_layer(
     rec: bool,
     ba_perm: &[usize],
     max_ctx: usize,
+    cache: &mut BootCache,
 ) -> Result<Layer> {
     let info = |name: &str| -> Result<TensorInfo> { Ok(g.info(name)?.clone()) };
-    let vecf = |name: &str| -> Result<B> { Ok(dev.upload_f32(&g.tensor_f32(name)?)) };
+    let vecf = |name: &str, cache: &mut BootCache| -> Result<B> {
+        let len = g.info(name)?.n_elements() as usize;
+        let g2 = &*g;
+        cache.upload_f32(dev, len, move || g2.tensor_f32(name).expect("tensor"))
+    };
     let hv = hp.ssm_v_heads;
     let t = |s: &str| format!("{pre}{s}");
     let (w_in, gdn, attn) = if rec {
         let w_in = upload_dense(
-            &dev,
-            &g,
+            dev,
+            g,
             &[
                 (info(&t("attn_qkv.weight"))?, None),
                 (info(&t("attn_gate.weight"))?, None),
-                (info(&t("ssm_ba.weight"))?, Some(&ba_perm[..])),
+                (info(&t("ssm_ba.weight"))?, Some(ba_perm)),
             ],
+            cache,
         )?;
         ensure!(
             w_in.rows == geo.gdn_b() + hv,
@@ -3318,10 +3511,10 @@ fn load_layer(
             w_in.rows
         );
         let gd = GdnL {
-            conv: vecf(&t("ssm_conv1d.weight"))?,
-            dt: vecf(&t("ssm_dt.bias"))?,
-            a: vecf(&t("ssm_a"))?,
-            norm: vecf(&t("ssm_norm.weight"))?,
+            conv: vecf(&t("ssm_conv1d.weight"), cache)?,
+            dt: vecf(&t("ssm_dt.bias"), cache)?,
+            a: vecf(&t("ssm_a"), cache)?,
+            norm: vecf(&t("ssm_norm.weight"), cache)?,
             state: dev.alloc_f32(hv * 128 * 128),
             hist: dev.alloc_f32(3 * geo.gdn_conv()),
             proj: dev.alloc_f32(MAX_T * w_in.rows),
@@ -3331,13 +3524,14 @@ fn load_layer(
         (w_in, Some(gd), None)
     } else {
         let w_in = upload_dense(
-            &dev,
-            &g,
+            dev,
+            g,
             &[
                 (info(&t("attn_q.weight"))?, None),
                 (info(&t("attn_k.weight"))?, None),
                 (info(&t("attn_v.weight"))?, None),
             ],
+            cache,
         )?;
         ensure!(
             w_in.rows == (2 * hp.n_head + 2 * hp.n_head_kv) * hp.head_dim,
@@ -3345,8 +3539,8 @@ fn load_layer(
             w_in.rows
         );
         let at = AttnL {
-            qn: vecf(&t("attn_q_norm.weight"))?,
-            kn: vecf(&t("attn_k_norm.weight"))?,
+            qn: vecf(&t("attn_q_norm.weight"), cache)?,
+            kn: vecf(&t("attn_k_norm.weight"), cache)?,
             k: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
             v: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
             proj: dev.alloc_f32(MAX_T * w_in.rows),
@@ -3366,6 +3560,7 @@ fn load_layer(
             }))?,
             None,
         )],
+        cache,
     )?;
     let router = upload_dense(
         &dev,
@@ -3374,22 +3569,23 @@ fn load_layer(
             (info(&t("ffn_gate_inp.weight"))?, None),
             (info(&t("ffn_gate_inp_shexp.weight"))?, None),
         ],
+        cache,
     )?;
     ensure!(router.rows == hp.n_expert + 1, "{pre} router rows");
-    let sh_gate = upload_experts(&dev, &g, &info(&t("ffn_gate_shexp.weight"))?)?;
-    let sh_up = upload_experts(&dev, &g, &info(&t("ffn_up_shexp.weight"))?)?;
-    let sh_down = upload_experts(&dev, &g, &info(&t("ffn_down_shexp.weight"))?)?;
+    let sh_gate = upload_experts(dev, g, &info(&t("ffn_gate_shexp.weight"))?, cache)?;
+    let sh_up = upload_experts(dev, g, &info(&t("ffn_up_shexp.weight"))?, cache)?;
+    let sh_down = upload_experts(dev, g, &info(&t("ffn_down_shexp.weight"))?, cache)?;
     ensure!(
         sh_gate.w.estride as usize / sh_gate.w.row_bytes as usize == hp.n_ff_exp,
         "{pre}: the shared expert's FF must equal the routed experts' ({})",
         hp.n_ff_exp
     );
-    let gate = upload_experts(&dev, &g, &info(&t("ffn_gate_exps.weight"))?)?;
-    let up = upload_experts(&dev, &g, &info(&t("ffn_up_exps.weight"))?)?;
-    let down = upload_experts(&dev, &g, &info(&t("ffn_down_exps.weight"))?)?;
+    let gate = upload_experts(dev, g, &info(&t("ffn_gate_exps.weight"))?, cache)?;
+    let up = upload_experts(dev, g, &info(&t("ffn_up_exps.weight"))?, cache)?;
+    let down = upload_experts(dev, g, &info(&t("ffn_down_exps.weight"))?, cache)?;
     Ok(Layer {
-        attn_norm: vecf(&t("attn_norm.weight"))?,
-        post_norm: vecf(&t("post_attention_norm.weight"))?,
+        attn_norm: vecf(&t("attn_norm.weight"), cache)?,
+        post_norm: vecf(&t("post_attention_norm.weight"), cache)?,
         w_in,
         w_out,
         router,
@@ -3420,10 +3616,13 @@ fn dense_bytes(d: &Dense) -> f64 {
 
 /// Stack `parts` (tensor, optional row permutation: output row `i` is input row `perm[i]`) by
 /// rows into one native-GEMV weight. Types the GEMV doesn't decode are dequantized to f32.
+/// On a warm boot the device bytes come from the cache blob; the per-segment metadata is
+/// rebuilt either way (`docs/fast-boot.md`).
 fn upload_dense(
     dev: &CudaComputeDevice,
     g: &Gguf,
     parts: &[(TensorInfo, Option<&[usize]>)],
+    cache: &mut BootCache,
 ) -> Result<Dense> {
     let k = parts[0].0.row_len();
     let mut ws = Vec::new();
@@ -3439,58 +3638,14 @@ fn upload_dense(
             t.row_len()
         );
         let rows = t.n_rows();
-        let (ty, rb, mut bytes) = match native_id(t.ty) {
-            Some(id) => (id, t.row_bytes()?, g.bytes(t).to_vec()),
-            None => {
-                let v = g.dequantize(t)?;
-                (0, k * 4, v.iter().flat_map(|x| x.to_le_bytes()).collect())
-            }
-        };
-        if let Some(p) = perm {
-            ensure!(
-                p.len() == rows,
-                "{}: permutation of {} rows",
-                t.name,
-                p.len()
-            );
-            let src = bytes.clone();
-            for (i, &j) in p.iter().enumerate() {
-                bytes[i * rb..(i + 1) * rb].copy_from_slice(&src[j * rb..(j + 1) * rb]);
-            }
-        }
-        // TANG_CODER_ROUTER16=1: F32 rows (the router) as bf16, half the bytes.
-        let (ty, rb, bytes) = if ty == 0 && env_is("TANG_CODER_ROUTER16", "1") {
-            let b16: Vec<u8> = bytes
-                .chunks(4)
-                .flat_map(|c| {
-                    let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_bits();
-                    (((x + 0x7fff + ((x >> 16) & 1)) >> 16) as u16).to_le_bytes()
-                })
-                .collect();
-            (30, k * 2, b16)
-        } else if ty == 8 && k.is_multiple_of(1024) && !env_is("TANG_CODER_Q8X", "0") {
-            // Q8X (type 108, default; TANG_CODER_Q8X=0 keeps Q8_0): [k codes][k / 32 f16 scales] a
-            // row, lossless.
-            let nb = k / 32;
-            let mut out = Vec::with_capacity(rows * (k + 2 * nb));
-            for r in 0..rows {
-                let row = &bytes[r * rb..(r + 1) * rb];
-                for b in 0..nb {
-                    out.extend_from_slice(&row[b * 34 + 2..b * 34 + 34]);
-                }
-                for b in 0..nb {
-                    out.extend_from_slice(&row[b * 34..b * 34 + 2]);
-                }
-            }
-            (108, k + 2 * nb, out)
-        } else {
-            (ty, rb, bytes)
-        };
-        let mut bytes = bytes;
-        // 16 bytes of slack: the GEMV stages rows with aligned 16-byte loads.
-        total += rows * rb;
-        bytes.extend_from_slice(&[0u8; 16]);
-        let w = dev.upload_bytes(&bytes);
+        // `dense_layout` is the layout both paths agree on; the blob must hold exactly
+        // `want` bytes here or it's stale.
+        let (ty, rb, want) = dense_layout(t);
+        let t2 = t.clone();
+        let perm2 = perm.map(|p| p.to_vec());
+        let w = cache.upload(dev, want, move || {
+            device_bytes(g, &t2, perm2.as_deref()).expect("dense device bytes")
+        })?;
         let p = dev.buffer_addr(&w);
         words.extend_from_slice(&[
             p as u32,
@@ -3505,6 +3660,7 @@ fn upload_dense(
         }
         ws.push(w);
         off += rows;
+        total += rows * rb;
     }
     let rb = segs16.into_iter().max().unwrap_or(0);
     const GEMM_TYPES: [u32; 11] = [2, 6, 8, 11, 12, 13, 14, 20, 23, 42, 108];
@@ -3525,41 +3681,26 @@ fn upload_dense(
 }
 
 /// A `[n_expert][rows][k]` expert tensor into VRAM in its GGUF type (Q8_0 when the expert
-/// kernels don't decode it).
-fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<Experts> {
+/// kernels don't decode it; on a warm boot the requantization is already in the blob).
+fn upload_experts(
+    dev: &CudaComputeDevice,
+    g: &Gguf,
+    t: &TensorInfo,
+    cache: &mut BootCache,
+) -> Result<Experts> {
     ensure!(
         t.dims.len() == 3 || t.dims.len() == 2,
         "{}: not an expert stack or matrix",
         t.name
     );
-    let (k, rows) = (t.dims[0] as usize, t.dims[1] as usize);
-    let ne = t.dims.get(2).map_or(1, |&d| d as usize);
-    let (ty, rb, mut bytes) = match native_id(t.ty).filter(|&id| id != 0 && id != 30) {
-        Some(id) => (id, t.row_bytes()?, g.bytes(t).to_vec()),
-        None => {
-            let mut out = Vec::with_capacity(ne * rows * k / 32 * 34);
-            for e in 0..ne {
-                let v = if ne == 1 {
-                    g.dequantize(t)?
-                } else {
-                    g.expert(t, e)?
-                };
-                out.extend_from_slice(&quantize_q8_0(&v));
-            }
-            (8, k / 32 * 34, out)
-        }
-    };
-    ensure!(
-        bytes.len() == ne * rows * rb,
-        "{}: {} bytes, want {}",
-        t.name,
-        bytes.len(),
-        ne * rows * rb
-    );
-    bytes.extend_from_slice(&[0u8; 16]);
-    let w = dev.upload_bytes(&bytes);
+    let (ty, rb, want) = experts_layout(t);
+    let t2 = t.clone();
+    let w = cache.upload(dev, want, move || {
+        experts_bytes(g, &t2).expect("expert device bytes")
+    })?;
     let base = dev.buffer_addr(&w);
-    if t.ty != GgmlType::from_id(ty) {
+    let rows = t.dims[1] as usize;
+    if t.ty != GgmlType::from_id(ty) && !cache.is_warm() {
         eprintln!("coder: {} requantized to Q8_0", t.name);
     }
     Ok(Experts {
