@@ -96,6 +96,46 @@ impl Glm5Ref {
         self.g.tensor_f32(name)
     }
 
+    /// One DSA layer's weights as W3's [`super::mla::MlaWeights`] (dequantised f32).
+    fn mla_weights(&self, l: usize) -> Result<super::mla::MlaWeights> {
+        let hp = &self.hp;
+        let t = |s: &str| super::t(l, s);
+        let v = |s: &str| self.vec(&t(s));
+        // 3-D GGUF layouts: attn_k_b [d_qk][kv_lora][n_head] flat, attn_v_b
+        // [kv_lora][d_v][n_head] flat.
+        let k_b = self.g.tensor_f32(&t("attn_k_b.weight"))?;
+        let v_b = self.g.tensor_f32(&t("attn_v_b.weight"))?;
+        Ok(super::mla::MlaWeights::new(
+            hp.n_embd,
+            hp.q_lora_rank,
+            hp.kv_lora_rank,
+            hp.n_head,
+            hp.d_qk,
+            hp.d_v,
+            hp.idx_heads,
+            hp.idx_dim,
+            hp.idx_top_k,
+            hp.kpool,
+            hp.kpool_select_tail,
+            hp.eps,
+            v("attn_q_a.weight")?,
+            v("attn_q_a_norm.weight")?,
+            v("attn_q_b.weight")?,
+            v("attn_kv_a_mqa.weight")?,
+            v("attn_kv_a_norm.weight")?,
+            k_b,
+            v_b,
+            v("attn_output.weight")?,
+            v("indexer.attn_k.weight")?,
+            v("indexer.k_norm.weight")?,
+            v("indexer.k_norm.bias")?,
+            v("indexer.attn_q_b.weight")?,
+            v("indexer.proj.weight")?,
+            v("indexer_compressor_gate.weight")?,
+            v("indexer_compressor_ape.weight")?,
+        ))
+    }
+
     /// The dense lead-in FFN (`Glm5NextTextMLP`): swiglu with the HF clamp semantics —
     /// `gate.clamp(max=limit)`, `up.clamp(-limit, limit)` — then `down`.
     fn dense_ffn(&self, l: usize, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
@@ -177,7 +217,59 @@ impl Glm5Ref {
             let y: Vec<f32> = if hp.is_kda[l] {
                 todo!("kda mixer: W4 (frog/glm5-kda) has not landed yet")
             } else {
-                todo!("mla mixer: W3 (frog/glm5-mla) has not landed yet")
+                // W3's MLA-NoPE + indexer, dense-causal while kv_len <= idx_top_k
+                // (W3 verified the indexer is a no-op there).
+                let w = self.mla_weights(l)?;
+                let q_resid = w.gemv_q_a(&x, t_len);
+                let mut k_latent = w.gemv_kv_a(&x, t_len);
+                let eps_idx = 1e-6;
+                let idx_dim = hp.idx_dim;
+                let mut cache_k = vec![0f32; t_len * idx_dim];
+                let mut cache_gate = vec![0f32; t_len * idx_dim];
+                for t in 0..t_len {
+                    let mut k = vec![0f32; idx_dim];
+                    let mut g = vec![0f32; idx_dim];
+                    super::mla::indexer_key(
+                        &w,
+                        &x[t * hp.n_embd..(t + 1) * hp.n_embd],
+                        &mut k,
+                        &mut g,
+                    );
+                    cache_k[t * idx_dim..(t + 1) * idx_dim].copy_from_slice(&k);
+                    cache_gate[t * idx_dim..(t + 1) * idx_dim].copy_from_slice(&g);
+                }
+                let sel = if super::mla::indexer_is_dense(t_len, hp.idx_top_k) {
+                    None
+                } else {
+                    Some(super::mla::indexer_select(
+                        &w,
+                        &x,
+                        &q_resid,
+                        &cache_k,
+                        &cache_gate,
+                        &vec![1u8; t_len],
+                        &vec![1u8; t_len],
+                        t_len,
+                        t_len,
+                        0,
+                    ))
+                };
+                let _ = eps_idx;
+                let mut out = vec![0f32; t_len * hp.n_embd];
+                super::mla::mla_forward(
+                    &w,
+                    &x,
+                    &q_resid,
+                    &k_latent,
+                    t_len,
+                    t_len,
+                    0,
+                    None,
+                    sel.as_deref(),
+                    &mut out,
+                );
+                k_latent.clear();
+                out
             };
             dput(&format!("L{l:02}.hc_attn_out"), &[n], &y[last * n..]);
             let r_mid = r.clone();
@@ -195,7 +287,9 @@ impl Glm5Ref {
             let y: Vec<f32> = if hp.is_dense(l) {
                 self.dense_ffn(l, &x, t_len)?
             } else {
-                todo!("moe: W5 (frog/glm5-moe) has not landed yet")
+                // W5's MoE: sigmoid/noaux_tc router + shared expert, all in one call.
+                let p = super::moe::MoeParams::from_gguf(&self.g, l)?;
+                super::moe::moe_layer(&p, &x, t_len)
             };
             dput(&format!("L{l:02}.ffn_out"), &[n], &y[last * n..]);
             let r_mid = r.clone();

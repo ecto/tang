@@ -68,17 +68,22 @@ pub struct MoeParams<'a> {
 
 impl<'a> MoeParams<'a> {
     /// Read one layer's MoE tensors out of a GGUF (mmap; routed experts are dequantised
-    /// lazily one at a time by [`route_and_run`], never all at once).
+    /// lazily one at a time by [`route_and_run`], never all at once). Metadata keys are
+    /// the `glm5-next.*` ones the converter writes.
     pub fn from_gguf(g: &'a Gguf, l: usize) -> Result<Self> {
-        let hidden = g.meta_u64("embedding_length")? as usize;
-        let n_expert = g.meta_u64("expert_count")? as usize;
-        let top_k = g.meta_u64("expert_used_count")? as usize;
-        let n_shared = g.meta_u64("expert_shared_count")? as usize;
-        let ff_exp = g.meta_u64("expert_feed_forward_length")? as usize;
-        let scale = g.meta_f64("expert_weights_scale")? as f32;
-        let norm = matches!(g.meta("expert_weights_norm")?, crate::gguf::Value::Bool(true));
+        let u = |k: &str| g.meta_u64(&format!("glm5-next.{k}"));
+        let hidden = u("embedding_length")? as usize;
+        let n_expert = u("expert_count")? as usize;
+        let top_k = u("expert_used_count")? as usize;
+        let n_shared = u("expert_shared_count")? as usize;
+        let ff_exp = u("expert_feed_forward_length")? as usize;
+        let scale = g.meta_f64("glm5-next.expert_weights_scale")? as f32;
+        let norm = matches!(
+            g.meta("glm5-next.expert_weights_norm")?,
+            crate::gguf::Value::Bool(true)
+        );
         let limit = {
-            let v = g.meta("swiglu_clamp_exp")?;
+            let v = g.meta("glm5-next.swiglu_clamp_exp")?;
             let arr = match v {
                 crate::gguf::Value::Array(a) => a
                     .iter()
