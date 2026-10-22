@@ -135,6 +135,17 @@ pub(super) struct Stream {
     prefill_s: f64,
     decode_from: Option<Instant>,
     prefill_only: bool,
+    /// Structured output's grammar. Such a stream prefills all but the prompt's last token,
+    /// which it then decodes like an output step, so every output token is checked with its
+    /// row's logits; it never drafts.
+    constraint: Option<crate::structured::Constraint>,
+}
+
+impl Stream {
+    /// Where prefill stops: a constrained stream decodes the prompt's last token.
+    fn prompt_end(&self) -> usize {
+        self.ids.len() - self.constraint.is_some() as usize
+    }
 }
 
 impl FlashServe {
@@ -264,9 +275,15 @@ impl FlashServe {
                 req.sampling.temperature
             );
         }
+        let constraint = self.constraint(req)?;
+        ensure!(
+            constraint.is_none() || ids.len() >= 2,
+            "prompt too short for structured output"
+        );
         let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
         let mut marks = self.marks(&ids, &text);
-        marks.retain(|&(p, _)| p > reused);
+        let end = ids.len() - constraint.is_some() as usize;
+        marks.retain(|&(p, _)| p > reused && p <= end);
         let limit = req
             .max_tokens
             .unwrap_or(usize::MAX)
@@ -277,6 +294,13 @@ impl FlashServe {
             .map_or(text.len(), |i| i + "<|im_start|>assistant\n".len());
         let opened = text.trim_end().ends_with("<think>");
         self.requests += 1;
+        // A constrained stream whose slot already holds all but the last prompt token decodes
+        // straight away.
+        let pending =
+            (constraint.is_some() && reused == end && !req.prefill_only).then(|| ids[end]);
+        let decode_from = pending.map(|_| Instant::now());
+        let finish =
+            (constraint.is_some() && reused == end && req.prefill_only).then_some(Finish::Stop);
         Ok(Box::new(Stream {
             slot,
             key: req.cache_key.clone(),
@@ -284,7 +308,7 @@ impl FlashServe {
             marks,
             reused,
             ids,
-            pending: None,
+            pending,
             drafts: Vec::new(),
             drafted: 0,
             accepted: 0,
@@ -298,12 +322,13 @@ impl FlashServe {
             content: String::new(),
             calls: Vec::new(),
             tail: text[gen_at..].to_string(),
-            finish: None,
+            finish,
             t0,
             first: None,
             prefill_s: 0.0,
-            decode_from: None,
+            decode_from,
             prefill_only: req.prefill_only,
+            constraint,
         }))
     }
 
@@ -320,6 +345,9 @@ impl FlashServe {
             return Ok(());
         }
         s.out.push(tok);
+        if let Some(c) = s.constraint.as_mut() {
+            c.accept(tok)?;
+        }
         for chunk in s
             .detok
             .push(&s.out, &self.tags, |ids| self.tok.decode(ids))?
@@ -338,7 +366,10 @@ impl FlashServe {
                 Some(i) => new[..new.len().saturating_sub(s.text_out.len() - i)].to_string(),
                 None => new,
             };
+            // Constrained output is the grammar's JSON verbatim: tool-call or think markers
+            // inside a string value are data, not structure.
             let pieces = match tag {
+                _ if s.constraint.is_some() => vec![Piece::Text(new)],
                 Some(t) if new == t => s.parser.push_tag(t),
                 _ => s.parser.push_text(&new),
             };
@@ -363,7 +394,10 @@ impl FlashServe {
                 return Ok(());
             }
         }
-        if s.out.len() >= s.limit {
+        // The JSON value is complete: nothing but an end of turn may follow.
+        if s.constraint.as_ref().is_some_and(|c| c.finished()) {
+            s.finish = Some(Finish::Stop);
+        } else if s.out.len() >= s.limit {
             s.finish = Some(Finish::Length);
         }
         Ok(())
@@ -391,8 +425,8 @@ impl FlashServe {
             .enumerate()
             .filter_map(|(i, l)| {
                 let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
-                (s.finish.is_none() && s.done_prompt < s.ids.len())
-                    .then(|| (s.ids.len() - s.done_prompt, i))
+                (s.finish.is_none() && s.done_prompt < s.prompt_end())
+                    .then(|| (s.prompt_end() - s.done_prompt, i))
             })
             .collect();
         let wide = self.e.wide_rows();
@@ -438,7 +472,15 @@ impl FlashServe {
             }
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
-            if s.done_prompt == s.ids.len() {
+            if s.done_prompt == s.prompt_end() && s.constraint.is_some() {
+                if s.prefill_only {
+                    s.finish = Some(Finish::Stop);
+                } else {
+                    // The last prompt token goes through the decode step (see `constraint`).
+                    s.decode_from = Some(Instant::now());
+                    s.pending = Some(s.ids[s.done_prompt]);
+                }
+            } else if s.done_prompt == s.ids.len() {
                 if s.prefill_only {
                     s.finish = Some(Finish::Stop);
                 } else {
@@ -460,6 +502,51 @@ impl FlashServe {
                 (s.finish.is_none() && s.pending.is_some()).then_some(i)
             })
             .collect();
+        // Structured-output streams: one row each and no drafts, in windows of their own (their
+        // logits are read before the MTP pass reuses the head buffer). The device's greedy
+        // pick stands when the grammar allows it; otherwise the masked argmax of the row.
+        let (constrained, ready): (Vec<usize>, Vec<usize>) = ready.into_iter().partition(|&i| {
+            let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
+            s.constraint.is_some()
+        });
+        let v = self.e.vocab_size();
+        for group in constrained.chunks(MAX_T) {
+            let rows: Vec<(usize, u32)> = group
+                .iter()
+                .map(|&i| {
+                    let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
+                    (s.slot, s.pending.unwrap())
+                })
+                .collect();
+            let t = Instant::now();
+            let (out, mut logits) = self.e.decode_batch_logits(&rows)?;
+            ensure!(
+                out.len() == rows.len() && logits.len() >= rows.len() * v,
+                "decode window returned {} tokens, {} logits for {} rows",
+                out.len(),
+                logits.len(),
+                rows.len()
+            );
+            self.prefill_debt = (self.prefill_debt - t.elapsed().as_secs_f64()).max(0.0);
+            for (k, &i) in group.iter().enumerate() {
+                let l = &mut lanes[i];
+                let s = l.stream.downcast_mut::<Stream>().unwrap();
+                s.pending = None;
+                s.windows += 1;
+                let pos = (s.ids.len() + s.out.len()) as u64;
+                let row = &mut logits[k * v..(k + 1) * v];
+                let tok = s.constraint.as_mut().unwrap().choose(
+                    out[k],
+                    row,
+                    &crate::structured::HostSampling::default(),
+                    pos,
+                )?;
+                self.batch_take(s, tok, l.on)?;
+                if s.finish.is_none() {
+                    s.pending = Some(tok);
+                }
+            }
+        }
         let mtp = self.e.use_mtp();
         for group in ready.chunks(MAX_T) {
             // Drafts for each stream, cut at an end of turn and the token limit, then the
@@ -528,7 +615,7 @@ impl FlashServe {
 
     pub(super) fn batch_state(s: &Inflight) -> (bool, bool) {
         let s = s.downcast_ref::<Stream>().expect("a flash stream");
-        (s.finish.is_some(), s.done_prompt < s.ids.len())
+        (s.finish.is_some(), s.done_prompt < s.prompt_end())
     }
 
     pub(super) fn batch_retire(&mut self, s: Inflight) -> Result<Outcome> {
