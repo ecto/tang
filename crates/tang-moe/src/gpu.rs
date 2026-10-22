@@ -5,7 +5,7 @@
 //! Everything here assumes the context is current on the calling thread
 //! ([`Gpu::bind`]). Handles free themselves on drop.
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::sync::Arc;
 
 use cudarc::driver::{sys, CudaContext};
@@ -28,6 +28,9 @@ impl From<cudarc::driver::DriverError> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What every kernel-cache entry starts with (version 1).
+const KERN_MAGIC: &[u8; 8] = b"tangkc\0\x01";
 
 /// Turn a `CUresult` into a `Result`, naming the call.
 pub fn check(r: sys::CUresult, what: &str) -> Result<()> {
@@ -87,22 +90,198 @@ impl Gpu {
     }
 
     /// Compile CUDA C with NVRTC for this device's architecture and load it.
+    ///
+    /// The compile asks nvrtc for a CUBIN of this arch (`--gpu-architecture=sm_XX`), which
+    /// loads without the driver's PTX JIT, and with `TANG_KERNEL_CACHE=<dir>` (see tang-llm
+    /// `docs/fast-boot.md`) both the CUBIN and its PTX are cached under the dir by source hash
+    /// and arch, so a warm boot skips NVRTC entirely. The cache key is the full source text,
+    /// which only changes with the binary, so a different build or arch never reuses an entry.
+    /// `TANG_KERNEL_CACHE=0` (or unset) compiles like before. Every cache error is logged and
+    /// ignored: a broken entry costs a recompile, not a boot.
     pub fn module(&self, src: &str) -> Result<Module> {
         let major =
             self.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
         let minor =
             self.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
         let arch: &'static str = Box::leak(format!("sm_{major}{minor}").into_boxed_str());
-        let opts = cudarc::nvrtc::CompileOptions {
-            arch: Some(arch),
-            ..Default::default()
+        let cache = kernel_cache(arch);
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ("tang-kernel-cache-v1", src).hash(&mut h);
+            h.finish()
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
-            .map_err(|e| Error(format!("nvrtc: {e:?}")))?;
-        let src = CString::new(ptx.to_src()).unwrap();
-        let mut m: sys::CUmodule = std::ptr::null_mut();
-        ck!(sys::cuModuleLoadData(&mut m, src.as_ptr() as *const c_void))?;
-        Ok(Module(m))
+        if let Some(dir) = &cache {
+            if let Ok(Some(image)) = KernelImage::read(dir, hash) {
+                if let Some(m) = image.load() {
+                    return Ok(m);
+                }
+                // present but unloadable (an old driver?): recompile below
+            }
+        }
+        let image = compile(src, arch).map_err(|e| Error(format!("nvrtc: {e}")))?;
+        if let Some(dir) = &cache {
+            if let Err(e) = image.write(dir, hash) {
+                eprintln!("kernel cache: {e} (kernels not cached)");
+            }
+        }
+        image
+            .load()
+            .ok_or_else(|| Error("nvrtc: no cubin and no ptx".into()))
+    }
+}
+
+/// `TANG_KERNEL_CACHE=<dir>`; `0` or unset = off. Returns the dir with the arch appended, made
+/// if needed; `None` when off or unusable (which just disables caching).
+fn kernel_cache(arch: &str) -> Option<std::path::PathBuf> {
+    let v = std::env::var_os("TANG_KERNEL_CACHE")?;
+    if v == "0" {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(v).join(arch);
+    std::fs::create_dir_all(&dir).is_ok().then_some(dir)
+}
+
+/// One cached compile: whatever nvrtc emitted for this arch — the CUBIN (preferred: it
+/// loads without the driver's PTX JIT), the PTX, or both (`--gpu-architecture=sm_XX` emits a
+/// CUBIN; older toolkits also hand out the PTX).
+struct KernelImage {
+    ptx: Option<String>,
+    cubin: Option<Vec<u8>>,
+}
+
+impl KernelImage {
+    fn entry(dir: &std::path::Path, hash: u64) -> std::path::PathBuf {
+        dir.join(format!("k-{hash:016x}.bin"))
+    }
+
+    /// The entry for `hash`, or `None` when absent or malformed (malformed = recompile).
+    fn read(dir: &std::path::Path, hash: u64) -> Result<Option<KernelImage>> {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(Self::entry(dir, hash)) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let mut b = Vec::new();
+        if f.read_to_end(&mut b).is_err() {
+            return Ok(None);
+        }
+        let u32_at = |c: &[u8]| u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        if b.len() < 8 || &b[..8] != KERN_MAGIC || b.len() < 12 {
+            return Ok(None);
+        }
+        let pl = u32_at(&b[8..12]) as usize;
+        if b.len() < 12 + pl + 1 {
+            return Ok(None);
+        }
+        let ptx = Some(String::from_utf8_lossy(&b[12..12 + pl]).into_owned());
+        let mut c = &b[12 + pl..];
+        let cubin = match c.first() {
+            Some(1) => {
+                c = &c[1..];
+                if c.len() < 4 {
+                    return Ok(None);
+                }
+                let cl = u32_at(&c[..4]) as usize;
+                c = &c[4..];
+                if c.len() < cl {
+                    return Ok(None);
+                }
+                Some(c[..cl].to_vec())
+            }
+            _ => None,
+        };
+        Ok(Some(KernelImage { ptx, cubin }))
+    }
+
+    fn write(&self, dir: &std::path::Path, hash: u64) -> std::io::Result<()> {
+        use std::io::Write;
+        let p = Self::entry(dir, hash);
+        let tmp = p.with_extension("tmp");
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        w.write_all(KERN_MAGIC)?;
+        let ptx = self.ptx.as_deref().unwrap_or_default();
+        w.write_all(&(ptx.len() as u32).to_le_bytes())?;
+        w.write_all(ptx.as_bytes())?;
+        match &self.cubin {
+            Some(c) => {
+                w.write_all(&[1u8])?;
+                w.write_all(&(c.len() as u32).to_le_bytes())?;
+                w.write_all(c)?;
+            }
+            None => w.write_all(&[0u8])?,
+        }
+        w.into_inner()?.sync_all()?;
+        std::fs::rename(&tmp, &p)
+    }
+}
+
+impl KernelImage {
+    /// Load this image's module: the CUBIN as-is (no driver JIT), the PTX NUL-terminated
+    /// (the driver JITs it then). `None` when nothing loads — the caller recompiles.
+    fn load(&self) -> Option<Module> {
+        let try_load = |image: &[u8], nul: bool| -> Option<Module> {
+            let mut buf = image.to_vec();
+            if nul {
+                buf.push(0);
+            }
+            let mut m: sys::CUmodule = std::ptr::null_mut();
+            check(
+                unsafe { sys::cuModuleLoadData(&mut m, buf.as_ptr() as *const c_void) },
+                "cuModuleLoadData",
+            )
+            .ok()
+            .map(|_| Module(m))
+        };
+        self.cubin
+            .as_deref()
+            .and_then(|c| try_load(c, false))
+            .or_else(|| {
+                self.ptx
+                    .as_deref()
+                    .and_then(|p| try_load(p.as_bytes(), true))
+            })
+    }
+}
+
+/// Compile `src` for `arch` once, taking both the PTX and (when nvrtc makes one) the CUBIN from
+/// the same program. A real `-arch=sm_XX` (not `compute_XX`) is what makes nvrtc emit CUBIN.
+fn compile(src: &str, arch: &str) -> std::result::Result<KernelImage, String> {
+    use cudarc::nvrtc::{result as nres, sys as nsys};
+    use std::ffi::CString;
+    let c_src = CString::new(src).map_err(|e| e.to_string())?;
+    let name = CString::new("tang.cu").map_err(|e| e.to_string())?;
+    let prog = nres::create_program(&c_src, Some(&name)).map_err(|e| e.to_string())?;
+    // Safety: `prog` is destroyed on every path below.
+    unsafe {
+        let arch = CString::new(format!("--gpu-architecture={arch}")).map_err(|e| e.to_string())?;
+        if let Err(e) = nres::compile_program(prog, &[arch]) {
+            let _ = nres::destroy_program(prog);
+            return Err(format!("{e:?}"));
+        }
+        let ptx = nres::get_ptx(prog)
+            .ok()
+            .map(|v| CStr::from_ptr(v.as_ptr()).to_string_lossy().into_owned());
+        let cubin = {
+            let mut out = None;
+            let mut size = 0usize;
+            if nsys::nvrtcGetCUBINSize(prog, &mut size) == nsys::nvrtcResult::NVRTC_SUCCESS
+                && size > 0
+            {
+                let mut cubin = vec![0u8; size];
+                if nsys::nvrtcGetCUBIN(prog, cubin.as_mut_ptr() as *mut std::os::raw::c_char)
+                    == nsys::nvrtcResult::NVRTC_SUCCESS
+                {
+                    out = Some(cubin);
+                }
+            }
+            out
+        };
+        let _ = nres::destroy_program(prog);
+        if cubin.is_none() && ptx.is_none() {
+            return Err("nvrtc emitted neither a cubin nor ptx".into());
+        }
+        Ok(KernelImage { ptx, cubin })
     }
 }
 

@@ -5,6 +5,7 @@
 //! The block math, with its traps, is written up in `docs/strata.md`; what the GGUF actually holds
 //! is in `docs/flash-next-tensors.md`.
 
+pub mod bootcache;
 #[cfg(feature = "cuda")]
 pub mod cli;
 #[cfg(feature = "cuda")]
