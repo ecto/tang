@@ -7,22 +7,32 @@
 //!   extends the conversation), so only the new tokens are prefilled; otherwise a fresh slot,
 //!   evicting the least recently used parked one when all are taken. The recurrent state can't
 //!   rewind, so a slot is only ever extended.
-//! - **A step.** Prefilling streams advance by a chunk, shortest remaining prompt first (an
-//!   agent's cached turn prefills a few dozen tokens and shouldn't wait behind a cold 15k
-//!   prompt), then one batched decode window runs every decoding stream's next token (up to
+//! - **A step.** Prefilling streams advance by a chunk, the step's token budget shared across
+//!   them (the budget shared equally; `TANG_PREFILL_POLICY=srf` for the old shortest-remaining-first
+//!   rule), then one batched decode window runs every decoding stream's next token (up to
 //!   `MAX_T` rows a window). While any stream is decoding, prefill gets `PREFILL_SLICE` tokens a
 //!   chunk and only as much GPU time as decode has had since, so decoders keep about half the
 //!   GPU instead of crawling at a token per prefill chunk.
 //! - **Greedy.** Batched windows sample greedily until the engine has per-row sampling; a
 //!   request that asks for a temperature is logged and runs greedy.
 //! - No drafts in batched windows yet (per-slot verify is engine work still to come).
+//!
+//! The planner half (this file's top) is pure and unit-tested without CUDA; the `FlashServe`
+//! methods below it need the cuda server (`serve.rs` includes this as `mod batch`).
 
+#[cfg(feature = "cuda")]
 use super::{FlashServe, Memo};
+#[cfg(feature = "cuda")]
 use crate::chat::{Chunk, Detok, Parser, Piece};
+#[cfg(feature = "cuda")]
 use crate::engine::{Finish, Outcome, Request, Usage};
+#[cfg(feature = "cuda")]
 use crate::server::{DynLane, Inflight};
+#[cfg(feature = "cuda")]
 use anyhow::{bail, ensure, Result};
+#[cfg(feature = "cuda")]
 use serde_json::Value;
+#[cfg(feature = "cuda")]
 use std::time::Instant;
 use tang_compute::flash::MAX_T;
 
@@ -45,7 +55,9 @@ fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(u
 }
 
 /// [`prefill_plan`] with the budgets given: `full` tokens when nothing decodes, `slice` while
-/// something does (wide windows: `WIDE_BUDGET` / `WIDE_SLICE`).
+/// something does (wide windows: `WIDE_BUDGET` / `WIDE_SLICE`). The policy comes from
+/// `TANG_PREFILL_POLICY` (`prefill_policy`): `fair` shares the budget (see `share_budget`),
+/// `srf` is the old shortest-remaining-first rule.
 fn prefill_plan_with(
     waiting: &[(usize, usize)],
     decoding: bool,
@@ -53,23 +65,106 @@ fn prefill_plan_with(
     full: usize,
     slice: usize,
 ) -> Vec<(usize, usize)> {
+    prefill_plan_policy(waiting, decoding, debt, full, slice, prefill_policy())
+}
+
+/// The one planner: `budget` tokens split by `policy` over the waiting streams.
+fn prefill_plan_policy(
+    waiting: &[(usize, usize)],
+    decoding: bool,
+    debt: f64,
+    full: usize,
+    slice: usize,
+    policy: Policy,
+) -> Vec<(usize, usize)> {
     let mut budget = match (decoding, debt > 0.0) {
         (false, _) => full,
         (true, false) => slice,
         (true, true) => 0,
     };
+    // Lanes in the order the policies work over: shortest remaining first.
     let mut order = waiting.to_vec();
     order.sort_unstable();
-    let mut plan = Vec::new();
-    for (rem, i) in order {
-        if budget == 0 {
+    let plan = match policy {
+        Policy::Fair => share_budget(&order, budget),
+        Policy::Srf => {
+            let mut plan = Vec::new();
+            for (rem, i) in order {
+                if budget == 0 {
+                    break;
+                }
+                let n = rem.min(budget);
+                plan.push((i, n));
+                budget -= n;
+            }
+            plan
+        }
+    };
+    plan
+}
+
+/// The prefill admission policy from `TANG_PREFILL_POLICY`: `fair` (the default) shares the
+/// step's budget across waiting streams, `srf` is the old shortest-remaining-first rule.
+fn prefill_policy() -> Policy {
+    match std::env::var("TANG_PREFILL_POLICY").as_deref() {
+        Ok("srf") => Policy::Srf,
+        _ => Policy::Fair,
+    }
+}
+
+/// Fair shares of `budget` over `order` (remaining, lane): every waiting stream gets an equal
+/// share (the earlier lanes take the rounding remainder), capped at what it still wants, so a
+/// short prompt finishes the step it arrives and is out of the way. Whatever the capped streams
+/// handed back goes to the streams still wanting, equally again, until the budget is spent — so
+/// N cold prompts arriving together finish together (each TTFT ≈ total, not 1×..N× serial),
+/// and the budget is never exceeded. The old rule (`TANG_PREFILL_POLICY=srf`) instead gave the
+/// shortest-remaining stream the whole budget, so N cold prompts prefill serially.
+fn share_budget(order: &[(usize, usize)], mut budget: usize) -> Vec<(usize, usize)> {
+    if order.is_empty() || budget == 0 {
+        return Vec::new();
+    }
+    // (remaining, lane, given), shortest remaining first (ties: the caller's lane order).
+    let mut streams: Vec<(usize, usize, usize)> =
+        order.iter().map(|&(rem, i)| (rem, i, 0)).collect();
+    streams.sort_unstable();
+    let equal = budget / streams.len();
+    let extra = budget % streams.len();
+    for (k, s) in streams.iter_mut().enumerate() {
+        s.2 = s.0.min(equal + if k < extra { 1 } else { 0 });
+    }
+    // Hand the capped streams' difference back, equally among who still wants.
+    let mut left = budget - streams.iter().map(|s| s.2).sum::<usize>();
+    while left > 0 {
+        let wanting: Vec<usize> = (0..streams.len())
+            .filter(|k| streams[*k].2 < streams[*k].0)
+            .collect();
+        if wanting.is_empty() {
             break;
         }
-        let n = rem.min(budget);
-        plan.push((i, n));
-        budget -= n;
+        let equal = left / wanting.len();
+        let extra = left % wanting.len();
+        for (n, &k) in wanting.iter().enumerate() {
+            let g = (streams[k].0 - streams[k].2).min(equal + if n < extra { 1 } else { 0 });
+            streams[k].2 += g;
+            left -= g;
+        }
+        if equal == 0 && extra == 0 {
+            break;
+        }
     }
-    plan
+    streams
+        .into_iter()
+        .filter(|s| s.2 > 0)
+        .map(|(rem, i, g)| (i, g.min(rem)))
+        .collect()
+}
+
+/// The prefill admission policy (see [`prefill_plan_policy`]): share the budget (`fair`, the
+/// default) or let the shortest-remaining stream take all of it (`srf`, the old rule).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Policy {
+    Fair,
+    Srf,
 }
 
 /// Draft rows per stream in one window, for streams wanting `want[i]` drafts: one row each for
@@ -95,6 +190,7 @@ fn share_drafts(want: &[usize]) -> Vec<usize> {
 }
 
 /// A parked or running sequence slot.
+#[cfg(feature = "cuda")]
 pub(super) struct SlotInfo {
     pub id: usize,
     pub busy: bool,
@@ -103,6 +199,7 @@ pub(super) struct SlotInfo {
 }
 
 /// One request in the batch.
+#[cfg(feature = "cuda")]
 pub(super) struct Stream {
     slot: usize,
     key: Option<String>,
@@ -137,6 +234,7 @@ pub(super) struct Stream {
     prefill_only: bool,
 }
 
+#[cfg(feature = "cuda")]
 impl FlashServe {
     pub(super) fn batch_can_admit(&self, key: Option<&str>) -> bool {
         let busy = self.slots.iter().filter(|s| s.busy).count();
@@ -377,8 +475,9 @@ impl FlashServe {
                 s.finish = Some(Finish::Cancelled);
             }
         }
-        // Prefill, shortest remaining prompt first. With streams decoding, a short chunk and only
-        // when decode has caught up on GPU time (prefill_debt), so both make progress.
+        // Prefill, the budget shared across waiting streams (see `prefill_plan_with`). With
+        // streams decoding, a short chunk and only when decode has caught up on GPU time
+        // (prefill_debt), so both make progress.
         let decoding = lanes.iter().any(|l| {
             let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
             s.finish.is_none() && s.pending.is_some()
@@ -598,6 +697,8 @@ impl FlashServe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "cuda"))]
+    use {crate::queue::Priority, std::time::Instant as _};
 
     /// A simulated engine: prefill costs `PF` seconds a token, a decode window `DW` seconds.
     /// Stream 0 is a cold 15k prompt, stream 1 decodes throughout, stream 2 is a cached agent
@@ -674,6 +775,149 @@ mod tests {
         assert!(prefill_plan_with(&w, true, 0.5, WIDE_BUDGET, WIDE_SLICE).is_empty());
     }
 
+    /// Fair shares: four cold 58k prompts arriving together make equal progress a step, and
+    /// the whole budget is spent (never exceeded).
+    #[test]
+    fn four_cold_prompts_share_the_budget_equally() {
+        let w = [(58_000, 0), (58_000, 1), (58_000, 2), (58_000, 3)];
+        let plan = prefill_plan_with(&w, false, 0.0, WIDE_BUDGET, WIDE_SLICE);
+        assert_eq!(plan, vec![(0, 512), (1, 512), (2, 512), (3, 512)]);
+        let step: usize = plan.iter().map(|(_, n)| n).sum();
+        assert_eq!(step, WIDE_BUDGET, "the budget is exactly spent");
+        // The same shares keep coming, so all four finish together.
+        let rem: Vec<(usize, usize)> = plan.iter().map(|&(i, n)| (58_000 - n, i)).collect();
+        assert_eq!(
+            prefill_plan_with(&rem, false, 0.0, WIDE_BUDGET, WIDE_SLICE),
+            vec![(0, 512), (1, 512), (2, 512), (3, 512)]
+        );
+    }
+
+    /// A short prompt behind long ones finishes the step it arrives: it takes its tokens and
+    /// the long streams share the rest.
+    #[test]
+    fn short_prompts_finish_the_step_they_arrive() {
+        let w = [(58_000, 0), (27, 1), (58_000, 2)];
+        let plan = prefill_plan_with(&w, false, 0.0, WIDE_BUDGET, WIDE_SLICE);
+        assert_eq!(plan, vec![(1, 27), (0, 1011), (2, 1010)]);
+        // While decoding, the short prompt still takes its 27 from the slice.
+        let plan = prefill_plan_with(&w, true, 0.0, WIDE_BUDGET, WIDE_SLICE);
+        assert_eq!(plan, vec![(1, 27), (0, 115), (2, 114)]);
+    }
+
+    /// With more streams than the budget has tokens for (a slice while decoding), every stream
+    /// still moves: each gets one token a step until the budget runs out, earlier lanes first.
+    #[test]
+    fn every_stream_moves_when_the_budget_is_tight() {
+        let w = [(4_000, 0), (4_000, 1), (4_000, 2), (4_000, 3)];
+        let plan = prefill_plan_with(&w, true, 0.0, WIDE_BUDGET, WIDE_SLICE.min(4));
+        assert_eq!(plan, vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
+        // Budget 0 (in debt to decode): nobody prefills, so decoders are never starved.
+        assert!(prefill_plan_with(&w, true, 0.5, WIDE_BUDGET, WIDE_SLICE).is_empty());
+    }
+
+    /// The budget is never exceeded, whatever the mix, and nobody gets more than it wants.
+    #[test]
+    fn the_budget_is_never_exceeded() {
+        let cases: Vec<Vec<(usize, usize)>> = vec![
+            vec![(58_000, 0)],
+            vec![(58_000, 0), (58_000, 1)],
+            vec![(58_000, 0), (3, 1), (58_000, 2)],
+            vec![(1, 0), (2, 1), (3, 2), (58_000, 3)],
+            vec![(100, 0), (2_000, 1), (3_000, 2), (4_000, 3), (5, 4)],
+            vec![(58_000, 0), (58_000, 1), (58_000, 2), (58_000, 3), (2, 4)],
+            vec![(2_048, 0), (2_048, 1), (2_049, 2)],
+        ];
+        for waiting in cases {
+            for decoding in [false, true] {
+                let plan = prefill_plan_with(&waiting, decoding, 0.0, WIDE_BUDGET, WIDE_SLICE);
+                let spent: usize = plan.iter().map(|(_, n)| n).sum();
+                let cap = if decoding { WIDE_SLICE } else { WIDE_BUDGET };
+                assert!(spent <= cap, "{waiting:?} spent {spent} > {cap}");
+                for &(i, n) in &plan {
+                    assert!(n > 0 && n <= waiting[i].0, "lane {i} gets {n}");
+                }
+            }
+        }
+    }
+
+    /// The old rule stays behind `TANG_PREFILL_POLICY=srf`: shortest remaining takes the whole
+    /// budget (what step 1 of dart-prefill measured as the 32/63/93/123 s staircase).
+    #[test]
+    fn srf_policy_restores_the_old_monopoly() {
+        let w = [(58_000, 0), (30, 1), (40_000, 2)];
+        let plan = prefill_plan_policy(&w, false, 0.0, WIDE_BUDGET, WIDE_SLICE, Policy::Srf);
+        assert_eq!(plan, vec![(1, 30), (2, WIDE_BUDGET - 30)]);
+        assert_eq!(
+            prefill_plan_policy(&w, true, 0.0, WIDE_BUDGET, WIDE_SLICE, Policy::Srf),
+            vec![(1, 30), (2, WIDE_SLICE - 30)]
+        );
+    }
+
+    /// A short prompt arriving behind long ones finishes in ~its own length over the budget,
+    /// while the long streams still make equal progress every step.
+    #[test]
+    fn a_short_prompt_is_not_blocked_behind_long_ones() {
+        // A 27-token cached agent turn lands behind four 58k cold prompts. It finishes the
+        // step it arrives (27 < the budget, so it's a "short" stream), and the cold streams
+        // keep their shares the whole way.
+        let long = [(58_000, 0), (58_000, 1), (58_000, 2), (58_000, 3)];
+        let (mut steps, mut tail_steps) = (0, 0);
+        let mut done = [false; 5];
+        let mut rem5: Vec<(usize, usize)> =
+            long.iter().enumerate().map(|(i, &(r, _))| (r, i)).collect();
+        rem5.push((27, 4));
+        while done.iter().any(|d| !d) {
+            let plan = prefill_plan_with(&rem5, false, 0.0, WIDE_BUDGET, WIDE_SLICE);
+            assert!(!plan.is_empty(), "no stream moved");
+            for (i, n) in plan {
+                rem5[i].0 -= n;
+                if rem5[i].0 == 0 {
+                    done[i] = true;
+                    if i == 4 {
+                        tail_steps = steps + 1;
+                    }
+                }
+            }
+            steps += 1;
+            assert!(steps < 500, "the cold prompts starved");
+        }
+        // The tail finished in one step (27 tokens fit the budget), long before the cold
+        // prompts (58k/2048 over 4 streams ≈ 114 steps).
+        assert_eq!(tail_steps, 1, "the tail took {tail_steps} steps");
+        assert!(steps >= 113, "the cold prompts finished too early: {steps}");
+    }
+
+    #[test]
+    fn four_cold_prompts_finish_together_under_fair_shares() {
+        // The end state the goal asks for: four 58k prompts all finish on the same step,
+        // so each TTFT ≈ total, not 1×..4× staggered.
+        let mut rem: Vec<(usize, usize)> = (0..4).map(|i| (58_000, i)).collect();
+        let mut done_at = vec![0usize; 4];
+        let mut steps = 0;
+        let mut live = 4;
+        while live > 0 {
+            for (i, n) in prefill_plan_with(&rem, false, 0.0, WIDE_BUDGET, WIDE_SLICE) {
+                rem[i].0 -= n;
+                if rem[i].0 == 0 {
+                    done_at[i] = steps;
+                    live -= 1;
+                }
+            }
+            steps += 1;
+            assert!(steps < 500);
+        }
+        assert_eq!(
+            done_at
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "all four finished the same step: {done_at:?}"
+        );
+        // 58k = 113×512 + 144, so 113 full steps and a 144-token one.
+        assert_eq!(steps, 114);
+    }
+
     #[test]
     fn spare_rows_go_to_drafts_round_robin() {
         assert_eq!(share_drafts(&[2]), vec![2]);
@@ -684,8 +928,20 @@ mod tests {
     }
 
     #[test]
-    fn nothing_decoding_gets_the_full_budget_shortest_first() {
+    fn nothing_decoding_shares_the_full_budget() {
+        // Fair shares with nothing decoding: the 30-token prompt finishes, the two cold
+        // prompts split the rest exactly (226 is even here).
         let plan = prefill_plan(&[(1000, 0), (30, 1), (500, 2)], false, 5.0);
+        assert_eq!(plan, vec![(1, 30), (2, 113), (0, 113)]);
+        // SRF (the old rule) gives the shortest remaining stream the whole budget.
+        let plan = prefill_plan_policy(
+            &[(1000, 0), (30, 1), (500, 2)],
+            false,
+            5.0,
+            PREFILL_BUDGET,
+            PREFILL_SLICE,
+            Policy::Srf,
+        );
         assert_eq!(plan, vec![(1, 30), (2, PREFILL_BUDGET - 30)]);
     }
 }

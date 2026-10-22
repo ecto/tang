@@ -29,6 +29,12 @@ pub mod requant;
 pub mod sampler;
 #[cfg(feature = "cuda")]
 pub mod serve;
+/// The batch scheduler's planner (`serve.rs`'s `mod batch`): pure prefill-budget rules, unit
+/// tested without CUDA. The `FlashServe` methods in the same file are compiled only with the
+/// cuda server (`serve_batch.rs` gates them on the feature).
+#[cfg(test)]
+#[path = "serve_batch.rs"]
+pub mod serve_batch;
 pub mod tokenize;
 
 use crate::gguf::{Gguf, TensorInfo};

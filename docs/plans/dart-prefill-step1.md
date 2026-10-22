@@ -126,6 +126,9 @@ fairness tweak alone still brings the 4×58k worst case from 123 s to ~52–70 s
    across waiting streams round-robin instead of shortest-remaining-takes-all. Small, pure,
    testable change (the file's existing unit tests at `serve_batch.rs:660-675` show the pattern).
    Bounds the worst-case TTFT and stops a 117k prompt from blocking the queue for 64 s.
+   **Done** (frog/dart-prefill, step 2): `share_budget` gives every waiting stream an equal
+   share capped at what it wants, `TANG_PREFILL_POLICY=srf` restores the old rule for A/B,
+   planner unit-tested without CUDA (`flash::serve_batch::tests`).
 5. **Deploy** via the zest node image (`TANG_REF` → new main; §6) and have the frog cloud
    manager re-run their live TTFT check (4 concurrent 58k cold prompts through the router).
 
