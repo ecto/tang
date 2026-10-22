@@ -116,7 +116,18 @@ struct Variants {
     /// `gdn_chunked.rs`). Not bitwise: equal to the per-token kernel up to reassociation. Off
     /// by default.
     gdn_chunked: bool,
+    /// `TANG_CODER_GDN=chunked2`: wide one-segment windows of at least [`GDN_C2_MIN`] rows run
+    /// the three-phase chunkwise kernels (`fl_gdn_c2_prep` / `_state` / `_out`, chunk 64, bf16
+    /// tensor cores; CPU reference `gdn_chunked::three_phase`). Needs ~150 KB of shared memory a
+    /// block (sm_90). Not bitwise. Off by default.
+    gdn_chunked2: bool,
 }
+
+/// `chunked2`'s chunk (the kernels' `GC2_C`) and the narrowest window it takes.
+const GDN_C2_CHUNK: usize = 64;
+const GDN_C2_MIN: usize = 64;
+/// Dynamic shared memory of the three `chunked2` kernels (`GC2_SMEM_A/B/C`).
+const GDN_C2_SMEM: [u32; 3] = [154_112, 104_704, 152_832];
 
 /// The narrowest window the chunked GDN kernel takes (two of its 16-token chunks); decode and
 /// verify windows keep the per-token kernel either way.
@@ -135,6 +146,7 @@ impl Default for Variants {
             wgemm_gu: true,
             wgemm_down: true,
             gdn_chunked: false,
+            gdn_chunked2: false,
         }
     }
 }
@@ -154,6 +166,7 @@ impl Variants {
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
             gdn_chunked: env_is("TANG_CODER_GDN", "chunked"),
+            gdn_chunked2: env_is("TANG_CODER_GDN", "chunked2"),
         }
     }
 }
@@ -412,6 +425,7 @@ struct Kern {
     gdn_step_seg: Fun,
     gdn_commit_seg: Fun,
     gdn_chunk_seg: Fun,
+    gdn_c2: [Fun; 3],
     copy: Fun,
     argmax1: Fun,
     argmax2: Fun,
@@ -454,6 +468,7 @@ impl Kern {
             gdn_step_seg: self.gdn_step_seg,
             gdn_commit_seg: self.gdn_commit_seg,
             gdn_chunk_seg: self.gdn_chunk_seg,
+            gdn_c2: self.gdn_c2,
             copy: self.copy,
             argmax1: self.argmax1,
             argmax2: self.argmax2,
@@ -488,6 +503,9 @@ impl Kern {
             self.moe_down_g,
             self.moe_gu_db,
             self.moe_down_db,
+            self.gdn_c2[0],
+            self.gdn_c2[1],
+            self.gdn_c2[2],
         ] {
             unsafe {
                 gpu::check(
@@ -629,6 +647,42 @@ struct Wide {
     proj: B,
     /// int8 codes and scales of a dense GEMM's f32 input (`XQ8_T` = rows layout).
     xq: B,
+    /// `TANG_CODER_GDN=chunked2` scratch, shared by every GDN layer of the window.
+    c2: Option<C2>,
+}
+
+/// The `chunked2` kernels' per-(v head, chunk) scratch for windows of up to `nc` chunks, f32:
+/// q, k, W, U, D `[64][128]`, `Aqk` `[64][64]`, cumulative log decay `[64]`, and each chunk's
+/// start state `[128][128]`: `hv * nc * 61_504` floats (~189 MB at 1024 rows, 48 heads).
+struct C2 {
+    nc: usize,
+    q: B,
+    k: B,
+    w: B,
+    u: B,
+    d: B,
+    a: B,
+    lg: B,
+    h: B,
+}
+
+impl C2 {
+    fn new(dev: &CudaComputeDevice, hv: usize, rows: usize) -> Self {
+        let nc = rows.div_ceil(GDN_C2_CHUNK);
+        let z = |per: usize| dev.alloc_f32(hv * nc * per);
+        let c = GDN_C2_CHUNK;
+        C2 {
+            nc,
+            q: z(c * 128),
+            k: z(c * 128),
+            w: z(c * 128),
+            u: z(c * 128),
+            d: z(c * 128),
+            a: z(c * c),
+            lg: z(c),
+            h: z(128 * 128),
+        }
+    }
 }
 
 /// Attention partials are computed this many rows of a wide window at a time (their scratch
@@ -951,6 +1005,11 @@ impl Coder {
             gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
             gdn_commit_seg: f(&fm, "fl_gdn_conv_commit_seg")?,
             gdn_chunk_seg: f(&fm, "fl_gdn_chunk_step_seg")?,
+            gdn_c2: [
+                f(&fm, "fl_gdn_c2_prep")?,
+                f(&fm, "fl_gdn_c2_state")?,
+                f(&fm, "fl_gdn_c2_out")?,
+            ],
             copy: f(&em, "fe_copy")?,
             argmax1: f(&em, "fe_argmax1")?,
             argmax2: f(&em, "fe_argmax2")?,
@@ -1482,6 +1541,10 @@ impl Coder {
         let xq = self
             .dev
             .alloc_f32((rows * kmax + rows * kmax / 32 * 4).div_ceil(4));
+        let c2 = self
+            .var
+            .gdn_chunked2
+            .then(|| C2::new(&self.dev, self.geo.gdn_hv, rows));
         self.dev.sync();
         self.wide = Some(Wide {
             rows,
@@ -1490,6 +1553,7 @@ impl Coder {
             io,
             proj,
             xq,
+            c2,
         });
         Ok(())
     }
@@ -1726,6 +1790,9 @@ impl Coder {
             (k.gdn_step_seg, "gdn_conv_step"),
             (k.gdn_commit_seg, "gdn_commit"),
             (k.gdn_chunk_seg, "gdn_conv_step"),
+            (k.gdn_c2[0], "gdn_c2_prep"),
+            (k.gdn_c2[1], "gdn_c2_state"),
+            (k.gdn_c2[2], "gdn_c2_out"),
             (k.copy, "copy"),
             (k.argmax1, "argmax"),
             (k.argmax2, "argmax"),
@@ -2176,6 +2243,11 @@ impl Coder {
     /// The GDN conv + recurrence for every segment of a `t`-row window (`t`: 0 when unknown,
     /// which keeps the per-token kernel).
     fn gdn_step_seg(&self, g: &GdnL, stride: usize, nseg: usize, commit: bool, t: usize) {
+        if let Some(c2) = self.wide_on().and_then(|w| w.c2.as_ref()) {
+            if nseg == 1 && t >= GDN_C2_MIN {
+                return self.gdn_c2(g, c2, stride, commit, t);
+            }
+        }
         let kern = if self.var.gdn_chunked && t >= GDN_CHUNKED_MIN {
             self.kn().gdn_chunk_seg
         } else {
@@ -2203,6 +2275,65 @@ impl Coder {
                 tang_moe::args![stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc],
             )
         };
+    }
+
+    /// `chunked2`: the three-phase chunkwise GDN for a one-segment `t`-row window (same
+    /// inputs, outputs, state and commit semantics as [`gdn_step_seg`](Self::gdn_step_seg)).
+    fn gdn_c2(&self, g: &GdnL, c2: &C2, stride: usize, commit: bool, t: usize) {
+        let k = &self.kn().gdn_c2;
+        let hv = self.geo.gdn_hv as u32;
+        let nch = t.div_ceil(GDN_C2_CHUNK) as u32;
+        let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
+            self.a(&g.stab),
+            self.a(&g.htab),
+            self.proj(&g.proj),
+            stride as u32,
+            self.a(&g.dt),
+            self.a(&g.a),
+            self.a(&g.norm),
+            self.a(&self.sc().y),
+            self.a(&self.sc().rows) + (2 * self.tw() * 4) as u64,
+            commit as u32,
+            self.eps,
+            self.a(&g.conv),
+        );
+        let (q, kk, w, u, d, a, lg, h, nc) = (
+            self.a(&c2.q),
+            self.a(&c2.k),
+            self.a(&c2.w),
+            self.a(&c2.u),
+            self.a(&c2.d),
+            self.a(&c2.a),
+            self.a(&c2.lg),
+            self.a(&c2.h),
+            c2.nc as u32,
+        );
+        unsafe {
+            self.launch_on(
+                &self.stream,
+                k[0],
+                (hv, nch, 1),
+                256,
+                GDN_C2_SMEM[0],
+                tang_moe::args![htab, p, sd, dt, sa, seg, cm, eps, wc, q, kk, w, u, a, lg, nc],
+            );
+            self.launch_on(
+                &self.stream,
+                k[1],
+                (hv, 4, 1),
+                128,
+                GDN_C2_SMEM[1],
+                tang_moe::args![stab, seg, cm, kk, w, u, lg, d, h, nc],
+            );
+            self.launch_on(
+                &self.stream,
+                k[2],
+                (hv, nch, 1),
+                256,
+                GDN_C2_SMEM[2],
+                tang_moe::args![seg, cm, p, sd, nw, y, eps, q, a, d, h, lg, nc],
+            );
+        }
     }
 
     fn gdn_commit_seg(&self, g: &GdnL, stride: usize, nseg: usize) {

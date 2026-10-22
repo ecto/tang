@@ -153,6 +153,139 @@ pub fn chunked(h: &Head, st: &mut [f32], c: usize) -> Vec<f32> {
     o
 }
 
+/// Phase A of [`three_phase`] for one chunk (no state needed): the in-chunk cumulative log decay
+/// `lg`, the gated, masked `Aqk[i][s] = e^{lg_i - lg_s} q_i.k_s` (s <= i), and the WY factors
+/// `W = T diag(beta e^lg) K`, `U = T diag(beta) V` with `T = (I + Akk)^{-1}`,
+/// `Akk[i][s] = beta_i e^{lg_i - lg_s} k_i.k_s` (s < i). `D = U - W S0` is then the chunk's
+/// `d` rows for any start state `S0`.
+pub struct ChunkPrep {
+    pub n: usize,
+    pub lg: Vec<f32>,
+    pub aqk: Vec<f32>,
+    pub w: Vec<f32>,
+    pub u: Vec<f32>,
+}
+
+/// [`ChunkPrep`] for tokens `t0 .. t0 + n` of `h`.
+pub fn chunk_prep(h: &Head, t0: usize, n: usize) -> ChunkPrep {
+    let d = h.d;
+    let row = |x: &[f32], i: usize| -> Vec<f32> { x[(t0 + i) * d..][..d].to_vec() };
+    let (q, k, v): (Vec<_>, Vec<_>, Vec<_>) = (
+        (0..n).map(|i| row(h.q, i)).collect(),
+        (0..n).map(|i| row(h.k, i)).collect(),
+        (0..n).map(|i| row(h.v, i)).collect(),
+    );
+    let beta = &h.beta[t0..t0 + n];
+    let mut lg = vec![0f32; n];
+    let mut acc = 0f32;
+    for (i, l) in lg.iter_mut().enumerate() {
+        acc += h.lg[t0 + i];
+        *l = acc;
+    }
+    let mut akk = vec![0f32; n * n];
+    let mut aqk = vec![0f32; n * n];
+    for i in 0..n {
+        for s in 0..=i {
+            let g = (lg[i] - lg[s]).exp();
+            aqk[i * n + s] = g * dot(&q[i], &k[s]);
+            if s < i {
+                akk[i * n + s] = beta[i] * g * dot(&k[i], &k[s]);
+            }
+        }
+    }
+    // T = (I + Akk)^{-1}: T_i = e_i - sum_{s<i} Akk_is T_s.
+    let mut tm = vec![0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut x = if i == j { 1.0 } else { 0.0 };
+            for s in j..i {
+                x -= akk[i * n + s] * tm[s * n + j];
+            }
+            tm[i * n + j] = if j <= i { x } else { 0.0 };
+        }
+    }
+    let (mut w, mut u) = (vec![0f32; n * d], vec![0f32; n * d]);
+    for i in 0..n {
+        for s in 0..=i {
+            let (tw, tu) = (
+                tm[i * n + s] * beta[s] * lg[s].exp(),
+                tm[i * n + s] * beta[s],
+            );
+            for c in 0..d {
+                w[i * d + c] += tw * k[s][c];
+                u[i * d + c] += tu * v[s][c];
+            }
+        }
+    }
+    ChunkPrep { n, lg, aqk, w, u }
+}
+
+/// fla's three-phase layout, the structure of the `chunked2` CUDA kernels: (A) [`chunk_prep`]
+/// for every chunk independently; (B) a sequential pass carrying the state,
+/// `D_c = U - W S_c`, `S_{c+1} = e^{lg_last} S_c + (e^{lg_last - lg} K)^T D_c`; (C) every
+/// chunk's outputs from its start state, `O = diag(e^lg) Q S_c + Aqk D_c`. Same contract as
+/// [`recurrent`].
+pub fn three_phase(h: &Head, st: &mut [f32], c: usize) -> Vec<f32> {
+    let (d, t) = (h.d, h.t());
+    let starts: Vec<usize> = (0..t).step_by(c).collect();
+    // A: parallel over chunks.
+    let preps: Vec<ChunkPrep> = starts
+        .iter()
+        .map(|&t0| chunk_prep(h, t0, c.min(t - t0)))
+        .collect();
+    // B: sequential, one small matmul pair a chunk.
+    let mut states = Vec::with_capacity(preps.len());
+    let mut ds = Vec::with_capacity(preps.len());
+    for (p, &t0) in preps.iter().zip(&starts) {
+        states.push(st.to_vec());
+        let n = p.n;
+        let mut dd = p.u.clone();
+        for i in 0..n {
+            for a in 0..d {
+                let wa = p.w[i * d + a];
+                for b in 0..d {
+                    dd[i * d + b] -= wa * st[a * d + b];
+                }
+            }
+        }
+        let last = p.lg[n - 1];
+        let gl = last.exp();
+        st.iter_mut().for_each(|e| *e *= gl);
+        for s in 0..n {
+            let g = (last - p.lg[s]).exp();
+            for a in 0..d {
+                let ka = g * h.k[(t0 + s) * d + a];
+                for b in 0..d {
+                    st[a * d + b] += ka * dd[s * d + b];
+                }
+            }
+        }
+        ds.push(dd);
+    }
+    // C: parallel over chunks.
+    let mut o = vec![0f32; t * d];
+    for (ci, (p, &t0)) in preps.iter().zip(&starts).enumerate() {
+        let (s0, dd, n) = (&states[ci], &ds[ci], p.n);
+        for i in 0..n {
+            let gi = p.lg[i].exp();
+            let orow = &mut o[(t0 + i) * d..][..d];
+            for a in 0..d {
+                let qa = gi * h.q[(t0 + i) * d + a];
+                for b in 0..d {
+                    orow[b] += qa * s0[a * d + b];
+                }
+            }
+            for s in 0..=i {
+                let w = p.aqk[i * n + s];
+                for b in 0..d {
+                    orow[b] += w * dd[s * d + b];
+                }
+            }
+        }
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +346,13 @@ mod tests {
             eo < 2e-4 && es < 2e-4,
             "d {d} t {t} c {c}: o err {eo}, state err {es}"
         );
+        let mut sc = s0.clone();
+        let oc = three_phase(&h, &mut sc, c);
+        let (eo, es) = (err(&oa, &oc), err(&sa, &sc));
+        assert!(
+            eo < 2e-4 && es < 2e-4,
+            "three-phase d {d} t {t} c {c}: o err {eo}, state err {es}"
+        );
     }
 
     #[test]
@@ -231,6 +371,45 @@ mod tests {
     #[test]
     fn chunked_matches_recurrent_d128() {
         check(128, 45, 16, 3, false);
+    }
+
+    /// The `chunked2` kernels' shape: d 128, chunk 64, a window of several chunks plus a short
+    /// tail, weak and strong decay.
+    #[test]
+    fn three_phase_matches_recurrent_d128_c64() {
+        check(128, 64 * 3 + 21, 64, 11, false);
+        check(128, 150, 64, 12, true);
+    }
+
+    /// Decode continues from the three-phase final state as from the recurrent one.
+    #[test]
+    fn decode_continues_from_three_phase_state() {
+        let (d, t, split) = (32, 200, 150);
+        let mut r = Rng(5);
+        let (mut q, mut k, v) = (r.vec(t * d), r.vec(t * d), r.vec(t * d));
+        l2_rows(&mut q, d);
+        l2_rows(&mut k, d);
+        let lg: Vec<f32> = (0..t).map(|_| -0.1 * (r.f() + 1.0)).collect();
+        let beta: Vec<f32> = (0..t).map(|_| 0.5 + 0.4 * r.f()).collect();
+        let part = |a: usize, b: usize| Head {
+            d,
+            q: &q[a * d..b * d],
+            k: &k[a * d..b * d],
+            v: &v[a * d..b * d],
+            lg: &lg[a..b],
+            beta: &beta[a..b],
+        };
+        let (mut sa, mut sb) = (vec![0f32; d * d], vec![0f32; d * d]);
+        recurrent(&part(0, split), &mut sa);
+        three_phase(&part(0, split), &mut sb, 64);
+        let oa = recurrent(&part(split, t), &mut sa);
+        let ob = recurrent(&part(split, t), &mut sb);
+        let e = oa
+            .iter()
+            .zip(&ob)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(e < 1e-4, "decode after three-phase prefill: {e}");
     }
 
     /// The final state handed to decode: continuing token-by-token from the chunked state

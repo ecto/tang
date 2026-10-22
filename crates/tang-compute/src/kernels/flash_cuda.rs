@@ -1418,6 +1418,357 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_chunk_step_seg(
         for (int r = 0; r < 32; r++) S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j] = st[r];
     }
 }
+
+// Chunked prefill v2 (TANG_CODER_GDN=chunked2): flash-linear-attention's three-phase layout of
+// chunk_gated_delta_rule (MIT; docs/bench/gdn-chunked2.md; CPU reference `three_phase` in
+// tang-llm/src/flash/gdn_chunked.rs), chunks of 64 tokens, bf16 tensor-core MMA (f32 accumulate),
+// one window segment (wide prefill). Per chunk c (state S_c at its start, in-chunk cumulative log
+// decay lg, beta b):
+//   A (fl_gdn_c2_prep, grid (GDN_HV, nchunks)): conv + SiLU + q/k L2 norm, lg, b;
+//      Akk = strict-lower(b_i e^{lg_i - lg_s} k_i.k_s), Aqk = lower(e^{lg_i - lg_s} q_i.k_s);
+//      T = (I + Akk)^-1; W = T diag(b e^lg) K, U = T diag(b) V.
+//   B (fl_gdn_c2_state, grid (GDN_HV, 4 value tiles of 32)): sequential over chunks,
+//      D_c = U - W S_c;  S_{c+1} = e^{lg_last} S_c + (e^{lg_last - lg} K)^T D_c.
+//   C (fl_gdn_c2_out, grid (GDN_HV, nchunks)): O = diag(e^lg) Q S_c + Aqk D_c, then the gated RMS
+//      norm exactly as the per-token kernel.
+// Scratch per (head, chunk), f32: Q, K, W, U, D [64][128], Aqk [64][64], lg [64], S_c [128][128].
+// Padded tokens (past the window) have q = k = v = 0, b = 0 and lg = the last real one, so they
+// contribute nothing. Not bitwise the per-token kernel (bf16 MMA operands).
+#define GC2_C 64
+#define GC2_LD 132
+#define GC2_LA 68
+#define GC2_BV 32
+#define GC2_LB 36
+
+__device__ __forceinline__ unsigned gc2_pack(float lo, float hi) {
+    unsigned d;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+}
+
+// c (a 16x8 f32 fragment) += A[16][K] * B[K][8] over bf16-rounded operands, A(m, k) at
+// A[m * am + k * ak], B(k, n) at B[k * bk + n * bn] (both already offset to the tile origin).
+__device__ __forceinline__ void gc2_mma(float* c, const float* A, int am, int ak, const float* B,
+                                        int bk, int bn, int K, unsigned lane) {
+    const int g = lane >> 2, q = (lane & 3) * 2;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        const float* a0 = A + g * am + (k0 + q) * ak;
+        const float* b0 = B + (k0 + q) * bk + g * bn;
+        unsigned a[4], b[2];
+        a[0] = gc2_pack(a0[0], a0[ak]);
+        a[1] = gc2_pack(a0[8 * am], a0[8 * am + ak]);
+        a[2] = gc2_pack(a0[8 * ak], a0[9 * ak]);
+        a[3] = gc2_pack(a0[8 * am + 8 * ak], a0[8 * am + 9 * ak]);
+        b[0] = gc2_pack(b0[0], b0[bk]);
+        b[1] = gc2_pack(b0[8 * bk], b0[9 * bk]);
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+}
+
+// The window's rows this launch runs (commit: the kept ones).
+__device__ __forceinline__ unsigned gc2_rows(const unsigned* sg, unsigned commit) {
+    return commit ? min(sg[3], sg[1]) : sg[1];
+}
+
+// Phase A. Block 256, dynamic shared memory GC2_SMEM_A bytes.
+#define GC2_SMEM_A ((3 * GC2_C * GC2_LD + 3 * GC2_C * GC2_LA + 2 * GC2_C) * 4)
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_c2_prep(
+    const u64* __restrict__ Htab, const float* __restrict__ P, unsigned int stride,
+    const float* __restrict__ DT, const float* __restrict__ SA, const unsigned int* __restrict__ SEG,
+    unsigned int commit, float eps, const float* __restrict__ Wc, float* __restrict__ Qg,
+    float* __restrict__ Kg, float* __restrict__ Wg, float* __restrict__ Ug, float* __restrict__ Ag,
+    float* __restrict__ Lg, unsigned int nc) {
+    extern __shared__ float sm[];
+    float* sq = sm;
+    float* sk = sq + GC2_C * GC2_LD;
+    float* sv = sk + GC2_C * GC2_LD;
+    float* sa = sv + GC2_C * GC2_LD;  // Akk
+    float* sw = sa + GC2_C * GC2_LA;  // T, then T diag(b e^lg)
+    float* su = sw + GC2_C * GC2_LA;  // T diag(b)
+    float* slg = su + GC2_C * GC2_LA;
+    float* sb = slg + GC2_C;
+    const unsigned int r0 = SEG[0], slot = SEG[2], n = gc2_rows(SEG, commit);
+    const unsigned int hv = blockIdx.x, c = blockIdx.y, t0 = c * GC2_C, hk = GDN_KH(hv);
+    if (t0 >= n) return;
+    const unsigned int nn = min(n - t0, (unsigned)GC2_C);
+    const unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* H0 = (const float*)Htab[slot];
+    P += (u64)r0 * stride;
+    // Conv + SiLU: conv row p of [hist | P], as in gdn_step_body.
+    for (unsigned int e = tid; e < 3 * 128 * GC2_C; e += 256) {
+        unsigned int t = e / 384, cc = e % 384, part = cc >> 7, j = cc & 127;
+        float v = 0.0f;
+        if (t < nn) {
+            unsigned int ch = part == 0 ? hk * 128 + j : (part == 1 ? GDN_HK * 128 + hk * 128 + j : 2 * GDN_HK * 128 + hv * 128 + j);
+            float4 w = ((const float4*)Wc)[ch];
+            float x[4];
+            #pragma unroll
+            for (unsigned int i = 0; i < 4; i++) {
+                unsigned int p = t0 + t + i;
+                x[i] = p < 3 ? H0[p * GDN_CONV + ch] : P[(u64)(p - 3) * stride + ch];
+            }
+            float acc = x[0] * w.x;
+            acc = __fmaf_rn(x[1], w.y, acc);
+            acc = __fmaf_rn(x[2], w.z, acc);
+            acc = __fmaf_rn(x[3], w.w, acc);
+            v = silu(acc);
+        }
+        (part == 0 ? sq : (part == 1 ? sk : sv))[t * GC2_LD + j] = v;
+    }
+    if (tid < GC2_C) {
+        float l = 0.0f, b = 0.0f;
+        if (tid < nn) {
+            float a = P[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
+            float sp = a > 20.0f ? a : log1pf(expf(a));
+            l = sp * SA[hv];
+            b = sigm(P[(u64)(t0 + tid) * stride + GDN_B + hv]);
+        }
+        slg[tid] = l;
+        sb[tid] = b;
+    }
+    __syncthreads();
+    // q / k L2 norm, a warp a row; the gate cumsum.
+    for (unsigned int r = warp; r < 2 * GC2_C; r += 8) {
+        float* x = (r < GC2_C ? sq : sk) + (r & (GC2_C - 1)) * GC2_LD;
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) ss = __fmaf_rn(x[lane + 32 * i], x[lane + 32 * i], ss);
+        ss = warp_sum(ss);
+        float inv = 1.0f / sqrtf(ss + eps);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) x[lane + 32 * i] *= inv;
+    }
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (unsigned int i = 0; i < GC2_C; i++) slg[i] = acc += slg[i];
+    }
+    __syncthreads();
+    const int g = lane >> 2, q2 = (lane & 3) * 2;
+    const u64 hc = (u64)hv * nc + c;
+    // K K^T and Q K^T (4 x 8 tiles of 16 x 8 each), gated and masked.
+    for (unsigned int tile = warp; tile < 64; tile += 8) {
+        unsigned int which = tile >> 5, mt = (tile & 31) >> 3, nt = tile & 7;
+        int m0 = mt * 16, n0 = nt * 8;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        gc2_mma(acc, (which ? sq : sk) + m0 * GC2_LD, GC2_LD, 1, sk + n0 * GC2_LD, 1, GC2_LD, 128, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int i = m0 + g + (e >= 2 ? 8 : 0), s = n0 + q2 + (e & 1);
+            float x = 0.0f;
+            if (which == 0) {
+                if (s < i) x = sb[i] * expf(slg[i] - slg[s]) * acc[e];
+                sa[i * GC2_LA + s] = x;
+            } else {
+                if (s <= i) x = expf(slg[i] - slg[s]) * acc[e];
+                Ag[hc * (GC2_C * GC2_C) + i * GC2_C + s] = x;
+            }
+        }
+    }
+    __syncthreads();
+    // T = (I + Akk)^-1, unit lower triangular, by forward substitution a row at a time:
+    // T_i = e_i - sum_{s<i} Akk_is T_s. Four threads a column.
+    {
+        const unsigned int jc = tid >> 2, part = tid & 3;
+        for (unsigned int i = 0; i < GC2_C; i++) {
+            float acc = 0.0f;
+            for (unsigned int s = jc + part; s < i; s += 4)
+                acc = __fmaf_rn(sa[i * GC2_LA + s], sw[s * GC2_LA + jc], acc);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+            if (part == 0) sw[i * GC2_LA + jc] = jc < i ? -acc : (jc == i ? 1.0f : 0.0f);
+            __syncthreads();
+        }
+    }
+    for (unsigned int e = tid; e < GC2_C * GC2_C; e += 256) {
+        unsigned int i = e >> 6, s = e & 63;
+        float t = sw[i * GC2_LA + s] * sb[s];
+        su[i * GC2_LA + s] = t;
+        sw[i * GC2_LA + s] = t * expf(slg[s]);
+    }
+    __syncthreads();
+    // W = sw K, U = su V (4 x 16 tiles each).
+    for (unsigned int tile = warp; tile < 128; tile += 8) {
+        unsigned int which = tile >> 6, mt = (tile & 63) >> 4, nt = tile & 15;
+        int m0 = mt * 16, n0 = nt * 8;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        gc2_mma(acc, (which ? su : sw) + m0 * GC2_LA, GC2_LA, 1, (which ? sv : sk) + n0, GC2_LD, 1, GC2_C, lane);
+        float* O = (which ? Ug : Wg) + hc * (GC2_C * 128);
+        O[(m0 + g) * 128 + n0 + q2] = acc[0];
+        O[(m0 + g) * 128 + n0 + q2 + 1] = acc[1];
+        O[(m0 + g + 8) * 128 + n0 + q2] = acc[2];
+        O[(m0 + g + 8) * 128 + n0 + q2 + 1] = acc[3];
+    }
+    for (unsigned int e = tid; e < GC2_C * 128; e += 256) {
+        unsigned int i = e >> 7, j = e & 127;
+        Qg[hc * (GC2_C * 128) + e] = sq[i * GC2_LD + j];
+        Kg[hc * (GC2_C * 128) + e] = sk[i * GC2_LD + j];
+    }
+    if (tid < GC2_C) Lg[hc * GC2_C + tid] = slg[tid];
+}
+
+// Phase B. Grid (GDN_HV, 128 / GC2_BV), block 128, dynamic shared memory GC2_SMEM_B bytes. The
+// state's value columns are independent, so each block carries a 128 x 32 slice of S.
+#define GC2_SMEM_B ((128 * GC2_LB + 2 * GC2_C * GC2_LD + 2 * GC2_C * GC2_LB + GC2_C) * 4)
+extern "C" __global__ void __launch_bounds__(128) fl_gdn_c2_state(
+    const u64* __restrict__ Stab, const unsigned int* __restrict__ SEG, unsigned int commit,
+    const float* __restrict__ Kg, const float* __restrict__ Wg, const float* __restrict__ Ug,
+    const float* __restrict__ Lg, float* __restrict__ Dg, float* __restrict__ Hg, unsigned int nc) {
+    extern __shared__ float sm[];
+    float* ss = sm;                       // S[128][32]
+    float* sw = ss + 128 * GC2_LB;        // W [64][128]
+    float* skd = sw + GC2_C * GC2_LD;     // e^{lg_last - lg_s} k_s [64][128]
+    float* su = skd + GC2_C * GC2_LD;     // U slice [64][32]
+    float* sd = su + GC2_C * GC2_LB;      // D slice [64][32]
+    float* slg = sd + GC2_C * GC2_LB;
+    const unsigned int slot = SEG[2], n = gc2_rows(SEG, commit);
+    const unsigned int hv = blockIdx.x, b0 = blockIdx.y * GC2_BV;
+    const unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, q2 = (lane & 3) * 2;
+    float* S = (float*)Stab[slot];
+    for (unsigned int e = tid; e < 128 * GC2_BV; e += 128) {
+        unsigned int a = e >> 5, b = e & 31;
+        ss[a * GC2_LB + b] = S[((u64)a * GDN_HV + hv) * 128 + b0 + b];
+    }
+    const unsigned int nch = (n + GC2_C - 1) / GC2_C;
+    for (unsigned int c = 0; c < nch; c++) {
+        const u64 hc = (u64)hv * nc + c;
+        if (tid < GC2_C) slg[tid] = Lg[hc * GC2_C + tid];
+        __syncthreads();
+        const float last = slg[GC2_C - 1];
+        for (unsigned int e = tid; e < GC2_C * 128; e += 128) {
+            unsigned int s = e >> 7, a = e & 127;
+            sw[s * GC2_LD + a] = Wg[hc * (GC2_C * 128) + e];
+            skd[s * GC2_LD + a] = expf(last - slg[s]) * Kg[hc * (GC2_C * 128) + e];
+        }
+        for (unsigned int e = tid; e < GC2_C * GC2_BV; e += 128) {
+            unsigned int s = e >> 5, b = e & 31;
+            su[s * GC2_LB + b] = Ug[hc * (GC2_C * 128) + s * 128 + b0 + b];
+        }
+        for (unsigned int e = tid; e < 128 * GC2_BV; e += 128) {
+            unsigned int a = e >> 5, b = e & 31;
+            Hg[hc * (128 * 128) + a * 128 + b0 + b] = ss[a * GC2_LB + b];
+        }
+        __syncthreads();
+        // D = U - W S (4 x 4 tiles).
+        for (unsigned int tile = warp; tile < 16; tile += 4) {
+            int m0 = (tile >> 2) * 16, n0 = (tile & 3) * 8;
+            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            gc2_mma(acc, sw + m0 * GC2_LD, GC2_LD, 1, ss + n0, GC2_LB, 1, 128, lane);
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int i = m0 + g + (e >= 2 ? 8 : 0), b = n0 + q2 + (e & 1);
+                float d = su[i * GC2_LB + b] - acc[e];
+                sd[i * GC2_LB + b] = d;
+                Dg[hc * (GC2_C * 128) + i * 128 + b0 + b] = d;
+            }
+        }
+        __syncthreads();
+        // S = e^{lg_last} S + Kd^T D (8 x 4 tiles; each reads and writes only its own S entries).
+        const float gl = expf(last);
+        for (unsigned int tile = warp; tile < 32; tile += 4) {
+            int m0 = (tile >> 2) * 16, n0 = (tile & 3) * 8;
+            float* s0 = ss + (m0 + g) * GC2_LB + n0 + q2;
+            float acc[4] = {s0[0] * gl, s0[1] * gl, s0[8 * GC2_LB] * gl, s0[8 * GC2_LB + 1] * gl};
+            gc2_mma(acc, skd + m0, 1, GC2_LD, sd + n0, GC2_LB, 1, GC2_C, lane);
+            s0[0] = acc[0];
+            s0[1] = acc[1];
+            s0[8 * GC2_LB] = acc[2];
+            s0[8 * GC2_LB + 1] = acc[3];
+        }
+        __syncthreads();
+    }
+    if (commit) {
+        for (unsigned int e = tid; e < 128 * GC2_BV; e += 128) {
+            unsigned int a = e >> 5, b = e & 31;
+            S[((u64)a * GDN_HV + hv) * 128 + b0 + b] = ss[a * GC2_LB + b];
+        }
+    }
+}
+
+// Phase C. Grid (GDN_HV, nchunks), block 256, dynamic shared memory GC2_SMEM_C bytes.
+#define GC2_SMEM_C ((2 * GC2_C * GC2_LD + 128 * GC2_LD + GC2_C * GC2_LA + GC2_C) * 4)
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_c2_out(
+    const unsigned int* __restrict__ SEG, unsigned int commit, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ NW, float* __restrict__ Y, float eps,
+    const float* __restrict__ Qg, const float* __restrict__ Ag, const float* __restrict__ Dg,
+    const float* __restrict__ Hg, const float* __restrict__ Lg, unsigned int nc) {
+    extern __shared__ float sm[];
+    float* sq = sm;                      // Q, then O
+    float* sd = sq + GC2_C * GC2_LD;     // D
+    float* sh = sd + GC2_C * GC2_LD;     // S_c [128][128]
+    float* sa = sh + 128 * GC2_LD;       // Aqk
+    float* slg = sa + GC2_C * GC2_LA;
+    const unsigned int r0 = SEG[0], n = gc2_rows(SEG, commit);
+    const unsigned int hv = blockIdx.x, c = blockIdx.y, t0 = c * GC2_C;
+    if (t0 >= n) return;
+    const unsigned int nn = min(n - t0, (unsigned)GC2_C);
+    const unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, q2 = (lane & 3) * 2;
+    const u64 hc = (u64)hv * nc + c;
+    P += (u64)r0 * stride;
+    Y += (u64)r0 * GDN_V;
+    for (unsigned int e = tid; e < GC2_C * 128; e += 256) {
+        unsigned int i = e >> 7, j = e & 127;
+        sq[i * GC2_LD + j] = Qg[hc * (GC2_C * 128) + e];
+        sd[i * GC2_LD + j] = Dg[hc * (GC2_C * 128) + e];
+    }
+    for (unsigned int e = tid; e < 128 * 128; e += 256) {
+        unsigned int a = e >> 7, b = e & 127;
+        sh[a * GC2_LD + b] = Hg[hc * (128 * 128) + e];
+    }
+    for (unsigned int e = tid; e < GC2_C * GC2_C; e += 256)
+        sa[(e >> 6) * GC2_LA + (e & 63)] = Ag[hc * (GC2_C * GC2_C) + e];
+    if (tid < GC2_C) slg[tid] = Lg[hc * GC2_C + tid];
+    __syncthreads();
+    // O = diag(e^lg) Q S_c + Aqk D: 4 x 16 tiles, 8 a warp, held in registers until every warp
+    // is done reading Q.
+    float acc[8][4];
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        unsigned int tile = warp + 8 * k;
+        int m0 = (tile >> 4) * 16, n0 = (tile & 15) * 8;
+        float* a4 = acc[k];
+        a4[0] = a4[1] = a4[2] = a4[3] = 0.0f;
+        gc2_mma(a4, sq + m0 * GC2_LD, GC2_LD, 1, sh + n0, GC2_LD, 1, 128, lane);
+        float e0 = expf(slg[m0 + g]), e1 = expf(slg[m0 + g + 8]);
+        a4[0] *= e0;
+        a4[1] *= e0;
+        a4[2] *= e1;
+        a4[3] *= e1;
+        gc2_mma(a4, sa + m0 * GC2_LA, GC2_LA, 1, sd + n0, GC2_LD, 1, GC2_C, lane);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        unsigned int tile = warp + 8 * k;
+        int m0 = (tile >> 4) * 16, n0 = (tile & 15) * 8;
+        float* o = sq + (m0 + g) * GC2_LD + n0 + q2;
+        o[0] = acc[k][0];
+        o[1] = acc[k][1];
+        o[8 * GC2_LD] = acc[k][2];
+        o[8 * GC2_LD + 1] = acc[k][3];
+    }
+    __syncthreads();
+    // Gated RMS norm, a warp a token.
+    for (unsigned int i = warp; i < nn; i += 8) {
+        float o[4], ss = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            o[k] = sq[i * GC2_LD + lane + 32 * k] * INV_SQRT_D;
+            ss = __fmaf_rn(o[k], o[k], ss);
+        }
+        ss = warp_sum(ss);
+        float rs = 1.0f / sqrtf(ss / 128.0f + eps);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            unsigned int j = lane + 32 * k;
+            float z = P[(u64)(t0 + i) * stride + GDN_Z + hv * 128 + j];
+            Y[(u64)(t0 + i) * GDN_V + hv * 128 + j] = o[k] * rs * NW[j] * GDN_GATE(z);
+        }
+    }
+}
 #endif
 
 // ---- MoE ----
