@@ -14,6 +14,7 @@ pub mod coder_kernels;
 #[cfg(feature = "cuda")]
 pub mod engine;
 pub mod fa2;
+pub mod gdn_chunked;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 pub mod mtp;

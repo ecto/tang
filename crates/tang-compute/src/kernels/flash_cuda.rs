@@ -1258,6 +1258,166 @@ extern "C" __global__ void fl_gdn_conv_commit_seg(const u64* __restrict__ Htab, 
     #pragma unroll
     for (unsigned int s = 0; s < 3; s++) H0[s * GDN_CONV + ch] = nw[s];
 }
+
+// Chunked prefill (TANG_CODER_GDN=chunked): a drop-in for fl_gdn_conv_step_seg (same args, same
+// grid (GDN_HV, nseg), block 512, same state layout and commit semantics) that runs the gated
+// delta rule a chunk of GDN_CHUNK tokens at a time in the UT/WY form of flash-linear-attention's
+// chunk_gated_delta_rule (MIT; see docs/bench/gdn-chunked-prefill.md and
+// tang-llm/src/flash/gdn_chunked.rs, its CPU reference). Per chunk, from state S0 and the
+// in-chunk cumulative log decay lg:
+//   d_i = b_i (v_i - e^{lg_i} S0^T k_i) - b_i sum_{s<i} e^{lg_i - lg_s} (k_i.k_s) d_s
+//   o_i = e^{lg_i} S0^T q_i + sum_{s<=i} e^{lg_i - lg_s} (q_i.k_s) d_s
+//   S'  = e^{lg_last} S0 + sum_s e^{lg_last - lg_s} k_s d_s^T
+// The sequential dependence is one state pass a chunk instead of one a token. Equal to the
+// per-token kernel up to float reassociation (not bitwise).
+#ifndef GDN_CHUNK
+#define GDN_CHUNK 16
+#endif
+extern "C" __global__ void __launch_bounds__(512) fl_gdn_chunk_step_seg(
+    const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
+    const float* __restrict__ NW, float* __restrict__ Y, const unsigned int* __restrict__ SEG,
+    unsigned int commit, float eps, const float* __restrict__ Wc) {
+    constexpr unsigned int C = GDN_CHUNK;
+    __shared__ float sq[C][128], sk[C][128], sv[C][128], so[C][128];
+    __shared__ float red[2][4][128];
+    __shared__ float skk[C][C], sqk[C][C];
+    __shared__ float slg[C], sb[C], sdec[C];
+    __shared__ float cred[2][4];
+    __shared__ float red2[4][4];
+    const unsigned int* sg = SEG + blockIdx.y * 4;
+    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2];
+    float* S = (float*)Stab[slot];
+    const float* H0 = (const float*)Htab[slot];
+    P += (u64)r0 * stride;
+    Y += (u64)r0 * GDN_V;
+    const unsigned int n = commit ? min(sg[3], len) : len;
+    unsigned int hv = blockIdx.x, hk = GDN_KH(hv), tid = threadIdx.x, j = tid & 127, rg = tid >> 7;
+    float st[32];
+    #pragma unroll
+    for (int r = 0; r < 32; r++) st[r] = S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j];
+    unsigned int ch = rg == 0 ? hk * 128 + j : (rg == 1 ? GDN_HK * 128 + hk * 128 + j : 2 * GDN_HK * 128 + hv * 128 + j);
+    float4 w = rg < 3 ? ((const float4*)Wc)[ch] : make_float4(0, 0, 0, 0);
+    for (unsigned int t0 = 0; t0 < n; t0 += C) {
+        const unsigned int nn = min(n - t0, C);
+        // Conv (+ SiLU, q/k L2 norm) for the chunk's tokens: conv row p of [hist | P].
+        for (unsigned int t = 0; t < nn; t++) {
+            float v = 0.0f;
+            if (rg < 3) {
+                float e[4];
+                #pragma unroll
+                for (unsigned int i = 0; i < 4; i++) {
+                    unsigned int p = t0 + t + i;
+                    e[i] = p < 3 ? H0[p * GDN_CONV + ch] : P[(u64)(p - 3) * stride + ch];
+                }
+                float acc = e[0] * w.x;
+                acc = __fmaf_rn(e[1], w.y, acc);
+                acc = __fmaf_rn(e[2], w.z, acc);
+                acc = __fmaf_rn(e[3], w.w, acc);
+                v = silu(acc);
+            }
+            float ss = warp_sum(v * v);
+            if (rg < 2 && (j & 31) == 0) cred[rg][j >> 5] = ss;
+            __syncthreads();
+            if (rg < 2) {
+                ss = ((cred[rg][0] + cred[rg][1]) + cred[rg][2]) + cred[rg][3];
+                v *= 1.0f / sqrtf(ss + eps);
+            }
+            __syncthreads();
+            if (rg == 0) sq[t][j] = v;
+            else if (rg == 1) sk[t][j] = v;
+            else if (rg == 2) sv[t][j] = v;
+        }
+        if (tid < nn) {
+            float a = P[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
+            float sp = a > 20.0f ? a : log1pf(expf(a));
+            slg[tid] = sp * SA[hv];
+            sb[tid] = sigm(P[(u64)(t0 + tid) * stride + GDN_B + hv]);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (unsigned int i = 0; i < nn; i++) slg[i] = acc += slg[i];
+            for (unsigned int s = 0; s < nn; s++) sdec[s] = expf(acc - slg[s]);
+        }
+        // k_i.k_s and q_i.k_s, s <= i (strictly below the diagonal for kk; unused elsewhere).
+        for (unsigned int e = tid; e < 2 * C * C; e += 512) {
+            unsigned int wq = e / (C * C), i = (e / C) % C, s = e % C;
+            if (i < nn && s <= i) {
+                const float* x = wq ? sq[i] : sk[i];
+                float p = 0.0f;
+                for (unsigned int c = 0; c < 128; c++) p = __fmaf_rn(x[c], sk[s][c], p);
+                (wq ? sqk : skk)[i][s] = p;
+            }
+        }
+        __syncthreads();
+        // S0^T k_i -> the right-hand side in sv; e^{lg_i} S0^T q_i -> so.
+        for (unsigned int i = 0; i < nn; i++) {
+            float pk = 0.0f, pq = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 32; r++) {
+                pk = __fmaf_rn(st[r], sk[i][rg * 32 + r], pk);
+                pq = __fmaf_rn(st[r], sq[i][rg * 32 + r], pq);
+            }
+            red[0][rg][j] = pk;
+            red[1][rg][j] = pq;
+            __syncthreads();
+            float gi = expf(slg[i]);
+            if (rg == 0) {
+                float ks = ((red[0][0][j] + red[0][1][j]) + red[0][2][j]) + red[0][3][j];
+                sv[i][j] = sb[i] * (sv[i][j] - gi * ks);
+            } else if (rg == 1) {
+                so[i][j] = gi * (((red[1][0][j] + red[1][1][j]) + red[1][2][j]) + red[1][3][j]);
+            }
+            __syncthreads();
+        }
+        // Unit lower-triangular solve, one value column a thread: sv becomes d.
+        if (rg == 0) {
+            for (unsigned int i = 1; i < nn; i++) {
+                float acc = 0.0f;
+                for (unsigned int s = 0; s < i; s++)
+                    acc = __fmaf_rn(expf(slg[i] - slg[s]) * skk[i][s], sv[s][j], acc);
+                sv[i][j] -= sb[i] * acc;
+            }
+        }
+        __syncthreads();
+        // Outputs, four tokens at a time (one per row group), then the gated RMS norm.
+        for (unsigned int base = 0; base < nn; base += 4) {
+            unsigned int i = base + rg;
+            float o = 0.0f;
+            if (i < nn) {
+                o = so[i][j];
+                for (unsigned int s = 0; s <= i; s++)
+                    o = __fmaf_rn(expf(slg[i] - slg[s]) * sqk[i][s], sv[s][j], o);
+                o *= INV_SQRT_D;
+            }
+            float ss = warp_sum(o * o);
+            if ((j & 31) == 0) red2[rg][j >> 5] = ss;
+            __syncthreads();
+            if (i < nn) {
+                ss = ((red2[rg][0] + red2[rg][1]) + red2[rg][2]) + red2[rg][3];
+                float rs = 1.0f / sqrtf(ss / 128.0f + eps);
+                float z = P[(u64)(t0 + i) * stride + GDN_Z + hv * 128 + j];
+                Y[(u64)(t0 + i) * GDN_V + hv * 128 + j] = o * rs * NW[j] * GDN_GATE(z);
+            }
+            __syncthreads();
+        }
+        // State pass to the next chunk.
+        float gl = expf(slg[nn - 1]);
+        #pragma unroll
+        for (int r = 0; r < 32; r++) {
+            float acc = st[r] * gl;
+            for (unsigned int s = 0; s < nn; s++)
+                acc = __fmaf_rn(sdec[s] * sk[s][rg * 32 + r], sv[s][j], acc);
+            st[r] = acc;
+        }
+        __syncthreads();
+    }
+    if (commit) {
+        #pragma unroll
+        for (int r = 0; r < 32; r++) S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j] = st[r];
+    }
+}
 #endif
 
 // ---- MoE ----
