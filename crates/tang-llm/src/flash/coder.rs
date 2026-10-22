@@ -133,7 +133,8 @@ struct Variants {
     wgemm_down: bool,
     /// Wide windows run attention as the FA2-style tensor-core kernel (`cx_attn_fa2`, then
     /// `cx_attn_merge` over its key splits) instead of split-K part/merge;
-    /// `TANG_CODER_ATTN=fa2`. Not bitwise: gated by `flash-wide-check`'s greedy + KL bar.
+    /// the default (H200: 1.66× at 30k, 2.15× at 54k); `TANG_CODER_ATTN=splitk` for split-K.
+    /// Not bitwise: gated by `flash-wide-check`'s greedy + KL bar.
     attn_fa2: bool,
 }
 
@@ -168,7 +169,7 @@ impl Variants {
             wgemm: !env_is("TANG_CODER_WGEMM", "0"),
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
-            attn_fa2: env_is("TANG_CODER_ATTN", "fa2"),
+            attn_fa2: !env_is("TANG_CODER_ATTN", "splitk"),
         }
     }
 }
