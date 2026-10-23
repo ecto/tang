@@ -20,7 +20,7 @@ log "apt done"
 nohup python3 -m http.server 8001 --directory "$R" >/dev/null 2>&1 &
 sleep 2; log "results server: $(curl -s -m 5 localhost:8001/ | head -c 80)"
 ( python3 -m venv /opt/hf && /opt/hf/bin/pip install -q 'huggingface_hub[cli]==0.35.3' \
-  && HF_HOME=$W/hf /opt/hf/bin/hf download unsloth/GLM-5.3-Flash-GGUF --include '*UD-Q4_K_XL*' --local-dir $W/glm53 > $W/model.dir 2>>"$R/dl.log" \
+  && HF_HOME=$W/hf /opt/hf/bin/hf download unsloth/GLM-5.3-Flash-GGUF --include 'UD-Q4_K_XL/*' --local-dir $W/glm53 > $W/model.dir 2>>"$R/dl.log" \
   && touch $W/MODEL_OK ) &
 curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.94.0 >/dev/null 2>&1 || die_pod "rustup failed"
 export PATH=/root/.cargo/bin:$PATH
@@ -30,7 +30,8 @@ cargo build -q --release -p tang-llm --no-default-features --features cuda >"$R/
 BIN=$W/tang/target/release/tang-llm; log "build done"
 
 while [ ! -f $W/MODEL_OK ]; do sleep 10; [ $(( ($(date +%s)-T0)/60 )) -ge 75 ] && die_pod "model download >75m: $(tail -3 $R/dl.log)"; done
-G=$(ls $W/glm53/*UD-Q4_K_XL*-00001-of-*.gguf | head -1); log "model $G"
+G=$(find $W/glm53 -name "*UD-Q4_K_XL-00001-of-*.gguf" | head -1); log "model $G ($(du -sh $W/glm53 | cut -f1))"
+[ -n "$G" ] || { ls -R $W/glm53 | head -20; die_pod "no model shard found"; }
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader >>"$R/pod.log"
 
 # 3. GPU kernel tests on the tiny GGUF (fixtures are committed in-repo)
@@ -39,7 +40,7 @@ cp -r $W/tang/crates/tang-llm/tests/fixtures/glm5/* /private/tmp/glm5-tiny/
 log "fixtures: $(ls /private/tmp/glm5-tiny | wc -l) dirs"
 log "kernel tests (tiny, cuda)"
 TANG_REQUIRE_CUDA=1 cargo test -q --release -p tang-llm --no-default-features --features cuda --lib glm5 -- --nocapture >"$R/kernels-tiny.log" 2>&1
-log "kernel tests rc=$? | $(grep -E 'test result' $R/kernels-tiny.log | tail -1)"; grep -E "FAILED|panicked|^test .* (ok|FAILED)$" "$R/kernels-tiny.log" | tail -40
+log "kernel tests rc=$? | $(grep -E 'test result' $R/kernels-tiny.log | tail -1)"; grep -A4 panicked "$R/kernels-tiny.log" | head -60
 TANG_REQUIRE_CUDA=1 TANG_GPUS=2 TANG_SPLIT_AT=2 cargo test -q --release -p tang-llm --no-default-features --features cuda --lib glm5::engine -- --nocapture >"$R/engine-split.log" 2>&1
 log "engine split tests rc=$? | $(grep -E 'test result' $R/engine-split.log | tail -1)"
 
@@ -56,8 +57,9 @@ export TANG_GLM5_GPU=0
 timeout 1800 $BIN flash-generate "$G" --prompt "Write a haiku about the sea." -n 8 --temp 0 --out /root/cpu.ids >"$R/cpuref.log" 2>&1
 log "cpu-ref rc=$?"
 unset TANG_GLM5_GPU
-A=$(head -c 32 /root/cpu.ids 2>/dev/null); B=$(head -c 32 /root/g2.ids 2>/dev/null)
-[ "$A" = "$B" ] && log "GREEDY MATCH gpu==cpu-ref: yes" || log "GREEDY MATCH: NO ($A vs $B)"
+A=$(tr -s " \n" " " </root/cpu.ids 2>/dev/null | cut -d" " -f1-8); B=$(tr -s " \n" " " </root/g2.ids 2>/dev/null | cut -d" " -f1-8)
+if [ -n "$A" ] && [ "$A" = "$B" ]; then log "GREEDY MATCH gpu==cpu-ref (8 ids): yes [$A]"; else log "GREEDY MATCH: NO gpu=[$B] cpu=[$A]"; fi
+echo "=== CPUREF LOG TAIL"; tail -12 "$R/cpuref.log"
 
 # 6. throughput, batch 1
 export TANG_GPUS=2
