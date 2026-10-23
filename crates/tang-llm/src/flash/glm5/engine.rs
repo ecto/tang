@@ -776,9 +776,9 @@ fn mhc_pre_gpu(
     let fb = DevBuf::from_slice(&w.f).map_err(gerr)?;
     let bb = DevBuf::from_slice(&w.b).map_err(gerr)?;
     let sb = DevBuf::from_slice(&w.s).map_err(gerr)?;
-    let xb = DevBuf::zeroed(t * n * 4).map_err(gerr)?;
-    let pb = DevBuf::zeroed(t * 4 * 4).map_err(gerr)?;
-    let cb = DevBuf::zeroed(t * 16 * 4).map_err(gerr)?;
+    let xb = DevBuf::zeroed(t * n).map_err(gerr)?;
+    let pb = DevBuf::zeroed(t * 4).map_err(gerr)?;
+    let cb = DevBuf::zeroed(t * 16).map_err(gerr)?;
     unsafe {
         k.pre(&s, rb.ptr, fb.ptr, bb.ptr, sb.ptr, xb.ptr, pb.ptr, cb.ptr, t, n, w.iters, w.eps, w.rms_eps)?;
     }
@@ -829,7 +829,7 @@ fn mhc_post_gpu(
     let rin = DevBuf::from_slice(r).map_err(gerr)?;
     let pb = DevBuf::from_slice(&post).map_err(gerr)?;
     let cb = DevBuf::from_slice(&comb).map_err(gerr)?;
-    let out = DevBuf::zeroed(t * 4 * n * 4).map_err(gerr)?;
+    let out = DevBuf::zeroed(t * 4 * n).map_err(gerr)?;
     unsafe {
         k.post(&s, yb.ptr, rin.ptr, pb.ptr, cb.ptr, out.ptr, t, n)?;
     }
