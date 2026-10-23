@@ -54,6 +54,8 @@ pub struct GpuFfn {
     kda_k: Vec<Option<super::kda_cuda::cuda::Kernels>>,
     /// W3's MLA + indexer kernels per device (`TANG_GLM5_GPU_MLA=0`: DSA stays on the CPU).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
+    /// W2's mHC pre/post kernels per device (`TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
+    mhc_k: Vec<Option<super::mhc::MhcKernels>>,
     layers: Vec<super::moe::gpu::DevMoe>,
     dev_of: Vec<usize>,
     pub split: usize,
@@ -80,6 +82,10 @@ impl GpuFfn {
         let mut kda_k = Vec::new();
         let mla_on = !std::env::var("TANG_GLM5_GPU_MLA").is_ok_and(|v| v == "0");
         let mut mla_k = Vec::new();
+        let mhc_on = hp.hc == 4
+            && hp.n_embd % 32 == 0
+            && !std::env::var("TANG_GLM5_GPU_MHC").is_ok_and(|v| v == "0");
+        let mut mhc_k = Vec::new();
         if std::env::var("TANG_GLM5_GPU").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
@@ -107,6 +113,11 @@ impl GpuFfn {
                         .map_err(|e| anyhow::anyhow!("MLA kernels on GPU {ord}: {e}"))?,
                 ),
                 _ => None,
+            });
+            mhc_k.push(if mhc_on {
+                Some(super::mhc::MhcKernels::new(&gpu)?)
+            } else {
+                None
             });
             devs.push((gpu, k));
         }
@@ -161,6 +172,7 @@ impl GpuFfn {
             devs,
             kda_k,
             mla_k,
+            mhc_k,
             layers,
             dev_of,
             split,
@@ -371,6 +383,49 @@ impl Glm5Engine {
         Ok(out)
     }
 
+    /// mHC pre for layer `l`'s block: W2's GPU kernel when loaded, else the CPU reference.
+    fn mhc_pre(
+        &self,
+        l: usize,
+        w: &super::mhc::MhcWeights,
+        r: &[f32],
+        t: usize,
+    ) -> Result<(Vec<f32>, Vec<super::mhc::Mix>)> {
+        let (hc, n) = (self.m.hp.hc, self.m.hp.n_embd);
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            let d = g.dev_of[l];
+            if let Some(k) = &g.mhc_k[d] {
+                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                return mhc_pre_gpu(k, w, r, t, n);
+            }
+        }
+        let _ = l;
+        mhc_pre_all(w, r, t, hc, n)
+    }
+
+    /// mHC post for layer `l`'s block: `r ← post ⊙ y + combᵀ r`, GPU or CPU as [`Self::mhc_pre`].
+    fn mhc_post(
+        &self,
+        l: usize,
+        mixes: &[super::mhc::Mix],
+        y: &[f32],
+        r: &mut [f32],
+        t: usize,
+    ) -> Result<()> {
+        let (hc, n) = (self.m.hp.hc, self.m.hp.n_embd);
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            let d = g.dev_of[l];
+            if let Some(k) = &g.mhc_k[d] {
+                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                return mhc_post_gpu(k, mixes, y, r, t, n);
+            }
+        }
+        let _ = l;
+        mhc_post_all(mixes, y, r, t, hc, n)
+    }
+
     /// Run `ids` after the tokens so far. Returns their logits `[ids.len()][n_vocab]`.
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
@@ -399,7 +454,7 @@ impl Glm5Engine {
         for l in 0..hp.n_layer {
             // ---- attention half
             let w_attn = super::mhc::MhcWeights::from_gguf(&self.m.g, l, "hc_attn", n, &mhp)?;
-            let (mut x, mixes) = mhc_pre_all(&w_attn, &r, t, hc, n)?;
+            let (mut x, mixes) = self.mhc_pre(l, &w_attn, &r, t)?;
             self.m.norm_all(&mut x, l, "attn_norm.weight")?;
             let y = if hp.is_kda[l] {
                 let (w, cfg) = self.kda_weights(l)?;
@@ -413,14 +468,14 @@ impl Glm5Engine {
                 let w = self.mla_weights(l)?;
                 self.dsa_layer(l, &w, &x, t, pos0)?
             };
-            mhc_post_all(&mixes, &y, &mut r, t, hc, n)?;
+            self.mhc_post(l, &mixes, &y, &mut r, t)?;
 
             // ---- FFN half
             let w_ffn = super::mhc::MhcWeights::from_gguf(&self.m.g, l, "hc_ffn", n, &mhp)?;
-            let (mut x, mixes) = mhc_pre_all(&w_ffn, &r, t, hc, n)?;
+            let (mut x, mixes) = self.mhc_pre(l, &w_ffn, &r, t)?;
             self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
             let y = self.ffn(l, &x, t)?;
-            mhc_post_all(&mixes, &y, &mut r, t, hc, n)?;
+            self.mhc_post(l, &mixes, &y, &mut r, t)?;
         }
 
         // ---- head: unweighted stream mean, output norm, lm_head
@@ -703,6 +758,87 @@ fn dsa_gpu(
     Ok(out)
 }
 
+/// W2's mHC pre on the GPU for `t` tokens (feature `cuda`), host-staged: `r` `[t][4][n]` in;
+/// the collapsed inputs `[t][n]` and each token's post/comb out (as the CPU [`super::mhc::Mix`]).
+#[cfg(feature = "cuda")]
+fn mhc_pre_gpu(
+    k: &super::mhc::MhcKernels,
+    w: &super::mhc::MhcWeights,
+    r: &[f32],
+    t: usize,
+    n: usize,
+) -> Result<(Vec<f32>, Vec<super::mhc::Mix>)> {
+    use tang_moe::gpu::{DevBuf, Stream};
+    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mhc cuda: {e}");
+    ensure!(r.len() == t * 4 * n, "mhc streams");
+    let s = Stream::new().map_err(gerr)?;
+    let rb = DevBuf::from_slice(r).map_err(gerr)?;
+    let fb = DevBuf::from_slice(&w.f).map_err(gerr)?;
+    let bb = DevBuf::from_slice(&w.b).map_err(gerr)?;
+    let sb = DevBuf::from_slice(&w.s).map_err(gerr)?;
+    let xb = DevBuf::zeroed(t * n * 4).map_err(gerr)?;
+    let pb = DevBuf::zeroed(t * 4 * 4).map_err(gerr)?;
+    let cb = DevBuf::zeroed(t * 16 * 4).map_err(gerr)?;
+    unsafe {
+        k.pre(&s, rb.ptr, fb.ptr, bb.ptr, sb.ptr, xb.ptr, pb.ptr, cb.ptr, t, n, w.iters, w.eps, w.rms_eps)?;
+    }
+    s.sync().map_err(gerr)?;
+    let x: Vec<f32> = xb.read(0, t * n).map_err(gerr)?;
+    let post: Vec<f32> = pb.read(0, t * 4).map_err(gerr)?;
+    let comb: Vec<f32> = cb.read(0, t * 16).map_err(gerr)?;
+    let mixes = (0..t)
+        .map(|i| {
+            let mut m = super::mhc::Mix {
+                x: x[i * n..(i + 1) * n].to_vec(),
+                post: [0f32; 4],
+                comb: [[0f32; 4]; 4],
+            };
+            m.post.copy_from_slice(&post[i * 4..(i + 1) * 4]);
+            for src in 0..4 {
+                m.comb[src].copy_from_slice(&comb[i * 16 + src * 4..i * 16 + src * 4 + 4]);
+            }
+            m
+        })
+        .collect();
+    Ok((x, mixes))
+}
+
+/// W2's mHC post on the GPU for `t` tokens (feature `cuda`), host-staged; updates `r` in place.
+#[cfg(feature = "cuda")]
+fn mhc_post_gpu(
+    k: &super::mhc::MhcKernels,
+    mixes: &[super::mhc::Mix],
+    y: &[f32],
+    r: &mut [f32],
+    t: usize,
+    n: usize,
+) -> Result<()> {
+    use tang_moe::gpu::{DevBuf, Stream};
+    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mhc cuda: {e}");
+    ensure!(r.len() == t * 4 * n && y.len() == t * n && mixes.len() == t, "mhc post shapes");
+    let mut post = Vec::with_capacity(t * 4);
+    let mut comb = Vec::with_capacity(t * 16);
+    for m in mixes {
+        post.extend_from_slice(&m.post);
+        for row in &m.comb {
+            comb.extend_from_slice(row);
+        }
+    }
+    let s = Stream::new().map_err(gerr)?;
+    let yb = DevBuf::from_slice(y).map_err(gerr)?;
+    let rin = DevBuf::from_slice(r).map_err(gerr)?;
+    let pb = DevBuf::from_slice(&post).map_err(gerr)?;
+    let cb = DevBuf::from_slice(&comb).map_err(gerr)?;
+    let out = DevBuf::zeroed(t * 4 * n * 4).map_err(gerr)?;
+    unsafe {
+        k.post(&s, yb.ptr, rin.ptr, pb.ptr, cb.ptr, out.ptr, t, n)?;
+    }
+    s.sync().map_err(gerr)?;
+    let o: Vec<f32> = out.read(0, t * 4 * n).map_err(gerr)?;
+    r.copy_from_slice(&o);
+    Ok(())
+}
+
 pub(crate) fn argmax(v: &[f32]) -> u32 {
     let mut best = 0;
     for (i, &x) in v.iter().enumerate() {
@@ -902,8 +1038,8 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// R3 (FFN + KDA, the f32 GPU paths): every FFN and the KDA conv + core on the GPU equal
-    /// the CPU engine on the tiny model: 150-token prefill (2 GPU chunks + a CPU tail), GPU
+    /// R3 (the f32 GPU paths: FFN, KDA, mHC): every FFN, the KDA conv + core and the mHC
+    /// pre/post on the GPU equal the CPU engine on the tiny model: 150-token prefill (2 GPU chunks + a CPU tail), GPU
     /// decode steps, then a short window. Pod: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
     /// --no-default-features --features cuda --lib glm5::engine -- --nocapture`
     /// (`TANG_GPUS=2 TANG_SPLIT_AT=2` exercises the split).
@@ -951,7 +1087,7 @@ mod tests {
                 worst = worst.max((x - y).abs());
             }
         }
-        eprintln!("GPU (FFN + KDA) vs CPU: logits max abs {worst:.3e}");
+        eprintln!("GPU (FFN + KDA + mHC) vs CPU: logits max abs {worst:.3e}");
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 
@@ -996,7 +1132,7 @@ mod tests {
             }
         }
         eprintln!(
-            "GPU (FFN + KDA + MLA bf16) vs CPU: top-1 {agree}/{total}, logits max abs {worst:.3e}"
+            "GPU (FFN + KDA + mHC + MLA bf16) vs CPU: top-1 {agree}/{total}, logits max abs {worst:.3e}"
         );
         assert!(agree as f32 >= 0.98 * total as f32, "top-1 {agree}/{total}");
         assert!(worst <= 0.25, "logits max abs {worst}");
