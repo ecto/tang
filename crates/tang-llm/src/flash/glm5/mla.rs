@@ -910,7 +910,7 @@ mod cuda {
                 &mut dl as *mut i32 as *mut std::ffi::c_void,
                 &mut eps as *mut f32 as *mut std::ffi::c_void,
             ];
-            unsafe { gpu::launch(f, (t as u32, 1, 1), 256, 0, stream, &mut args)? };
+            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, &mut args)? };
             let rows: Vec<u16> = yd.read(0, t * self.dl)?;
             cache[pos0 * self.dl..(pos0 + t) * self.dl].copy_from_slice(&rows);
             Ok(())
@@ -976,7 +976,7 @@ mod cuda {
                 &mut scale as *mut f32 as *mut std::ffi::c_void,
             ];
             let smem = ((self.dk + self.dv) * 4) as u32;
-            unsafe { gpu::launch(f, (self.nh as u32, t as u32, 1), 256, smem, stream, &mut args)? };
+            unsafe { gpu::launch(f, (self.nh as u32, t as u32, 1), (256, 1, 1), smem, stream, &mut args)? };
             out_v.copy_from_slice(&od.read(0, out_v.len())?);
             Ok(())
         }
