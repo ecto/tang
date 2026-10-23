@@ -41,6 +41,8 @@ pub fn prelude(cfg: &super::kda::KdaConfig) -> String {
 /// channel (oldest first), `W` `[chan][d_conv]` tap 0 = newest. `Y` is the conv output
 /// (pre-SiLU in `H`, post-SiLU in `Y`). One thread per channel; grid `ceil(KDA_CONV/256)`.
 pub const CONV_SRC: &str = r#"
+typedef unsigned long long u64;
+
 extern "C" __global__ void kda_conv(const float* __restrict__ X, unsigned int stride,
                                     const float* __restrict__ H0, const float* __restrict__ W,
                                     float* __restrict__ Y, unsigned int T) {
@@ -85,6 +87,8 @@ extern "C" __global__ void kda_conv_commit(float* __restrict__ H0, const float* 
 /// Grid `KDA_H`, block `KDA_D` (128) — naive: each thread owns one value column; the key
 /// dim loops in registers.
 pub const STEP_SRC: &str = r#"
+typedef unsigned long long u64;
+
 // One thread per value column x of one head: q/k in shared (normed), the state in GLOBAL
 // (naive: read and rewritten per token; registers can't hold a row the column reduction
 // needs). Decay per key row a uses g[a] = exp(G[h*D + a]) — the gate channel is the KEY dim.
@@ -101,7 +105,7 @@ extern "C" __global__ void kda_step(const float* __restrict__ QKV,
     G += (u64)bi * KDA_H * D;
     B += (u64)bi * KDA_H;
     // ---- fused conv (this head's q/k/v channels) + l2 norm + scale, in shared ----
-    __shared__ float q[D], k[D], sk[D];
+    __shared__ float q[KDA_D], k[KDA_D], sk[KDA_D];
     float qv = 0.0f, kv = 0.0f, vv = 0.0f;
     {
         unsigned int qc = h * D + x;
@@ -165,6 +169,8 @@ extern "C" __global__ void kda_step(const float* __restrict__ QKV,
 /// Matches `kda_chunk` (HF's `chunk_kimi_delta_attention`) step for step, in f32 (the CPU
 /// reference's f64 accumulation is not reproduced; parity tolerance 1e-4).
 pub const PREFILL_SRC: &str = r#"
+typedef unsigned long long u64;
+
 // One float per thread → the block sum (D is a power of two; naive tree over shared red).
 __device__ __forceinline__ float block_red(float* red, unsigned int a, float p, unsigned int D) {
     volatile float* r = red;
