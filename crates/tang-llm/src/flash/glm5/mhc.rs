@@ -838,6 +838,8 @@ mod tests {
                 k.post(&stream, a(&y), a(&r), a(&post), a(&comb), a(&out), t, n)
                     .unwrap();
             }
+            // the kernels ran on `stream` (non-blocking): sync it, not just the device stream
+            stream.sync().unwrap();
             dev.sync();
             let gx = x.to_vec();
             let gpost = post.to_vec();
