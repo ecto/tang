@@ -215,6 +215,12 @@ pub struct DevBuf {
 }
 
 impl DevBuf {
+    /// GOTCHA (cost a glm5 first-tokens pod): `alloc`/`zeroed` take BYTES, but `read::<T>`/
+    /// `write::<T>` take ELEMENT counts. Calling `zeroed(n * size_of::<T>())` and then
+    /// `read::<T>` is fine, but passing an element count to `zeroed` (or bytes to `read`)
+    /// leaves the buffer 4× (or 4× too small) and the kernel writes past the allocation —
+    /// the assert fires later, in an unrelated read. When in doubt: `alloc_bytes(n * size)` +
+    /// `read::<T>(0, n)` never mix.
     pub fn alloc(len: usize) -> Result<Self> {
         let mut p: sys::CUdeviceptr = 0;
         ck!(sys::cuMemAlloc_v2(&mut p, len.max(1)))?;
