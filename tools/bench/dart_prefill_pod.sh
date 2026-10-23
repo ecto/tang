@@ -39,8 +39,9 @@ while [ ! -f $W/MODEL_OK ]; do sleep 10; [ $(( ($(date +%s)-T0)/60 )) -ge 60 ] &
 GGUF=$(find "$(cat $W/model.dir)" -name '*.gguf' | sort | head -1); log "model $GGUF"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader >>"$R/pod.log"
 
-serve(){ # $1 policy
+serve(){ # $1 policy. Wipes saved prompt states so every run is COLD (they survive restarts).
   pkill -f "tang-llm serve" 2>/dev/null; sleep 3
+  rm -rf /root/.cache/tang/flash-serve
   TANG_PREFILL_POLICY=$1 TANG_MAX_BATCH=8 nohup $BIN serve "$GGUF" --host 127.0.0.1 --port 8912 --ctx 131072 \
     --kv-ttl 3600 --batch 8 >"$R/serve-$1-$(date +%s).log" 2>&1 &
   for i in $(seq 1 120); do curl -sf -m 3 localhost:8912/health >/dev/null && { log "serve[$1] up"; break; }; sleep 5; done
