@@ -96,6 +96,46 @@ impl Glm5Ref {
         self.g.tensor_f32(name)
     }
 
+    /// One KDA layer's weights as W4's [`super::kda::KdaLayerW`] (dequantised f32, HF layout:
+    /// GGUF `[cols, rows]` row-major is HF `[out][in]`; the three depthwise convs, GGUF
+    /// `[d_conv, 1, d_inner, 1]` = flat `[chan][tap]`, are stacked q|k|v).
+    fn kda_weights(&self, l: usize) -> Result<(super::kda::KdaLayerW, super::kda::KdaConfig)> {
+        let hp = &self.hp;
+        let t = |s: &str| super::t(l, s);
+        let v = |s: &str| self.vec(&t(s));
+        let cfg = super::kda::KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let d_inner = hp.n_head * hp.kda_head_dim;
+        let mut conv = Vec::with_capacity(3 * d_inner * hp.ssm_d_conv);
+        for name in ["ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"] {
+            let c = v(name)?;
+            ensure!(c.len() == d_inner * hp.ssm_d_conv, "blk.{l}.{name}: {} floats", c.len());
+            conv.extend_from_slice(&c);
+        }
+        let w = super::kda::KdaLayerW {
+            q: v("attn_q.weight")?,
+            k: v("attn_k.weight")?,
+            v: v("attn_v.weight")?,
+            conv,
+            f_a: v("ssm_f_a.weight")?,
+            f_b: v("ssm_f_b.weight")?,
+            dt_bias: v("ssm_dt.bias")?,
+            decay_rate: super::kda::ForgetGateW::decay_rate_from_gguf(&v("ssm_a")?),
+            b_proj: v("ssm_beta.weight")?,
+            g_a: v("ssm_g_a.weight")?,
+            g_b: v("ssm_g_b.weight")?,
+            o_norm: v("ssm_norm.weight")?,
+            o_proj: v("attn_output.weight")?,
+            hidden: hp.n_embd,
+        };
+        Ok((w, cfg))
+    }
+
     /// One DSA layer's weights as W3's [`super::mla::MlaWeights`] (dequantised f32).
     fn mla_weights(&self, l: usize) -> Result<super::mla::MlaWeights> {
         let hp = &self.hp;
@@ -240,8 +280,11 @@ impl Glm5Ref {
             self.norm_all(&mut x, l, "attn_norm.weight")?;
             let y: Vec<f32> = if hp.is_kda[l] {
                 // W4's KDA (reference recurrent form until frog/glm5-kda lands)
-                let w = super::kda::KdaWeights::from_gguf(&self.g, hp, l)?;
-                super::kda::kda_forward(&w, &x, t_len)?
+                // W4's KDA layer (prefill from position 0: fresh conv + recurrent state)
+                let (w, cfg) = self.kda_weights(l)?;
+                let mut conv = super::kda::ConvState::zeros(&cfg, 1);
+                let mut state = super::kda::KdaState::zeros(&cfg, 1);
+                super::kda::kda_layer(&x, &w, &cfg, &mut conv, &mut state, 1, t_len)?
             } else {
                 // W3's MLA-NoPE + indexer, dense-causal while kv_len <= idx_top_k
                 // (W3 verified the indexer is a no-op there).
