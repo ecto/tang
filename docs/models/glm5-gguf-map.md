@@ -262,7 +262,8 @@ minus hc_*, plus fresh eh_proj [H, 2H] -> GGUF ne [2H, H]).
    per-tensor types (it already does for other K-quant models via `flash_native.rs`).
 8. **Tiny-fidelity note**: the tiny GGUF is all F32, so parity vs HF is exact-path; Q8_0 and
    Q4_K_M copies exist at `/private/tmp/glm5-tiny/glm5-tiny-{q8_0,q4_k_m}.gguf` for
-   smoke-testing tang's quant decoders (llama.cpp greedy matches HF on all three).
+   smoke-testing tang's quant decoders (llama.cpp F32 greedy == HF 16/16; the quantized
+   copies diverge early on this random model and are decoder smoke tests only).
 
 ## 5. Fixture paths (what W1–W5 should use)
 
@@ -272,11 +273,24 @@ minus hc_*, plus fresh eh_proj [H, 2H] -> GGUF ne [2H, H]).
   `embed.bin [T,256]`, `layerB{i}.bin [T,4,256]` (mHC streams after block i),
   `final.bin [T,256]`, `logits.bin [T,154880]` (seq1 = 52 tokens), `*_seq2.bin` for the
   2052-token sequence, `meta.json` (ids, shapes). All little-endian f32.
-- GGUFs: `/private/tmp/glm5-tiny/glm5-tiny-f32.gguf` (183 tensors, 46 blocks, matches the
+- GGUFs: `/private/tmp/glm5-tiny/glm5-tiny-f32.gguf` (177 tensors, 46 blocks, matches the
   real tensor set minus quant), `-q8_0`, `-q4_k_m`.
 - Compare tool: `crates/tang-llm/scripts/glm5_compare.py` (TANG_DUMP_DIR format below).
 - llama.cpp CPU build (for extra sanity runs): `/private/tmp/glm5-harness-llama/build-cpu/bin/`
   (llama-cli, llama-quantize, llama-perplexity, llama-server).
+
+### Indexer tie-freedom (R2 fix)
+
+The fixture's DSA indexer is built so top-k selection has **no exact ties** between valid
+pools: `indexer.wq_b` query heads are paired `(h, -h)` (keys are one shared head, so one of
+each pair always has `q·k > 0` and no pool scores exactly 0.0 after relu). The generator
+asserts, for every query row with more than `index_topk/kpool = 4` visible pools, that the
+4th-best pool score beats the 5th by >= 1e-4 (masked pools at `finfo.min` are excluded:
+rows with <= 4 visible pools select every visible pool regardless of tie order).
+Seed 0: seq1 min margin 2.5e-2 (33 rows), seq2 min margin 1.50e-4 (relative 3.3e-4) at
+query pos 456 over 2033 rows, 0 exact-0.0 valid scores. If tang's indexer pool scores at
+seq2 pos 456 drift by more than ~1e-4 from HF, a selection flip there is a real precision
+issue, not a fixture tie.
 
 ## 6. TANG_DUMP_DIR format (W1 writes, glm5_compare.py reads)
 
