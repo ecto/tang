@@ -34,6 +34,12 @@ struct DsaCache {
     latent: Vec<f32>,
     idx_k: Vec<f32>,
     idx_g: Vec<f32>,
+    /// The GPU path's latent cache: `[n][kv_lora]` bf16 (W3's layout).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    lat16: Vec<u16>,
+    /// The GPU path's indexer validity marks, `[n]`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    valid: Vec<u8>,
 }
 
 /// The FFNs on the GPU (feature `cuda`): every layer's dense or MoE FFN (W5's
@@ -46,6 +52,8 @@ pub struct GpuFfn {
     devs: Vec<(tang_moe::gpu::Gpu, super::moe::gpu::Kernels)>,
     /// W4's KDA kernels per device (`TANG_GLM5_GPU_KDA=0`: KDA stays on the CPU).
     kda_k: Vec<Option<super::kda_cuda::cuda::Kernels>>,
+    /// W3's MLA + indexer kernels per device (`TANG_GLM5_GPU_MLA=0`: DSA stays on the CPU).
+    mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
     layers: Vec<super::moe::gpu::DevMoe>,
     dev_of: Vec<usize>,
     pub split: usize,
@@ -54,7 +62,11 @@ pub struct GpuFfn {
 #[cfg(feature = "cuda")]
 impl GpuFfn {
     /// Upload every layer's FFN. `Ok(None)` when there is no CUDA device or `TANG_GLM5_GPU=0`.
-    pub fn load(g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<Option<Self>> {
+    pub fn load(
+        g: &crate::gguf::Gguf,
+        hp: &super::Hparams,
+        mla_sample: Option<&MlaWeights>,
+    ) -> Result<Option<Self>> {
         use tang_moe::gpu::Gpu;
         let n_layer = hp.n_layer;
         let kda_cfg = KdaConfig {
@@ -66,6 +78,8 @@ impl GpuFfn {
         };
         let kda_on = !std::env::var("TANG_GLM5_GPU_KDA").is_ok_and(|v| v == "0");
         let mut kda_k = Vec::new();
+        let mla_on = !std::env::var("TANG_GLM5_GPU_MLA").is_ok_and(|v| v == "0");
+        let mut mla_k = Vec::new();
         if std::env::var("TANG_GLM5_GPU").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
@@ -86,6 +100,13 @@ impl GpuFfn {
                 Some(super::kda_cuda::cuda::load(&gpu, &kda_cfg)?)
             } else {
                 None
+            });
+            mla_k.push(match (mla_on, mla_sample) {
+                (true, Some(w)) => Some(
+                    super::mla::cuda::MlaCuda::new_at(w, ord)
+                        .map_err(|e| anyhow::anyhow!("MLA kernels on GPU {ord}: {e}"))?,
+                ),
+                _ => None,
             });
             devs.push((gpu, k));
         }
@@ -139,6 +160,7 @@ impl GpuFfn {
         Ok(Some(Self {
             devs,
             kda_k,
+            mla_k,
             layers,
             dev_of,
             split,
@@ -196,7 +218,11 @@ impl Glm5Engine {
     /// Returns whether they moved.
     #[cfg(feature = "cuda")]
     pub fn use_gpu(&mut self) -> Result<bool> {
-        self.gpu = GpuFfn::load(&self.m.g, &self.m.hp)?;
+        let sample = match self.m.hp.is_kda.iter().position(|&k| !k) {
+            Some(l) => Some(self.m.mla_weights(l)?),
+            None => None,
+        };
+        self.gpu = GpuFfn::load(&self.m.g, &self.m.hp, sample.as_ref())?;
         Ok(self.gpu.is_some())
     }
 
@@ -270,6 +296,81 @@ impl Glm5Engine {
         super::kda::kda_layer(x, w, cfg, &mut st.0, &mut st.1, 1, t)
     }
 
+    /// DSA layer `l`: W3's GPU MLA + indexer when loaded, else the CPU path.
+    fn dsa_layer(
+        &mut self,
+        l: usize,
+        w: &MlaWeights,
+        x: &[f32],
+        t: usize,
+        pos0: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            let d = g.dev_of[l];
+            if let Some(cu) = &g.mla_k[d] {
+                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[l]);
+            }
+        }
+        self.dsa_cpu(l, w, x, t, pos0)
+    }
+
+    /// DSA layer `l` on the CPU: W3's MLA-NoPE + pooled indexer over the f32 caches.
+    fn dsa_cpu(
+        &mut self,
+        l: usize,
+        w: &MlaWeights,
+        x: &[f32],
+        t: usize,
+        pos0: usize,
+    ) -> Result<Vec<f32>> {
+        let hp = self.m.hp.clone();
+        let n = hp.n_embd;
+        let kv_len = pos0 + t;
+                let q_resid = w.gemv_q_a(x, t);
+                let latent = w.gemv_kv_a(x, t);
+                let idx_dim = hp.idx_dim;
+                let cache = &mut self.dsa[l];
+                cache.latent.extend_from_slice(&latent);
+                for i in 0..t {
+                    let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
+                    super::mla::indexer_key(w, &x[i * n..(i + 1) * n], &mut k, &mut g);
+                    cache.idx_k.extend_from_slice(&k);
+                    cache.idx_g.extend_from_slice(&g);
+                }
+                let sel = if super::mla::indexer_is_dense(kv_len, hp.idx_top_k) {
+                    None
+                } else {
+                    Some(super::mla::indexer_select(
+                        &w,
+                        x,
+                        &q_resid,
+                        &cache.idx_k,
+                        &cache.idx_g,
+                        &vec![1u8; kv_len],
+                        &vec![1u8; t],
+                        t,
+                        kv_len,
+                        pos0,
+                    ))
+                };
+                let mut out = vec![0f32; t * n];
+                super::mla::mla_forward(
+                    &w,
+                    x,
+                    &q_resid,
+                    &cache.latent,
+                    kv_len,
+                    t,
+                    pos0,
+                    None,
+                    sel.as_deref(),
+                    &mut out,
+                );
+        Ok(out)
+    }
+
     /// Run `ids` after the tokens so far. Returns their logits `[ids.len()][n_vocab]`.
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
@@ -277,7 +378,6 @@ impl Glm5Engine {
         let hp = self.m.hp.clone();
         let (n, hc, t) = (hp.n_embd, hp.hc, ids.len());
         let pos0 = self.tokens.len();
-        let kv_len = pos0 + t;
 
         // ---- embedding into every stream
         let embd = self.m.g.info("token_embd.weight")?;
@@ -311,47 +411,7 @@ impl Glm5Engine {
                 y?
             } else {
                 let w = self.mla_weights(l)?;
-                let q_resid = w.gemv_q_a(&x, t);
-                let latent = w.gemv_kv_a(&x, t);
-                let idx_dim = hp.idx_dim;
-                let cache = &mut self.dsa[l];
-                cache.latent.extend_from_slice(&latent);
-                for i in 0..t {
-                    let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
-                    super::mla::indexer_key(&w, &x[i * n..(i + 1) * n], &mut k, &mut g);
-                    cache.idx_k.extend_from_slice(&k);
-                    cache.idx_g.extend_from_slice(&g);
-                }
-                let sel = if super::mla::indexer_is_dense(kv_len, hp.idx_top_k) {
-                    None
-                } else {
-                    Some(super::mla::indexer_select(
-                        &w,
-                        &x,
-                        &q_resid,
-                        &cache.idx_k,
-                        &cache.idx_g,
-                        &vec![1u8; kv_len],
-                        &vec![1u8; t],
-                        t,
-                        kv_len,
-                        pos0,
-                    ))
-                };
-                let mut out = vec![0f32; t * n];
-                super::mla::mla_forward(
-                    &w,
-                    &x,
-                    &q_resid,
-                    &cache.latent,
-                    kv_len,
-                    t,
-                    pos0,
-                    None,
-                    sel.as_deref(),
-                    &mut out,
-                );
-                out
+                self.dsa_layer(l, &w, &x, t, pos0)?
             };
             mhc_post_all(&mixes, &y, &mut r, t, hc, n)?;
 
@@ -555,6 +615,94 @@ fn kda_gpu(
     Ok(matmul(&w.o_proj, hidden, nh * hd, &y, t))
 }
 
+/// One DSA layer with W3's CUDA kernels (feature `cuda`), naive: the caches live on the
+/// host and are staged per call (W3's launchers), q_a / q_b / o_proj are host GEMVs.
+/// Latents are bf16 (W3's cache format), so this is ~1e-3 from the f32 CPU path.
+/// Order follows W3's parity test: kv_append → idx_append → (sparse) idx_pool + idx_run →
+/// attend.
+#[cfg(feature = "cuda")]
+fn dsa_gpu(
+    w: &MlaWeights,
+    cu: &super::mla::cuda::MlaCuda,
+    x: &[f32],
+    t: usize,
+    pos0: usize,
+    c: &mut DsaCache,
+) -> Result<Vec<f32>> {
+    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla cuda: {e}");
+    let s = tang_moe::gpu::Stream::new().map_err(gerr)?;
+    let (n, dl, idd) = (w.hidden, w.kv_lora, w.idx_dim);
+    let kv_len = pos0 + t;
+    ensure!(x.len() == t * n, "layer input");
+    ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
+    let q_resid = w.gemv_q_a(x, t);
+    // caches grow by t rows; the launchers write rows [pos0, kv_len)
+    c.lat16.resize(kv_len * dl, 0);
+    cu.kv_append(&w.kv_a, &w.kv_a_norm, x, t, pos0, &mut c.lat16, &s)
+        .map_err(gerr)?;
+    c.idx_k.resize(kv_len * idd, 0.0);
+    c.idx_g.resize(kv_len * idd, 0.0);
+    c.valid.resize(kv_len, 0);
+    cu.idx_append(
+        &w.i_wk,
+        &w.i_k_norm_w,
+        &w.i_k_norm_b,
+        &w.i_gate,
+        x,
+        t,
+        pos0,
+        &mut c.idx_k,
+        &mut c.idx_g,
+        &mut c.valid,
+        &s,
+    )
+    .map_err(gerr)?;
+    let sel = if super::mla::indexer_is_dense(kv_len, w.topk) {
+        None
+    } else {
+        let n_pool = kv_len / w.kpool;
+        let mut pool_keys = vec![0f32; n_pool * idd];
+        cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, &s)
+            .map_err(gerr)?;
+        let mut sel = vec![-1i32; t * w.select_width()];
+        cu.idx_run(
+            &w.i_wq_b,
+            &w.i_proj,
+            &q_resid,
+            x,
+            &pool_keys,
+            &c.valid,
+            kv_len,
+            0,
+            n_pool,
+            t,
+            pos0,
+            &mut sel,
+            &s,
+        )
+        .map_err(gerr)?;
+        Some(sel)
+    };
+    let q = w.gemv_q_b(&q_resid, t);
+    let wk: Vec<f32> = (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect();
+    let wv: Vec<f32> = (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect();
+    let hv = w.n_head * w.v_head;
+    let mut out_v = vec![0f32; t * hv];
+    cu.attend(&wk, &wv, &q, &c.lat16, kv_len, t, pos0, sel.as_deref(), &mut out_v, &s)
+        .map_err(gerr)?;
+    // o_proj on the host
+    let mut out = vec![0f32; t * n];
+    for i in 0..t {
+        for r in 0..n {
+            out[i * n + r] = crate::flash::reference::dot(
+                &w.o[r * hv..(r + 1) * hv],
+                &out_v[i * hv..(i + 1) * hv],
+            );
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn argmax(v: &[f32]) -> u32 {
     let mut best = 0;
     for (i, &x) in v.iter().enumerate() {
@@ -754,7 +902,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// R3 (FFN + KDA): the engine with every FFN and the KDA conv + core on the GPU equals
+    /// R3 (FFN + KDA, the f32 GPU paths): every FFN and the KDA conv + core on the GPU equal
     /// the CPU engine on the tiny model: 150-token prefill (2 GPU chunks + a CPU tail), GPU
     /// decode steps, then a short window. Pod: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
     /// --no-default-features --features cuda --lib glm5::engine -- --nocapture`
@@ -772,6 +920,10 @@ mod tests {
         let mut cpu = Glm5Engine::open(Path::new(TINY)).unwrap();
         let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
         assert!(gpu.use_gpu().unwrap(), "GPU FFNs did not load");
+        // f32 paths only here: DSA stays on the CPU (the bf16 MLA path has its own test)
+        for k in &mut gpu.gpu.as_mut().unwrap().mla_k {
+            *k = None;
+        }
         let nv = cpu.m.hp.n_vocab;
         let mut worst = 0f32;
         // seq2 (2052 tokens) for a window ≥ 64: two GPU prefill chunks + a CPU tail, then
@@ -801,6 +953,53 @@ mod tests {
         }
         eprintln!("GPU (FFN + KDA) vs CPU: logits max abs {worst:.3e}");
         assert!(worst <= 1e-3, "logits max abs {worst}");
+    }
+
+    /// R3 (all of it): FFN + KDA + MLA/indexer on the GPU vs the CPU engine. W3's GPU
+    /// latents are bf16 (the CPU's are f32), so the bar is top-1 agreement ≥ 98% and logits
+    /// within 0.25; both numbers are printed for the pod log.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_mla_matches_cpu() {
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            return;
+        }
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        let mut cpu = Glm5Engine::open(Path::new(TINY)).unwrap();
+        let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(gpu.use_gpu().unwrap(), "GPU did not load");
+        assert!(
+            gpu.gpu.as_ref().unwrap().mla_k.iter().all(|k| k.is_some()),
+            "MLA kernels did not load"
+        );
+        let nv = cpu.m.hp.n_vocab;
+        let (mut worst, mut agree, mut total) = (0f32, 0usize, 0usize);
+        // dense (≤ top-k) then sparse windows, then decode steps
+        for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
+            let a = cpu.window(w).unwrap();
+            let b = gpu.window(w).unwrap();
+            for p in 0..w.len() {
+                total += 1;
+                if argmax(&a[p * nv..(p + 1) * nv]) == argmax(&b[p * nv..(p + 1) * nv]) {
+                    agree += 1;
+                }
+            }
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        eprintln!(
+            "GPU (FFN + KDA + MLA bf16) vs CPU: top-1 {agree}/{total}, logits max abs {worst:.3e}"
+        );
+        assert!(agree as f32 >= 0.98 * total as f32, "top-1 {agree}/{total}");
+        assert!(worst <= 0.25, "logits max abs {worst}");
     }
 
     /// reset() gives a fresh sequence.

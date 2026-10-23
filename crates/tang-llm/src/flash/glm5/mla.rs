@@ -981,7 +981,7 @@ pub fn cuda_prelude(hidden: usize, q_lora: usize, kv_lora: usize, n_head: usize)
 ///    [cap][128] f32 k and gate rows and a [cap] u8 valid vector (the indexer stays
 ///    f32 — its APE/gate math is sensitive).
 #[cfg(feature = "cuda")]
-mod cuda {
+pub mod cuda {
     use super::*;
     use tang_moe::gpu::{self, DevBuf, Gpu, Module, Stream};
 
@@ -1008,7 +1008,12 @@ mod cuda {
         /// Compile the kernels for this weight set's geometry. Host weights are kept
         /// by the caller and staged per call (the naive path is not yet weight-resident).
         pub fn new(w: &MlaWeights) -> Result<Self, gpu::Error> {
-            let g = Gpu::new()?;
+            Self::new_at(w, 0)
+        }
+
+        /// [`Self::new`] on CUDA device `ordinal` (the two-GPU split's stage 1).
+        pub fn new_at(w: &MlaWeights, ordinal: usize) -> Result<Self, gpu::Error> {
+            let g = Gpu::at(ordinal)?;
             g.bind()?;
             let src = format!(
                 "{}{}",
