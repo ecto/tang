@@ -80,9 +80,15 @@ __device__ float g5_deq(unsigned ty, const unsigned char* row, int j) {
     if (ty == 14) {  // Q6_K 210 B: ql[128], qh[64], int8 scales[16], f16 d
         const unsigned char* b = row + (j / 256) * 210;
         const int e = j % 256, n = e / 128, r = e % 128, qd = r / 32, l = r % 32;
-        const int lo = (b[n * 64 + l + (qd & 1) * 32] >> (qd >= 2 ? 4 : 0)) & 0xF;
-        const int h2 = (b[128 + n * 32 + l] >> (2 * qd)) & 3;
-        const int sc = (signed char)b[192 + n * 8 + l / 16 + 2 * qd];
+        // slice n: ql_n = b + n*64, qh_n = b + 128 + n*32. Per (l, qd):
+        //   qd 0: lo = ql_n[l] lo nibble  qd 1: lo = ql_n[l+32] lo nibble
+        //   qd 2: lo = ql_n[l] hi nibble  qd 3: lo = ql_n[l+32] hi nibble
+        //   h2 = qh_n[l] >> (2*qd) & 3; the value's scale row is sc[2*qd + l/16].
+        const unsigned char* ql = b + n * 64;
+        const unsigned char* qh = b + 128 + n * 32;
+        const int lo = (ql[l + (qd & 1) * 32] >> ((qd & 2) ? 4 : 0)) & 0xF;
+        const int h2 = (qh[l] >> (2 * qd)) & 3;
+        const int sc = (signed char)b[192 + n * 8 + (qd * 2 + l / 16)];
         return g5_h2f(g5_u16(b + 208)) * (float)sc * (float)((lo | (h2 << 4)) - 32);
     }
     return __uint_as_float(0x7fc00000u);
