@@ -492,7 +492,12 @@ impl Kern {
             .module(&format!("#define GDN_SLOTS 1\n{}", geo.cuda_source()))
             .map_err(|e| anyhow!("flash kernels: {e}"))?;
         let em = gpu.module(kernels::SRC).map_err(|e| anyhow!("{e}"))?;
-        Kern::from_modules(&cm, &fm, &em)
+        let k = Kern::from_modules(&cm, &fm, &em)?;
+        // Keep the modules alive for as long as the handles: dropping a CudaModule unloads
+        // the cubin and every function handle in it dies with it.
+        let mut k = k;
+        k._mods = vec![cm, fm, em];
+        Ok(k)
     }
 }
 
