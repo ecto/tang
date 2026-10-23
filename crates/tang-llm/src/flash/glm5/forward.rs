@@ -71,7 +71,7 @@ impl Glm5Ref {
     }
 
     /// Dequantize `blk.{l}.{name}` as a matrix `[cols, rows]` (dims[0] fastest).
-    fn mat(&self, l: usize, name: &str) -> Result<crate::flash::reference::Mat> {
+    pub(crate) fn mat(&self, l: usize, name: &str) -> Result<crate::flash::reference::Mat> {
         let info = self.g.info(&super::t(l, name))?;
         ensure!(
             info.dims.len() <= 2,
@@ -92,14 +92,14 @@ impl Glm5Ref {
         })
     }
 
-    fn vec(&self, name: &str) -> Result<Vec<f32>> {
+    pub(crate) fn vec(&self, name: &str) -> Result<Vec<f32>> {
         self.g.tensor_f32(name)
     }
 
     /// One KDA layer's weights as W4's [`super::kda::KdaLayerW`] (dequantised f32, HF layout:
     /// GGUF `[cols, rows]` row-major is HF `[out][in]`; the three depthwise convs, GGUF
     /// `[d_conv, 1, d_inner, 1]` = flat `[chan][tap]`, are stacked q|k|v).
-    fn kda_weights(&self, l: usize) -> Result<(super::kda::KdaLayerW, super::kda::KdaConfig)> {
+    pub(crate) fn kda_weights(&self, l: usize) -> Result<(super::kda::KdaLayerW, super::kda::KdaConfig)> {
         let hp = &self.hp;
         let t = |s: &str| super::t(l, s);
         let v = |s: &str| self.vec(&t(s));
@@ -137,7 +137,7 @@ impl Glm5Ref {
     }
 
     /// One DSA layer's weights as W3's [`super::mla::MlaWeights`] (dequantised f32).
-    fn mla_weights(&self, l: usize) -> Result<super::mla::MlaWeights> {
+    pub(crate) fn mla_weights(&self, l: usize) -> Result<super::mla::MlaWeights> {
         let hp = &self.hp;
         let t = |s: &str| super::t(l, s);
         let v = |s: &str| self.vec(&t(s));
@@ -178,7 +178,7 @@ impl Glm5Ref {
 
     /// The dense lead-in FFN (`Glm5NextTextMLP`): swiglu with the HF clamp semantics —
     /// `gate.clamp(max=limit)`, `up.clamp(-limit, limit)` — then `down`.
-    fn dense_ffn(&self, l: usize, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
+    pub(crate) fn dense_ffn(&self, l: usize, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
         let limit = self
             .hp
             .clamp_shexp(l)
@@ -194,7 +194,7 @@ impl Glm5Ref {
 
     /// RMSNorm in place over every token row. Layer weights are `blk.{l}.{suffix}`;
     /// the head norm passes its full tensor name via `exact`.
-    fn norm_all(&self, x: &mut [f32], l: usize, suffix: &str) -> Result<()> {
+    pub(crate) fn norm_all(&self, x: &mut [f32], l: usize, suffix: &str) -> Result<()> {
         let n = self.hp.n_embd;
         let w = self.vec(&super::t(l, suffix))?;
         ensure!(w.len() == n, "blk.{l}.{suffix}: {} wide, want {n}", w.len());
@@ -205,7 +205,7 @@ impl Glm5Ref {
     }
 
     /// RMSNorm with a full tensor name (the head's `output_norm.weight`).
-    fn norm_all_exact(&self, x: &mut [f32], name: &str) -> Result<()> {
+    pub(crate) fn norm_all_exact(&self, x: &mut [f32], name: &str) -> Result<()> {
         let n = self.hp.n_embd;
         let w = self.vec(name)?;
         ensure!(w.len() == n, "{name}: {} wide, want {n}", w.len());
@@ -475,7 +475,7 @@ impl Glm5Ref {
 
     /// The lm_head matrix (tied or not — the converter drops `lm_head` when tied, in which case
     /// the embedding is the head).
-    fn head(&self) -> Result<crate::flash::reference::Mat> {
+    pub(crate) fn head(&self) -> Result<crate::flash::reference::Mat> {
         let info = match self.g.get("output.weight") {
             Some(t) => t,
             None => self.g.info("token_embd.weight")?,

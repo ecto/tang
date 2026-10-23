@@ -7,6 +7,7 @@
 //! - [`kda`] (W4): the 34 Kimi-delta-attention layers.
 //! - [`moe`] (W5): the sigmoid/noaux_tc router, routed + shared experts, dense lead-in FFN.
 
+pub mod engine;
 pub mod forward;
 pub mod gguf;
 pub mod kda;
