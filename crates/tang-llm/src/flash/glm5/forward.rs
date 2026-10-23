@@ -152,11 +152,23 @@ impl Glm5Ref {
         Ok(self.mat(l, "ffn_down.weight")?.apply(&h, t_len, false))
     }
 
-    /// RMSNorm in place with the layer weight `blk.{l}.{suffix}` over every token row.
+    /// RMSNorm in place over every token row. Layer weights are `blk.{l}.{suffix}`;
+    /// the head norm passes its full tensor name via `exact`.
     fn norm_all(&self, x: &mut [f32], l: usize, suffix: &str) -> Result<()> {
         let n = self.hp.n_embd;
         let w = self.vec(&super::t(l, suffix))?;
         ensure!(w.len() == n, "blk.{l}.{suffix}: {} wide, want {n}", w.len());
+        let eps = self.hp.eps;
+        x.par_chunks_mut(n)
+            .for_each(|row| rms_norm_mul(row, &w, eps));
+        Ok(())
+    }
+
+    /// RMSNorm with a full tensor name (the head's `output_norm.weight`).
+    fn norm_all_exact(&self, x: &mut [f32], name: &str) -> Result<()> {
+        let n = self.hp.n_embd;
+        let w = self.vec(name)?;
+        ensure!(w.len() == n, "{name}: {} wide, want {n}", w.len());
         let eps = self.hp.eps;
         x.par_chunks_mut(n)
             .for_each(|row| rms_norm_mul(row, &w, eps));
@@ -227,7 +239,9 @@ impl Glm5Ref {
             }
             self.norm_all(&mut x, l, "attn_norm.weight")?;
             let y: Vec<f32> = if hp.is_kda[l] {
-                todo!("kda mixer: W4 (frog/glm5-kda) has not landed yet")
+                // W4's KDA (reference recurrent form until frog/glm5-kda lands)
+                let w = super::kda::KdaWeights::from_gguf(&self.g, hp, l)?;
+                super::kda::kda_forward(&w, &x, t_len)?
             } else {
                 // W3's MLA-NoPE + indexer, dense-causal while kv_len <= idx_top_k
                 // (W3 verified the indexer is a no-op there).
@@ -360,7 +374,7 @@ impl Glm5Ref {
             }
         }
         let mut x = h;
-        self.norm_all(&mut x, usize::MAX, "output_norm.weight")?;
+        self.norm_all_exact(&mut x, "output_norm.weight")?;
         dput("final_x", &[n], &x[last * n..]);
 
         let head = self.head()?;

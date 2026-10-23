@@ -97,7 +97,8 @@ impl<'a> MoeParams<'a> {
         let name = |n: &str| format!("blk.{l}.{n}");
         let v = |n: &str| -> Result<&'a [f32]> {
             let t = g.info(n)?;
-            ensure!(t.dims.len() <= 2, "{n}: not a matrix ({:?})", t.dims);
+            // expert tensors are 3-D [n, ff_exp, n_expert]; the data is row-major flat
+            ensure!(!t.dims.is_empty(), "{n}: empty dims");
             let d = g.dequantize(t)?;
             Ok(Box::leak(d.into_boxed_slice()))
         };
@@ -130,7 +131,8 @@ impl<'a> MoeParams<'a> {
             (None, None, None)
         };
         let ff_shexp = if let Some(t) = g.get(&name("ffn_gate_shexp.weight")) {
-            t.dims[0] as usize
+            // GGUF dims: [cols=hidden, rows=ff_shexp]
+            t.dims[1] as usize
         } else {
             0
         };
