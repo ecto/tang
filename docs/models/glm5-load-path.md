@@ -92,13 +92,25 @@ Notes:
   It is checked against the full reference forward on the tiny model (chunked prefill +
   decode: logits ≤3e-5, greedy identical).
 - What runs where (naive-but-correct, GATES.md):
-  - **GPU** (cuda build): every FFN, i.e. the dense lead-in and all routed + shared experts
-    (W5's `DevMoe`, GGUF bytes resident, split across GPUs at `TANG_SPLIT_AT`).
-  - **CPU f32**: embedding, mHC, KDA, MLA + indexer, norms, head. These are the small parts
-    (~6 GB of the 196 GB). W2/W3/W4's CUDA kernels are written and type-check, but they
-    aren't in the decode path yet. They're the next wiring step, and this engine is their oracle.
-  - Activations cross host↔GPU once each way per FFN. That's slow but correct.
-- `TANG_GLM5_GPU=0` forces the all-CPU engine; `TANG_GLM5_CACHE=1` caches mixer weights.
+  - **GPU** (cuda build), on the layer's device (`TANG_SPLIT_AT`):
+    - every FFN: the dense lead-in and all routed + shared experts (W5's `DevMoe`, GGUF
+      bytes resident in VRAM);
+    - KDA: conv + delta core (W4). Prefill runs in 64-token GPU chunks, decode uses the GPU
+      step kernel, and a sub-64 tail runs the CPU core on the same state;
+    - DSA: latent append, pooled indexer (keys, pools, selection) and attention (W3), with
+      the latent cache in **bf16** (W3's format);
+    - mHC pre/post (W2).
+  - **CPU f32**: embedding, the projection GEMVs around each GPU kernel (KDA q/k/v/gates/
+    gated norm/o_proj, MLA q_a/q_b/o_proj), RMSNorms, head.
+  - Naive: every kernel stages its inputs and caches host↔GPU per call, and recurrent and
+    latent state lives on the host. That's slow but correct. Next is making weights and
+    caches device-resident and the layer loop host-free, then fusing (GATES.md "FAST").
+- Switches: `TANG_GLM5_GPU=0` runs everything on the CPU. `TANG_GLM5_GPU_KDA=0`,
+  `TANG_GLM5_GPU_MLA=0` and `TANG_GLM5_GPU_MHC=0` each move one component back to the CPU,
+  for bisecting a GPU mismatch. `TANG_GLM5_CACHE=1` caches mixer weights.
+- GPU-vs-CPU bars (cuda tests in `glm5::engine`): FFN + KDA + mHC are f32, so ≤1e-3 logits
+  and identical top-1. With MLA on, the GPU latents are bf16, so the bar is ≥98% top-1 and
+  logits ≤0.25 (both printed).
 - Type-checking the cuda build without a toolkit: `CUDARC_CUDA_VERSION=12080 cargo check
   -p tang-llm --no-default-features --features cuda --lib --tests --bins`.
 - Tokenizer: `tokenizer.ggml.pre = "glm4"`, supported since aff94dd6 (`tokenize.rs`); the
