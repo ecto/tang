@@ -700,6 +700,9 @@ pub fn mla_forward_dense(
 pub const CUDA_SRC: &str = r#"
 #define NEG_INF_F __int_as_float(0xff800000)
 
+#define G5_INF_F __uint_as_float(0x7f800000u)
+#define G5_NEG_INF_F __uint_as_float(0xff800000u)
+
 __device__ __forceinline__ unsigned short f2bf(float x) {
     unsigned int b = __float_as_uint(x);
     return (unsigned short)((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
@@ -756,7 +759,7 @@ extern "C" __global__ void mla_attn_naive(
     for (int d = threadIdx.x; d < dv; d += blockDim.x) acc[d] = 0.f;
 
     // pass 1: max score
-    float m = -INFINITY;
+    float m = G5_NEG_INF_F;
     for (int w = 0; w < width; w++) {
         int k;
         if (sel == NULL) { k = w; if (k > qpos) break; }
@@ -862,7 +865,7 @@ extern "C" __global__ void idx_pool_keys(
     // each thread owns a dim; softmax over kp slots per dim
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float lg[8];
-        float mx = -INFINITY;
+        float mx = G5_NEG_INF_F;
         for (int j = 0; j < kp; j++) {
             lg[j] = cache_gate[(size_t)(base + j) * hd + d] + ape[(size_t)j * hd + d];
             if (lg[j] > mx) mx = lg[j];
@@ -902,7 +905,7 @@ extern "C" __global__ void idx_select(
     int filled = 0;
     for (int p = 0; p < npool; p++) {
         const int end = first_key + p * kp + kp - 1;
-        float s = -INFINITY;
+        float s = G5_NEG_INF_F;
         if (end <= qpos && valid[end]) {
             const float* pkp = pk + (size_t)p * hd;
             const float* qh = iq + (size_t)qi * nh * hd;
@@ -942,7 +945,7 @@ extern "C" __global__ void idx_select(
     // exactly n_select pool slots, always (invisible pools emit -1)
     for (int i = 0; i < n_select && wi < width; i++) {
         const int p = pool_idx[i];
-        const bool vis = pool_sc[i] != -INFINITY;
+        const bool vis = pool_sc[i] != G5_NEG_INF_F;
         for (int j = 0; j < kp && wi < width; j++)
             out[wi++] = vis ? (first_key + p * kp + j) : -1;
     }
