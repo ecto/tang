@@ -375,7 +375,7 @@ impl Glm5Ref {
             } else {
                 // W5's MoE: sigmoid/noaux_tc router + shared expert, all in one call.
                 let p = super::moe::MoeParams::from_gguf(&self.g, l)?;
-                super::moe::moe_layer(&p, &x, t_len)
+                super::moe::moe_layer(&p, &x, t_len)?
             };
             dput(&format!("L{l:02}.ffn_out"), &[n], &y[last * n..]);
             let r_in = r.clone();
