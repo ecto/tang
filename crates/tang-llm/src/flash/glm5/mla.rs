@@ -1060,10 +1060,10 @@ mod cuda {
                 gpu::launch(
                     f,
                     (t as u32, 1, 1),
-                    256,
+                    (256, 1, 1),
                     0,
                     stream,
-                    gpu::args![a.ptr, an.ptr, xd.ptr, yd.ptr, tt, hid, dl, eps],
+                    tang_moe::args![a.ptr, an.ptr, xd.ptr, yd.ptr, tt, hid, dl, eps],
                 )?
             };
             let rows: Vec<u16> = yd.read(0, t * self.dl)?;
@@ -1104,10 +1104,10 @@ mod cuda {
             gpu::launch(
                 f,
                 (n_pool as u32, 1, 1),
-                256,
+                (256, 1, 1),
                 0,
                 stream,
-                gpu::args![ck.ptr, cg.ptr, apd.ptr, vd.ptr, pd.ptr, kvlen, fk, npl, hd_, kp_],
+                tang_moe::args![ck.ptr, cg.ptr, apd.ptr, vd.ptr, pd.ptr, kvlen, fk, npl, hd_, kp_],
             )?
         };
         pool_keys.copy_from_slice(&pd.read(0, pool_keys.len())?);
@@ -1152,10 +1152,10 @@ mod cuda {
             gpu::launch(
                 f,
                 (t as u32, 1, 1),
-                256,
+                (256, 1, 1),
                 0,
                 stream,
-                gpu::args![wkd.ptr, kwd.ptr, kbd.ptr, gwd.ptr, xd.ptr, ck.ptr, cg.ptr, tt, p0, hid, hd_, vd.ptr],
+                tang_moe::args![wkd.ptr, kwd.ptr, kbd.ptr, gwd.ptr, xd.ptr, ck.ptr, cg.ptr, tt, p0, hid, hd_, vd.ptr],
             )?
         };
         let nk: Vec<f32> = ck.read(0, (pos0 + t) * hd)?;
@@ -1232,10 +1232,10 @@ mod cuda {
             gpu::launch(
                 f,
                 (t as u32, 1, 1),
-                256,
+                (256, 1, 1),
                 smem,
                 stream,
-                gpu::args![iqd.ptr, hwd.ptr, pkd.ptr, vd.ptr, sd.ptr, tt, kvlen, p0, fk, npl, nh_, hd_, kp_, tk_, wd_, ssc, hsc],
+                tang_moe::args![iqd.ptr, hwd.ptr, pkd.ptr, vd.ptr, sd.ptr, tt, kvlen, p0, fk, npl, nh_, hd_, kp_, tk_, wd_, ssc, hsc],
             )?
         };
         sel.copy_from_slice(&sd.read(0, sel.len())?);
@@ -1290,10 +1290,10 @@ mod cuda {
                 gpu::launch(
                     f,
                     (self.nh as u32, t as u32, 1),
-                    256,
+                    (256, 1, 1),
                     smem,
                     stream,
-                    gpu::args![qd.ptr, ld.ptr, wkd.ptr, wvd.ptr, sel_ptr, od.ptr, tt, nkv, p0, nh, dk, dv, dl, wd, scale],
+                    tang_moe::args![qd.ptr, ld.ptr, wkd.ptr, wvd.ptr, sel_ptr, od.ptr, tt, nkv, p0, nh, dk, dv, dl, wd, scale],
                 )?
             };
             out_v.copy_from_slice(&od.read(0, out_v.len())?);

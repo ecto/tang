@@ -509,7 +509,7 @@ impl MhcKernels {
     /// Compile [`SRC`] for this device's architecture. `Gpu::bind` first.
     pub fn new(gpu: &tang_moe::gpu::Gpu) -> Result<Self> {
         Ok(Self {
-            module: gpu.module(SRC).map_err(|e| anyhow!("mhc kernels: {e}"))?,
+            module: gpu.module(SRC).map_err(|e| anyhow::anyhow!("mhc kernels: {e}"))?,
         })
     }
 
@@ -541,7 +541,7 @@ impl MhcKernels {
         let f = self
             .module
             .func("mhc_pre")
-            .map_err(|e| anyhow!("mhc_pre: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("mhc_pre: {e}"))?;
         let (nt, it) = (n as i32, iters as i32);
         g::launch(
             f,
@@ -551,7 +551,7 @@ impl MhcKernels {
             stream,
             tang_moe::args![r, fn_, base, scale, x, post, comb, nt, it, hc_eps, rms_eps],
         )
-        .map_err(|e| anyhow!("mhc_pre launch: {e}"))
+        .map_err(|e| anyhow::anyhow!("mhc_pre launch: {e}"))
     }
 
     /// [`mhc_post`](super::super::glm5::mhc) for `t` tokens. One 32-thread block per token.
@@ -577,7 +577,7 @@ impl MhcKernels {
         let f = self
             .module
             .func("mhc_post")
-            .map_err(|e| anyhow!("mhc_post: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("mhc_post: {e}"))?;
         let nt = n as i32;
         g::launch(
             f,
@@ -587,7 +587,7 @@ impl MhcKernels {
             stream,
             tang_moe::args![y, r_in, post, comb, r_out, nt],
         )
-        .map_err(|e| anyhow!("mhc_post launch: {e}"))
+        .map_err(|e| anyhow::anyhow!("mhc_post launch: {e}"))
     }
 }
 
