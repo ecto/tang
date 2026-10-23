@@ -780,7 +780,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn mhc_cuda() {
-        use tang_compute::{ComputeDevice, CudaComputeDevice};
+        use tang_compute::{ComputeBuffer, ComputeDevice, CudaComputeDevice};
         use tang_moe::gpu::{Gpu, Stream};
 
         if !fixture_dir().join("index.json").exists() {
@@ -817,7 +817,7 @@ mod tests {
             let post = dev.upload_f32(&vec![0f32; t * 4]);
             let comb = dev.upload_f32(&vec![0f32; t * 16]);
             let out = dev.upload_f32(&vec![0f32; t * 4 * n]);
-            let a = |v: &tang_compute::CudaBuffer| dev.buffer_addr(v);
+            let a = |v: &tang_compute::cuda::CudaBuffer| dev.buffer_addr(v);
             unsafe {
                 k.pre(
                     &stream,
