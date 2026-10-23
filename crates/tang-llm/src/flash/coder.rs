@@ -479,6 +479,95 @@ impl Kern {
         Ok(k)
     }
 
+    /// The engine kernels compiled on `gpu`'s device for `rows`-wide windows: the Coder
+    /// module (GEMV/MoE/attention), the flash module's GDN kernels and the shared engine
+    /// module (copy/argmax). Every device of a layer split compiles its own handle set
+    /// (module handles are per context).
+    fn build_on(gpu: &Gpu, sh: &Shapes, geo: &Geometry, rows: usize) -> Result<Kern> {
+        let src = format!("{}{}{}", ck::prelude(sh, rows), kernels::GEMV_SRC, ck::SRC);
+        let cm = gpu
+            .module(&src)
+            .map_err(|e| anyhow!("coder kernels: {e}"))?;
+        let fm = gpu
+            .module(&format!("#define GDN_SLOTS 1\n{}", geo.cuda_source()))
+            .map_err(|e| anyhow!("flash kernels: {e}"))?;
+        let em = gpu.module(kernels::SRC).map_err(|e| anyhow!("{e}"))?;
+        Kern::from_modules(&cm, &fm, &em)
+    }
+}
+
+impl Kern {
+    /// The `Kern` for compiled modules `cm` (Coder), `fm` (flash GDN) and `em` (engine):
+    /// every function handle, and the big-smem attributes set.
+    fn from_modules(cm: &Module, fm: &Module, em: &Module) -> Result<Kern> {
+        let f = |m: &Module, n: &str| m.func(n).map_err(|e| anyhow!("{n}: {e}"));
+        let mut gemv8 = [std::ptr::null_mut(); MAX_T];
+        for (i, slot) in gemv8.iter_mut().enumerate() {
+            *slot = f(cm, &format!("fe_gemv8_t{}", i + 1))?;
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        *slot,
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        99 * 1024,
+                    ),
+                    "cuFuncSetAttribute",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
+        let mut gemvk = [std::ptr::null_mut(); MAX_T];
+        for (i, slot) in gemvk.iter_mut().enumerate() {
+            *slot = f(cm, &format!("cx_gemvk_t{}", i + 1))?;
+        }
+        let sized = |names: [String; MAX_T]| -> Result<[Fun; MAX_T]> {
+            let mut a: [Fun; MAX_T] = [std::ptr::null_mut(); MAX_T];
+            for (i, name) in names.iter().enumerate() {
+                a[i] = f(cm, name)?;
+            }
+            Ok(a)
+        };
+        let k = Kern {
+            q8: f(cm, "fe_q8")?,
+            gemv8,
+            gemvk,
+            gemvk1: sized(std::array::from_fn(|i| format!("cx_gemvk1_t{}", i + 1)))?,
+            gemvk2: sized(std::array::from_fn(|i| format!("cx_gemvk2_t{}", i + 1)))?,
+            gemvk8: sized(std::array::from_fn(|i| format!("cx_gemvk8_t{}", i + 1)))?,
+            norm_q8: f(cm, "cx_norm_q8")?,
+            route: f(cm, "cx_route")?,
+            moe_gu: f(cm, "cx_moe_gu")?,
+            silu_q: f(cm, "cx_silu_q")?,
+            moe_down: f(cm, "cx_moe_down")?,
+            moe_plan: f(cm, "cx_moe_plan")?,
+            moe_gu_d: [f(cm, "cx_moe_gu_d2")?, f(cm, "cx_moe_gu_d4")?],
+            moe_down_d: [f(cm, "cx_moe_down_d2")?, f(cm, "cx_moe_down_d4")?],
+            moe_down_df: [f(cm, "cx_moe_down_d2f")?, f(cm, "cx_moe_down_d4f")?],
+            moe_gu_db: f(cm, "cx_moe_gu_db")?,
+            moe_down_db: f(cm, "cx_moe_down_db")?,
+            moe_gu_g: f(cm, "cx_moe_gu_g")?,
+            moe_down_g: f(cm, "cx_moe_down_g")?,
+            moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
+            moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
+            gemm_dense: f(cm, "cx_gemm_dense")?,
+            moe_add_norm: f(cm, "cx_moe_add_norm")?,
+            prep: f(cm, "cx_attn_prep")?,
+            part: f(cm, "cx_attn_part")?,
+            merge: f(cm, "cx_attn_merge")?,
+            fa2: f(cm, "cx_attn_fa2")?,
+            gdn_step: f(fm, "fl_gdn_conv_step")?,
+            gdn_commit: f(fm, "fl_gdn_conv_commit")?,
+            gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
+            gdn_commit_seg: f(fm, "fl_gdn_conv_commit_seg")?,
+            copy: f(em, "fe_copy")?,
+            argmax1: f(em, "fe_argmax1")?,
+            argmax2: f(em, "fe_argmax2")?,
+            _mods: vec![],
+        };
+        k.set_smem()?;
+        Ok(k)
+    }
+
     /// Up to 200 KB of staged expert rows, capped at what the device allows a block (99 KB on
     /// sm_86/89, 227 KB on sm_90), so the engine also loads on smaller GPUs.
     fn set_smem(&self) -> Result<()> {
@@ -662,6 +751,48 @@ struct Slot {
     tokens: Vec<u32>,
 }
 
+/// The second GPU of a two-GPU layer split (`TANG_GPUS=2`; see [`super::split`]): layers
+/// `[split, L)` of `layers`, the head, the output norm and any MTP layer live here, with
+/// their own kernels, scratch, pinned staging, streams and captured graphs. `None` means
+/// one GPU — every code path below then runs exactly as before, on `self.dev`.
+struct Peer {
+    /// GPU 1 as a compute device (its own pool/context; allocations live on it).
+    dev: CudaComputeDevice,
+    ctx: super::split::Ctx,
+    layers: Vec<Layer>,
+    out_norm: B,
+    head: Dense,
+    rope: (B, B),
+    s: Scratch,
+    io: Io,
+    k: Kern,
+    side: Stream,
+    ev_fork: gpu::Event,
+    ev_join: gpu::Event,
+    wide: Option<Wide>,
+    graphs: HashMap<(usize, bool, usize, usize, bool), Graph>,
+    /// GPU 1's commit graphs, by window width.
+    commit_graphs: Vec<Option<Graph>>,
+    /// GPU 1's slots: their `gdn`/`kv` entries, per GPU 1 layer.
+    slots: Vec<Option<(Vec<Option<(B, B)>>, Vec<Option<(B, B)>>)>>,
+}
+
+/// One GPU's share of a window: the device, stream, kernels, scratch, staging, layers and
+/// side stream the enqueue functions need — GPU 0's own (`self.…`) or the peer's. With no
+/// split there is only stage 0, and it reads exactly the old fields.
+struct Stage<'a> {
+    dev: &'a CudaComputeDevice,
+    /// The launch stream (GPU 0: the legacy `dev` stream wrapped in `Stream`).
+    stream: &'a Stream,
+    k: &'a Kern,
+    s: &'a Scratch,
+    io: &'a Io,
+    layers: &'a [Layer],
+    side: &'a Stream,
+    #[allow(dead_code)]
+    wide: Option<&'a Wide>,
+}
+
 pub struct Coder {
     pub dev: CudaComputeDevice,
     gpu: Gpu,
@@ -729,6 +860,8 @@ pub struct Coder {
     /// Per-segment commit graphs after a batched verify window, by segment count.
     commit_seg_graphs: Vec<Option<Graph>>,
     pub last_mtp_ms: f64,
+    /// The second GPU of the layer split (`None`: one GPU, everything on `self.dev`).
+    peer: Option<Box<Peer>>,
 }
 
 #[derive(Default)]
@@ -782,6 +915,9 @@ impl Coder {
         let max_ctx = opts.max_ctx.next_multiple_of(ck::attn_chunk());
         let eps = hp.eps;
 
+        // Where a two-GPU split cuts the layer list (`TANG_SPLIT_AT`, or the balanced point).
+        let split_at = split_point(&g, &hp);
+
         let dev = CudaComputeDevice::new().map_err(|e| anyhow!("CUDA: {e:?}"))?;
         let gpu = Gpu {
             ctx: dev.cuda_context().clone(),
@@ -789,12 +925,12 @@ impl Coder {
         gpu.bind().map_err(|e| anyhow!("{e}"))?;
         let (free0, _) = gpu.mem_info().map_err(|e| anyhow!("{e}"))?;
 
-        // ---- weights
+        // ---- weights (a layer split loads [0, k) here; [k, L) on GPU 1 below)
         let t1 = Instant::now();
         let info = |name: &str| -> Result<TensorInfo> { Ok(g.info(name)?.clone()) };
         let vecf = |name: &str| -> Result<B> { Ok(dev.upload_f32(&g.tensor_f32(name)?)) };
         let mut expert_bytes = 0usize;
-        let mut layers = Vec::with_capacity(hp.n_layer);
+        let mut layers: Vec<Layer> = Vec::with_capacity(hp.n_layer);
         let (hk, hv) = (hp.ssm_k_heads, hp.ssm_v_heads);
         let r = hv / hk;
         // ssm_ba rows per k head g: [b of v heads g·r..g·r + r | a of the same]; the flash
@@ -806,7 +942,7 @@ impl Coder {
                 gk * 2 * r + if is_b { j } else { r + j }
             })
             .collect();
-        for l in 0..hp.n_layer {
+        for l in 0..split_at {
             let layer = load_layer(
                 &dev,
                 &g,
@@ -883,97 +1019,7 @@ impl Coder {
 
         // ---- kernels
         let t2 = Instant::now();
-        let src = format!(
-            "{}{}{}",
-            ck::prelude(&sh, MAX_T),
-            kernels::GEMV_SRC,
-            ck::SRC
-        );
-        let cm = gpu
-            .module(&src)
-            .map_err(|e| anyhow!("coder kernels: {e}"))?;
-        // GDN_SLOTS: the per-segment GDN kernels (several sequences a window); Flash-Next builds
-        // without it, so its module is unchanged.
-        let fm = gpu
-            .module(&format!("#define GDN_SLOTS 1\n{}", geo.cuda_source()))
-            .map_err(|e| anyhow!("flash kernels: {e}"))?;
-        let em = gpu.module(kernels::SRC).map_err(|e| anyhow!("{e}"))?;
-        let f = |m: &Module, n: &str| m.func(n).map_err(|e| anyhow!("{n}: {e}"));
-        let mut gemv8 = [std::ptr::null_mut(); MAX_T];
-        for (i, slot) in gemv8.iter_mut().enumerate() {
-            *slot = f(&cm, &format!("fe_gemv8_t{}", i + 1))?;
-            unsafe {
-                gpu::check(
-                    cudarc::driver::sys::cuFuncSetAttribute(
-                        *slot,
-                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        99 * 1024,
-                    ),
-                    "cuFuncSetAttribute",
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-            }
-        }
-        let mut gemvk = [std::ptr::null_mut(); MAX_T];
-        for (i, slot) in gemvk.iter_mut().enumerate() {
-            *slot = f(&cm, &format!("cx_gemvk_t{}", i + 1))?;
-        }
-        let k = Kern {
-            q8: f(&cm, "fe_q8")?,
-            gemv8,
-            gemvk,
-            gemvk1: {
-                let mut a = [std::ptr::null_mut(); MAX_T];
-                for (i, slot) in a.iter_mut().enumerate() {
-                    *slot = f(&cm, &format!("cx_gemvk1_t{}", i + 1))?;
-                }
-                a
-            },
-            gemvk2: {
-                let mut a = [std::ptr::null_mut(); MAX_T];
-                for (i, slot) in a.iter_mut().enumerate() {
-                    *slot = f(&cm, &format!("cx_gemvk2_t{}", i + 1))?;
-                }
-                a
-            },
-            gemvk8: {
-                let mut a = [std::ptr::null_mut(); MAX_T];
-                for (i, slot) in a.iter_mut().enumerate() {
-                    *slot = f(&cm, &format!("cx_gemvk8_t{}", i + 1))?;
-                }
-                a
-            },
-            norm_q8: f(&cm, "cx_norm_q8")?,
-            route: f(&cm, "cx_route")?,
-            moe_gu: f(&cm, "cx_moe_gu")?,
-            silu_q: f(&cm, "cx_silu_q")?,
-            moe_down: f(&cm, "cx_moe_down")?,
-            moe_plan: f(&cm, "cx_moe_plan")?,
-            moe_gu_d: [f(&cm, "cx_moe_gu_d2")?, f(&cm, "cx_moe_gu_d4")?],
-            moe_down_d: [f(&cm, "cx_moe_down_d2")?, f(&cm, "cx_moe_down_d4")?],
-            moe_down_df: [f(&cm, "cx_moe_down_d2f")?, f(&cm, "cx_moe_down_d4f")?],
-            moe_gu_db: f(&cm, "cx_moe_gu_db")?,
-            moe_down_db: f(&cm, "cx_moe_down_db")?,
-            moe_gu_g: f(&cm, "cx_moe_gu_g")?,
-            moe_down_g: f(&cm, "cx_moe_down_g")?,
-            moe_gemm_gu: f(&cm, "cx_moe_gemm_gu")?,
-            moe_gemm_down: f(&cm, "cx_moe_gemm_down")?,
-            gemm_dense: f(&cm, "cx_gemm_dense")?,
-            moe_add_norm: f(&cm, "cx_moe_add_norm")?,
-            prep: f(&cm, "cx_attn_prep")?,
-            part: f(&cm, "cx_attn_part")?,
-            merge: f(&cm, "cx_attn_merge")?,
-            fa2: f(&cm, "cx_attn_fa2")?,
-            gdn_step: f(&fm, "fl_gdn_conv_step")?,
-            gdn_commit: f(&fm, "fl_gdn_conv_commit")?,
-            gdn_step_seg: f(&fm, "fl_gdn_conv_step_seg")?,
-            gdn_commit_seg: f(&fm, "fl_gdn_conv_commit_seg")?,
-            copy: f(&em, "fe_copy")?,
-            argmax1: f(&em, "fe_argmax1")?,
-            argmax2: f(&em, "fe_argmax2")?,
-            _mods: vec![cm, fm, em],
-        };
-        k.set_smem()?;
+        let k = Kern::build_on(&gpu, &sh, &geo, MAX_T)?;
         let mtp = match mtp_parts {
             Some((layer, fc, enorm, hnorm, onorm)) => {
                 let m = gpu
@@ -990,8 +1036,8 @@ impl Coder {
                     cat: dev.alloc_f32(MAX_T * 2 * n),
                     ids: dev.alloc_f32(2 * MAX_T),
                     prob: dev.alloc_f32(2 * MAX_T),
-                    f_in: f(&m, "cx_mtp_in")?,
-                    f_pick: f(&m, "cx_mtp_pick")?,
+                    f_in: m.func("cx_mtp_in").map_err(|e| anyhow!("{e}"))?,
+                    f_pick: m.func("cx_mtp_pick").map_err(|e| anyhow!("{e}"))?,
                     _m: m,
                 })
             }
@@ -1012,9 +1058,20 @@ impl Coder {
             .register(&gpu.ctx, &[])
             .map_err(|e| anyhow!("{e}"))?;
         let stream = ManuallyDrop::new(Stream(dev.cu_stream()));
+
+        // ---- the optional second GPU (`TANG_GPUS=2`): layers [split_at, L), head, out_norm
+        // and rope loaded on device 1, with their own kernels/scratch/staging.
+        let (peer, peer_report) = if super::split::gpus() == 2 && hp.n_layer > 1 {
+            let (peer, report) =
+                build_peer(&g, &gpu, &hp, &geo, &sh, max_ctx, &mtp_path, split_at, &ba_perm)?;
+            (Some(peer), report)
+        } else {
+            (None, String::new())
+        };
+
         let load_report = format!(
             "coder: {} layers ({} GDN, {} attention), {} experts top-{}, hidden {}, vocab {}; \
-             {:.1} GB VRAM ({:.1} GB experts), weights {:.0} s, kernels {:.0} s, total {:.0} s",
+             {:.1} GB VRAM ({:.1} GB experts), weights {:.0} s, kernels {:.0} s, total {:.0} s{}",
             hp.n_layer,
             hp.is_recurrent.iter().filter(|&&x| x).count(),
             hp.is_recurrent.iter().filter(|&&x| !x).count(),
@@ -1026,7 +1083,8 @@ impl Coder {
             expert_bytes as f64 / 1e9,
             t_weights,
             t_kernels,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            peer_report
         );
         let c = Coder {
             dev,
@@ -1082,6 +1140,7 @@ impl Coder {
             slot_chain: vec![Vec::new(); MAX_SLOTS],
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
+            peer,
         };
         let mut c = c;
         c.write_slot_tables();
@@ -1093,45 +1152,8 @@ impl Coder {
     /// Rewrite every layer's slot tables from the live slots (slot 0: the layer's own buffers;
     /// a free slot: 0).
     fn write_slot_tables(&mut self) {
-        let nl = self.layers.len();
-        for l in 0..nl {
-            let mut ta = [0u64; MAX_SLOTS];
-            let mut tb = [0u64; MAX_SLOTS];
-            let layer = &self.layers[l];
-            let (a0, b0) = match (&layer.gdn, &layer.attn) {
-                (Some(g), _) => (self.a(&g.state), self.a(&g.hist)),
-                (_, Some(at)) => (self.a(&at.k), self.a(&at.v)),
-                _ => continue,
-            };
-            ta[0] = a0;
-            tb[0] = b0;
-            for (i, sl) in self.slots.iter().enumerate().skip(1) {
-                if let Some(sl) = sl {
-                    let pair = if layer.gdn.is_some() {
-                        &sl.gdn[l]
-                    } else {
-                        &sl.kv[l]
-                    };
-                    if let Some((a, b)) = pair {
-                        ta[i] = self.a(a);
-                        tb[i] = self.a(b);
-                    }
-                }
-            }
-            let words = |t: &[u64; MAX_SLOTS]| -> Vec<f32> {
-                t.iter()
-                    .flat_map(|&v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
-                    .collect()
-            };
-            let (wa, wb) = (words(&ta), words(&tb));
-            let layer = &mut self.layers[l];
-            let (da, db) = match (&mut layer.gdn, &mut layer.attn) {
-                (Some(g), _) => (&mut g.stab, &mut g.htab),
-                (_, Some(at)) => (&mut at.ktab, &mut at.vtab),
-                _ => continue,
-            };
-            self.dev.upload_into_f32(da, &wa);
-            self.dev.upload_into_f32(db, &wb);
+        for w in 0..self.n_stages() {
+            self.write_slot_tables_on(w);
         }
         // The MTP layer: slot 0 its own buffers, the others their `mtp_kv`.
         if self.mtp.is_some() {
@@ -1161,8 +1183,80 @@ impl Coder {
         self.dev.sync();
     }
 
-    /// Switch the per-pair expert kernels (`TANG_CODER_MOE`, `TANG_CODER_FUSE_SILU`) without reloading; drops
-    /// the captured window graphs, which hold the old kernels.
+
+    /// [`write_slot_tables`](Self::write_slot_tables) for stage `w`'s layers only.
+    fn write_slot_tables_on(&mut self, w: usize) {
+        let nl = self.stage_view(w).layers.len();
+        let mut tables = Vec::with_capacity(nl);
+        for l in 0..nl {
+            let mut ta = [0u64; MAX_SLOTS];
+            let mut tb = [0u64; MAX_SLOTS];
+            let layer = &self.stage_view(w).layers[l];
+            let (a0, b0) = match (&layer.gdn, &layer.attn) {
+                (Some(g), _) => (self.a_on(w, &g.state), self.a_on(w, &g.hist)),
+                (_, Some(at)) => (self.a_on(w, &at.k), self.a_on(w, &at.v)),
+                _ => continue,
+            };
+            ta[0] = a0;
+            tb[0] = b0;
+            for (i, sl) in self.slots.iter().enumerate().skip(1) {
+                if sl.is_none() {
+                    continue;
+                }
+                let (gdn, kv) = if w == 0 {
+                    (&sl.as_ref().unwrap().gdn, &sl.as_ref().unwrap().kv)
+                } else {
+                    let p = self.peer.as_ref().expect("no peer");
+                    let (a, b) = p.slots[i].as_ref().expect("peer slot");
+                    (a, b)
+                };
+                let pair = if layer.gdn.is_some() {
+                    &gdn[l]
+                } else {
+                    &kv[l]
+                };
+                if let Some((a, b)) = pair {
+                    ta[i] = self.a_on(w, a);
+                    tb[i] = self.a_on(w, b);
+                }
+            }
+            tables.push((l, ta, tb));
+        }
+        let words = |t: &[u64; MAX_SLOTS]| -> Vec<f32> {
+            t.iter()
+                .flat_map(|&v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+                .collect()
+        };
+        if w == 0 {
+            for (l, ta, tb) in tables {
+                let (wa, wb) = (words(&ta), words(&tb));
+                let layer = &mut self.layers[l];
+                let (da, db) = match (&mut layer.gdn, &mut layer.attn) {
+                    (Some(g), _) => (&mut g.stab, &mut g.htab),
+                    (_, Some(at)) => (&mut at.ktab, &mut at.vtab),
+                    _ => continue,
+                };
+                self.dev.upload_into_f32(da, &wa);
+                self.dev.upload_into_f32(db, &wb);
+            }
+        } else {
+            let p = self.peer.as_deref_mut().expect("no peer");
+            for (l, ta, tb) in tables {
+                let (wa, wb) = (words(&ta), words(&tb));
+                let layer = &mut p.layers[l];
+                let (da, db) = match (&mut layer.gdn, &mut layer.attn) {
+                    (Some(g), _) => (&mut g.stab, &mut g.htab),
+                    (_, Some(at)) => (&mut at.ktab, &mut at.vtab),
+                    _ => continue,
+                };
+                p.dev.upload_into_f32(da, &wa);
+                p.dev.upload_into_f32(db, &wb);
+            }
+        }
+    }
+
+    /// Switch the per-pair expert kernels (`TANG_CODER_MOE`, `TANG_CODER_FUSE_SILU`)
+    /// without reloading; drops the captured window graphs, which hold the old kernels.
     pub fn set_moe_variant(&mut self, v: usize, fuse_silu: bool) {
         self.var.moe = v;
         self.var.fuse_silu = fuse_silu;
@@ -1204,14 +1298,37 @@ impl Coder {
             );
         }
         self.slots[i] = Some(sl);
+        // The peer's layers get their own state for the slot.
+        if let Some(p) = self.peer.as_deref_mut() {
+            let mut gdn = Vec::with_capacity(p.layers.len());
+            let mut kvv = Vec::with_capacity(p.layers.len());
+            for layer in &p.layers {
+                gdn.push(layer.gdn.as_ref().map(|_| {
+                    (
+                        p.dev.alloc_f32(hv * 128 * 128),
+                        p.dev.alloc_f32(3 * conv),
+                    )
+                }));
+                kvv.push(
+                    layer
+                        .attn
+                        .as_ref()
+                        .map(|_| (p.dev.alloc_bf16(kv), p.dev.alloc_bf16(kv))),
+                );
+            }
+            p.slots[i] = Some((gdn, kvv));
+        }
         self.slot_chain[i].clear();
         self.write_slot_tables();
         Ok(i)
     }
 
-    /// Release slot `i` (not 0) and its memory.
+    /// Release slot `i` (not 0) and its memory, on every stage.
     pub fn free_slot(&mut self, i: usize) {
         if i > 0 && i < MAX_SLOTS && self.slots[i].take().is_some() {
+            if let Some(p) = self.peer.as_deref_mut() {
+                p.slots[i] = None;
+            }
             self.write_slot_tables();
         }
     }
@@ -1263,7 +1380,42 @@ impl Coder {
         for (b, sg) in segs.iter().enumerate() {
             rec[2 * tw + 4 * b..2 * tw + 4 * b + 4].copy_from_slice(sg);
         }
+        self.mirror_staging(tw, t);
         Ok(())
+    }
+
+    /// Copy this window's staged control words, rows and embeddings into GPU 1's own pinned
+    /// staging (a split runs the same window on both, each from its own arena). Host-side
+    /// only, a few KiB.
+    fn mirror_staging(&mut self, tw: usize, t: usize) {
+        let Some(p) = self.peer.as_deref_mut() else {
+            return;
+        };
+        let n = self.hp.n_embd;
+        let bytes = |off: usize, len: usize| unsafe {
+            std::slice::from_raw_parts(self.io.arena.as_ptr().add(off), len)
+        };
+        let ctl = bytes(Io::CTL, 5 * 4);
+        let rows = bytes(Io::rows(n, tw), ROWS_PER_T * tw * 4);
+        let emb = bytes(Io::EMB, t * n * 4);
+        let pio = &mut p.io;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ctl.as_ptr(),
+                pio.arena.as_ptr().add(Io::CTL) as *mut u8,
+                ctl.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                rows.as_ptr(),
+                pio.arena.as_ptr().add(Io::rows(n, tw)) as *mut u8,
+                rows.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                emb.as_ptr(),
+                pio.arena.as_ptr().add(Io::EMB) as *mut u8,
+                emb.len(),
+            );
+        }
     }
 
     /// Feed `ids` to slot `slot` (windows of up to `MAX_T` of its rows) and return the next
@@ -1382,7 +1534,7 @@ impl Coder {
         }
         self.commit_batch(b)?;
         // The commit reads the staged row record when it runs: let it, before restaging.
-        self.dev.sync();
+        self.sync_all();
         for (i, (slot, _, _)) in items.iter().enumerate() {
             let p = pos0[i] + kept[i].len();
             self.slot_tokens_mut(*slot)?.truncate(p);
@@ -1408,37 +1560,140 @@ impl Coder {
             self.enqueue_commit_seg(nseg);
             return Ok(());
         }
-        if self.commit_seg_graphs[nseg].is_none() {
+        if self.peer.is_none() {
+            if self.commit_seg_graphs[nseg].is_none() {
+                self.enqueue_commit_seg(nseg);
+                self.dev.sync();
+                let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+                let me = self as *const Self;
+                let gr = Graph::capture(&stream, |_| {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }.enqueue_commit_seg(nseg);
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("capture commit nseg={nseg}: {e}"))?;
+                self.commit_seg_graphs[nseg] = Some(gr);
+                return Ok(());
+            }
+            return self.commit_seg_graphs[nseg]
+                .as_ref()
+                .unwrap()
+                .launch(&self.stream)
+                .map_err(|e| anyhow!("{e}"));
+        }
+        // A split: per-stage graphs (GPU 1's seg graphs in the peer).
+        let need = self.peer.as_ref().expect("no peer").commit_graphs[nseg].is_none();
+        if need {
             self.enqueue_commit_seg(nseg);
-            self.dev.sync();
-            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            self.sync_all();
             let me = self as *const Self;
-            let gr = Graph::capture(&stream, |_| {
+            {
+                let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+                let g0 = Graph::capture(&stream, |_| {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }.enqueue_commit_seg_stage(0, nseg);
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("capture commit nseg={nseg} stage 0: {e}"))?;
+                self.commit_seg_graphs[nseg] = Some(g0);
+            }
+            let peer = self.peer.as_mut().expect("no peer");
+            peer.ctx.gpu.bind().map_err(|e| anyhow!("{e}"))?;
+            let g1 = Graph::capture(&peer.ctx.stream, |_| {
                 // SAFETY: `self` is not otherwise touched during capture.
-                unsafe { &*me }.enqueue_commit_seg(nseg);
+                unsafe { &*me }.enqueue_commit_seg_stage(1, nseg);
                 Ok(())
             })
-            .map_err(|e| anyhow!("capture commit nseg={nseg}: {e}"))?;
-            self.commit_seg_graphs[nseg] = Some(gr);
+            .map_err(|e| anyhow!("capture commit nseg={nseg} stage 1: {e}"))?;
+            self.peer.as_mut().expect("no peer").commit_graphs[nseg] = Some(g1);
+            self.gpu.bind().map_err(|e| anyhow!("{e}"))?;
             return Ok(());
         }
         self.commit_seg_graphs[nseg]
             .as_ref()
             .unwrap()
             .launch(&self.stream)
+            .map_err(|e| anyhow!("{e}"))?;
+        let peer = self.peer.as_ref().expect("no peer");
+        peer.commit_graphs[nseg]
+            .as_ref()
+            .unwrap()
+            .launch(&peer.ctx.stream)
             .map_err(|e| anyhow!("{e}"))
     }
 
-    fn enqueue_commit_seg(&self, nseg: usize) {
-        self.kcopy(
-            self.a(&self.s.rows),
-            self.io_dev(Io::rows(self.hp.n_embd, MAX_T)),
+    /// Stage `w`'s half of a segment commit (graph capture).
+    fn enqueue_commit_seg_stage(&self, w: usize, nseg: usize) {
+        let v = self.stage_view(w);
+        self.kcopy_on(
+            w,
+            v.dev.buffer_addr(&v.s.rows),
+            self.io_dev_on(w, Io::rows(self.hp.n_embd, MAX_T)),
             ROWS_U32 * 4,
         );
-        for layer in &self.layers {
+        for layer in v.layers {
             if let Some(g) = &layer.gdn {
-                self.gdn_step_seg(g, layer.w_in.rows, nseg, true);
-                self.gdn_commit_seg(g, layer.w_in.rows, nseg);
+                self.gdn_step_seg(w, g, layer.w_in.rows, nseg, true);
+                self.gdn_commit_seg(w, g, layer.w_in.rows, nseg);
+            }
+        }
+    }
+
+    fn enqueue_commit_seg(&self, nseg: usize) {
+        for w in 0..self.n_stages() {
+            let st = self.stage_view(w);
+            let (rows_addr, io_rows) = (
+                st.dev.buffer_addr(&st.s.rows),
+                self.io_dev_on(w, Io::rows(self.hp.n_embd, MAX_T)),
+            );
+            self.kcopy_on(w, rows_addr, io_rows, ROWS_U32 * 4);
+            for layer in st.layers {
+                if let Some(g) = &layer.gdn {
+                    self.gdn_step_seg(w, g, layer.w_in.rows, nseg, true);
+                    self.gdn_commit_seg(w, g, layer.w_in.rows, nseg);
+                }
+            }
+        }
+    }
+
+    /// How many stages the layer list is split over (1, or 2 with `TANG_GPUS=2`).
+    fn n_stages(&self) -> usize {
+        1 + usize::from(self.peer.is_some())
+    }
+
+    /// Synchronise every stage's device.
+    fn sync_all(&self) {
+        self.dev.sync();
+        if let Some(p) = &self.peer {
+            p.ctx.sync().expect("GPU 1 sync");
+        }
+    }
+
+    /// The last stage writes the window's sampled ids (and the MTP's ids/probabilities)
+    /// into its own pinned staging; bring them back into GPU 0's host arena, which the
+    /// host reads from. Host memcpy, `t * 4` bytes (and `2 * MAX_T` words for the MTP).
+    fn collect_out(&mut self, t: usize, mtp: bool) {
+        let Some(p) = self.peer.as_deref_mut() else {
+            return;
+        };
+        let (src, dst) = (p.io.arena.as_ptr(), self.io.arena.as_ptr());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(Io::IDS) as *const u8,
+                dst.add(Io::IDS) as *mut u8,
+                t * 4,
+            );
+            if mtp {
+                std::ptr::copy_nonoverlapping(
+                    src.add(Io::IDS) as *const u8,
+                    dst.add(Io::IDS) as *mut u8,
+                    2 * MAX_T * 4,
+                );
+                std::ptr::copy_nonoverlapping(
+                    src.add(Io::MTP_PROB) as *const u8,
+                    dst.add(Io::MTP_PROB) as *mut u8,
+                    2 * MAX_T * 4,
+                );
             }
         }
     }
@@ -1455,6 +1710,9 @@ impl Coder {
             return Ok(());
         }
         self.wide = None;
+        if let Some(p) = self.peer.as_deref_mut() {
+            p.wide = None;
+        }
         let src = format!(
             "{}{}{}",
             ck::prelude(&self.shapes, rows),
@@ -1508,6 +1766,51 @@ impl Coder {
             proj,
             xq,
         });
+        // The peer's own wide set: the same kernels compiled on its context, its scratch
+        // and staging, sized by its layers.
+        if let Some(p) = self.peer.as_deref_mut() {
+            let cm = p
+                .ctx
+                .gpu
+                .module(&src)
+                .map_err(|e| anyhow!("coder kernels ({rows} rows, GPU 1): {e}"))?;
+            let pk = p.k.with_coder_module(cm)?;
+            let ps = Scratch::new(&p.dev, &self.hp, &self.geo, n, self.max_ctx, rows, WIDE_ATTN_ROWS);
+            let mut pio = Io {
+                arena: HostArena::new(
+                    Io::bytes(n, rows),
+                    ArenaOptions {
+                        try_hugetlb: false,
+                        thp: false,
+                    },
+                )?,
+            };
+            pio.arena
+                .register(&p.ctx.gpu.ctx, &[])
+                .map_err(|e| anyhow!("{e}"))?;
+            let prj = p
+                .dev
+                .alloc_f32(rows * p.layers.iter().map(|l| l.w_in.rows).max().unwrap_or(0));
+            let pkm = p
+                .layers
+                .iter()
+                .map(|l| l.w_out.k.max(l.w_in.k))
+                .max()
+                .unwrap_or(n);
+            let pxq = p
+                .dev
+                .alloc_f32((rows * pkm + rows * pkm / 32 * 4).div_ceil(4));
+            p.dev.sync();
+            p.wide = Some(Wide {
+                rows,
+                s: ps,
+                k: pk,
+                io: pio,
+                proj: prj,
+                xq: pxq,
+            });
+            p.ctx.sync()?;
+        }
         Ok(())
     }
 
@@ -1515,17 +1818,87 @@ impl Coder {
     /// rows. No head: prefill doesn't need these rows' logits.
     fn enqueue_wide(&self, t: usize) {
         self.enqueue_inputs(t);
-        self.norm_q8(None, &self.layers[0].attn_norm, t);
-        let nl = self.layers.len();
-        for l in 0..nl {
-            self.enqueue_mixer(l, t, false, 0, 1);
-            self.norm_q8(Some(self.a(&self.sc().mix)), &self.layers[l].post_norm, t);
-            let next = if l + 1 < nl {
-                &self.layers[l + 1].attn_norm
-            } else {
-                &self.out_norm
+        self.norm_q8(0, None, &self.layers[0].attn_norm, t);
+        for w in 0..self.n_stages() {
+            let st = self.stage_view(w);
+            for l in 0..st.layers.len() {
+                let layer = &st.layers[l];
+                self.enqueue_mixer(w, l, t, false, 0, 1);
+                self.norm_q8(
+                    w,
+                    Some(st.dev.buffer_addr(&st.s.mix)),
+                    &layer.post_norm,
+                    t,
+                );
+                let next = if l + 1 < st.layers.len() {
+                    &st.layers[l + 1].attn_norm
+                } else if w + 1 < self.n_stages() {
+                    // The next stage's first norm, read over the peer link.
+                    &self.stage_view(w + 1).layers[0].attn_norm
+                } else if self.peer.is_some() {
+                    &self.peer.as_ref().unwrap().out_norm
+                } else {
+                    &self.out_norm
+                };
+                self.enqueue_moe(w, l, t, next, false);
+            }
+            if w + 1 < self.n_stages() {
+                self.enqueue_boundary(w, t);
+            }
+        }
+    }
+
+    /// Between stage `w` and `w + 1`: record the last layer's state, wait on the next stage,
+    /// copy `x`, `mxq` and `r` over, so stage `w + 1` starts exactly where `w`'s last
+    /// `moe_add_norm` left `x`/`mxq`/`r`. Layer indices in `enqueue_moe`'s "next" are the
+    /// *next stage's* first layer, read over the peer link.
+    fn enqueue_boundary(&self, w: usize, t: usize) {
+        let (a, b) = (self.stage_view(w), self.stage_view(w + 1));
+        // Order: stage w+1's stream waits for stage w's work before it reads the copies.
+        let done = gpu::Event::new(false).expect("event");
+        done.record(a.stream).expect("record");
+        b.stream.wait(&done).expect("wait");
+        let n = self.hp.n_embd;
+        // x, then r (t rows of n f32), then mxq (t rows of n + n/8 bytes codes+scales).
+        // Peer copies are enqueued on the *destination* device's stream (the destination
+        // context must be current), after its wait above.
+        let peer = &self.peer.as_ref().expect("no peer").ctx;
+        let xq_bytes = t * (n + n / 32 * 4);
+        let tw = self.tw();
+        for (dst, src, bytes) in [
+            (b.dev.buffer_addr(&b.s.x), a.dev.buffer_addr(&a.s.x), t * n * 4),
+            (b.dev.buffer_addr(&b.s.r), a.dev.buffer_addr(&a.s.r), t * n * 4),
+            (
+                b.dev.buffer_addr(&b.s.mxq),
+                a.dev.buffer_addr(&a.s.mxq),
+                xq_bytes,
+            ),
+            (
+                b.dev.buffer_addr(&b.s.ctl),
+                a.dev.buffer_addr(&a.s.ctl),
+                32,
+            ),
+            (
+                b.dev.buffer_addr(&b.s.rows),
+                a.dev.buffer_addr(&a.s.rows),
+                ROWS_PER_T * tw * 4,
+            ),
+        ] {
+            // SAFETY: plain peer copy of `bytes` from GPU 0's buffer to GPU 1's, on GPU 1's
+            // stream, after the wait above (so after GPU 0's last layer has written them).
+            let r = unsafe {
+                cudarc::driver::sys::cuMemcpyPeerAsync(
+                    dst,
+                    peer.gpu.ctx.cu_ctx(),
+                    src,
+                    a.dev.cuda_context().cu_ctx(),
+                    bytes,
+                    peer.stream.0,
+                )
             };
-            self.enqueue_moe(l, t, next, false);
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                panic!("boundary copy: {r:?}");
+            }
         }
     }
 
@@ -1571,7 +1944,7 @@ impl Coder {
                 .stage_rows(&rws, &[[0, t as u32, slot as u32, t as u32]])
                 .map(|_| self.enqueue_wide(t));
             // The pinned staging is reused by the next window.
-            self.dev.sync();
+            self.sync_all();
             self.prof_collect();
             self.in_wide.set(false);
             r?;
@@ -1640,14 +2013,98 @@ impl Coder {
                 self.dev.zero_buffer(&mut g.hist);
             }
         }
+        if let Some(p) = self.peer.as_deref_mut() {
+            for l in &mut p.layers {
+                if let Some(g) = l.gdn.as_mut() {
+                    p.dev.zero_buffer(&mut g.state);
+                    p.dev.zero_buffer(&mut g.hist);
+                }
+            }
+            // GPU 1's slot states (its `slots` hold the buffers; slot 0's are the layers' own).
+            for sl in p.slots.iter_mut().skip(1).flatten() {
+                for (state, hist) in sl.0.iter_mut().flatten() {
+                    p.dev.zero_buffer(state);
+                    p.dev.zero_buffer(hist);
+                }
+            }
+            p.ctx.sync().expect("GPU 1 sync");
+        }
+        // GPU 0's slot states.
+        for sl in self.slots.iter_mut().skip(1).flatten() {
+            for (state, hist) in sl.gdn.iter_mut().flatten() {
+                self.dev.zero_buffer(state);
+                self.dev.zero_buffer(hist);
+            }
+        }
         self.dev.sync();
         self.tokens.clear();
     }
 
     // ---- launch helpers
 
+    /// Stage `which` (0: GPU 0, 1: the peer): its device, stream, kernels, scratch, staging
+    /// and layers. The wide-window variants (`sc`, `kn`, `iox`, `tw`, `proj`) resolve within
+    /// the stage.
+    fn stage_view(&self, which: usize) -> Stage<'_> {
+        let in_wide = self.in_wide.get();
+        if which == 0 {
+            Stage {
+                dev: &self.dev,
+                stream: &self.stream,
+                k: &self.k,
+                s: if in_wide {
+                    self.wide.as_ref().map(|w| &w.s).unwrap_or(&self.s)
+                } else {
+                    &self.s
+                },
+                io: if in_wide {
+                    self.wide.as_ref().map(|w| &w.io).unwrap_or(&self.io)
+                } else {
+                    &self.io
+                },
+                layers: &self.layers,
+                side: &self.side,
+                wide: self.wide.as_ref().filter(|_| in_wide),
+            }
+        } else {
+            let p = self.peer.as_ref().expect("no peer stage");
+            Stage {
+                dev: &p.dev,
+                stream: &p.ctx.stream,
+                k: if in_wide {
+                    p.wide.as_ref().map(|w| &w.k).unwrap_or(&p.k)
+                } else {
+                    &p.k
+                },
+                s: if in_wide {
+                    p.wide.as_ref().map(|w| &w.s).unwrap_or(&p.s)
+                } else {
+                    &p.s
+                },
+                io: if in_wide {
+                    p.wide.as_ref().map(|w| &w.io).unwrap_or(&p.io)
+                } else {
+                    &p.io
+                },
+                layers: &p.layers,
+                side: &p.side,
+                wide: p.wide.as_ref().filter(|_| in_wide),
+            }
+        }
+    }
+
+    /// Bound pairs (per stage): which device and Gpu the kernels/launches belong to.
     fn a(&self, b: &B) -> u64 {
         self.dev.buffer_addr(b)
+    }
+
+    /// Stage `which`'s address of `b`.
+    fn a_on(&self, which: usize, b: &B) -> u64 {
+        if which == 0 {
+            self.dev.buffer_addr(b)
+        } else {
+            self.peer.as_ref().expect("no peer").dev.buffer_addr(b)
+        }
     }
 
     /// The active window's scratch, Coder kernels, staging and row capacity: the wide set while
@@ -1655,38 +2112,11 @@ impl Coder {
     fn wide_on(&self) -> Option<&Wide> {
         self.wide.as_ref().filter(|_| self.in_wide.get())
     }
-    fn sc(&self) -> &Scratch {
-        self.wide_on().map_or(&self.s, |w| &w.s)
-    }
-    fn kn(&self) -> &Kern {
-        self.wide_on().map_or(&self.k, |w| &w.k)
-    }
     fn iox(&self) -> &Io {
         self.wide_on().map_or(&self.io, |w| &w.io)
     }
     fn tw(&self) -> usize {
         self.wide_on().map_or(MAX_T, |w| w.rows)
-    }
-    /// A layer's projection buffer, or the wide window's shared one.
-    fn proj(&self, b: &B) -> u64 {
-        self.wide_on()
-            .map_or_else(|| self.a(b), |w| self.a(&w.proj))
-    }
-
-    unsafe fn launch(
-        &self,
-        f: Fun,
-        grid: (u32, u32, u32),
-        block: u32,
-        args: &mut [*mut std::ffi::c_void],
-    ) {
-        if self.skip(self.kname(f)) {
-            return;
-        }
-        gpu::launch(f, grid, (block, 1, 1), 0, &self.stream, args).expect("launch");
-        if self.prof.is_some() {
-            self.mark(self.kname(f));
-        }
     }
 
     /// A launch with dynamic shared memory on any stream.
@@ -1790,21 +2220,36 @@ impl Coder {
         )
     }
 
-    fn io_dev(&self, off: usize) -> u64 {
-        self.iox()
+    /// Stage `w`'s device pointer for pinned-staging byte `off` (GPU 1 maps the same host
+    /// arena through its own context).
+    fn io_dev_on(&self, w: usize, off: usize) -> u64 {
+        let st = self.stage_view(w);
+        if w == 0 {
+            return st
+                .io
+                .arena
+                .device_ptr(off)
+                .expect("io arena is mapped");
+        }
+        // The peer's own registered arena (registered from its context in `build_peer`).
+        st.io
             .arena
             .device_ptr(off)
             .expect("io arena is mapped")
     }
 
-    /// `bytes` (a multiple of 4) from `src` to `dst` with a kernel (device or mapped host).
-    fn kcopy(&self, dst: u64, src: u64, bytes: usize) {
+    /// `bytes` (a multiple of 4) from `src` to `dst` with the copy kernel on stage `w`'s
+    /// stream (device or mapped host).
+    fn kcopy_on(&self, w: usize, dst: u64, src: u64, bytes: usize) {
+        let st = self.stage_view(w);
         let n = (bytes / 4) as i32;
         unsafe {
-            self.launch(
-                self.k.copy,
+            self.launch_on(
+                st.stream,
+                st.k.copy,
                 ((n as u32).div_ceil(256).max(1), 1, 1),
                 256,
+                0,
                 tang_moe::args![dst, src, n],
             )
         };
@@ -1815,6 +2260,7 @@ impl Coder {
     #[allow(clippy::too_many_arguments)]
     fn gemv(
         &self,
+        wi: usize,
         name: &'static str,
         w: &Dense,
         x: u64,
@@ -1826,13 +2272,14 @@ impl Coder {
         if self.skip(name) {
             return;
         }
+        let v = self.stage_view(wi);
         // Wide windows: the tensor-core GEMM over every row (TANG_CODER_WGEMM=0: the GEMVs below).
         if t > MAX_T && self.var.wgemm && w.gemm_ok {
-            if let Some(wd) = self.wide_on() {
+            if let Some(wd) = v.wide {
                 let xq = match xq {
                     Some(q) => q,
                     None => {
-                        let q = self.a(&wd.xq);
+                        let q = v.dev.buffer_addr(&wd.xq);
                         let ki = w.k as i32;
                         unsafe {
                             gpu::launch(
@@ -1840,7 +2287,7 @@ impl Coder {
                                 ((w.k / 32) as u32, t as u32, 1),
                                 (32, 1, 1),
                                 0,
-                                &self.stream,
+                                v.stream,
                                 tang_moe::args![x, q, ki],
                             )
                             .expect("fe_q8");
@@ -1849,7 +2296,7 @@ impl Coder {
                     }
                 };
                 let (sp, ns, ki, os, ti) = (
-                    self.a(&w.segs),
+                    v.dev.buffer_addr(&w.segs),
                     w.nseg,
                     w.k as i32,
                     ostride as i32,
@@ -1861,18 +2308,19 @@ impl Coder {
                         (w.rows.div_ceil(128) as u32, t.div_ceil(64) as u32, 1),
                         (256, 1, 1),
                         0,
-                        &self.stream,
+                        v.stream,
                         tang_moe::args![sp, ns, xq, ki, out, os, ti],
                     )
                     .expect("cx_gemm_dense");
                 }
                 // Debug: the GEMVs into a scratch, compared (first 2 rows' outputs of each kind).
                 if env_is("TANG_CODER_WGEMM_CHECK", "1") {
-                    let tmp = self.dev.alloc_f32(t * ostride);
-                    let tp = self.a(&tmp);
+                    let tmp = v.dev.alloc_f32(t * ostride);
+                    let tp = v.dev.buffer_addr(&tmp);
                     for r0 in (0..t).step_by(MAX_T) {
                         let c = MAX_T.min(t - r0);
                         self.gemv_narrow(
+                            wi,
                             w,
                             x + (r0 * w.k * 4) as u64,
                             tp + (r0 * ostride * 4) as u64,
@@ -1880,7 +2328,7 @@ impl Coder {
                             ostride,
                         );
                     }
-                    self.dev.sync();
+                    v.dev.sync();
                     let n_out = t * ostride;
                     let mut a = vec![0f32; n_out];
                     unsafe {
@@ -1890,7 +2338,7 @@ impl Coder {
                             n_out * 4,
                         );
                     }
-                    let b = self.dev.download(&tmp);
+                    let b = v.dev.download(&tmp);
                     let (mut worst, mut sum, mut cnt) = (0f64, 0f64, 0usize);
                     for tt in 0..t {
                         for r in 0..w.rows {
@@ -1917,6 +2365,7 @@ impl Coder {
             for r0 in (0..t).step_by(MAX_T) {
                 let c = MAX_T.min(t - r0);
                 self.gemv(
+                    wi,
                     name,
                     w,
                     x + (r0 * w.k * 4) as u64,
@@ -1928,18 +2377,24 @@ impl Coder {
             }
             return;
         }
-        let (sp, ns, os, r16, ki) = (self.a(&w.segs), w.nseg, ostride as i32, w.row16, w.k as i32);
+        let (sp, ns, os, r16, ki) = (
+            v.dev.buffer_addr(&w.segs),
+            w.nseg,
+            ostride as i32,
+            w.row16,
+            w.k as i32,
+        );
         let xq = match xq {
             Some(q) => q,
             None => {
-                let q = self.a(&self.s.xq8);
+                let q = v.dev.buffer_addr(&v.s.xq8);
                 unsafe {
                     gpu::launch(
-                        self.k.q8,
+                        v.k.q8,
                         ((w.k / 32) as u32, t as u32, 1),
                         (32, 1, 1),
                         0,
-                        &self.stream,
+                        v.stream,
                         tang_moe::args![x, q, ki],
                     )
                     .expect("fe_q8");
@@ -1950,10 +2405,10 @@ impl Coder {
         let kq = self.var.kq;
         if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
             let f = match kq {
-                8 => self.k.gemvk8[t - 1],
-                2 => self.k.gemvk2[t - 1],
-                1 => self.k.gemvk1[t - 1],
-                _ => self.k.gemvk[t - 1],
+                8 => v.k.gemvk8[t - 1],
+                2 => v.k.gemvk2[t - 1],
+                1 => v.k.gemvk1[t - 1],
+                _ => v.k.gemvk[t - 1],
             };
             unsafe {
                 gpu::launch(
@@ -1961,7 +2416,7 @@ impl Coder {
                     (w.rows.div_ceil(8 / kq) as u32, 1, 1),
                     (256, 1, 1),
                     0,
-                    &self.stream,
+                    v.stream,
                     tang_moe::args![sp, ns, x, xq, ki, out, os],
                 )
                 .expect("cx_gemvk")
@@ -1969,11 +2424,11 @@ impl Coder {
         } else {
             unsafe {
                 gpu::launch(
-                    self.k.gemv8[t - 1],
+                    v.k.gemv8[t - 1],
                     (w.rows.div_ceil(8) as u32, 1, 1),
                     (128, 1, 1),
                     (8 * 16 * r16) as u32,
-                    &self.stream,
+                    v.stream,
                     tang_moe::args![sp, ns, x, xq, ki, out, os, r16],
                 )
                 .expect("fe_gemv8")
@@ -1982,30 +2437,68 @@ impl Coder {
         self.mark(name);
     }
 
+    /// Stage `w`'s scratch (the wide set's during a wide window): the per-stage resolution
+    /// of the old `sc()`.
+    fn sc_on(&self, w: usize) -> &Scratch {
+        self.stage_view(w).s
+    }
+
+    /// Stage `w`'s kernels.
+    fn kn_on(&self, w: usize) -> &Kern {
+        self.stage_view(w).k
+    }
+
+    /// Stage `w`'s stream.
+    fn stream_on(&self, w: usize) -> &Stream {
+        self.stage_view(w).stream
+    }
+
+    /// Stage `w`'s ротable: the projection buffer of the stage's layers, or the wide
+    /// window's shared one.
+    fn proj_on(&self, w: usize, b: &B) -> u64 {
+        let v = self.stage_view(w);
+        match v.wide {
+            Some(wd) => v.dev.buffer_addr(&wd.proj),
+            None => v.dev.buffer_addr(b),
+        }
+    }
+
+    /// Stage `w`'s rope tables.
+    fn rope_on(&self, w: usize) -> &(B, B) {
+        if w == 0 {
+            &self.rope
+        } else {
+            &self.peer.as_ref().expect("no peer").rope
+        }
+    }
+
     /// The narrow GEMV for `t <= MAX_T` rows (debug comparisons).
-    fn gemv_narrow(&self, w: &Dense, x: u64, out: u64, t: usize, ostride: usize) {
+    fn gemv_narrow(&self, wi: usize, w: &Dense, x: u64, out: u64, t: usize, ostride: usize) {
         let wide = self.in_wide.replace(false);
-        self.gemv("check", w, x, None, out, t, ostride);
+        self.gemv(wi, "check", w, x, None, out, t, ostride);
         self.in_wide.set(wide);
     }
 
     /// `r += y` (when given), then `s.x = rmsnorm(r) * w` and its int8 codes in `s.mxq`.
-    fn norm_q8(&self, add: Option<u64>, w: &B, t: usize) {
+    fn norm_q8(&self, w_stage: usize, add: Option<u64>, w: &B, t: usize) {
+        let st = self.stage_view(w_stage);
         let (r, y, wp, x, xq, n, eps, ad) = (
-            self.a(&self.sc().r),
+            st.dev.buffer_addr(&st.s.r),
             add.unwrap_or(0),
-            self.a(w),
-            self.a(&self.sc().x),
-            self.a(&self.sc().mxq),
+            st.dev.buffer_addr(w),
+            st.dev.buffer_addr(&st.s.x),
+            st.dev.buffer_addr(&st.s.mxq),
             self.hp.n_embd as i32,
             self.eps,
             add.is_some() as i32,
         );
         unsafe {
-            self.launch(
-                self.kn().norm_q8,
+            self.launch_on(
+                st.stream,
+                st.k.norm_q8,
                 (t as u32, 1, 1),
                 1024,
+                0,
                 tang_moe::args![r, y, wp, x, xq, n, eps, ad],
             )
         };
@@ -2020,7 +2513,7 @@ impl Coder {
 
     /// Key splits for the FA2 attention of a wide window of `t` rows, or `None` for split-K
     /// (not a wide window, `TANG_CODER_ATTN` not `fa2`, or partials that wouldn't fit).
-    fn fa2_splits(&self, t: usize) -> Option<usize> {
+    fn fa2_splits(&self, _w: usize, t: usize) -> Option<usize> {
         if !(self.in_wide.get() && self.var.attn_fa2) {
             return None;
         }
@@ -2036,47 +2529,64 @@ impl Coder {
 
     fn enqueue_inputs(&self, t: usize) {
         self.mark("start");
-        self.kcopy(self.a(&self.sc().ctl), self.io_dev(Io::CTL), 32);
-        self.kcopy(
-            self.a(&self.sc().rows),
-            self.io_dev(Io::rows(self.hp.n_embd, self.tw())),
-            ROWS_PER_T * self.tw() * 4,
+        let n_rows = ROWS_PER_T * self.tw();
+        let s = self.stage_view(0).s;
+        self.kcopy_on(0, self.dev.buffer_addr(&s.ctl), self.io_dev_on(0, Io::CTL), 32);
+        self.kcopy_on(
+            0,
+            self.dev.buffer_addr(&s.rows),
+            self.io_dev_on(0, Io::rows(self.hp.n_embd, self.tw())),
+            n_rows * 4,
         );
-        self.kcopy(
-            self.a(&self.sc().r),
-            self.io_dev(Io::EMB),
+        self.kcopy_on(
+            0,
+            self.dev.buffer_addr(&s.r),
+            self.io_dev_on(0, Io::EMB),
             t * self.hp.n_embd * 4,
         );
     }
 
-    /// Decoder layer `l`, or the MTP layer for `MTP_L`.
-    fn lay(&self, l: usize) -> &Layer {
-        match (l, &self.mtp) {
-            (MTP_L, Some(m)) => &m.layer,
-            _ => &self.layers[l],
+    /// Stage `w`'s layer `l`, or the MTP layer for `MTP_L`.
+    fn lay(&self, w: usize, l: usize) -> &Layer {
+        if l == MTP_L {
+            return &self.mtp.as_ref().expect("MTP layer").layer;
         }
+        let v = self.stage_view(w);
+        &v.layers[l]
     }
 
-    /// Layer `l`'s mixer (input `s.x` / `s.mxq`) into `s.mix`.
-    fn enqueue_mixer(&self, l: usize, t: usize, verify: bool, nchunk: usize, nseg: usize) {
-        let layer = self.lay(l);
-        let s = self.sc();
-        let (x, xq) = (self.a(&s.x), Some(self.a(&s.mxq)));
+    /// Layer `l` of stage `w`'s mixer (input `s.x` / `s.mxq`) into `s.mix`.
+    fn enqueue_mixer(
+        &self,
+        w: usize,
+        l: usize,
+        t: usize,
+        verify: bool,
+        nchunk: usize,
+        nseg: usize,
+    ) {
+        let layer = self.lay(w, l);
+        let s = self.sc_on(w);
+        let (x, xq) = (
+            self.a_on(w, &s.x),
+            Some(self.a_on(w, &s.mxq)),
+        );
         let eps = self.eps;
         let n = self.hp.n_embd;
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
-            self.gemv("gdn_in", &layer.w_in, x, xq, self.proj(&g.proj), t, stride);
-            self.gdn_step_seg(g, stride, nseg, !verify);
+            self.gemv(w, "gdn_in", &layer.w_in, x, xq, self.proj_on(w, &g.proj), t, stride);
+            self.gdn_step_seg(w, g, stride, nseg, !verify);
             if !verify {
-                self.gdn_commit_seg(g, stride, nseg);
+                self.gdn_commit_seg(w, g, stride, nseg);
             }
             self.gemv(
+                w,
                 "gdn_out",
                 &layer.w_out,
-                self.a(&s.y),
+                self.a_on(w, &s.y),
                 None,
-                self.a(&s.mix),
+                self.a_on(w, &s.mix),
                 t,
                 n,
             );
@@ -2084,33 +2594,36 @@ impl Coder {
         if let Some(at) = &layer.attn {
             let stride = layer.w_in.rows;
             self.gemv(
+                w,
                 "attn_in",
                 &layer.w_in,
                 x,
                 xq,
-                self.proj(&at.proj),
+                self.proj_on(w, &at.proj),
                 t,
                 stride,
             );
             let hp = &self.hp;
             let (proj, st, qn, kn, rc, rs, q, kt, vt, rows) = (
-                self.proj(&at.proj),
+                self.proj_on(w, &at.proj),
                 stride as i32,
-                self.a(&at.qn),
-                self.a(&at.kn),
-                self.a(&self.rope.0),
-                self.a(&self.rope.1),
-                self.a(&s.q),
-                self.a(&at.ktab),
-                self.a(&at.vtab),
-                self.a(&s.rows),
+                self.a_on(w, &at.qn),
+                self.a_on(w, &at.kn),
+                self.a_on(w, &self.rope_on(w).0),
+                self.a_on(w, &self.rope_on(w).1),
+                self.a_on(w, &s.q),
+                self.a_on(w, &at.ktab),
+                self.a_on(w, &at.vtab),
+                self.a_on(w, &s.rows),
             );
-            let (part, attn) = (self.a(&s.part), self.a(&s.attn));
+            let (part, attn) = (self.a_on(w, &s.part), self.a_on(w, &s.attn));
             unsafe {
-                self.launch(
-                    self.kn().prep,
+                self.launch_on(
+                    self.stream_on(w),
+                    self.kn_on(w).prep,
                     (t as u32, (hp.n_head + hp.n_head_kv) as u32, 1),
                     hp.head_dim as u32,
+                    0,
                     tang_moe::args![proj, st, qn, kn, rc, rs, rows, q, kt, vt, eps],
                 );
             }
@@ -2122,26 +2635,28 @@ impl Coder {
                 t
             };
             let qrow = (hp.n_head * hp.head_dim * 4) as u64;
-            if let Some(ns) = self.fa2_splits(t) {
+            if let Some(ns) = self.fa2_splits(w, t) {
                 let g = hp.n_head / hp.n_head_kv;
                 let tiles = (t * g).div_ceil(ck::FA2_BM);
                 unsafe {
                     self.launch_on(
-                        &self.stream,
-                        self.kn().fa2,
+                        self.stream_on(w),
+                        self.kn_on(w).fa2,
                         (tiles as u32, hp.n_head_kv as u32, ns as u32),
                         128,
                         ck::fa2_smem(hp.head_dim) as u32,
                         tang_moe::args![q, kt, vt, rows, t as i32, part, ns as i32],
                     );
-                    self.launch(
-                        self.kn().merge,
+                    self.launch_on(
+                        self.stream_on(w),
+                        self.kn_on(w).merge,
                         (t as u32, hp.n_head as u32, 1),
                         hp.head_dim as u32,
+                        0,
                         tang_moe::args![part, ns as i32, proj, st, attn],
                     );
                 }
-                self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
+                self.gemv(w, "attn_out", &layer.w_out, attn, None, self.a_on(w, &s.mix), t, n);
                 return;
             }
             for r0 in (0..t).step_by(slice) {
@@ -2158,67 +2673,77 @@ impl Coder {
                     attn + r0 as u64 * qrow,
                 );
                 unsafe {
-                    self.launch(
-                        self.kn().part,
+                    self.launch_on(
+                        self.stream_on(w),
+                        self.kn_on(w).part,
                         (c as u32, hp.n_head_kv as u32, nc as u32),
                         128,
+                        0,
                         tang_moe::args![q0, kt, vt, rows0, part, nc],
                     );
-                    self.launch(
-                        self.kn().merge,
+                    self.launch_on(
+                        self.stream_on(w),
+                        self.kn_on(w).merge,
                         (c as u32, hp.n_head as u32, 1),
                         hp.head_dim as u32,
+                        0,
                         tang_moe::args![part, nc, proj0, st, attn0],
                     );
                 }
             }
-            self.gemv("attn_out", &layer.w_out, attn, None, self.a(&s.mix), t, n);
+            self.gemv(w, "attn_out", &layer.w_out, attn, None, self.a_on(w, &s.mix), t, n);
         }
     }
 
     /// The GDN conv and recurrence in one launch (`commit`: write the state for `win[1]`
     /// tokens), from the stacked projection and the conv history.
-    fn gdn_step(&self, g: &GdnL, stride: usize, t: usize, commit: bool) {
+    fn gdn_step(&self, w: usize, g: &GdnL, stride: usize, t: usize, commit: bool) {
+        let v = self.stage_view(w);
         let (st, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant, h0, wc) = (
-            self.a(&g.state),
-            self.a(&g.proj),
+            v.dev.buffer_addr(&g.state),
+            v.dev.buffer_addr(&g.proj),
             stride as u32,
-            self.a(&g.dt),
-            self.a(&g.a),
-            self.a(&g.norm),
-            self.a(&self.s.y),
+            v.dev.buffer_addr(&g.dt),
+            v.dev.buffer_addr(&g.a),
+            v.dev.buffer_addr(&g.norm),
+            v.dev.buffer_addr(&v.s.y),
             t as u32,
-            self.a(&self.s.ctl),
+            v.dev.buffer_addr(&v.s.ctl),
             commit as u32,
             self.eps,
             0u64,
             0u32,
-            self.a(&g.hist),
-            self.a(&g.conv),
+            v.dev.buffer_addr(&g.hist),
+            v.dev.buffer_addr(&g.conv),
         );
         unsafe {
-            self.launch(
-                self.k.gdn_step,
+            self.launch_on(
+                v.stream,
+                v.k.gdn_step,
                 (self.geo.gdn_hv as u32, 1, 1),
                 512,
+                0,
                 tang_moe::args![st, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant, h0, wc],
             )
         };
     }
 
-    fn gdn_commit(&self, g: &GdnL, stride: usize, t: usize) {
+    fn gdn_commit(&self, w: usize, g: &GdnL, stride: usize, t: usize) {
+        let v = self.stage_view(w);
         let (h0, p, sd, win, tu) = (
-            self.a(&g.hist),
-            self.a(&g.proj),
+            v.dev.buffer_addr(&g.hist),
+            v.dev.buffer_addr(&g.proj),
             stride as u32,
-            self.a(&self.s.ctl),
+            v.dev.buffer_addr(&v.s.ctl),
             t as u32,
         );
         unsafe {
-            self.launch(
-                self.k.gdn_commit,
+            self.launch_on(
+                v.stream,
+                v.k.gdn_commit,
                 (self.geo.gdn_conv().div_ceil(256) as u32, 1, 1),
                 256,
+                0,
                 tang_moe::args![h0, p, sd, win, tu],
             )
         };
@@ -2226,43 +2751,49 @@ impl Coder {
 
     /// [`gdn_step`](Self::gdn_step) for every segment of the window (`s.rows`): each segment's
     /// rows run against its slot's state and history.
-    fn gdn_step_seg(&self, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
+    fn gdn_step_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
+        let v = self.stage_view(w);
         let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
-            self.a(&g.stab),
-            self.a(&g.htab),
-            self.proj(&g.proj),
+            v.dev.buffer_addr(&g.stab),
+            v.dev.buffer_addr(&g.htab),
+            self.proj_on(w, &g.proj),
             stride as u32,
-            self.a(&g.dt),
-            self.a(&g.a),
-            self.a(&g.norm),
-            self.a(&self.sc().y),
-            self.a(&self.sc().rows) + (2 * self.tw() * 4) as u64,
+            v.dev.buffer_addr(&g.dt),
+            v.dev.buffer_addr(&g.a),
+            v.dev.buffer_addr(&g.norm),
+            v.dev.buffer_addr(&v.s.y),
+            v.dev.buffer_addr(&v.s.rows) + (2 * self.tw() * 4) as u64,
             commit as u32,
             self.eps,
-            self.a(&g.conv),
+            v.dev.buffer_addr(&g.conv),
         );
         unsafe {
-            self.launch(
-                self.kn().gdn_step_seg,
+            self.launch_on(
+                v.stream,
+                v.k.gdn_step_seg,
                 (self.geo.gdn_hv as u32, nseg as u32, 1),
                 512,
+                0,
                 tang_moe::args![stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc],
             )
         };
     }
 
-    fn gdn_commit_seg(&self, g: &GdnL, stride: usize, nseg: usize) {
+    fn gdn_commit_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize) {
+        let v = self.stage_view(w);
         let (htab, p, sd, seg) = (
-            self.a(&g.htab),
-            self.proj(&g.proj),
+            v.dev.buffer_addr(&g.htab),
+            self.proj_on(w, &g.proj),
             stride as u32,
-            self.a(&self.sc().rows) + (2 * self.tw() * 4) as u64,
+            v.dev.buffer_addr(&v.s.rows) + (2 * self.tw() * 4) as u64,
         );
         unsafe {
-            self.launch(
-                self.kn().gdn_commit_seg,
+            self.launch_on(
+                v.stream,
+                v.k.gdn_commit_seg,
                 (self.geo.gdn_conv().div_ceil(256) as u32, nseg as u32, 1),
                 256,
+                0,
                 tang_moe::args![htab, p, sd, seg],
             )
         };
@@ -2272,23 +2803,31 @@ impl Coder {
     /// same launches, then `r +=` the result and the next norm (`next`: the next layer's
     /// `attn_norm`, or `output_norm`) into `s.x` / `s.mxq`. `s.moe_y` gets the MoE output when
     /// `keep_y`.
-    fn enqueue_moe(&self, l: usize, t: usize, next: &B, keep_y: bool) {
-        let layer = self.lay(l);
-        let (s, hp) = (self.sc(), &self.hp);
+    fn enqueue_moe(&self, wi: usize, l: usize, t: usize, next: &B, keep_y: bool) {
+        let layer = self.lay(wi, l);
+        let v = self.stage_view(wi);
+        let (s, hp) = (&v.s, &self.hp);
         let (ne, kk) = (hp.n_expert, hp.n_expert_used);
-        let (x, mxq) = (self.a(&s.x), self.a(&s.mxq));
+        let (x, mxq) = (
+            v.dev.buffer_addr(&s.x),
+            v.dev.buffer_addr(&s.mxq),
+        );
         let ls = ne + 1;
         let (lg, lsi, ids, w, scale) = (
-            self.a(&s.lg),
+            v.dev.buffer_addr(&s.lg),
             ls as i32,
-            self.a(&s.ids),
-            self.a(&s.w),
+            v.dev.buffer_addr(&s.ids),
+            v.dev.buffer_addr(&s.w),
             hp.expert_weights_scale,
         );
         let (r, yo, wn, xo, eps, ti) = (
-            self.a(&s.r),
-            if keep_y { self.a(&s.moe_y) } else { 0u64 },
-            self.a(next),
+            v.dev.buffer_addr(&s.r),
+            if keep_y {
+                v.dev.buffer_addr(&s.moe_y)
+            } else {
+                0u64
+            },
+            v.dev.buffer_addr(next),
             x,
             self.eps,
             t as i32,
@@ -2297,37 +2836,43 @@ impl Coder {
         if self.var.shared_par {
             // The shared expert doesn't depend on the routing: fork it onto the side stream
             // before the router, join before the combine.
-            self.fork();
-            self.experts(layer, t, routed, t, &self.side);
-            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
+            self.fork(wi);
+            self.experts(wi, layer, t, routed, t, v.side);
+            self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
             unsafe {
-                self.launch(
-                    self.kn().route,
+                self.launch_on(
+                    v.stream,
+                    v.k.route,
                     (t as u32, 1, 1),
                     32,
+                    0,
                     tang_moe::args![lg, lsi, ids, w, scale],
                 );
             }
-            self.experts(layer, t, 0, routed, &self.stream);
-            self.join();
+            self.experts(wi, layer, t, 0, routed, v.stream);
+            self.join(wi);
         } else {
-            self.gemv("router", &layer.router, x, Some(mxq), lg, t, ls);
+            self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
             unsafe {
-                self.launch(
-                    self.kn().route,
+                self.launch_on(
+                    v.stream,
+                    v.k.route,
                     (t as u32, 1, 1),
                     32,
+                    0,
                     tang_moe::args![lg, lsi, ids, w, scale],
                 );
             }
-            self.experts(layer, t, 0, routed + t, &self.stream);
+            self.experts(wi, layer, t, 0, routed + t, v.stream);
         }
-        let parts = self.a(&s.parts);
+        let parts = v.dev.buffer_addr(&s.parts);
         unsafe {
-            self.launch(
-                self.kn().moe_add_norm,
+            self.launch_on(
+                v.stream,
+                v.k.moe_add_norm,
                 (t as u32, 1, 1),
                 1024,
+                0,
                 tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
             );
         }
@@ -2335,20 +2880,29 @@ impl Coder {
 
     /// Expert pairs `pbase..pbase + n` (routed pairs first, then the shared expert per token):
     /// gate|up rows, SiLU+int8, down rows, on `stream`.
-    fn experts(&self, layer: &Layer, t: usize, pbase: usize, n: usize, stream: &Stream) {
+    fn experts(
+        &self,
+        wi: usize,
+        layer: &Layer,
+        t: usize,
+        pbase: usize,
+        n: usize,
+        stream: &Stream,
+    ) {
         if n == 0 {
             return;
         }
-        let (s, hp) = (self.sc(), &self.hp);
+        let v = self.stage_view(wi);
+        let (s, hp) = (&v.s, &self.hp);
         let (nh, ff) = (hp.n_embd, hp.n_ff_exp);
         let (gw, uw, dw) = (layer.gate.w, layer.up.w, layer.down.w);
         let (sg, su, sd) = (layer.sh_gate.w, layer.sh_up.w, layer.sh_down.w);
         let (ids, mxq, egu, hq, parts) = (
-            self.a(&s.ids),
-            self.a(&s.mxq),
-            self.a(&s.egu),
-            self.a(&s.hq),
-            self.a(&s.parts),
+            v.dev.buffer_addr(&s.ids),
+            v.dev.buffer_addr(&s.mxq),
+            v.dev.buffer_addr(&s.egu),
+            v.dev.buffer_addr(&s.hq),
+            v.dev.buffer_addr(&s.parts),
         );
         let (ti, r16g, r16d, fastk, pb) = (
             t as i32,
@@ -2361,13 +2915,13 @@ impl Coder {
         if self.var.grouped || self.in_wide.get() {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
             let pw = 2 + 2 * self.tw() * (hp.n_expert_used + 1);
-            let plan = self.a(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
+            let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
             let ni = n as i32;
             let groups = n.min(hp.n_expert + 1) as u32;
             unsafe {
                 self.launch_on(
                     stream,
-                    self.kn().moe_plan,
+                    v.k.moe_plan,
                     (1, 1, 1),
                     if self.in_wide.get() { 1024 } else { 128 },
                     0,
@@ -2379,7 +2933,7 @@ impl Coder {
                 if gemm && self.var.wgemm_gu {
                     self.launch_on(
                         stream,
-                        self.kn().moe_gemm_gu,
+                        v.k.moe_gemm_gu,
                         ((2 * ff / 128) as u32, groups, tiles),
                         256,
                         0,
@@ -2391,15 +2945,15 @@ impl Coder {
                         let refb = parts;
                         self.launch_on(
                             stream,
-                            self.kn().moe_gu_g,
+                            v.k.moe_gu_g,
                             ((2 * ff / 16) as u32, groups, 1),
                             256,
                             (16 * 16 * r16g) as u32,
                             tang_moe::args![gw, uw, sg, su, ids, mxq, refb, ti, r16g, fastk, plan],
                         );
-                        self.dev.sync();
-                        let a = self.dev.download(&s.egu);
-                        let b = self.dev.download(&s.parts);
+                        v.dev.sync();
+                        let a = v.dev.download(&s.egu);
+                        let b = v.dev.download(&s.parts);
                         let rows = 2 * ff;
                         let (mut worst, mut wi, mut sum, mut cnt) = (0f64, 0usize, 0f64, 0usize);
                         for i in 0..n * rows {
@@ -2424,7 +2978,7 @@ impl Coder {
                 } else {
                     self.launch_on(
                         stream,
-                        self.kn().moe_gu_g,
+                        v.k.moe_gu_g,
                         ((2 * ff / 16) as u32, groups, 1),
                         256,
                         (16 * 16 * r16g) as u32,
@@ -2433,7 +2987,7 @@ impl Coder {
                 }
                 self.launch_on(
                     stream,
-                    self.kn().silu_q,
+                    v.k.silu_q,
                     ((ff / 32) as u32, np, 1),
                     32,
                     0,
@@ -2442,7 +2996,7 @@ impl Coder {
                 if gemm && self.var.wgemm_down {
                     self.launch_on(
                         stream,
-                        self.kn().moe_gemm_down,
+                        v.k.moe_gemm_down,
                         ((nh / 128) as u32, groups, tiles),
                         256,
                         0,
@@ -2451,7 +3005,7 @@ impl Coder {
                 } else {
                     self.launch_on(
                         stream,
-                        self.kn().moe_down_g,
+                        v.k.moe_down_g,
                         ((nh / 16) as u32, groups, 1),
                         256,
                         (16 * 16 * r16d) as u32,
@@ -2468,19 +3022,19 @@ impl Coder {
             v => v,
         };
         let (gu_f, down_f, rows, smem_g, smem_d) = match moe {
-            2 => (self.kn().moe_gu_d[0], self.kn().moe_down_d[0], 16, 0, 0),
-            4 => (self.kn().moe_gu_d[1], self.kn().moe_down_d[1], 32, 0, 0),
+            2 => (v.k.moe_gu_d[0], v.k.moe_down_d[0], 16, 0, 0),
+            4 => (v.k.moe_gu_d[1], v.k.moe_down_d[1], 32, 0, 0),
             // Double-buffered: 8 warps × 2 rows × 4 groups a block, two buffers.
             8 => (
-                self.kn().moe_gu_db,
-                self.kn().moe_down_db,
+                v.k.moe_gu_db,
+                v.k.moe_down_db,
                 64,
                 (2 * 16 * 16 * r16g) as u32,
                 (2 * 16 * 16 * r16d) as u32,
             ),
             _ => (
-                self.kn().moe_gu,
-                self.kn().moe_down,
+                v.k.moe_gu,
+                v.k.moe_down,
                 16,
                 (16 * 16 * r16g) as u32,
                 (16 * 16 * r16d) as u32,
@@ -2497,7 +3051,7 @@ impl Coder {
             );
             // The direct down kernels can make SiLU(gate) * up's int8 themselves.
             if self.var.fuse_silu && (moe == 2 || moe == 4) {
-                let df = self.kn().moe_down_df[usize::from(moe == 4)];
+                let df = v.k.moe_down_df[usize::from(moe == 4)];
                 self.launch_on(
                     stream,
                     df,
@@ -2510,7 +3064,7 @@ impl Coder {
             }
             self.launch_on(
                 stream,
-                self.kn().silu_q,
+                v.k.silu_q,
                 ((ff / 32) as u32, np, 1),
                 32,
                 0,
@@ -2527,66 +3081,97 @@ impl Coder {
         }
     }
 
-    /// Side stream: start after everything enqueued so far on the main stream.
-    fn fork(&self) {
-        self.ev_fork.record(&self.stream).expect("record");
-        self.side.wait(&self.ev_fork).expect("wait");
+    /// Side stream: start after everything enqueued so far on stage `w`'s main stream.
+    fn fork(&self, w: usize) {
+        if w == 0 {
+            self.ev_fork.record(&self.stream).expect("record");
+            self.side.wait(&self.ev_fork).expect("wait");
+        } else {
+            let p = self.peer.as_ref().expect("no peer");
+            p.ev_fork.record(&p.ctx.stream).expect("record");
+            p.side.wait(&p.ev_fork).expect("wait");
+        }
     }
 
-    /// Main stream: wait for everything enqueued so far on the side stream.
-    fn join(&self) {
-        self.ev_join.record(&self.side).expect("record");
-        self.stream.wait(&self.ev_join).expect("wait");
+    /// Main stream: wait for everything enqueued so far on the side stream of stage `w`.
+    fn join(&self, w: usize) {
+        if w == 0 {
+            self.ev_join.record(&self.side).expect("record");
+            self.stream.wait(&self.ev_join).expect("wait");
+        } else {
+            let p = self.peer.as_ref().expect("no peer");
+            p.ev_join.record(&p.side).expect("record");
+            p.ctx.stream.wait(&p.ev_join).expect("wait");
+        }
     }
 
+    /// The head runs on the last stage (where the final `x` is produced); its sampled ids go
+    /// to that stage's view of the shared pinned staging.
     fn enqueue_head(&self, t: usize) {
-        let v = self.hp.n_vocab;
+        let last = self.n_stages() - 1;
+        let v = self.stage_view(last);
+        let head = if last == 0 {
+            &self.head
+        } else {
+            &self.peer.as_ref().expect("no peer").head
+        };
+        let voc = self.hp.n_vocab;
         self.gemv(
+            last,
             "head",
-            &self.head,
-            self.a(&self.s.x),
-            Some(self.a(&self.s.mxq)),
-            self.a(&self.s.head),
+            head,
+            v.dev.buffer_addr(&v.s.x),
+            Some(v.dev.buffer_addr(&v.s.mxq)),
+            v.dev.buffer_addr(&v.s.head),
             t,
-            v,
+            voc,
         );
         let (lg, ids, n, part, np, ctl) = (
-            self.a(&self.s.head),
-            self.a(&self.s.out_ids),
-            v as i32,
-            self.a(&self.s.amax),
+            v.dev.buffer_addr(&v.s.head),
+            v.dev.buffer_addr(&v.s.out_ids),
+            voc as i32,
+            v.dev.buffer_addr(&v.s.amax),
             64i32,
-            self.a(&self.s.ctl),
+            v.dev.buffer_addr(&v.s.ctl),
         );
         if let Some(sp) = self.sampler.as_ref().filter(|_| !self.greedy.get()) {
             if !self.skip("argmax") {
                 sp.enqueue(
-                    &self.dev,
-                    &self.stream,
-                    &self.s.head,
-                    &self.s.ctl,
-                    &self.s.out_ids,
+                    v.dev,
+                    v.stream,
+                    &self.head_buf(last),
+                    &v.s.ctl,
+                    &v.s.out_ids,
                     t,
                 );
             }
-            self.kcopy(self.io_dev(Io::IDS), ids, t * 4);
+            self.kcopy_on(last, self.io_dev_on(last, Io::IDS), ids, t * 4);
             return;
         }
         unsafe {
-            self.launch(
-                self.k.argmax1,
+            self.launch_on(
+                v.stream,
+                v.k.argmax1,
                 (64, t as u32, 1),
                 1024,
+                0,
                 tang_moe::args![lg, n, part, ctl],
             );
-            self.launch(
-                self.k.argmax2,
+            self.launch_on(
+                v.stream,
+                v.k.argmax2,
                 (t as u32, 1, 1),
                 32,
+                0,
                 tang_moe::args![part, np, ids],
             );
         }
-        self.kcopy(self.io_dev(Io::IDS), ids, t * 4);
+        self.kcopy_on(last, self.io_dev_on(last, Io::IDS), ids, t * 4);
+    }
+
+    /// The head buffer of stage `w`'s device — the sampler needs it by reference.
+    fn head_buf(&self, w: usize) -> &B {
+        &self.stage_view(w).s.head
     }
 
     /// Everything a window enqueues; with `probe`, eager, syncing after each layer to read its
@@ -2601,43 +3186,56 @@ impl Coder {
     ) -> Result<()> {
         self.enqueue_inputs(t);
         let n = self.hp.n_embd;
-        let last = |b: &B| -> Vec<f32> { self.dev.download(b)[(t - 1) * n..t * n].to_vec() };
-        let nl = self.layers.len();
-        self.norm_q8(None, &self.layers[0].attn_norm, t);
-        for l in 0..nl {
-            let layer = &self.layers[l];
-            self.enqueue_mixer(l, t, verify, nchunk, nseg);
-            self.norm_q8(Some(self.a(&self.s.mix)), &layer.post_norm, t);
-            if let Some(p) = probe.as_deref_mut() {
-                self.dev.sync();
-                p.mixer_out.push(last(&self.s.mix));
-                p.post_mixer.push(last(&self.s.r));
+        self.norm_q8(0, None, &self.layers[0].attn_norm, t);
+        for w in 0..self.n_stages() {
+            let v = self.stage_view(w);
+            let last =
+                |dev: &CudaComputeDevice, b: &B| -> Vec<f32> {
+                    dev.download(b)[(t - 1) * n..t * n].to_vec()
+                };
+            let nl = v.layers.len();
+            for l in 0..nl {
+                let layer = &v.layers[l];
+                self.enqueue_mixer(w, l, t, verify, nchunk, nseg);
+                self.norm_q8(w, Some(v.dev.buffer_addr(&v.s.mix)), &layer.post_norm, t);
+                if let Some(p) = probe.as_deref_mut() {
+                    v.dev.sync();
+                    p.mixer_out.push(last(v.dev, &v.s.mix));
+                    p.post_moe.push(last(v.dev, &v.s.r));
+                }
+                let next = if l + 1 < nl {
+                    &v.layers[l + 1].attn_norm
+                } else if w + 1 < self.n_stages() {
+                    // The next stage's first `attn_norm`, read over the peer link by this
+                    // stage's `moe_add_norm`.
+                    &self.stage_view(w + 1).layers[0].attn_norm
+                } else if self.peer.is_some() {
+                    &self.peer.as_ref().unwrap().out_norm
+                } else {
+                    &self.out_norm
+                };
+                self.enqueue_moe(w, l, t, next, probe.is_some());
+                if let Some(p) = probe.as_deref_mut() {
+                    v.dev.sync();
+                    p.moe_out.push(last(v.dev, &v.s.moe_y));
+                    p.post_moe.push(last(v.dev, &v.s.r));
+                    let k = self.hp.n_expert_used;
+                    let ids = v.dev.download(&v.s.ids);
+                    p.router_ids.push(
+                        ids[(t - 1) * k..t * k]
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect(),
+                    );
+                    p.qsa_sel.push(None);
+                }
             }
-            let next = if l + 1 < nl {
-                &self.layers[l + 1].attn_norm
-            } else {
-                &self.out_norm
-            };
-            self.enqueue_moe(l, t, next, probe.is_some());
-            if let Some(p) = probe.as_deref_mut() {
-                self.dev.sync();
-                p.moe_out.push(last(&self.s.moe_y));
-                p.post_moe.push(last(&self.s.r));
-                let k = self.hp.n_expert_used;
-                let ids = self.dev.download(&self.s.ids);
-                p.router_ids.push(
-                    ids[(t - 1) * k..t * k]
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .collect(),
-                );
-                p.qsa_sel.push(None);
+            if w + 1 < self.n_stages() {
+                self.enqueue_boundary(w, t);
             }
         }
         self.enqueue_head(t);
-        if let Some(m) = &self.mtp {
-            self.kcopy(self.a(&m.mh), self.a(&self.s.x), t * n * 4);
-        }
+        self.enqueue_mtp_in(t)?;
         Ok(())
     }
 
@@ -2647,63 +3245,84 @@ impl Coder {
     fn enqueue_mtp(&self, t: usize, nchunk: usize) {
         let m = self.mtp.as_ref().expect("MTP layer");
         let (s, n) = (&self.s, self.hp.n_embd);
-        self.kcopy(
-            self.a(&s.rows),
-            self.io_dev(Io::rows(n, MAX_T)),
+        self.kcopy_on(
+            0,
+            self.dev.buffer_addr(&s.rows),
+            self.io_dev_on(0, Io::rows(n, MAX_T)),
             ROWS_U32 * 4,
         );
-        self.kcopy(self.a(&m.emb), self.io_dev(Io::EMB), t * n * 4);
+        self.kcopy_on(0, self.dev.buffer_addr(&m.emb), self.io_dev_on(0, Io::EMB), t * n * 4);
+        // The MTP layer stays on GPU 0: its buffers were allocated there at load, its input
+        // `m.mh` was copied from the last stage's `x`, its output ids go to the shared staging.
         let (emb, mh, we, wh, eps, ni, cat) = (
-            self.a(&m.emb),
-            self.a(&m.mh),
-            self.a(&m.enorm),
-            self.a(&m.hnorm),
+            self.dev.buffer_addr(&m.emb),
+            self.dev.buffer_addr(&m.mh),
+            self.dev.buffer_addr(&m.enorm),
+            self.dev.buffer_addr(&m.hnorm),
             self.eps,
             n as i32,
-            self.a(&m.cat),
+            self.dev.buffer_addr(&m.cat),
         );
         unsafe {
-            self.launch(
+            self.launch_on(
+                &self.stream,
                 m.f_in,
                 (t as u32, 2, 1),
                 1024,
+                0,
                 tang_moe::args![emb, mh, we, wh, eps, ni, cat],
             )
         };
-        self.gemv("mtp_fc", &m.fc, cat, None, self.a(&s.r), t, n);
-        self.norm_q8(None, &m.layer.attn_norm, t);
-        self.enqueue_mixer(MTP_L, t, true, nchunk, 1);
-        self.norm_q8(Some(self.a(&s.mix)), &m.layer.post_norm, t);
-        self.enqueue_moe(MTP_L, t, &m.onorm, false);
+        self.gemv(0, "mtp_fc", &m.fc, cat, None, self.dev.buffer_addr(&s.r), t, n);
+        self.norm_q8(0, None, &m.layer.attn_norm, t);
+        self.enqueue_mixer(0, MTP_L, t, true, nchunk, 1);
+        self.norm_q8(0, Some(self.dev.buffer_addr(&s.mix)), &m.layer.post_norm, t);
+        self.enqueue_moe(0, MTP_L, t, &m.onorm, false);
         let v = self.hp.n_vocab;
         self.gemv(
+            0,
             "mtp_head",
             &self.head,
-            self.a(&s.x),
-            Some(self.a(&s.mxq)),
-            self.a(&s.head),
+            self.dev.buffer_addr(&s.x),
+            Some(self.dev.buffer_addr(&s.mxq)),
+            self.dev.buffer_addr(&s.head),
             t,
             v,
         );
-        let (lg, vi, ids, prob) = (self.a(&s.head), v as i32, self.a(&m.ids), self.a(&m.prob));
+        let (lg, vi, ids, prob) = (
+            self.dev.buffer_addr(&s.head),
+            v as i32,
+            self.dev.buffer_addr(&m.ids),
+            self.dev.buffer_addr(&m.prob),
+        );
         unsafe {
-            self.launch(
+            self.launch_on(
+                &self.stream,
                 m.f_pick,
                 (t as u32, 1, 1),
                 1024,
+                0,
                 tang_moe::args![lg, vi, ids, prob],
             )
         };
-        self.kcopy(self.io_dev(Io::IDS), ids, 2 * MAX_T * 4);
-        self.kcopy(self.io_dev(Io::MTP_PROB), prob, 2 * MAX_T * 4);
+        self.kcopy_on(0, self.io_dev_on(0, Io::IDS), ids, 2 * MAX_T * 4);
+        self.kcopy_on(0, self.io_dev_on(0, Io::MTP_PROB), prob, 2 * MAX_T * 4);
     }
 
     fn enqueue_commit(&self, t: usize) {
-        self.kcopy(self.a(&self.s.ctl), self.io_dev(Io::CCTL), 32);
-        for layer in &self.layers {
-            if let Some(g) = &layer.gdn {
-                self.gdn_step(g, layer.w_in.rows, t, true);
-                self.gdn_commit(g, layer.w_in.rows, t);
+        for w in 0..self.n_stages() {
+            let v = self.stage_view(w);
+            self.kcopy_on(
+                w,
+                v.dev.buffer_addr(&v.s.ctl),
+                self.io_dev_on(w, Io::CCTL),
+                32,
+            );
+            for layer in v.layers {
+                if let Some(g) = &layer.gdn {
+                    self.gdn_step(w, g, layer.w_in.rows, t, true);
+                    self.gdn_commit(w, g, layer.w_in.rows, t);
+                }
             }
         }
     }
@@ -2734,6 +3353,7 @@ impl Coder {
             rows[i] = (pos0 + i) as u32;
         }
         rows[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[0, t as u32, 0, t as u32]);
+        self.mirror_staging(MAX_T, t);
         Ok(())
     }
 
@@ -2791,9 +3411,9 @@ impl Coder {
             return;
         }
         for (i, &f) in from.iter().enumerate() {
-            self.kcopy(cat + (i * b) as u64, src + (f * b) as u64, b);
+            self.kcopy_on(0, cat + (i * b) as u64, src + (f * b) as u64, b);
         }
-        self.kcopy(mh, cat, from.len() * b);
+        self.kcopy_on(0, mh, cat, from.len() * b);
     }
 
     /// The MTP layer after a window, for groups `(slot, pos, r0, next)`: positions
@@ -2833,6 +3453,29 @@ impl Coder {
             out[gi].1 = Some(self.mtp_read_alt(r - 1));
         }
         for j in 1..self.mtp_steps {
+            // With a split, the chained step's source hidden rows are GPU 1's `s.x`; bring
+            // them over before the gather (a few rows of `n` f32).
+            if self.peer.is_some() {
+                let lastv = self.stage_view(self.n_stages() - 1);
+                let n = self.hp.n_embd;
+                let done = gpu::Event::new(false).expect("event");
+                done.record(lastv.stream).expect("record");
+                self.stream.wait(&done).expect("wait");
+                let r = unsafe {
+                    cudarc::driver::sys::cuMemcpyPeerAsync(
+                        self.dev.buffer_addr(&self.s.x),
+                        self.dev.cuda_context().cu_ctx(),
+                        lastv.dev.buffer_addr(&lastv.s.x),
+                        lastv.dev.cuda_context().cu_ctx(),
+                        MAX_T * n * 4,
+                        self.stream.0,
+                    )
+                };
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    return Err(anyhow!("mtp chain boundary copy: {r:?}"));
+                }
+                self.dev.sync();
+            }
             self.mtp_gather(self.a(&self.s.x), &last);
             let rows: Vec<(usize, usize, u32)> = groups
                 .iter()
@@ -2953,8 +3596,9 @@ impl Coder {
             self.temperature == 0.0 && self.sampler.as_ref().is_none_or(|s| s.presence == 0.0),
         );
         let key = (t, verify, nchunk, nseg, self.greedy.get());
+        let split = self.peer.is_some();
         if probe.is_none() && self.use_graphs {
-            if !self.graphs.contains_key(&key) {
+            if !split && !self.graphs.contains_key(&key) {
                 // First use: run eagerly (loads every kernel), then capture.
                 self.enqueue_window(t, verify, nchunk, nseg, None)?;
                 self.dev.sync();
@@ -2973,20 +3617,162 @@ impl Coder {
                 self.graphs.insert(key, gr);
                 return Ok(self.finish(st, w0, ids));
             }
-            self.graphs[&key]
-                .launch(&self.stream)
-                .map_err(|e| anyhow!("{e}"))?;
+            if split {
+                // Two devices: a graph per stage, the boundary copies between the launches.
+                // First use on a stage: run the whole window eagerly (which loads every
+                // kernel on both), then capture each stage once.
+                if !self.peer.as_ref().unwrap().graphs.contains_key(&key) {
+                    self.enqueue_window(t, verify, nchunk, nseg, None)?;
+                    self.sync_all();
+                    self.collect_out(t, false);
+                    let ids = self.io.u32s(Io::IDS, t).to_vec();
+                    self.capture_stages(t, verify, nchunk, nseg)?;
+                    return Ok(self.finish(st, w0, ids));
+                }
+                let p = self.peer.as_ref().unwrap();
+                self.graphs[&key]
+                    .launch(&self.stream)
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.enqueue_boundary(0, t);
+                p.graphs[&key]
+                    .launch(&p.ctx.stream)
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.enqueue_mtp_in(t)?;
+            } else {
+                self.graphs[&key]
+                    .launch(&self.stream)
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
         } else {
             self.enqueue_window(t, verify, nchunk, nseg, probe.as_deref_mut())?;
         }
-        self.dev.sync();
+        self.sync_all();
+        self.collect_out(t, false);
         self.prof_collect();
         let ids = self.io.u32s(Io::IDS, t).to_vec();
         if let Some(p) = probe {
             let n = self.hp.n_embd;
-            p.final_x = self.dev.download(&self.s.x)[(t - 1) * n..t * n].to_vec();
+            let last = self.stage_view(self.n_stages() - 1);
+            p.final_x = last.dev.download(&last.s.x)[(t - 1) * n..t * n].to_vec();
         }
         Ok(self.finish(st, w0, ids))
+    }
+
+    /// Capture each stage's half of the window by (temporarily) masking the other stage out:
+    /// `enqueue_window` with `only_stage` set enqueues just that stage's layers (the
+    /// boundary event/copy between the stages stays outside the graphs).
+    fn capture_stages(
+        &mut self,
+        t: usize,
+        verify: bool,
+        nchunk: usize,
+        nseg: usize,
+    ) -> Result<()> {
+        let key = (t, verify, nchunk, nseg, self.greedy.get());
+        let me = self as *const Self;
+        {
+            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            let g0 = Graph::capture(&stream, |_| {
+                // SAFETY: `self` is not otherwise touched during capture.
+                unsafe { &*me }
+                    .enqueue_stage(0, t, verify, nchunk, nseg)
+                    .map_err(|e| tang_moe::gpu::Error(format!("{e}")))
+            })
+            .map_err(|e| anyhow!("capture T={t} stage 0: {e}"))?;
+            self.graphs.insert(key.clone(), g0);
+        }
+        {
+            let p = self.peer.as_ref().expect("no peer");
+            p.ctx.gpu.bind().map_err(|e| anyhow!("{e}"))?;
+            let me = self as *const Self;
+            let g1 = Graph::capture(&p.ctx.stream, |_| {
+                // SAFETY: `self` is not otherwise touched during capture.
+                unsafe { &*me }
+                    .enqueue_stage(1, t, verify, nchunk, nseg)
+                    .map_err(|e| tang_moe::gpu::Error(format!("{e}")))
+            })
+            .map_err(|e| anyhow!("capture T={t} stage 1: {e}"))?;
+            self.peer.as_mut().unwrap().graphs.insert(key, g1);
+        }
+        self.gpu.bind().map_err(|e| anyhow!("{e}"))?;
+        Ok(())
+    }
+
+    /// Stage `w`'s half of a window (graph capture): its layers, and — for the last stage —
+    /// the head and the MTP input copy. `enqueue_window` is the both-stages version.
+    fn enqueue_stage(
+        &self,
+        w: usize,
+        t: usize,
+        verify: bool,
+        nchunk: usize,
+        nseg: usize,
+    ) -> Result<()> {
+        if w == 0 {
+            self.enqueue_inputs(t);
+            self.norm_q8(0, None, &self.layers[0].attn_norm, t);
+        }
+        let last_stage = self.n_stages() - 1;
+        let v = self.stage_view(w);
+        for l in 0..v.layers.len() {
+            let layer = &v.layers[l];
+            self.enqueue_mixer(w, l, t, verify, nchunk, nseg);
+            self.norm_q8(w, Some(v.dev.buffer_addr(&v.s.mix)), &layer.post_norm, t);
+            let next = if l + 1 < v.layers.len() {
+                &v.layers[l + 1].attn_norm
+            } else if w + 1 < self.n_stages() {
+                &self.stage_view(w + 1).layers[0].attn_norm
+            } else {
+                &self.peer.as_ref().expect("split").out_norm
+            };
+            self.enqueue_moe(w, l, t, next, false);
+        }
+        if w == last_stage {
+            self.enqueue_head(t);
+            // The MTP input copy is *not* here: a capture on one device cannot order the
+            // other device's work, and with a split `m.mh` (GPU 0) reads GPU 1's `x`. The
+            // eager `enqueue_window` enqueues it with its own stream ordering; the graph
+            // path (`run_staged`) does it between the two launches.
+        }
+        Ok(())
+    }
+
+    /// The MTP input copy for a window whose head ran on the last stage: `m.mh ← x_last`.
+    /// Eager, ordered after GPU 1's work (`enqueue_window` calls it; the graph path calls
+    /// it between the stage launches). With no split it's a plain kcopy on GPU 0.
+    fn enqueue_mtp_in(&self, t: usize) -> Result<()> {
+        let Some(m) = &self.mtp else {
+            return Ok(());
+        };
+        let last = self.n_stages() - 1;
+        let v = self.stage_view(last);
+        let n = self.hp.n_embd;
+        if last == 0 {
+            self.kcopy_on(
+                0,
+                self.dev.buffer_addr(&m.mh),
+                self.dev.buffer_addr(&v.s.x),
+                t * n * 4,
+            );
+            return Ok(());
+        }
+        let done = gpu::Event::new(false).expect("event");
+        done.record(v.stream).expect("record");
+        self.stream.wait(&done).expect("wait");
+        let r = unsafe {
+            cudarc::driver::sys::cuMemcpyPeerAsync(
+                self.dev.buffer_addr(&m.mh),
+                self.dev.cuda_context().cu_ctx(),
+                v.dev.buffer_addr(&v.s.x),
+                v.dev.cuda_context().cu_ctx(),
+                t * n * 4,
+                self.stream.0,
+            )
+        };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow!("mtp boundary copy: {r:?}"));
+        }
+        Ok(())
     }
 
     fn finish(&mut self, mut st: WinStats, w0: Instant, ids: Vec<u32>) -> Vec<u32> {
@@ -3003,35 +3789,88 @@ impl Coder {
         let c = self.io.u32s(Io::CCTL, 2);
         c[0] = 0;
         c[1] = n_keep as u32;
+        if let Some(p) = self.peer.as_deref_mut() {
+            // The commit replays the same window segment on both devices.
+            let pc = p.io.u32s(Io::CCTL, 2);
+            let (a, b) = (c[0], c[1]);
+            pc[0] = a;
+            pc[1] = b;
+        }
         if !self.use_graphs {
             self.enqueue_commit(t);
             return Ok(());
         }
         if self.commit_graphs[t].is_none() {
             self.enqueue_commit(t);
-            self.dev.sync();
-            let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+            self.sync_all();
+            if self.peer.is_none() {
+                let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+                let me = self as *const Self;
+                let gr = Graph::capture(&stream, |_| {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }.enqueue_commit(t);
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("capture commit T={t}: {e}"))?;
+                self.commit_graphs[t] = Some(gr);
+                return Ok(());
+            }
+            // A split: capture each stage's commit on its own device.
             let me = self as *const Self;
-            let gr = Graph::capture(&stream, |_| {
+            {
+                let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
+                let g0 = Graph::capture(&stream, |_| {
+                    // SAFETY: `self` is not otherwise touched during capture.
+                    unsafe { &*me }.enqueue_commit_stage(0, t);
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("capture commit T={t} stage 0: {e}"))?;
+                self.commit_graphs[t] = Some(g0);
+            }
+            let peer = self.peer.as_mut().expect("no peer");
+            peer.ctx.gpu.bind().map_err(|e| anyhow!("{e}"))?;
+            let g1 = Graph::capture(&peer.ctx.stream, |_| {
                 // SAFETY: `self` is not otherwise touched during capture.
-                unsafe { &*me }.enqueue_commit(t);
+                unsafe { &*me }.enqueue_commit_stage(1, t);
                 Ok(())
             })
-            .map_err(|e| anyhow!("capture commit T={t}: {e}"))?;
-            self.commit_graphs[t] = Some(gr);
+            .map_err(|e| anyhow!("capture commit T={t} stage 1: {e}"))?;
+            self.peer.as_mut().unwrap().commit_graphs[t] = Some(g1);
+            self.gpu.bind().map_err(|e| anyhow!("{e}"))?;
             return Ok(());
         }
         self.commit_graphs[t]
             .as_ref()
             .unwrap()
             .launch(&self.stream)
-            .map_err(|e| anyhow!("{e}"))
+            .map_err(|e| anyhow!("{e}"))?;
+        if let Some(peer) = self.peer.as_ref() {
+            peer.commit_graphs[t]
+                .as_ref()
+                .expect("peer commit graph")
+                .launch(&peer.ctx.stream)
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Stage `w`'s half of a commit (graph capture): CCTL in, then its GDN layers' replay.
+    fn enqueue_commit_stage(&self, w: usize, t: usize) {
+        let v = self.stage_view(w);
+        self.kcopy_on(w, v.dev.buffer_addr(&v.s.ctl), self.io_dev_on(w, Io::CCTL), 32);
+        for layer in v.layers {
+            if let Some(g) = &layer.gdn {
+                self.gdn_step(w, g, layer.w_in.rows, t, true);
+                self.gdn_commit(w, g, layer.w_in.rows, t);
+            }
+        }
     }
 
     /// Download the last window's logits (`[t][vocab]`).
     pub fn logits(&self, t: usize) -> Vec<f32> {
         let v = self.hp.n_vocab;
-        self.dev.download(&self.s.head)[..t * v].to_vec()
+        let last = self.stage_view(self.n_stages() - 1);
+        last.dev.download(&last.s.head)[..t * v].to_vec()
     }
 
     /// Feed `ids` as a prompt (windows of up to `MAX_T`), then return the next token.
@@ -3124,6 +3963,7 @@ impl Coder {
     /// (stage, µs a step, bytes a step), the whole window first. Run after a decode (the
     /// routing buffers then hold real expert ids).
     pub fn stage_sweep(&mut self) -> Result<Vec<(&'static str, f64, f64)>> {
+        ensure!(self.peer.is_none(), "stage_sweep is single-GPU (TANG_GPUS=1)");
         ensure!(!self.tokens.is_empty(), "decode something first");
         let pos0 = self.tokens.len() - 1;
         self.stage(pos0, 1)?;
@@ -3283,6 +4123,153 @@ impl Coder {
         }
         b + dense_bytes(&self.head)
     }
+}
+
+/// Every layer's expert-weight bytes (the part of a layer that can land on either GPU; the
+/// router/norm/attention weights are uniform enough across layers not to matter, and the
+/// K/V + GDN state is allocated on whichever device owns the layer either way).
+fn layer_vram(g: &Gguf, hp: &Hparams) -> Vec<usize> {
+    (0..hp.n_layer)
+        .map(|l| {
+            let pre = format!("blk.{l}.");
+            ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                .iter()
+                .map(|t| {
+                    g.get(&format!("{pre}{t}.weight"))
+                        .map_or(0, |t| t.nbytes as usize)
+                })
+                .sum::<usize>()
+        })
+        .collect()
+}
+
+/// The first layer of GPU 1 in a `TANG_GPUS=2` load: `TANG_SPLIT_AT` overrides; otherwise
+/// the cut that best balances the two devices' weight bytes (the embedding and head, which
+/// stay on GPU 0, are a rounding error next to the experts).
+fn split_point(g: &Gguf, hp: &Hparams) -> usize {
+    let cap = hp.n_layer.saturating_sub(1);
+    if let Ok(k) = std::env::var("TANG_SPLIT_AT") {
+        return k.parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("TANG_SPLIT_AT: a layer index; using the balanced split");
+            balanced(g, hp)
+        }).min(cap);
+    }
+    balanced(g, hp).min(cap)
+}
+
+/// The layer index whose prefix of weight bytes is closest to half the total (ties: the
+/// smaller side; `n_layer / 2` when the tensor table can't be read).
+fn balanced(g: &Gguf, hp: &Hparams) -> usize {
+    let bytes = layer_vram(g, hp);
+    let total: usize = bytes.iter().sum();
+    let (mut best, mut best_err) = (hp.n_layer / 2, usize::MAX);
+    for k in 0..bytes.len() {
+        let a: usize = bytes[..=k].iter().sum();
+        let err = a.abs_diff(total / 2);
+        if err < best_err {
+            (best, best_err) = (k, err);
+        }
+    }
+    best + 1 // layers [0, best] on GPU 0
+}
+
+/// GPU 1's half of a two-GPU load: layers `[split_at, L)` with their own kernels, scratch,
+/// pinned staging, side stream, the output norm, head, rope, and (when requested) the MTP
+/// parts. Returns the peer, the layer split, and its share of the load report.
+#[allow(clippy::too_many_arguments)]
+fn build_peer(
+    g: &Gguf,
+    gpu0: &Gpu,
+    hp: &Hparams,
+    geo: &Geometry,
+    sh: &Shapes,
+    max_ctx: usize,
+    mtp_path: &Option<std::path::PathBuf>,
+    split: usize,
+    ba_perm: &[usize],
+) -> Result<(Box<Peer>, String)> {
+    let split_at = split;
+    let ctx = super::split::Ctx::for_device(1)?;
+    let peer_ok = ctx
+        .enable_peer(gpu0)
+        .map_err(|e| anyhow!("peer access: {e}"))?;
+    if !peer_ok {
+        eprintln!("coder: GPU 1 has no peer access; boundary copies stage through host");
+    }
+    let (free0, _) = ctx
+        .gpu
+        .mem_info()
+        .map_err(|e| anyhow!("GPU 1: {e}"))?;
+    let dev = CudaComputeDevice::on(1).map_err(|e| anyhow!("GPU 1: {e:?}"))?;
+    let mut layers = Vec::with_capacity(hp.n_layer - split_at);
+    for l in split_at..hp.n_layer {
+        layers.push(load_layer(
+            &dev,
+            g,
+            hp,
+            geo,
+            &format!("blk.{l}."),
+            hp.is_recurrent[l],
+            ba_perm,
+            max_ctx,
+        )?);
+    }
+    let ff_sh = hp.n_ff_exp;
+    let kmax = [2 * hp.n_embd, geo.gdn_v(), hp.n_head * hp.head_dim, ff_sh]
+        .into_iter()
+        .max()
+        .unwrap();
+    let s = Scratch::new(&dev, hp, geo, kmax, max_ctx, MAX_T, MAX_T);
+    let k = Kern::build_on(&ctx.gpu, sh, geo, MAX_T)?;
+    let head_name = if g.get("output.weight").is_some() {
+        "output.weight"
+    } else {
+        "token_embd.weight"
+    };
+    let head = upload_dense(&dev, g, &[(g.info(head_name)?.clone(), None)])?;
+    let out_norm = dev.upload_f32(&g.tensor_f32("output_norm.weight")?);
+    let rope = {
+        let (c, s) = fl::rope_table(max_ctx, hp.rope_base as f64);
+        (dev.upload_f32(&c), dev.upload_f32(&s))
+    };
+    let mut io = Io {
+        arena: HostArena::new(
+            Io::bytes(hp.n_embd, MAX_T),
+            ArenaOptions {
+                try_hugetlb: false,
+                thp: false,
+            },
+        )?,
+    };
+    io.arena.register(&ctx.gpu.ctx, &[]).map_err(|e| anyhow!("{e}"))?;
+    dev.sync();
+    let (free1, _) = ctx.gpu.mem_info()?;
+    let spent = (free0 - free1) as f64 / 1e9;
+    let _ = mtp_path; // the MTP layer stays on GPU 0 (it reads GPU 0's pinned staging)
+    let report = format!(
+        "; GPU 1: layers {split_at}..{} ({:.1} GB), peer split at {split_at}",
+        hp.n_layer,
+        spent,
+    );
+    let peer = Peer {
+        dev,
+        ctx,
+        layers,
+        out_norm,
+        head,
+        rope,
+        s,
+        io,
+        k,
+        side: Stream::new().map_err(|e| anyhow!("{e}"))?,
+        ev_fork: gpu::Event::new(false).map_err(|e| anyhow!("{e}"))?,
+        ev_join: gpu::Event::new(false).map_err(|e| anyhow!("{e}"))?,
+        wide: None,
+        graphs: HashMap::new(),
+        commit_graphs: (0..=MAX_T).map(|_| None).collect(),
+        slots: (0..MAX_SLOTS).map(|_| None).collect(),
+    };
+    Ok((Box::new(peer), report))
 }
 
 /// One decoder layer's weights and state buffers from `g`, its tensors named `{pre}…` (a GDN
@@ -3612,11 +4599,33 @@ impl Coder {
 
     /// Slot `slot`'s recurrent state (after its tokens), to resume it later in any slot.
     pub fn save_running_at(&mut self, slot: usize) -> Result<super::engine::RunningState> {
-        self.dev.sync();
+        self.sync_all();
         let mut parts = Vec::new();
         for (st, hist) in self.running_bufs(slot)? {
             parts.push(self.dev.download(st));
             parts.push(self.dev.download(hist));
+        }
+        if let Some(p) = self.peer.as_deref_mut() {
+            let bufs: Vec<(&B, &B)> = if slot == 0 {
+                p.layers
+                    .iter()
+                    .filter_map(|l| l.gdn.as_ref())
+                    .map(|g| (&g.state, &g.hist))
+                    .collect()
+            } else {
+                p.slots[slot]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?
+                    .0
+                    .iter()
+                    .filter_map(|x| x.as_ref())
+                    .map(|(a, b)| (a, b))
+                    .collect()
+            };
+            for (st, hist) in bufs {
+                parts.push(p.dev.download(st));
+                parts.push(p.dev.download(hist));
+            }
         }
         let n = parts.len() / 2;
         parts.push(Vec::new());
@@ -3651,15 +4660,49 @@ impl Coder {
             .into_iter()
             .map(|(a, b)| (self.a(a), self.a(b)))
             .collect();
+        // A saved state covers both stages' GDN layers (GPU 0's first, GPU 1's after).
+        let total_gdn = bufs.len()
+            + self.peer.as_ref().map_or(0, |p| {
+                p.layers.iter().filter(|l| l.gdn.is_some()).count()
+            });
         ensure!(
-            s.gdn_layers() == bufs.len() && parts.len() == 2 * bufs.len() + 1,
+            s.gdn_layers() == total_gdn && parts.len() == 2 * total_gdn + 1,
             "state is for another model"
         );
+        let n0 = bufs.len();
         self.dev.sync();
         for (i, (st, hist)) in bufs.into_iter().enumerate() {
             for (addr, host) in [(st, parts[2 * i]), (hist, parts[2 * i + 1])] {
                 htod(addr, bytemuck_f32(host))?;
             }
+        }
+        if let Some(p) = self.peer.as_deref_mut() {
+            let bufs1: Vec<(&B, &B)> = if slot == 0 {
+                p.layers
+                    .iter()
+                    .filter_map(|l| l.gdn.as_ref())
+                    .map(|g| (&g.state, &g.hist))
+                    .collect()
+            } else {
+                p.slots[slot]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?
+                    .0
+                    .iter()
+                    .filter_map(|x| x.as_ref())
+                    .map(|(a, b)| (a, b))
+                    .collect()
+            };
+            for (i, (st, hist)) in bufs1.into_iter().enumerate() {
+                let (a, b) = (p.dev.buffer_addr(st), p.dev.buffer_addr(hist));
+                for (addr, host) in [
+                    (a, parts[2 * (n0 + i)]),
+                    (b, parts[2 * (n0 + i) + 1]),
+                ] {
+                    htod(addr, bytemuck_f32(host))?;
+                }
+            }
+            p.ctx.sync().expect("GPU 1 sync");
         }
         self.dev.sync();
         let toks = self.slot_tokens_mut(slot)?;
@@ -3706,7 +4749,7 @@ impl Coder {
         to: usize,
     ) -> Result<super::engine::Positional> {
         ensure!(from <= to && to <= self.max_ctx);
-        self.dev.sync();
+        self.sync_all();
         let mut bufs = Vec::new();
         for (addr, row) in self.positional_bufs_at(slot)? {
             let mut host = vec![0u8; (to - from) * row];
@@ -3725,6 +4768,45 @@ impl Coder {
             }
             bufs.push(host);
         }
+        if let Some(p) = self.peer.as_deref_mut() {
+            let row = self.hp.n_head_kv * self.hp.head_dim * 2;
+            let bufs1: Vec<(&B, &B)> = if slot == 0 {
+                p.layers
+                    .iter()
+                    .filter_map(|l| l.attn.as_ref())
+                    .flat_map(|a| [(&a.k, &a.v)])
+                    .collect()
+            } else {
+                p.slots[slot]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?
+                    .1
+                    .iter()
+                    .filter_map(|x| x.as_ref())
+                    .flat_map(|(k, v)| [(k, v)])
+                    .collect()
+            };
+            for (k, v) in bufs1 {
+                for b in [k, v] {
+                    let addr = p.dev.buffer_addr(b);
+                    let mut host = vec![0u8; (to - from) * row];
+                    if !host.is_empty() {
+                        let r = unsafe {
+                            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                                host.as_mut_ptr() as *mut _,
+                                addr + (from * row) as u64,
+                                host.len(),
+                            )
+                        };
+                        ensure!(
+                            r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                            "cuMemcpyDtoH: {r:?}"
+                        );
+                    }
+                    bufs.push(host);
+                }
+            }
+        }
         Ok(super::engine::Positional::from_parts(from, to, bufs))
     }
 
@@ -3741,13 +4823,32 @@ impl Coder {
         from: usize,
     ) -> Result<()> {
         let bufs = self.positional_bufs_at(slot)?;
+        // GPU 0's K/V first, then GPU 1's (the order `save_positional_at` wrote).
+        let mut n0 = bufs.len();
+        if let Some(p) = self.peer.as_ref() {
+            n0 += if slot == 0 {
+                2 * p.layers.iter().filter(|l| l.attn.is_some()).count()
+            } else {
+                p.slots[slot]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?
+                    .1
+                    .iter()
+                    .filter(|x| x.is_some())
+                    .count()
+                    * 2
+            };
+        }
         ensure!(
-            bufs.len() == p.parts().len(),
+            n0 == p.parts().len(),
             "positional state is for another model"
         );
-        self.dev.sync();
+        self.sync_all();
         let from = from.max(p.from);
-        for ((addr, row), host) in bufs.into_iter().zip(p.parts()) {
+        let parts = p.parts();
+        let mut i = 0;
+        for ((addr, row), host) in bufs.into_iter().zip(parts) {
+            i += 1;
             ensure!(
                 host.len() == (p.to - p.from) * row,
                 "positional state size differs"
@@ -3759,12 +4860,56 @@ impl Coder {
                 )?;
             }
         }
+        if let Some(peer) = self.peer.as_deref_mut() {
+            let row = self.hp.n_head_kv * self.hp.head_dim * 2;
+            let bufs1: Vec<(&B, &B)> = if slot == 0 {
+                peer.layers
+                    .iter()
+                    .filter_map(|l| l.attn.as_ref())
+                    .flat_map(|a| [(&a.k, &a.v)])
+                    .collect()
+            } else {
+                peer.slots[slot]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("slot {slot} isn't allocated"))?
+                    .1
+                    .iter()
+                    .filter_map(|x| x.as_ref())
+                    .flat_map(|(k, v)| [(k, v)])
+                    .collect()
+            };
+            for (k, v) in bufs1 {
+                for b in [k, v] {
+                    let addr = peer.dev.buffer_addr(b);
+                    let host = &parts[i];
+                    i += 1;
+                    ensure!(
+                        host.len() == (p.to - p.from) * row,
+                        "positional state size differs"
+                    );
+                    if p.to > from {
+                        htod(
+                            addr + (from * row) as u64,
+                            &host[(from - p.from) * row..(p.to - p.from) * row],
+                        )?;
+                    }
+                }
+            }
+            peer.ctx.sync().expect("GPU 1 sync");
+        }
         Ok(())
     }
 
     /// Sample in the head with top-k / top-p / a presence penalty (`flash::sampler`) instead of
     /// the Gumbel-max over the whole vocabulary. Window graphs are recaptured.
     pub fn enable_sampler(&mut self) -> Result<()> {
+        if self.peer.is_some() {
+            // The sampler's kernels are compiled on GPU 0's context; on a split the head
+            // runs on GPU 1, where those handles are invalid. Sampling stays greedy until
+            // the sampler is per-stage; generation is otherwise unaffected.
+            eprintln!("coder: sampling with TANG_GPUS=2 stays greedy for now");
+            return Ok(());
+        }
         if self.sampler.is_none() {
             self.sampler = Some(Box::new(super::sampler::Sampler::new(
                 &self.gpu,

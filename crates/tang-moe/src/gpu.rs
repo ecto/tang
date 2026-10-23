@@ -52,7 +52,13 @@ pub struct Gpu {
 impl Gpu {
     /// Device 0's primary context. Errors (instead of panicking) when there is no driver.
     pub fn new() -> Result<Self> {
-        let ctx = std::panic::catch_unwind(|| CudaContext::new(0))
+        Gpu::at(0)
+    }
+
+    /// Device `ordinal`'s primary context (device 0 for [`Gpu::new`]). Errors (instead of
+    /// panicking) when there is no driver, or no such device.
+    pub fn at(ordinal: usize) -> Result<Self> {
+        let ctx = std::panic::catch_unwind(|| CudaContext::new(ordinal))
             .map_err(|_| Error("no CUDA driver".into()))??;
         Ok(Gpu { ctx })
     }

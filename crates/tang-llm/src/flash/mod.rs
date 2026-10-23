@@ -29,6 +29,8 @@ pub mod requant;
 pub mod sampler;
 #[cfg(feature = "cuda")]
 pub mod serve;
+#[cfg(feature = "cuda")]
+pub mod split;
 pub mod tokenize;
 
 use crate::gguf::{Gguf, TensorInfo};
