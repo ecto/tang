@@ -33,7 +33,7 @@ DUMP_FORMAT (little-endian f32 .bin + sidecar .json {"shape": [...]}), row-major
   final.bin      [T, H]        after final norm + stream mean (hc_head)
   logits.bin     [T, V]        lm_head output (seq1 only)
   meta.json      lengths + token ids
-seq1 = 64-token prompt; seq2 = 2052 tokens (>2048 so the indexer top-16/kpool-4 actually
+seq1 = 52-token prompt; seq2 = 2052 tokens (>2048 so the indexer top-16/kpool-4 actually
 drops keys; dumps layerB{i}_seq2.bin for the second sequence).
 """
 import argparse
@@ -134,6 +134,26 @@ def _init_tiny(model):
                 p.normal_(0.0, 0.3)  # noaux_tc bias: nonzero so selection != weighting
             elif name.endswith("index_kpool_compress_ape"):
                 p.normal_(0.0, 0.2)
+            elif name.endswith("index_kpool_compress_gate"):
+                # bias the pool gate positive so pooled softmax picks well-spread pools;
+                # together with the positive-score bias below this keeps indexer scores
+                # away from the relu floor (exact 0.0 ties break torch.topk tie order)
+                p.normal_(0.5, 0.2)
+            elif name.endswith("indexer.wk.weight"):
+                # indexer keys: larger-than-default scale so q·k pooled scores spread
+                # well clear of the relu floor (exact 0.0 scores tie in topk)
+                p.normal_(0.0, 0.5)
+            elif name.endswith("indexer.wq_b.weight"):
+                # pool keys are a single shared head, so pairing query heads as
+                # (h, -h) guarantees one of each pair has q·k > 0: every pool gets a
+                # nonzero relu'd score, so no exact-0.0 ties at the top-k boundary
+                p.normal_(0.0, 0.5)
+                w = p.view(TINY["index_n_heads"], TINY["index_head_dim"], -1)
+                w[1::2] = -w[0::2]
+            elif name.endswith("indexer.weights_proj"):
+                # per-head indexer weights: positive mean so pooled scores are mostly
+                # positive after relu (exact-zero scores create top-k ties)
+                p.normal_(0.3, 0.2)
             elif name.endswith(("hc_attn_base", "hc_ffn_base")):
                 p.normal_(0.0, 0.2)
             elif "conv1d" in name:
@@ -230,6 +250,84 @@ def dump(path_stem, t):
         json.dump({"shape": list(t.shape)}, f)
 
 
+def assert_indexer_tie_free(model, ids, name, min_margin=1e-4):
+    """For every query position of every DSA layer, the top-k boundary pool score must
+    strictly beat the next-best rejected one (margin >= min_margin).
+
+    Exact-tie (or near-tie) boundary scores make torch.topk's tie order (upper-index-first
+    on equal values) differ from tang's lower-index-first, which is a fixture bug, not a
+    port bug. Random init can put many pool scores exactly at the relu floor (0.0); the
+    _init_tiny biases (`indexer.weights_proj` mean +0.3, `index_kpool_compress_gate`
+    mean +0.5) keep scores mostly positive and spread. This assert runs during fixture
+    generation so the committed fixture is provably tie-free.
+    """
+    captured = {}
+
+    indexer_layers = [
+        (i, layer.self_attn.indexer)
+        for i, layer in enumerate(model.model.language_model.layers)
+        if getattr(getattr(layer, "self_attn", None), "indexer", None) is not None
+    ]
+    assert indexer_layers, "no full DSA indexer layers found"
+
+    orig_topk = torch.Tensor.topk
+
+    def spy_topk(self, k, *args, **kwargs):
+        captured.setdefault("scores", []).append(self.detach().float().cpu())
+        return orig_topk(self, k, *args, **kwargs)
+
+    torch.Tensor.topk = spy_topk
+    try:
+        with torch.no_grad():
+            model(input_ids=torch.tensor([ids]))
+    finally:
+        torch.Tensor.topk = orig_topk
+
+    # the indexer selects with the Tensor.topk method (index_scores.topk(select_k)); the
+    # MoE router uses torch.topk — spy the method and keep only indexer-shaped calls
+    # ([B, S, P] pools with select_k = index_topk // index_kpool)
+    select_k = TINY["index_topk"] // TINY["index_kpool"]
+    scores = [s for s in captured["scores"] if s.dim() == 3 and s.shape[-1] >= select_k
+              and s.shape[0] == 1]
+    assert scores, f"{name}: no indexer topk calls captured"
+
+    k = select_k
+    # masked (non-visible) pools are filled with finfo.min; a row whose k-th or (k+1)-th
+    # score is masked has <= k visible pools, so every visible pool is selected and the
+    # tie order among masked fills is irrelevant (they become -1). Only boundaries
+    # between two VALID pool scores can flip the selected set.
+    masked = torch.finfo(torch.float32).min / 2
+    worst = float("inf")
+    worst_at = None
+    n_rows = 0
+    n_zero_valid = 0
+    for si, s in enumerate(scores):
+        s2 = s[0].float()  # [S, P]
+        if s2.shape[-1] <= k:
+            continue
+        top = torch.topk(s2, k + 1, dim=-1).values
+        boundary, next_best = top[:, k - 1], top[:, k]
+        live = next_best > masked  # > k valid pools: a real selection boundary
+        n_rows += int(live.sum())
+        n_zero_valid += int(((s2 == 0) & (s2 > masked)).sum())
+        if not live.any():
+            continue
+        m = (boundary - next_best)[live]
+        if m.min().item() < worst:
+            worst = m.min().item()
+            worst_at = (si, int(live.nonzero()[m.argmin()].item()))
+            worst_rel = worst / max(abs(boundary[live][m.argmin()].item()), 1e-30)
+    assert n_rows > 0, f"{name}: no query row has more than {k} visible pools"
+    assert worst >= min_margin, (
+        f"{name}: indexer top-k boundary tie — min margin {worst:.3e} at call "
+        f"{worst_at[0]} pos {worst_at[1]} (< {min_margin:g}); strengthen the indexer "
+        f"init in _init_tiny")
+    print(f"{name}: indexer tie-free over {n_rows} boundary rows, min margin "
+          f"{worst:.4e} (>= {min_margin:g}) at pos {worst_at[1]}, relative {worst_rel:.2e}; "
+          f"exact-0.0 valid scores: {n_zero_valid}")
+    return worst, n_rows
+
+
 def run_and_dump(model, ids, ref_dir, suffix=""):
     """One fp32 forward; returns (logits, per-block mHC stream outputs, final hidden)."""
     n_layers = model.config.text_config.num_hidden_layers
@@ -280,6 +378,9 @@ def main():
     ids1 = tok(PROMPT)["input_ids"]
     ids2 = [(i * 7 + 3) % 150000 + 20 for i in range(2052)]
     print(f"seq1 {len(ids1)} tokens; seq2 {len(ids2)} tokens")
+
+    assert_indexer_tie_free(model, ids1, "seq1")
+    assert_indexer_tie_free(model, ids2, "seq2")
 
     with torch.no_grad():
         emb = model.model.language_model.embed_tokens(torch.tensor([ids1]))
