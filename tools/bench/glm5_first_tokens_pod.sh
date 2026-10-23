@@ -13,7 +13,8 @@ die_pod(){ log "TERMINATE: $1"
   sleep 600; exit 0; }
 ( sleep $((HARD_MIN*60)); die_pod "hard deadline ${HARD_MIN}m" ) &
 log "pod $RUNPOD_POD_ID; self-terminate auth: $(gql "query { pod(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) { id } }" | head -c 120)"
-(cd "$R" && nohup python3 -m http.server 8001 >/dev/null 2>&1 &) 2>/dev/null
+nohup python3 -m http.server 8001 --directory "$R" >/dev/null 2>&1 &
+log "results server: $(curl -s -m 5 localhost:8001/ | head -c 80)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git build-essential pkg-config python3 python3-venv rsync >/dev/null 2>&1 || die_pod "apt failed"
