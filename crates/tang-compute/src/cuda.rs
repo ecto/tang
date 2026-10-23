@@ -255,6 +255,40 @@ pub fn cuda_memory_info() -> Result<(String, usize, usize), cudarc::driver::Driv
 }
 
 impl CudaComputeDevice {
+    /// Create a CUDA device on `ordinal` (the default [`CudaComputeDevice::new`] is 0).
+    pub fn on(ordinal: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let ctx = CudaContext::new(ordinal)?;
+        // Single-stream: disable event tracking to avoid per-op cuEventRecord overhead
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+        // Use non-blocking stream to support CUDA graph capture
+        let stream = ctx.new_stream()?;
+        let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
+        if std::env::var("GAIA_TF32")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            unsafe {
+                cudarc::cublas::sys::cublasSetMathMode(
+                    *cublas.handle(),
+                    cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+                );
+            }
+        }
+        Ok(CudaComputeDevice {
+            ctx,
+            stream,
+            cublas,
+            module_cache: RefCell::new(HashMap::new()),
+            mixed_precision: false,
+            pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
+            flash_src: RefCell::new(None),
+        })
+    }
+
     /// Create a new CUDA device (ordinal 0), f32 precision.
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
         let ctx = CudaContext::new(0)?;
