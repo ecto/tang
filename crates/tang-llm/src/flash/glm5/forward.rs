@@ -204,16 +204,28 @@ impl Glm5Ref {
         //      the pieces this file owns still run (norms, dense FFN, plumbing, dumps).
         //      The `todo!()` arms make the rest of the loop dead to the compiler; the allows
         //      go away as each component lands.
-        #[allow(unused_variables, unreachable_code)]
         for l in 0..hp.n_layer {
             let lt = std::time::Instant::now();
-            // --- attention half
-            let x = self.mhc_pre_attn(l, &r, t_len)?;
-            let x = {
-                let mut x = x;
-                self.norm_all(&mut x, l, "attn_norm.weight")?;
-                x
+            // --- attention half. W2's mHC is per token over [hc][n] stream slices.
+            let mhp = super::mhc::MhcHparams {
+                streams: hc,
+                sinkhorn_iters: hp.hc_sinkhorn_iters as u32,
+                hc_eps: hp.hc_eps,
+                rms_eps: hp.eps,
             };
+            let w_attn =
+                super::mhc::MhcWeights::from_gguf(&self.g, l, "hc_attn", n, &mhp)?;
+            let mut mixes: Vec<super::mhc::Mix> = Vec::with_capacity(t_len);
+            let mut x = vec![0f32; t_len * n];
+            for t in 0..t_len {
+                let streams: Vec<&[f32]> = (0..hc)
+                    .map(|c| &r[(t * hc + c) * n..(t * hc + c + 1) * n])
+                    .collect();
+                let mix = super::mhc::mhc_pre(&w_attn, &streams)?;
+                x[t * n..(t + 1) * n].copy_from_slice(&mix.x);
+                mixes.push(mix);
+            }
+            self.norm_all(&mut x, l, "attn_norm.weight")?;
             let y: Vec<f32> = if hp.is_kda[l] {
                 todo!("kda mixer: W4 (frog/glm5-kda) has not landed yet")
             } else {
@@ -272,8 +284,16 @@ impl Glm5Ref {
                 out
             };
             dput(&format!("L{l:02}.hc_attn_out"), &[n], &y[last * n..]);
-            let r_mid = r.clone();
-            self.mhc_post(l, &mut r, &y, &r_mid, t_len)?;
+            let r_in = r.clone();
+            for t in 0..t_len {
+                let streams: Vec<&[f32]> = (0..hc)
+                    .map(|c| &r_in[(t * hc + c) * n..(t * hc + c + 1) * n])
+                    .collect();
+                let (tok, _) = r.split_at_mut((t + 1) * hc * n);
+                let token = &mut tok[t * hc * n..];
+                let mut outs: Vec<&mut [f32]> = token.chunks_mut(n).collect();
+                super::mhc::mhc_post(&mixes[t], &y[t * n..(t + 1) * n], &streams, &mut outs)?;
+            }
             dput(
                 &format!("L{l:02}.post_attn"),
                 &[hc, n],
@@ -281,8 +301,17 @@ impl Glm5Ref {
             );
 
             // --- FFN half
-            let x = self.mhc_pre_ffn(l, &r, t_len)?;
-            let mut x = x;
+            let w_ffn = super::mhc::MhcWeights::from_gguf(&self.g, l, "hc_ffn", n, &mhp)?;
+            let mut mixes: Vec<super::mhc::Mix> = Vec::with_capacity(t_len);
+            let mut x = vec![0f32; t_len * n];
+            for t in 0..t_len {
+                let streams: Vec<&[f32]> = (0..hc)
+                    .map(|c| &r[(t * hc + c) * n..(t * hc + c + 1) * n])
+                    .collect();
+                let mix = super::mhc::mhc_pre(&w_ffn, &streams)?;
+                x[t * n..(t + 1) * n].copy_from_slice(&mix.x);
+                mixes.push(mix);
+            }
             self.norm_all(&mut x, l, "ffn_norm.weight")?;
             let y: Vec<f32> = if hp.is_dense(l) {
                 self.dense_ffn(l, &x, t_len)?
@@ -292,8 +321,16 @@ impl Glm5Ref {
                 super::moe::moe_layer(&p, &x, t_len)
             };
             dput(&format!("L{l:02}.ffn_out"), &[n], &y[last * n..]);
-            let r_mid = r.clone();
-            self.mhc_post(l, &mut r, &y, &r_mid, t_len)?;
+            let r_in = r.clone();
+            for t in 0..t_len {
+                let streams: Vec<&[f32]> = (0..hc)
+                    .map(|c| &r_in[(t * hc + c) * n..(t * hc + c + 1) * n])
+                    .collect();
+                let (tok, _) = r.split_at_mut((t + 1) * hc * n);
+                let token = &mut tok[t * hc * n..];
+                let mut outs: Vec<&mut [f32]> = token.chunks_mut(n).collect();
+                super::mhc::mhc_post(&mixes[t], &y[t * n..(t + 1) * n], &streams, &mut outs)?;
+            }
             dput(
                 &format!("L{l:02}.post_ffn"),
                 &[hc, n],
@@ -396,35 +433,6 @@ impl Glm5Ref {
         })
     }
 
-    // ---------------------------------------------------------------------
-    // mHC plumbing: until W2 lands, the pre/post combinatorics live behind
-    // these two thin wrappers so W2 can replace them in one place.
-    // ---------------------------------------------------------------------
-
-    /// `hc_pre` for the attention half. W2 owns the real implementation; the stream
-    /// *bookkeeping* (the `[t][hc][n]` layout and the flattened norm) is fixed here.
-    fn mhc_pre_attn(&self, l: usize, r: &[f32], t_len: usize) -> Result<Vec<f32>> {
-        self.mhc_pre(l, r, t_len, "hc_attn_")
-    }
-
-    fn mhc_pre_ffn(&self, l: usize, r: &[f32], t_len: usize) -> Result<Vec<f32>> {
-        self.mhc_pre(l, r, t_len, "hc_ffn_")
-    }
-
-    fn mhc_pre(&self, _l: usize, _r: &[f32], _t_len: usize, _prefix: &str) -> Result<Vec<f32>> {
-        todo!("mhc_pre: W2 (frog/glm5-mhc) has not landed yet")
-    }
-
-    fn mhc_post(
-        &self,
-        _l: usize,
-        _r: &mut [f32],
-        _y: &[f32],
-        _residual: &[f32],
-        _t_len: usize,
-    ) -> Result<()> {
-        todo!("mhc_post: W2 (frog/glm5-mhc) has not landed yet")
-    }
 }
 
 /// The top-k next-token log-probs of one position's logits (f64, ties to the lower id).

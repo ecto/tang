@@ -238,6 +238,13 @@ impl Hparams {
     }
 }
 
+/// mHC stream count (`hyper_connection.count`).
+pub const HC_STREAMS: usize = 4;
+/// mHC Sinkhorn iterations (`hyper_connection.sinkhorn_iterations`).
+pub const SINKHORN_ITERS: u32 = 20;
+/// mHC epsilon (`hyper_connection.epsilon`).
+pub const HC_EPS: f32 = 1e-6;
+
 /// `blk.{l}.{name}`.
 pub fn t(l: usize, name: &str) -> String {
     format!("blk.{l}.{name}")
