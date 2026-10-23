@@ -21,6 +21,10 @@
 // Dense FFN (first 3 layers): g5_expert_gu + g5_expert_down with ids = 0, writing y directly.
 // All kernels: block 128 (any size works; each thread bounds-checks its index).
 
+// nvrtc has no <cmath>: use the bit pattern for +/−infinity.
+#define G5_INF_F __uint_as_float(0x7f800000u)
+#define G5_NEG_INF_F __uint_as_float(0xff800000u)
+
 struct G5W {
     unsigned long long base;
     unsigned long long estride;
@@ -129,11 +133,11 @@ extern "C" __global__ void g5_router_select(const float* s, const float* bias, u
     if (n_group > 1) {
         gmask = 0ull;
         for (int pick = 0; pick < topk_group; pick++) {
-            float best = -INFINITY;
+            float best = G5_NEG_INF_F;
             int bg = -1;
             for (int g = 0; g < n_group; g++) {
                 if ((gmask >> g) & 1ull) continue;
-                float a = -INFINITY, b2 = -INFINITY;
+                float a = G5_NEG_INF_F, b2 = G5_NEG_INF_F;
                 for (int e = g * gs; e < (g + 1) * gs; e++) {
                     const float v = st[e] + (bias ? bias[e] : 0.f);
                     if (v > a) { b2 = a; a = v; } else if (v > b2) b2 = v;
@@ -145,7 +149,7 @@ extern "C" __global__ void g5_router_select(const float* s, const float* bias, u
     }
     float wsum = 0.f;
     for (int j = 0; j < k; j++) {
-        float best = -INFINITY;
+        float best = G5_NEG_INF_F;
         int bi = -1;
         for (int e = 0; e < ne; e++) {
             if (!((gmask >> (e / gs)) & 1ull)) continue;
