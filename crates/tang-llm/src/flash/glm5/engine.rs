@@ -36,6 +36,105 @@ struct DsaCache {
     idx_g: Vec<f32>,
 }
 
+/// The FFNs on the GPU (feature `cuda`): every layer's dense or MoE FFN (W5's
+/// [`super::moe::gpu::DevMoe`]) uploaded once in its GGUF storage format and kept resident.
+/// With `TANG_GPUS=2`, layers `[0, split)` live on GPU 0 and `[split, L)` on GPU 1
+/// (`TANG_SPLIT_AT`, default: the cut that balances routed-expert bytes). Activations cross
+/// through the host for now (naive; one copy each way per FFN).
+#[cfg(feature = "cuda")]
+pub struct GpuFfn {
+    devs: Vec<(tang_moe::gpu::Gpu, super::moe::gpu::Kernels)>,
+    layers: Vec<super::moe::gpu::DevMoe>,
+    dev_of: Vec<usize>,
+    pub split: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuFfn {
+    /// Upload every layer's FFN. `Ok(None)` when there is no CUDA device or `TANG_GLM5_GPU=0`.
+    pub fn load(g: &crate::gguf::Gguf, n_layer: usize) -> Result<Option<Self>> {
+        use tang_moe::gpu::Gpu;
+        if std::env::var("TANG_GLM5_GPU").is_ok_and(|v| v == "0") {
+            return Ok(None);
+        }
+        let ngpu = crate::flash::split::gpus();
+        let mut devs = Vec::new();
+        for ord in 0..ngpu {
+            let gpu = match Gpu::at(ord) {
+                Ok(g) => g,
+                Err(e) if ord == 0 => {
+                    eprintln!("glm5: no CUDA device ({e}); FFNs on the CPU");
+                    return Ok(None);
+                }
+                Err(e) => bail!("TANG_GPUS={ngpu}: CUDA device {ord}: {e}"),
+            };
+            gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU {ord}: {e}"))?;
+            let k = super::moe::gpu::Kernels::new(&gpu)?;
+            devs.push((gpu, k));
+        }
+        let split = if devs.len() < 2 {
+            n_layer
+        } else if let Ok(k) = std::env::var("TANG_SPLIT_AT") {
+            k.parse::<usize>().context("TANG_SPLIT_AT")?.min(n_layer)
+        } else {
+            let bytes: Vec<u64> = (0..n_layer)
+                .map(|l| super::moe::expert_bytes(g, l).unwrap_or(0))
+                .collect();
+            let total: u64 = bytes.iter().sum();
+            let (mut best, mut err, mut acc) = (n_layer / 2, u64::MAX, 0u64);
+            for (l, b) in bytes.iter().enumerate() {
+                acc += b;
+                if acc.abs_diff(total / 2) < err {
+                    (best, err) = (l + 1, acc.abs_diff(total / 2));
+                }
+            }
+            best
+        };
+        let t0 = Instant::now();
+        let mut layers = Vec::with_capacity(n_layer);
+        let mut dev_of = Vec::with_capacity(n_layer);
+        for l in 0..n_layer {
+            let d = usize::from(l >= split);
+            devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            let p = super::moe::MoeParams::from_gguf(g, l)?;
+            layers.push(
+                super::moe::gpu::DevMoe::new(&p)
+                    .with_context(|| format!("uploading layer {l}'s FFN to GPU {d}"))?,
+            );
+            dev_of.push(d);
+            if l % 8 == 7 || l + 1 == n_layer {
+                eprintln!(
+                    "glm5: {} of {n_layer} FFNs on the GPU ({:.0} s)",
+                    l + 1,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+        eprintln!(
+            "glm5: FFNs on {} GPU(s), layers [0, {split}) on GPU 0{}",
+            devs.len(),
+            if devs.len() > 1 {
+                format!(", [{split}, {n_layer}) on GPU 1")
+            } else {
+                String::new()
+            }
+        );
+        Ok(Some(Self {
+            devs,
+            layers,
+            dev_of,
+            split,
+        }))
+    }
+
+    /// Layer `l`'s FFN on its GPU: host `x` `[t][hidden]` in, host `y` out.
+    fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+        let (gpu, k) = &self.devs[self.dev_of[l]];
+        gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        super::moe::gpu::ffn_host(k, &self.layers[l], x, t)
+    }
+}
+
 /// The resumable GLM-5.3-Flash model.
 pub struct Glm5Engine {
     pub m: Glm5Ref,
@@ -49,6 +148,9 @@ pub struct Glm5Engine {
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
+    /// The FFNs on the GPU, when a CUDA build finds one ([`Glm5Engine::use_gpu`]).
+    #[cfg(feature = "cuda")]
+    pub gpu: Option<GpuFfn>,
 }
 
 impl Glm5Engine {
@@ -67,7 +169,31 @@ impl Glm5Engine {
             mla_w: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
+            #[cfg(feature = "cuda")]
+            gpu: None,
         })
+    }
+
+    /// Move the FFNs to the GPU(s) (no-op without a device or with `TANG_GLM5_GPU=0`).
+    /// Returns whether they moved.
+    #[cfg(feature = "cuda")]
+    pub fn use_gpu(&mut self) -> Result<bool> {
+        self.gpu = GpuFfn::load(&self.m.g, self.m.hp.n_layer)?;
+        Ok(self.gpu.is_some())
+    }
+
+    /// Layer `l`'s FFN: on its GPU when loaded, else W1's dense FFN / W5's CPU MoE.
+    fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            return g.ffn(l, x, t);
+        }
+        if self.m.hp.is_dense(l) {
+            self.m.dense_ffn(l, x, t)
+        } else {
+            let p = super::moe::MoeParams::from_gguf(&self.m.g, l)?;
+            super::moe::moe_layer(&p, x, t)
+        }
     }
 
     /// Forget the sequence. Cached weights stay.
@@ -190,12 +316,7 @@ impl Glm5Engine {
             let w_ffn = super::mhc::MhcWeights::from_gguf(&self.m.g, l, "hc_ffn", n, &mhp)?;
             let (mut x, mixes) = mhc_pre_all(&w_ffn, &r, t, hc, n)?;
             self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
-            let y = if hp.is_dense(l) {
-                self.m.dense_ffn(l, &x, t)?
-            } else {
-                let p = super::moe::MoeParams::from_gguf(&self.m.g, l)?;
-                super::moe::moe_layer(&p, &x, t)?
-            };
+            let y = self.ffn(l, &x, t)?;
             mhc_post_all(&mixes, &y, &mut r, t, hc, n)?;
         }
 
@@ -354,6 +475,8 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     let t0 = Instant::now();
     let mut e = Glm5Engine::open(&path)?;
     e.verbose = verbose;
+    #[cfg(feature = "cuda")]
+    e.use_gpu()?;
     let hp = &e.m.hp;
     eprintln!(
         "glm5: {} layers ({} KDA, {} DSA), hidden {}, {} experts top-{}, vocab {}; open {:.1} s",
@@ -482,6 +605,43 @@ mod tests {
             got.push(e.step(t).unwrap());
         }
         assert_eq!(got, want);
+    }
+
+    /// R3 (FFN part): the engine with every FFN on the GPU equals the CPU engine on the tiny
+    /// model, prefill + decode. Pod: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
+    /// --no-default-features --features cuda --lib glm5::engine -- --nocapture`
+    /// (`TANG_GPUS=2 TANG_SPLIT_AT=2` exercises the split).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_ffn_matches_cpu() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            eprintln!("skip: tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            return;
+        }
+        let mut cpu = Glm5Engine::open(Path::new(TINY)).unwrap();
+        let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(gpu.use_gpu().unwrap(), "GPU FFNs did not load");
+        let nv = cpu.m.hp.n_vocab;
+        let mut worst = 0f32;
+        for w in [&ids[..20], &ids[20..21], &ids[21..22], &ids[22..30]] {
+            let a = cpu.window(w).unwrap();
+            let b = gpu.window(w).unwrap();
+            for p in 0..w.len() {
+                assert_eq!(
+                    argmax(&a[p * nv..(p + 1) * nv]),
+                    argmax(&b[p * nv..(p + 1) * nv]),
+                    "top-1 differs"
+                );
+            }
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        eprintln!("GPU FFN vs CPU: logits max abs {worst:.3e}");
+        assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 
     /// reset() gives a fresh sequence.
