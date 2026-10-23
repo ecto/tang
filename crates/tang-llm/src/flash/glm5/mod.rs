@@ -94,18 +94,26 @@ impl Hparams {
         let u = |s: &str| g.meta_u64(&k(s)).map(|v| v as usize);
         let f = |s: &str| g.meta_f64(&k(s)).map(|v| v as f32);
 
-        let n_layer = u("block_count")?;
+        // block_count covers trunk + NextN layers; the trunk is what we loop over.
+        let n_total = u("block_count")?;
+        let n_nextn = match g.meta.get(&k("nextn_predict_layers")) {
+            Some(v) => v.as_u64().unwrap_or(0) as usize,
+            None => 0,
+        };
+        ensure!(
+            n_total > n_nextn,
+            "block_count {n_total} <= nextn layers {n_nextn}"
+        );
+        let n_layer = n_total - n_nextn;
         // The converter pads attention.head_count_kv to block_count with 1s for the NextN
         // layer; a layer is KDA exactly when its kv head count is 0 (llama.cpp is_recr).
         let kv_heads = g.meta_u64s(&k("attention.head_count_kv"))?;
-        let is_kda: Vec<bool> = if kv_heads.len() == n_layer || kv_heads.len() >= n_layer {
-            kv_heads[..n_layer].iter().map(|&h| h == 0).collect()
-        } else {
-            bail!(
-                "attention.head_count_kv has {} entries, want {n_layer}",
-                kv_heads.len()
-            );
-        };
+        ensure!(
+            kv_heads.len() >= n_total,
+            "attention.head_count_kv has {} entries, want {n_total}",
+            kv_heads.len()
+        );
+        let is_kda: Vec<bool> = kv_heads[..n_layer].iter().map(|&h| h == 0).collect();
         ensure!(
             is_kda.iter().any(|b| !b),
             "no DSA layers: not a glm5-next model?"
@@ -116,8 +124,16 @@ impl Hparams {
                 let a = v
                     .as_array()
                     .context("attention.indexer.types is not an array")?;
-                ensure!(a.len() >= n_layer, "indexer.types has {} entries", a.len());
-                a[..n_layer].iter().map(|x| x.as_u64().unwrap_or(0) != 0).collect()
+                // one entry per *trunk* layer
+                ensure!(
+                    a.len() >= n_layer,
+                    "indexer.types has {} entries, want {n_layer}",
+                    a.len()
+                );
+                a[..n_layer]
+                    .iter()
+                    .map(|x| x.as_u64().unwrap_or(0) != 0)
+                    .collect()
             }
             None => vec![true; n_layer],
         };
@@ -146,10 +162,6 @@ impl Hparams {
             }
         };
 
-        let n_nextn = match g.meta.get(&k("nextn_predict_layers")) {
-            Some(v) => v.as_u64().unwrap_or(0) as usize,
-            None => 0,
-        };
 
         Ok(Self {
             n_vocab: g.info("token_embd.weight")?.dims[1] as usize,
