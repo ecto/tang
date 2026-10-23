@@ -1,722 +1,452 @@
-//! GLM-5.3-Flash MoE: sigmoid+bias router (`noaux_tc`), 288 routed experts top-8 + 1 shared
-//! expert (ungated), expert FFN 2048 with `swiglu_limit` clamping, dense FFN 12288 for the
-//! first 3 layers.
+//! GLM-5.3-Flash MoE (GGUF arch `glm5-next`): sigmoid+bias router (`noaux_tc`), 288 routed experts
+//! top-8 plus 1 ungated shared expert, expert FFN 2048 with clamped SwiGLU, and the dense FFN
+//! (12288) of the first 3 layers. CPU f32 reference + naive CUDA kernels ([`SRC`]).
 //!
-//! Reference: HF `Glm5NextTextTopkRouter` / `Glm5NextTextExperts` / `Glm5NextTextMLP` /
-//! `Glm5NextTextMoE` (`modeling_glm5_next.py`), and llama.cpp `glm5-next.cpp` +
-//! `llama-graph.cpp::build_moe_ffn` (GGUF tensor names, sigmoid gating, bias-for-selection-only).
+//! Ground truth is HF `modeling_glm5_next.py` (`Glm5NextTextTopkRouter`, `Glm5NextTextExperts`,
+//! `Glm5NextTextMLP`, `Glm5NextTextMoE`); llama.cpp `models/glm5-next.cpp` +
+//! `llama-graph.cpp::build_moe_ffn` gives the GGUF names and the per-layer clamp arrays.
 //!
-//! Semantics pinned down from HF (all fp32 in the reference):
-//! - router: `scores = sigmoid(W·x)` (W in fp32, `moe_router_dtype`), selection on
-//!   `scores + e_score_correction_bias`, top-k **not** sorted, weights are the *unbiased*
-//!   sigmoid scores of the selected experts, renormalised (`norm_topk_prob`, `+1e-20` in HF;
-//!   llama.cpp clamps the denominator at `6.103515625e-5`), then × `routed_scaling_factor` 2.5.
-//!   Group-limited selection (`n_group`/`topk_group`) exists in the code but is a no-op for
-//!   this model (`n_group = topk_group = 1`), so it is not implemented here.
-//! - experts: `gate = clamp(gate_proj·x, max=limit)`, `up = clamp(up_proj·x, ±limit)`,
-//!   `h = silu(gate) * up`, `y = down_proj·h`. `limit = swiglu_limit` = 10.
-//!   HF's `Glm5NextTextExperts` holds `gate_up_proj [E, 2·ff, hid]` fused; GGUF (and this
-//!   code) keep separate `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` `[·, ·, E]`.
-//! - shared expert: a plain `Glm5NextTextMLP` on the *residual* (router) input, same
-//!   clamped swiglu, **no gate** (unlike Qwen3-Next's sigmoid-gated shared expert), added to
-//!   the routed output with weight 1.
-//! - a token may select expert id `num_experts` (the HF "no expert" sentinel from padded
-//!   top-k); it contributes nothing.
+//! Semantics (all f32):
+//! - router: `s = sigmoid(W x)`; selection on `s + e_score_correction_bias`, after the group limit
+//!   (`n_group`/`topk_group`: group score = sum of its top-2 biased scores; a no-op for this model,
+//!   whose `n_group = topk_group = 1`); weights are the *unbiased* `s` of the chosen experts,
+//!   divided by `sum + 1e-20` when `norm_topk_prob`, then always × `routed_scaling_factor` (2.5).
+//! - SwiGLU with limit L: `silu(min(g, L)) * clamp(u, -L, L)`. Routed experts use
+//!   `swiglu_clamp_exp[l]`; the shared expert *and* the dense FFN use `swiglu_clamp_shexp[l]`
+//!   (llama.cpp `build_ffn`); HF has one `swiglu_limit` for all three. Both arrays are all 10 in
+//!   the real GGUF. A missing or ≤ 1e-6 limit means no clamp (llama.cpp's rule).
+//! - shared expert: a plain MLP on the same input, **no sigmoid gate** (unlike Qwen3-Next), added
+//!   with weight 1. An expert id ≥ `n_expert` (HF's "no expert" sentinel) contributes nothing.
 //!
-//! GGUF: `blk.N.ffn_gate_inp.weight [hid, E]` (F32), `blk.N.exp_probs_b.bias [E]` (F32),
-//! `blk.N.ffn_gate_exps.weight [hid, ff, E]`, `ffn_up_exps` same, `ffn_down_exps [ff, hid, E]`,
-//! `ffn_gate_shexp/up_shexp [hid, ff_sh]`, `ffn_down_shexp [ff_sh, hid]`; dense layers have
-//! `ffn_gate/up/down [hid, 12288]` instead. At UD-Q4_K_XL: gate/up_exps Q4_K (9 layers Q5_K),
-//! down_exps Q5_K (layers 11, 12, 44 Q6_K), shexp + dense Q8_0, router/bias F32.
+//! GGUF tensors of layer `l` (ggml dims, `dims[0]` fastest): `ffn_gate_inp [hid, E]` F32,
+//! `exp_probs_b.bias [E]` F32, `ffn_{gate,up}_exps [hid, ff, E]`, `ffn_down_exps [ff, hid, E]`,
+//! `ffn_{gate,up}_shexp [hid, ff]`, `ffn_down_shexp [ff, hid]`; dense layers `ffn_{gate,up}
+//! [hid, 12288]`, `ffn_down [12288, hid]`. Experts are read lazily, one at a time, through
+//! [`Gguf::expert`]; nothing is dequantised up front.
+//!
+//! UD-Q4_K_XL (unsloth; read from the published shard headers, no weights downloaded): MoE layers
+//! 3..=45 (45 is the MTP layer), 43 in all. Experts gate/up/down are Q4_K/Q4_K/Q5_K on 40 layers
+//! (4,378,853,376 B each), Q5_K/Q5_K/Q6_K on layer 11 (5,303,697,408 B), Q4_K/Q4_K/Q6_K on layers
+//! 12 and 44 (4,699,717,632 B each): 189,857,267,712 B in all. Shared experts and dense FFNs are
+//! Q8_0; router and bias F32. [`expert_bytes`] measures any GGUF.
+//!
+//! Later (FAST, only after the RIGHT gates): int8 activations + dp4a / tensor-core expert GEMMs
+//! (the Coder-Next `cx_moe_*` path), weight rows staged in shared memory, tokens grouped by
+//! expert, router+select and gate/up+silu fusion, a warp-per-token top-k, CUDA graphs.
 
-use crate::gguf::Gguf;
-use anyhow::{ensure, Result};
+use crate::gguf::{Gguf, TensorInfo, Value};
+use anyhow::{bail, ensure, Context, Result};
+use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------------------------
-// Parameters
+// Weights and parameters
 // ---------------------------------------------------------------------------------------------
 
-/// One layer's MoE (or dense-FFN) geometry and tensor views, mmap-backed.
-#[derive(Clone)]
+/// A weight: row-major f32 in memory, or a GGUF tensor read (and dequantised) on demand.
+#[derive(Clone, Copy)]
+pub enum W<'a> {
+    /// `[n_mat][rows][cols]` row-major (one matrix for a 2-D weight).
+    F32(&'a [f32]),
+    Gguf(&'a Gguf, &'a TensorInfo),
+}
+
+impl<'a> W<'a> {
+    /// Matrix `e` (0 for a 2-D weight) as `rows × cols` row-major f32.
+    pub fn mat(&self, e: usize, rows: usize, cols: usize) -> Result<Cow<'a, [f32]>> {
+        let n = rows * cols;
+        match *self {
+            W::F32(v) => {
+                ensure!(
+                    v.len() >= (e + 1) * n,
+                    "f32 weight: matrix {e} of {rows}x{cols} out of range ({})",
+                    v.len()
+                );
+                Ok(Cow::Borrowed(&v[e * n..(e + 1) * n]))
+            }
+            W::Gguf(g, t) => {
+                ensure!(
+                    t.dims.len() >= 2 && t.dims[0] as usize == cols && t.dims[1] as usize == rows,
+                    "{}: dims {:?}, want [{cols}, {rows}, ..]",
+                    t.name,
+                    t.dims
+                );
+                match t.dims.len() {
+                    2 => {
+                        ensure!(e == 0, "{}: 2-D tensor has no matrix {e}", t.name);
+                        Ok(Cow::Owned(g.dequantize(t)?))
+                    }
+                    3 => Ok(Cow::Owned(g.expert(t, e)?)),
+                    _ => bail!("{}: unexpected rank {:?}", t.name, t.dims),
+                }
+            }
+        }
+    }
+
+    /// A 1-D weight of `n` values.
+    pub fn vec(&self, n: usize) -> Result<Cow<'a, [f32]>> {
+        match *self {
+            W::F32(v) => {
+                ensure!(v.len() == n, "f32 vector: {} values, want {n}", v.len());
+                Ok(Cow::Borrowed(v))
+            }
+            W::Gguf(g, t) => {
+                ensure!(
+                    t.dims == [n as u64],
+                    "{}: dims {:?}, want [{n}]",
+                    t.name,
+                    t.dims
+                );
+                Ok(Cow::Owned(g.dequantize(t)?))
+            }
+        }
+    }
+}
+
+/// One layer's FFN: geometry, routing constants and weight handles. A dense layer has
+/// `dense_*` set and no router or experts.
+#[derive(Clone, Copy, Default)]
 pub struct MoeParams<'a> {
     pub hidden: usize,
     pub n_expert: usize,
     pub top_k: usize,
-    pub n_shared: usize,
+    /// Group-limited routing; 1 / 1 (the real model) disables it.
+    pub n_group: usize,
+    pub topk_group: usize,
     pub ff_exp: usize,
     pub ff_shexp: usize,
+    pub ff_dense: usize,
     pub scale: f32,
     pub norm_topk_prob: bool,
-    pub swiglu_limit: f32,
-    /// `[E][hid]`, row-major: `router_logits[e] = dot(w_e, x)`.
-    pub router_w: &'a [f32],
-    /// `[E]` selection bias (`e_score_correction_bias`), or empty for dense layers.
-    pub bias: &'a [f32],
-    /// Routed experts `[E][ff][hid]` (per-expert rows of `hid`), or None for a dense layer.
-    pub gate_exps: Option<&'a [f32]>,
-    pub up_exps: Option<&'a [f32]>,
-    pub down_exps: Option<&'a [f32]>,
-    /// Shared expert, as `[ff_sh][hid]`, `[ff_sh][hid]`, `[hid][ff_sh]`; None if `n_shared == 0`.
-    pub sh_gate: Option<&'a [f32]>,
-    pub sh_up: Option<&'a [f32]>,
-    pub sh_down: Option<&'a [f32]>,
-    /// Dense-FFN (first-3) tensors, same layout as the shared expert at `ff = 12288`.
-    pub dense_gate: Option<&'a [f32]>,
-    pub dense_up: Option<&'a [f32]>,
-    pub dense_down: Option<&'a [f32]>,
+    /// SwiGLU limits (`f32::INFINITY` = no clamp): routed experts / shared expert + dense FFN.
+    pub limit_exp: f32,
+    pub limit_shexp: f32,
+    /// `[E][hid]`.
+    pub router: Option<W<'a>>,
+    /// `[E]`; None = zero bias.
+    pub bias: Option<W<'a>>,
+    /// `[E][ff][hid]`, `[E][ff][hid]`, `[E][hid][ff]`.
+    pub gate_exps: Option<W<'a>>,
+    pub up_exps: Option<W<'a>>,
+    pub down_exps: Option<W<'a>>,
+    /// `[ff_sh][hid]`, `[ff_sh][hid]`, `[hid][ff_sh]`.
+    pub sh_gate: Option<W<'a>>,
+    pub sh_up: Option<W<'a>>,
+    pub sh_down: Option<W<'a>>,
+    /// `[ff_dense][hid]`, `[ff_dense][hid]`, `[hid][ff_dense]`.
+    pub dense_gate: Option<W<'a>>,
+    pub dense_up: Option<W<'a>>,
+    pub dense_down: Option<W<'a>>,
 }
 
-impl<'a> MoeParams<'a> {
-    /// Read one layer's MoE tensors out of a GGUF (mmap; routed experts are dequantised
-    /// lazily one at a time by [`route_and_run`], never all at once).
-    pub fn from_gguf(g: &'a Gguf, l: usize) -> Result<Self> {
-        let hidden = g.meta_u64("embedding_length")? as usize;
-        let n_expert = g.meta_u64("expert_count")? as usize;
-        let top_k = g.meta_u64("expert_used_count")? as usize;
-        let n_shared = g.meta_u64("expert_shared_count")? as usize;
-        let ff_exp = g.meta_u64("expert_feed_forward_length")? as usize;
-        let scale = g.meta_f64("expert_weights_scale")? as f32;
-        let norm = matches!(g.meta("expert_weights_norm")?, crate::gguf::Value::Bool(true));
-        let limit = {
-            let v = g.meta("swiglu_clamp_exp")?;
-            let arr = match v {
-                crate::gguf::Value::Array(a) => a
-                    .iter()
-                    .map(|x| x.as_f64().unwrap_or(10.0))
-                    .collect::<Vec<f64>>(),
-                other => vec![other.as_f64().unwrap_or(10.0)],
-            };
-            ensure!(arr.len() > l, "swiglu_clamp_exp: no entry for layer {l}");
-            arr[l] as f32
-        };
-        let name = |n: &str| format!("blk.{l}.{n}");
-        let v = |n: &str| -> Result<&'a [f32]> {
-            let t = g.info(n)?;
-            ensure!(t.dims.len() <= 2, "{n}: not a matrix ({:?})", t.dims);
-            let d = g.dequantize(t)?;
-            Ok(Box::leak(d.into_boxed_slice()))
-        };
-        let dense = g.get(&name("ffn_gate.weight")).is_some();
-        let (gate_exps, up_exps, down_exps) = if dense {
-            (None, None, None)
-        } else {
-            (
-                Some(v(&name("ffn_gate_exps.weight"))?),
-                Some(v(&name("ffn_up_exps.weight"))?),
-                Some(v(&name("ffn_down_exps.weight"))?),
-            )
-        };
-        let (sh_gate, sh_up, sh_down) = if n_shared > 0 {
-            (
-                Some(v(&name("ffn_gate_shexp.weight"))?),
-                Some(v(&name("ffn_up_shexp.weight"))?),
-                Some(v(&name("ffn_down_shexp.weight"))?),
-            )
-        } else {
-            (None, None, None)
-        };
-        let (dense_gate, dense_up, dense_down) = if dense {
-            (
-                Some(v(&name("ffn_gate.weight"))?),
-                Some(v(&name("ffn_up.weight"))?),
-                Some(v(&name("ffn_down.weight"))?),
-            )
-        } else {
-            (None, None, None)
-        };
-        let ff_shexp = if let Some(t) = g.get(&name("ffn_gate_shexp.weight")) {
-            t.dims[0] as usize
-        } else {
-            0
-        };
-        let bias: &'a [f32] = if dense {
-            &[]
-        } else {
-            v(&name("exp_probs_b.bias"))?
-        };
-        Ok(Self {
-            hidden,
-            n_expert,
-            top_k,
-            n_shared,
-            ff_exp,
-            ff_shexp,
-            scale,
-            norm_topk_prob: norm,
-            swiglu_limit: limit,
-            router_w: if dense {
-                &[]
-            } else {
-                v(&name("ffn_gate_inp.weight"))?
-            },
-            bias,
-            gate_exps,
-            up_exps,
-            down_exps,
-            sh_gate,
-            sh_up,
-            sh_down,
-            dense_gate,
-            dense_up,
-            dense_down,
-        })
+fn limit(v: f64) -> f32 {
+    if v > 1e-6 {
+        v as f32
+    } else {
+        f32::INFINITY
     }
 }
 
+/// Layer `l`'s value of a scalar-or-array metadata key (llama.cpp `get_key_or_arr`).
+fn per_layer_f64(g: &Gguf, key: &str, l: usize) -> Result<Option<f64>> {
+    let Ok(v) = g.meta(key) else { return Ok(None) };
+    let x = match v {
+        Value::Array(a) => a
+            .get(l)
+            .with_context(|| format!("{key}: no entry for layer {l} ({})", a.len()))?,
+        other => other,
+    };
+    Ok(Some(
+        x.as_f64().with_context(|| format!("{key}: not a number"))?,
+    ))
+}
+
+impl<'a> MoeParams<'a> {
+    pub fn is_dense(&self) -> bool {
+        self.dense_gate.is_some()
+    }
+
+    /// Layer `l`'s FFN from a `glm5-next` GGUF. Reads metadata and tensor handles only.
+    pub fn from_gguf(g: &'a Gguf, l: usize) -> Result<Self> {
+        let arch = g.meta_str("general.architecture")?;
+        ensure!(arch == "glm5-next", "not a glm5-next GGUF ({arch})");
+        let key = |s: &str| format!("{arch}.{s}");
+        let u = |s: &str| g.meta_u64(&key(s)).map(|v| v as usize);
+        let t = |s: &str| {
+            g.info(&format!("blk.{l}.{s}.weight"))
+                .map(|t| W::Gguf(g, t))
+        };
+        let lim_exp = per_layer_f64(g, &key("swiglu_clamp_exp"), l)?.unwrap_or(0.0);
+        let lim_sh = per_layer_f64(g, &key("swiglu_clamp_shexp"), l)?.unwrap_or(lim_exp);
+        let mut p = MoeParams {
+            hidden: u("embedding_length")?,
+            limit_exp: limit(lim_exp),
+            limit_shexp: limit(lim_sh),
+            n_group: 1,
+            topk_group: 1,
+            ..Default::default()
+        };
+        if l < u("leading_dense_block_count")? {
+            p.ff_dense = u("feed_forward_length")?;
+            p.dense_gate = Some(t("ffn_gate")?);
+            p.dense_up = Some(t("ffn_up")?);
+            p.dense_down = Some(t("ffn_down")?);
+            return Ok(p);
+        }
+        let gating = u("expert_gating_func")?;
+        ensure!(
+            gating == 2,
+            "expert_gating_func {gating}: only 2 (sigmoid) is implemented"
+        );
+        p.n_expert = u("expert_count")?;
+        p.top_k = u("expert_used_count")?;
+        p.n_group = u("expert_group_count").unwrap_or(1).max(1);
+        p.topk_group = u("expert_group_used_count").unwrap_or(1).max(1);
+        p.ff_exp = u("expert_feed_forward_length")?;
+        p.scale = g.meta_f64(&key("expert_weights_scale")).unwrap_or(1.0) as f32;
+        p.norm_topk_prob = matches!(g.meta(&key("expert_weights_norm")), Ok(Value::Bool(true)));
+        p.router = Some(t("ffn_gate_inp")?);
+        p.bias = g
+            .get(&format!("blk.{l}.exp_probs_b.bias"))
+            .map(|t| W::Gguf(g, t));
+        p.gate_exps = Some(t("ffn_gate_exps")?);
+        p.up_exps = Some(t("ffn_up_exps")?);
+        p.down_exps = Some(t("ffn_down_exps")?);
+        let n_sh = u("expert_shared_count").unwrap_or(0);
+        if n_sh > 0 {
+            p.ff_shexp = u("expert_shared_feed_forward_length").unwrap_or(p.ff_exp) * n_sh;
+            p.sh_gate = Some(t("ffn_gate_shexp")?);
+            p.sh_up = Some(t("ffn_up_shexp")?);
+            p.sh_down = Some(t("ffn_down_shexp")?);
+        }
+        Ok(p)
+    }
+}
+
+/// Bytes of layer `l`'s routed experts (gate + up + down) in a GGUF, from its tensor directory.
+pub fn expert_bytes(g: &Gguf, l: usize) -> Result<u64> {
+    ["gate", "up", "down"]
+        .iter()
+        .map(|n| {
+            g.info(&format!("blk.{l}.ffn_{n}_exps.weight"))
+                .map(|t| t.nbytes)
+        })
+        .sum()
+}
+
 // ---------------------------------------------------------------------------------------------
-// CPU f32 reference (documents the signatures W1 calls)
+// CPU f32 reference
 // ---------------------------------------------------------------------------------------------
+
+/// `y[r] = Σ_j w[r][j] x[j]` for a `rows × cols` row-major matrix (f64 accumulation).
+fn matvec(w: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    w.chunks_exact(cols)
+        .map(|r| {
+            r.iter()
+                .zip(x)
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum::<f64>() as f32
+        })
+        .collect()
+}
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// One row of a `[rows][cols]` weight matrix against one input row: `y[r] = dot(w_r, x)`.
-fn matrow(w: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
-    debug_assert!(w.len() == rows * cols);
-    (0..rows)
-        .map(|r| {
-            let wr = &w[r * cols..(r + 1) * cols];
-            let mut s = 0f32;
-            for (a, b) in wr.iter().zip(x) {
-                s += a * b;
-            }
-            s
-        })
-        .collect()
+/// One clamped-SwiGLU MLP on one token: `down · (silu(min(gate·x, L)) * clamp(up·x, ±L))`.
+fn mlp(
+    gate: &[f32],
+    up: &[f32],
+    down: &[f32],
+    ff: usize,
+    hid: usize,
+    x: &[f32],
+    lim: f32,
+) -> Vec<f32> {
+    let g = matvec(gate, ff, hid, x);
+    let u = matvec(up, ff, hid, x);
+    let h: Vec<f32> = g
+        .iter()
+        .zip(&u)
+        .map(|(g, u)| silu(g.min(lim)) * u.clamp(-lim, lim))
+        .collect();
+    matvec(down, hid, ff, &h)
 }
 
-/// Router for `n` tokens (`x[t * hid..]`): per token, the top-`k` expert ids and their
-/// weights, in selection order. Returns `(ids, weights)` laid out `[t][k]`.
-///
-/// This is the exact HF `Glm5NextTextTopkRouter` for `n_group = topk_group = 1`: sigmoid
-/// scores, selection by `scores + bias`, weights from the unbiased scores, renormalised
-/// (denominator clamped at `2^-14`, llama.cpp's rule; HF adds `1e-20` instead — same result
-/// for any real routing), then scaled by `routed_scaling_factor`.
-pub fn route(p: &MoeParams, x: &[f32], t_len: usize) -> (Vec<u32>, Vec<f32>) {
+/// Router for `t_len` tokens (`x` is `[t_len][hidden]`): per token the top-`k` expert ids and
+/// their weights, `[t][k]`, highest biased score first.
+pub fn route(p: &MoeParams, x: &[f32], t_len: usize) -> Result<(Vec<u32>, Vec<f32>)> {
     let (e, k, hid) = (p.n_expert, p.top_k, p.hidden);
-    let mut ids = vec![0u32; t_len * k];
-    let mut wts = vec![0f32; t_len * k];
-    for t in 0..t_len {
-        let xt = &x[t * hid..(t + 1) * hid];
-        let mut scores: Vec<f32> = Vec::with_capacity(e);
-        for i in 0..e {
-            let mut s = 0f32;
-            let wr = &p.router_w[i * hid..(i + 1) * hid];
-            for (a, b) in wr.iter().zip(xt) {
-                s += a * b;
+    ensure!(
+        x.len() == t_len * hid,
+        "route: x has {} values, want {t_len}x{hid}",
+        x.len()
+    );
+    let w = p.router.context("route: no router")?.mat(0, e, hid)?;
+    let bias = match p.bias {
+        Some(b) => b.vec(e)?.into_owned(),
+        None => vec![0.0; e],
+    };
+    let ng = p.n_group.max(1);
+    ensure!(
+        e % ng == 0 && p.topk_group <= ng,
+        "route: {e} experts in {ng} groups, keep {}",
+        p.topk_group
+    );
+    let gs = e / ng;
+    let (mut ids, mut wts) = (Vec::with_capacity(t_len * k), Vec::with_capacity(t_len * k));
+    for xt in x.chunks_exact(hid) {
+        let s: Vec<f32> = matvec(&w, e, hid, xt)
+            .into_iter()
+            .map(|a| 1.0 / (1.0 + (-a).exp()))
+            .collect();
+        let mut choice: Vec<f32> = s.iter().zip(&bias).map(|(s, b)| s + b).collect();
+        if ng > 1 {
+            let score = |gi: usize| {
+                let mut v = choice[gi * gs..(gi + 1) * gs].to_vec();
+                v.sort_by(|a, b| b.total_cmp(a));
+                v.iter().take(2).sum::<f32>()
+            };
+            let mut groups: Vec<usize> = (0..ng).collect();
+            groups.sort_by(|&a, &b| score(b).total_cmp(&score(a)).then(a.cmp(&b)));
+            for &gi in &groups[p.topk_group..] {
+                choice[gi * gs..(gi + 1) * gs].fill(f32::NEG_INFINITY);
             }
-            scores.push(1.0 / (1.0 + (-s).exp()));
         }
-        // top-k selection on scores + bias, ties by lower expert id (torch.topk's rule);
-        // an unsorted partial selection, like torch's topk(sorted=False).
-        let biased: Vec<f32> = scores
-            .iter()
-            .enumerate()
-            .map(|(j, &s)| s + p.bias.get(j).copied().unwrap_or(0.0))
-            .collect();
-        let mut chosen: Vec<usize> = (0..e).collect();
-        chosen.sort_by(|&a, &b| biased[b].total_cmp(&biased[a]).then(a.cmp(&b)));
-        chosen.truncate(k);
-        let raw: Vec<f32> = chosen
-            .iter()
-            .map(|&i| scores[i])
-            .collect();
-        let sum: f32 = raw.iter().sum::<f32>().max(6.103515625e-5_f64 as f32);
-        for (j, &i) in chosen.iter().enumerate() {
-            let mut w = raw[j] / sum;
-            if p.scale != 0.0 && p.scale != 1.0 {
-                w *= p.scale;
-            }
-            ids[t * k + j] = i as u32;
-            wts[t * k + j] = w;
+        let mut order: Vec<usize> = (0..e).collect();
+        order.sort_by(|&a, &b| choice[b].total_cmp(&choice[a]).then(a.cmp(&b)));
+        let chosen = &order[..k];
+        let sum: f32 = chosen.iter().map(|&i| s[i]).sum();
+        for &i in chosen {
+            let w = if p.norm_topk_prob {
+                s[i] / (sum + 1e-20)
+            } else {
+                s[i]
+            };
+            ids.push(i as u32);
+            wts.push(w * p.scale);
         }
     }
-    (ids, wts)
+    Ok((ids, wts))
 }
 
-/// One routed + shared expert FFN layer (the whole `Glm5NextTextMoE.forward`): `x` is
-/// `[t_len][hidden]` (the residual / pre-FFN stream), returns `[t_len][hidden]` already
-/// including the shared expert. Expert `e == n_expert` is the HF "none" sentinel and
-/// contributes 0.
-pub fn moe_layer(p: &MoeParams, x: &[f32], t_len: usize) -> Vec<f32> {
+/// The routed experts for a given routing (`ids` / `wts` `[t][k]`), without the shared expert:
+/// `y[t] = Σ_j wts[t][j] · expert_{ids[t][j]}(x[t])`. Ids ≥ `n_expert` are skipped.
+pub fn experts(
+    p: &MoeParams,
+    x: &[f32],
+    t_len: usize,
+    ids: &[u32],
+    wts: &[f32],
+) -> Result<Vec<f32>> {
     let (hid, ff, k) = (p.hidden, p.ff_exp, p.top_k);
-    let (ids, wts) = route(p, x, t_len);
-    let mut y = vec![0f32; t_len * hid];
-    // group by expert so each expert matrix is traversed once
+    ensure!(
+        ids.len() == t_len * k && wts.len() == t_len * k,
+        "experts: routing is not [{t_len}][{k}]"
+    );
+    let (gw, uw, dw) = (
+        p.gate_exps.context("no gate_exps")?,
+        p.up_exps.context("no up_exps")?,
+        p.down_exps.context("no down_exps")?,
+    );
+    // (token, slot) pairs per expert, so each expert is dequantised once
     let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); p.n_expert];
-    for t in 0..t_len {
-        for (j, &id) in ids[t * k..(t + 1) * k].iter().enumerate() {
-            if (id as usize) < p.n_expert {
-                by_expert[id as usize].push((t, j));
-            }
+    for (i, &id) in ids.iter().enumerate() {
+        if (id as usize) < p.n_expert {
+            by_expert[id as usize].push((i / k, i));
         }
     }
-    for (e, toks) in by_expert.iter().enumerate() {
-        if toks.is_empty() {
-            continue;
-        }
-        let gate = &p.gate_exps.expect("routed expert weights")[e * ff * hid..(e + 1) * ff * hid];
-        let up = &p.up_exps.expect("routed expert weights")[e * ff * hid..(e + 1) * ff * hid];
-        let down = &p.down_exps.expect("routed expert weights")[e * hid * ff..(e + 1) * hid * ff];
-        for &(t, j) in toks {
-            let xt = &x[t * hid..(t + 1) * hid];
-            let g = matrow(gate, ff, hid, xt);
-            let u = matrow(up, ff, hid, xt);
-            let mut h = vec![0f32; ff];
-            for i in 0..ff {
-                let gc = g[i].min(p.swiglu_limit);
-                let uc = u[i].clamp(-p.swiglu_limit, p.swiglu_limit);
-                h[i] = silu(gc) * uc;
-            }
-            let out = matrow(down, hid, ff, &h);
-            let w = wts[t * k + j];
-            for (o, v) in y[t * hid..(t + 1) * hid].iter_mut().zip(out) {
-                *o += w * v;
-            }
-        }
-    }
-    // shared expert, ungated, on the residual input
-    if p.n_shared > 0 {
-        let ffs = p.ff_shexp;
-        let sg = p.sh_gate.expect("shared expert weights");
-        let su = p.sh_up.expect("shared expert weights");
-        let sd = p.sh_down.expect("shared expert weights");
-        for t in 0..t_len {
-            let xt = &x[t * hid..(t + 1) * hid];
-            let g = matrow(sg, ffs, hid, xt);
-            let u = matrow(su, ffs, hid, xt);
-            let mut h = vec![0f32; ffs];
-            for i in 0..ffs {
-                let gc = g[i].min(p.swiglu_limit);
-                let uc = u[i].clamp(-p.swiglu_limit, p.swiglu_limit);
-                h[i] = silu(gc) * uc;
-            }
-            let out = matrow(sd, hid, ffs, &h);
-            for (o, v) in y[t * hid..(t + 1) * hid].iter_mut().zip(out) {
-                *o += v;
-            }
-        }
-    }
-    y
-}
-
-/// Dense FFN of the first-3 layers (`Glm5NextTextMLP` with `intermediate_size = 12288`):
-/// `x` is `[t_len][hidden]`, returns `[t_len][hidden]`. Same clamped swiglu.
-pub fn dense_ffn(p: &MoeParams, x: &[f32], t_len: usize) -> Vec<f32> {
-    let hid = p.hidden;
-    let ff = p
-        .dense_gate
-        .map(|gw| gw.len() / hid)
-        .unwrap_or(p.ff_shexp);
-    let g = p.dense_gate.or(p.sh_gate).expect("dense weights");
-    let u = p.dense_up.or(p.sh_up).expect("dense weights");
-    let d = p.dense_down.or(p.sh_down).expect("dense weights");
     let mut y = vec![0f32; t_len * hid];
-    for t in 0..t_len {
-        let xt = &x[t * hid..(t + 1) * hid];
-        let gg = matrow(g, ff, hid, xt);
-        let uu = matrow(u, ff, hid, xt);
-        let mut h = vec![0f32; ff];
-        for i in 0..ff {
-            let gc = gg[i].min(p.swiglu_limit);
-            let uc = uu[i].clamp(-p.swiglu_limit, p.swiglu_limit);
-            h[i] = silu(gc) * uc;
+    for (e, pairs) in by_expert.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+        let (g, u, d) = (
+            gw.mat(e, ff, hid)?,
+            uw.mat(e, ff, hid)?,
+            dw.mat(e, hid, ff)?,
+        );
+        for &(t, i) in pairs {
+            let out = mlp(&g, &u, &d, ff, hid, &x[t * hid..(t + 1) * hid], p.limit_exp);
+            for (o, v) in y[t * hid..(t + 1) * hid].iter_mut().zip(out) {
+                *o += wts[i] * v;
+            }
         }
-        let out = matrow(d, hid, ff, &h);
-        y[t * hid..(t + 1) * hid].copy_from_slice(&out);
     }
-    y
+    Ok(y)
 }
 
-/// Byte size of one MoE layer's routed experts at UD-Q4_K_XL (for W6's memory plan).
-/// `ffn_gate/up_exps`: Q4_K at 144 B / 256 el (Q5_K 176 on layer 11's gate|up);
-/// `ffn_down_exps`: Q5_K at 176 B / 256 el (Q6_K 210 on layers 11, 12, 44).
-pub fn ud_q4_xl_expert_bytes_geom(_n_expert: usize, _ff: usize, _hid: usize) -> (u64, u64, u64) {
-    let e: u64 = 288;
-    let gate_up_q4k: u64 = 4096 * 2048 / 256 * 144;
-    let gate_up_q5k: u64 = 4096 * 2048 / 256 * 176;
-    let down_q5k: u64 = 2048 * 4096 / 256 * 176;
-    let down_q6k: u64 = 2048 * 4096 / 256 * 210;
-    let typical = e * (2 * gate_up_q4k + down_q5k);
-    let l11 = e * (2 * gate_up_q5k + down_q6k);
-    let l1244 = e * (2 * gate_up_q4k + down_q6k);
-    (typical, l11, l1244)
+/// The shared expert alone, `[t_len][hidden]` (zeros if the layer has none).
+pub fn shared_expert(p: &MoeParams, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
+    let hid = p.hidden;
+    ensure!(
+        x.len() == t_len * hid,
+        "shared_expert: x has {} values, want {t_len}x{hid}",
+        x.len()
+    );
+    let (Some(gw), Some(uw), Some(dw)) = (p.sh_gate, p.sh_up, p.sh_down) else {
+        return Ok(vec![0.0; t_len * hid]);
+    };
+    let ff = p.ff_shexp;
+    let (g, u, d) = (
+        gw.mat(0, ff, hid)?,
+        uw.mat(0, ff, hid)?,
+        dw.mat(0, hid, ff)?,
+    );
+    Ok(x.chunks_exact(hid)
+        .flat_map(|xt| mlp(&g, &u, &d, ff, hid, xt, p.limit_shexp))
+        .collect())
+}
+
+/// One MoE layer FFN (`Glm5NextTextMoE.forward`): `x` `[t_len][hidden]` (the post-`ffn_norm`
+/// input), returns routed + shared, `[t_len][hidden]`.
+pub fn moe_layer(p: &MoeParams, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
+    let (ids, wts) = route(p, x, t_len)?;
+    let mut y = experts(p, x, t_len, &ids, &wts)?;
+    for (o, s) in y.iter_mut().zip(shared_expert(p, x, t_len)?) {
+        *o += s;
+    }
+    Ok(y)
+}
+
+/// Dense FFN of the first `leading_dense_block_count` layers: `[t_len][hidden]` in and out.
+pub fn dense_ffn(p: &MoeParams, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
+    let (hid, ff) = (p.hidden, p.ff_dense);
+    ensure!(
+        x.len() == t_len * hid,
+        "dense_ffn: x has {} values, want {t_len}x{hid}",
+        x.len()
+    );
+    let (g, u, d) = (
+        p.dense_gate.context("no dense ffn_gate")?.mat(0, ff, hid)?,
+        p.dense_up.context("no dense ffn_up")?.mat(0, ff, hid)?,
+        p.dense_down.context("no dense ffn_down")?.mat(0, hid, ff)?,
+    );
+    Ok(x.chunks_exact(hid)
+        .flat_map(|xt| mlp(&g, &u, &d, ff, hid, xt, p.limit_shexp))
+        .collect())
+}
+
+/// The layer's FFN, dense or MoE: what W1's forward calls after `ffn_norm`.
+pub fn ffn(p: &MoeParams, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
+    if p.is_dense() {
+        dense_ffn(p, x, t_len)
+    } else {
+        moe_layer(p, x, t_len)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
-// CUDA kernels (NVRTC source; can't compile on this Mac)
+// CUDA
 // ---------------------------------------------------------------------------------------------
 
-/// Kernels for the GLM-5 MoE at the real geometry (hidden 4096, ff 2048, 288 experts top-8,
-/// 1 shared expert, limit 10). Weight types: 12 = Q4_K, 13 = Q5_K, 14 = Q6_K, 8 = Q8_0.
-/// Activations are int8-quantised per 32 (codes then f32 scales), the same contract as the
-/// Coder-Next expert kernels (`cx_moe_gu`/`cx_moe_down`), so the decoders are copies.
-/// The launch sequence and per-kernel grids are documented in the .cuh header comment.
+/// The naive kernels (NVRTC source); launch plan in its header. Also compiled as host C++ and
+/// executed on the fixtures by `scripts/glm5_moe_cuda_host.sh`.
 pub const SRC: &str = include_str!("moe_cuda.cuh");
 
-/// Pod commands for the manager's H200 kernel-parity session (once W1's forward lands):
-/// `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm --features cuda --lib flash::glm5::moe`
-/// (cuda-gated parity test against these same fixtures; kernels wire up with W6's engine work).
 #[cfg(feature = "cuda")]
-pub fn moe_layer_cuda() -> Result<()> {
-    anyhow::bail!("cuda launcher lands with W6's engine wiring; kernels in SRC are ready")
-}
-
-// ---------------------------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------------------------
+#[path = "moe_gpu.rs"]
+pub mod gpu;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::Path;
-
-    fn load(name: &str) -> Option<Vec<f32>> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5/moe");
-        let meta: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(dir.join("fixtures.json")).expect("fixtures.json"),
-        )
-        .expect("fixtures.json");
-        let t = meta["tensors"].get(name)?;
-        let shape: Vec<usize> = t["shape"]
-            .as_array()
-            .expect("shape")
-            .iter()
-            .map(|v| v.as_u64().expect("dim") as usize)
-            .collect();
-        let bytes = fs::read(dir.join(t["file"].as_str().expect("file"))).ok()?;
-        let n: usize = shape.iter().product();
-        assert_eq!(bytes.len(), n * 4, "{name}: file size");
-        let mut v = vec![0f32; n];
-        for (i, b) in bytes.chunks_exact(4).enumerate() {
-            v[i] = f32::from_le_bytes(b.try_into().unwrap());
-        }
-        Some(v)
-    }
-
-    fn fixture(name: &str) -> Vec<f32> {
-        load(name).unwrap_or_else(|| panic!("{name}: missing fixture"))
-    }
-
-    fn par() -> (MoeParams<'static>, Vec<f32>) {
-        let x = fixture("x");
-        let t_len = x.len() / 64;
-        let p = MoeParams {
-            hidden: 64,
-            n_expert: 16,
-            top_k: 4,
-            n_shared: 1,
-            ff_exp: 32,
-            ff_shexp: 64,
-            scale: 2.5,
-            norm_topk_prob: true,
-            swiglu_limit: 10.0,
-            router_w: Box::leak(fixture("router.weight").into_boxed_slice()),
-            bias: Box::leak(fixture("router.bias").into_boxed_slice()),
-            gate_exps: Some(Box::leak(fixture("experts.gate_up_proj").into_boxed_slice())),
-            up_exps: Some(Box::leak(fixture("experts.down_proj").into_boxed_slice())),
-            down_exps: None,
-            sh_gate: Some(Box::leak(fixture("shared.gate_proj").into_boxed_slice())),
-            sh_up: Some(Box::leak(fixture("shared.up_proj").into_boxed_slice())),
-            sh_down: Some(Box::leak(fixture("shared.down_proj").into_boxed_slice())),
-            dense_gate: None,
-            dense_up: None,
-            dense_down: None,
-        };
-        // experts.gate_up is fused [E, 2ff, hid]: split it into gate and up halves
-        let (e, ff, hid) = (p.n_expert, p.ff_exp, p.hidden);
-        let gu = fixture("experts.gate_up_proj");
-        let (mut g, mut u) = (vec![], vec![]);
-        for i in 0..e {
-            g.extend_from_slice(&gu[i * 2 * ff * hid..(i * 2 + 1) * ff * hid]);
-            u.extend_from_slice(&gu[(i * 2 + 1) * ff * hid..(i + 1) * 2 * ff * hid]);
-        }
-        let down = fixture("experts.down_proj");
-        let p = MoeParams {
-            gate_exps: Some(Box::leak(g.into_boxed_slice())),
-            up_exps: Some(Box::leak(u.into_boxed_slice())),
-            down_exps: Some(Box::leak(down.into_boxed_slice())),
-            ..p
-        };
-        (p, x[..t_len * 64].to_vec())
-    }
-
-    fn max_err(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
-    }
-
-    #[test]
-    fn router_matches_hf() {
-        let (p, x) = par();
-        let t_len = x.len() / p.hidden;
-        let (ids, wts) = route(&p, &x, t_len);
-        let want_ids: Vec<u32> = fixture("router_out.indices").iter().map(|v| *v as u32).collect();
-        let want_wts = fixture("router_out.weights");
-        // ids: torch.topk is unsorted; compare as sets per token, and weights likewise
-        for t in 0..t_len {
-            let mut got: Vec<u32> = ids[t * p.top_k..(t + 1) * p.top_k].to_vec();
-            let mut want: Vec<u32> = want_ids[t * p.top_k..(t + 1) * p.top_k].to_vec();
-            got.sort();
-            want.sort();
-            assert_eq!(got, want, "token {t}: expert sets differ");
-            let mut gw: Vec<(u32, f32)> = ids[t * p.top_k..(t + 1) * p.top_k]
-                .iter()
-                .copied()
-                .zip(wts[t * p.top_k..(t + 1) * p.top_k].iter().copied())
-                .collect();
-            gw.sort_by_key(|(i, _)| *i);
-            let mut ww: Vec<(u32, f32)> = want_ids[t * p.top_k..(t + 1) * p.top_k]
-                .iter()
-                .copied()
-                .zip(want_wts[t * p.top_k..(t + 1) * p.top_k].iter().copied())
-                .collect();
-            ww.sort_by_key(|(i, _)| *i);
-            for ((gi, gw2), (wi, ww2)) in gw.iter().zip(ww.iter()) {
-                assert_eq!(gi, wi);
-                assert!((gw2 - ww2).abs() < 1e-5, "token {t} expert {gi}: {gw2} vs {ww2}");
-            }
-        }
-    }
-
-    #[test]
-    fn experts_match_hf() {
-        let (p, x) = par();
-        let t_len = x.len() / p.hidden;
-        // run only the routed experts: shared expert off
-        let p2 = MoeParams { n_shared: 0, ..p.clone() };
-        let y = moe_layer(&p2, &x, t_len);
-        // the fixture's experts_out uses the HF router's own idx/wts; replicate by routing first
-        // (validated above) — moe_layer already routes internally, and the fixtures were made
-        // with the same router, so the comparison is direct.
-        let want = fixture("experts_out");
-        assert_eq!(y.len(), want.len());
-        let e = max_err(&y, &want);
-        assert!(e <= 1e-4, "experts max abs err {e}");
-    }
-
-    #[test]
-    fn clamped_experts_match_hf() {
-        let x = fixture("x");
-        let t_len = x.len() / 64;
-        let gu = fixture("experts_l1.gate_up_proj");
-        let down = fixture("experts_l1.down_proj");
-        let (e, ff, hid) = (16usize, 32usize, 64usize);
-        let (mut g, mut u) = (vec![], vec![]);
-        for i in 0..e {
-            g.extend_from_slice(&gu[i * 2 * ff * hid..(i * 2 + 1) * ff * hid]);
-            u.extend_from_slice(&gu[(i * 2 + 1) * ff * hid..(i + 1) * 2 * ff * hid]);
-        }
-        let p = MoeParams {
-            hidden: hid,
-            n_expert: e,
-            top_k: 4,
-            n_shared: 0,
-            ff_exp: ff,
-            ff_shexp: 0,
-            scale: 2.5,
-            norm_topk_prob: true,
-            swiglu_limit: 1.0,
-            router_w: Box::leak(fixture("router.weight").into_boxed_slice()),
-            bias: Box::leak(fixture("router.bias").into_boxed_slice()),
-            gate_exps: Some(Box::leak(g.into_boxed_slice())),
-            up_exps: Some(Box::leak(u.into_boxed_slice())),
-            down_exps: Some(Box::leak(down.into_boxed_slice())),
-            sh_gate: None,
-            sh_up: None,
-            sh_down: None,
-            dense_gate: None,
-            dense_up: None,
-            dense_down: None,
-        };
-        let y = moe_layer(&p, &x, t_len);
-        let want = fixture("experts_l1_out");
-        assert_eq!(y.len(), want.len());
-        let err = max_err(&y, &want);
-        assert!(err <= 1e-4, "clamped experts max abs err {err}");
-    }
-
-    #[test]
-    fn shared_expert_matches_hf() {
-        let x = fixture("x");
-        let t_len = x.len() / 64;
-        let p = MoeParams {
-            hidden: 64,
-            n_expert: 0,
-            top_k: 0,
-            n_shared: 1,
-            ff_exp: 0,
-            ff_shexp: 64,
-            scale: 0.0,
-            norm_topk_prob: true,
-            swiglu_limit: 10.0,
-            router_w: &[],
-            bias: &[],
-            gate_exps: None,
-            up_exps: None,
-            down_exps: None,
-            sh_gate: Some(Box::leak(fixture("shared.gate_proj").into_boxed_slice())),
-            sh_up: Some(Box::leak(fixture("shared.up_proj").into_boxed_slice())),
-            sh_down: Some(Box::leak(fixture("shared.down_proj").into_boxed_slice())),
-            dense_gate: None,
-            dense_up: None,
-            dense_down: None,
-        };
-        // n_expert = 0: the routed part is empty; only the shared expert is exercised.
-        let y = moe_layer(&p, &x, t_len);
-        let want = fixture("shared_out");
-        let err = max_err(&y, &want);
-        assert!(err <= 1e-4, "shared expert max abs err {err}");
-    }
-
-    #[test]
-    fn full_moe_matches_hf() {
-        let (p, x) = par();
-        let t_len = x.len() / p.hidden;
-        // the full-MoE fixture has its own weights (moe.*), so rebuild params from those
-        let (e, ff, hid) = (p.n_expert, p.ff_exp, p.hidden);
-        let gu = fixture("moe.experts.gate_up_proj");
-        let (mut g, mut u) = (vec![], vec![]);
-        for i in 0..e {
-            g.extend_from_slice(&gu[i * 2 * ff * hid..(i * 2 + 1) * ff * hid]);
-            u.extend_from_slice(&gu[(i * 2 + 1) * ff * hid..(i + 1) * 2 * ff * hid]);
-        }
-        let p = MoeParams {
-            hidden: hid,
-            n_expert: e,
-            top_k: 4,
-            n_shared: 1,
-            ff_exp: ff,
-            ff_shexp: 32,
-            scale: 2.5,
-            norm_topk_prob: true,
-            swiglu_limit: 10.0,
-            router_w: Box::leak(fixture("moe.gate.weight").into_boxed_slice()),
-            bias: Box::leak(fixture("moe.gate.e_score_correction_bias").into_boxed_slice()),
-            gate_exps: Some(Box::leak(g.into_boxed_slice())),
-            up_exps: Some(Box::leak(u.into_boxed_slice())),
-            down_exps: Some(Box::leak(fixture("moe.experts.down_proj").into_boxed_slice())),
-            sh_gate: Some(Box::leak(fixture("moe.shared_experts.gate_proj.weight").into_boxed_slice())),
-            sh_up: Some(Box::leak(fixture("moe.shared_experts.up_proj.weight").into_boxed_slice())),
-            sh_down: Some(Box::leak(fixture("moe.shared_experts.down_proj.weight").into_boxed_slice())),
-            dense_gate: None,
-            dense_up: None,
-            dense_down: None,
-        };
-        let y = moe_layer(&p, &x, t_len);
-        let want = fixture("moe_out");
-        let err = max_err(&y, &want);
-        assert!(err <= 1e-4, "full moe max abs err {err}");
-    }
-
-    #[test]
-    fn dense_ffn_matches_hf() {
-        let x = fixture("x");
-        let t_len = x.len() / 64;
-        let p = MoeParams {
-            hidden: 64,
-            n_expert: 0,
-            top_k: 0,
-            n_shared: 0,
-            ff_exp: 0,
-            ff_shexp: 64,
-            scale: 0.0,
-            norm_topk_prob: true,
-            swiglu_limit: 10.0,
-            router_w: &[],
-            bias: &[],
-            gate_exps: None,
-            up_exps: None,
-            down_exps: None,
-            sh_gate: None,
-            sh_up: None,
-            sh_down: None,
-            dense_gate: Some(Box::leak(fixture("dense.gate_proj.weight").into_boxed_slice())),
-            dense_up: Some(Box::leak(fixture("dense.up_proj.weight").into_boxed_slice())),
-            dense_down: Some(Box::leak(fixture("dense.down_proj.weight").into_boxed_slice())),
-        };
-        let y = dense_ffn(&p, &x, t_len);
-        let want = fixture("dense_out");
-        assert_eq!(y.len(), want.len());
-        let err = max_err(&y, &want);
-        assert!(err <= 1e-4, "dense ffn max abs err {err}");
-    }
-
-    #[test]
-    fn dense_ffn_clamp_matches_hf() {
-        let x = fixture("x");
-        let t_len = x.len() / 64;
-        let p = MoeParams {
-            hidden: 64,
-            n_expert: 0,
-            top_k: 0,
-            n_shared: 0,
-            ff_exp: 0,
-            ff_shexp: 64,
-            scale: 0.0,
-            norm_topk_prob: true,
-            swiglu_limit: 1.0,
-            router_w: &[],
-            bias: &[],
-            gate_exps: None,
-            up_exps: None,
-            down_exps: None,
-            sh_gate: None,
-            sh_up: None,
-            sh_down: None,
-            dense_gate: Some(Box::leak(fixture("dense_l1.gate_proj.weight").into_boxed_slice())),
-            dense_up: Some(Box::leak(fixture("dense_l1.up_proj.weight").into_boxed_slice())),
-            dense_down: Some(Box::leak(fixture("dense_l1.down_proj.weight").into_boxed_slice())),
-        };
-        let y = dense_ffn(&p, &x, t_len);
-        let want = fixture("dense_l1_out");
-        let err = max_err(&y, &want);
-        assert!(err <= 1e-4, "clamped dense ffn max abs err {err}");
-    }
-
-    #[test]
-    fn expert_bytes_match_published_gguf() {
-        // from the unsloth UD-Q4_K_XL GGUF headers (see docs note in the module header)
-        let (typical, l11, l1244) = ud_q4_xl_expert_bytes_geom(288, 2048, 4096);
-        assert_eq!(typical, 4_378_853_376);
-        assert_eq!(l11, 5_303_697_408);
-        assert_eq!(l1244, 4_699_717_632);
-        let total: u64 = 40 * typical + l11 + 2 * l1244;
-        assert_eq!(total, 189_857_267_712);
-    }
-
-    #[test]
-    fn router_denominator_hf_vs_llamacpp() {
-        // the two clamps (1e-20 and 2^-14) agree on any routing where the top-1 score is
-        // non-degenerate; here the smallest top-8 sigmoid sum in the fixture is >> 2^-14.
-        let (p, x) = par();
-        let t_len = x.len() / p.hidden;
-        let (_, wts) = route(&p, &x, t_len);
-        for t in 0..t_len {
-            let raw: f32 = wts[t * p.top_k..(t + 1) * p.top_k]
-                .iter()
-                .map(|w| w / p.scale)
-                .sum();
-            assert!(raw > 6.2e-5, "fixture routing too degenerate to distinguish");
-        }
-    }
-
-    #[test]
-    fn sentinel_expert_contributes_nothing() {
-        // the HF "no expert" sentinel id == n_expert must be skipped by the expert loop:
-        // call the routed-expert part with a routing where every id is the sentinel by
-        // pointing top_k at 1 expert and marking it out of range via a manual pass
-        let (p, x) = par();
-        let t_len = x.len() / p.hidden;
-        let y = moe_layer(&p, &x, t_len);
-        let zero: Vec<f32> = vec![0.0; t_len * p.hidden];
-        assert_ne!(y, zero, "real routing produces output");
-        // by construction: the by_expert table drops any id >= n_expert
-        let (ids, _) = route(&p, &x, t_len);
-        assert!(
-            ids.iter().all(|i| (*i as usize) < p.n_expert),
-            "fixture routing stays in range"
-        );
-    }
-}
+#[path = "moe_tests.rs"]
+mod tests;

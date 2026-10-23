@@ -23,21 +23,21 @@
    ]
   },
   "router_out.weights": {
-   "file": "router_weights.bin",
+   "file": "router_out_weights.bin",
    "shape": [
     12,
     4
    ]
   },
   "router_out.indices": {
-   "file": "router_indices.bin",
+   "file": "router_out_indices.bin",
    "shape": [
     12,
     4
    ]
   },
   "experts.gate_up_proj": {
-   "file": "experts_gate_up.bin",
+   "file": "experts_gate_up_proj.bin",
    "shape": [
     16,
     64,
@@ -45,7 +45,7 @@
    ]
   },
   "experts.down_proj": {
-   "file": "experts_down.bin",
+   "file": "experts_down_proj.bin",
    "shape": [
     16,
     64,
@@ -59,22 +59,72 @@
     64
    ]
   },
+  "experts_l1.gate_up_proj": {
+   "file": "experts_l1_gate_up_proj.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "experts_l1.down_proj": {
+   "file": "experts_l1_down_proj.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "experts_l1_out": {
+   "file": "experts_l1_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "router_g4.weight": {
+   "file": "router_g4_weight.bin",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "router_g4.bias": {
+   "file": "router_g4_bias.bin",
+   "shape": [
+    16
+   ]
+  },
+  "router_g4_out.weights": {
+   "file": "router_g4_out_weights.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "router_g4_out.indices": {
+   "file": "router_g4_out_indices.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
   "shared.gate_proj": {
-   "file": "shared_gate.bin",
+   "file": "shared_gate_proj.bin",
    "shape": [
     64,
     64
    ]
   },
   "shared.up_proj": {
-   "file": "shared_up.bin",
+   "file": "shared_up_proj.bin",
    "shape": [
     64,
     64
    ]
   },
   "shared.down_proj": {
-   "file": "shared_down.bin",
+   "file": "shared_down_proj.bin",
    "shape": [
     64,
     64
@@ -200,41 +250,109 @@
     64
    ]
   },
-  "experts_l1.gate_up_proj": {
-   "file": "experts_l1_gate_up.bin",
+  "tiny_x": {
+   "file": "tiny_x.bin",
    "shape": [
-    16,
-    64,
-    64
+    8,
+    256
    ]
   },
-  "experts_l1.down_proj": {
-   "file": "experts_l1_down.bin",
+  "tiny_l0_dense_out": {
+   "file": "tiny_l0_dense_out.bin",
    "shape": [
-    16,
-    64,
-    32
+    8,
+    256
    ]
   },
-  "experts_l1_out.weights": {
-   "file": "experts_l1_weights.bin",
+  "tiny_l2_moe_out": {
+   "file": "tiny_l2_moe_out.bin",
    "shape": [
-    12,
-    4
+    8,
+    256
    ]
   },
-  "experts_l1_out.indices": {
-   "file": "experts_l1_indices.bin",
+  "tiny_l2_router_out.indices": {
+   "file": "tiny_l2_router_out_indices.bin",
    "shape": [
-    12,
-    4
+    8,
+    2
    ]
   },
-  "experts_l1_out": {
-   "file": "experts_l1_out.bin",
+  "tiny_l2_router_out.weights": {
+   "file": "tiny_l2_router_out_weights.bin",
    "shape": [
-    12,
-    64
+    8,
+    2
+   ]
+  },
+  "quant_f16_raw": {
+   "file": "quant_f16_raw.bin",
+   "shape": [
+    1024
+   ],
+   "dtype": "u8",
+   "ggml_type": 1
+  },
+  "quant_f16_want": {
+   "file": "quant_f16_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q8_0_raw": {
+   "file": "quant_q8_0_raw.bin",
+   "shape": [
+    544
+   ],
+   "dtype": "u8",
+   "ggml_type": 8
+  },
+  "quant_q8_0_want": {
+   "file": "quant_q8_0_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q4_k_raw": {
+   "file": "quant_q4_k_raw.bin",
+   "shape": [
+    288
+   ],
+   "dtype": "u8",
+   "ggml_type": 12
+  },
+  "quant_q4_k_want": {
+   "file": "quant_q4_k_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q5_k_raw": {
+   "file": "quant_q5_k_raw.bin",
+   "shape": [
+    352
+   ],
+   "dtype": "u8",
+   "ggml_type": 13
+  },
+  "quant_q5_k_want": {
+   "file": "quant_q5_k_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q6_k_raw": {
+   "file": "quant_q6_k_raw.bin",
+   "shape": [
+    420
+   ],
+   "dtype": "u8",
+   "ggml_type": 14
+  },
+  "quant_q6_k_want": {
+   "file": "quant_q6_k_want.bin",
+   "shape": [
+    512
    ]
   }
  }
