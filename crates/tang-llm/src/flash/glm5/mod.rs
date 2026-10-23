@@ -11,6 +11,8 @@ pub mod engine;
 pub mod forward;
 pub mod gguf;
 pub mod kda;
+#[cfg(feature = "cuda")]
+pub mod kda_cuda;
 pub mod mhc;
 pub mod mla;
 pub mod moe;

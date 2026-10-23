@@ -44,6 +44,8 @@ struct DsaCache {
 #[cfg(feature = "cuda")]
 pub struct GpuFfn {
     devs: Vec<(tang_moe::gpu::Gpu, super::moe::gpu::Kernels)>,
+    /// W4's KDA kernels per device (`TANG_GLM5_GPU_KDA=0`: KDA stays on the CPU).
+    kda_k: Vec<Option<super::kda_cuda::cuda::Kernels>>,
     layers: Vec<super::moe::gpu::DevMoe>,
     dev_of: Vec<usize>,
     pub split: usize,
@@ -52,8 +54,18 @@ pub struct GpuFfn {
 #[cfg(feature = "cuda")]
 impl GpuFfn {
     /// Upload every layer's FFN. `Ok(None)` when there is no CUDA device or `TANG_GLM5_GPU=0`.
-    pub fn load(g: &crate::gguf::Gguf, n_layer: usize) -> Result<Option<Self>> {
+    pub fn load(g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<Option<Self>> {
         use tang_moe::gpu::Gpu;
+        let n_layer = hp.n_layer;
+        let kda_cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let kda_on = !std::env::var("TANG_GLM5_GPU_KDA").is_ok_and(|v| v == "0");
+        let mut kda_k = Vec::new();
         if std::env::var("TANG_GLM5_GPU").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
@@ -70,6 +82,11 @@ impl GpuFfn {
             };
             gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU {ord}: {e}"))?;
             let k = super::moe::gpu::Kernels::new(&gpu)?;
+            kda_k.push(if kda_on && hp.is_kda.iter().any(|&b| b) {
+                Some(super::kda_cuda::cuda::load(&gpu, &kda_cfg)?)
+            } else {
+                None
+            });
             devs.push((gpu, k));
         }
         let split = if devs.len() < 2 {
@@ -121,6 +138,7 @@ impl GpuFfn {
         );
         Ok(Some(Self {
             devs,
+            kda_k,
             layers,
             dev_of,
             split,
@@ -178,7 +196,7 @@ impl Glm5Engine {
     /// Returns whether they moved.
     #[cfg(feature = "cuda")]
     pub fn use_gpu(&mut self) -> Result<bool> {
-        self.gpu = GpuFfn::load(&self.m.g, self.m.hp.n_layer)?;
+        self.gpu = GpuFfn::load(&self.m.g, &self.m.hp)?;
         Ok(self.gpu.is_some())
     }
 
@@ -229,6 +247,29 @@ impl Glm5Engine {
         Ok(w)
     }
 
+    /// KDA layer `l`'s mixer: W4's GPU conv + core when loaded, else the CPU reference.
+    fn kda_mixer(
+        &self,
+        l: usize,
+        x: &[f32],
+        t: usize,
+        w: &KdaLayerW,
+        cfg: &KdaConfig,
+        st: &mut (ConvState, KdaState),
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            let d = g.dev_of[l];
+            if let Some(k) = &g.kda_k[d] {
+                let gpu = &g.devs[d].0;
+                gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                return kda_gpu(x, t, w, cfg, k, gpu, &mut st.0, &mut st.1);
+            }
+        }
+        let _ = l;
+        super::kda::kda_layer(x, w, cfg, &mut st.0, &mut st.1, 1, t)
+    }
+
     /// Run `ids` after the tokens so far. Returns their logits `[ids.len()][n_vocab]`.
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
@@ -262,10 +303,12 @@ impl Glm5Engine {
             self.m.norm_all(&mut x, l, "attn_norm.weight")?;
             let y = if hp.is_kda[l] {
                 let (w, cfg) = self.kda_weights(l)?;
-                let st = self.kda[l].get_or_insert_with(|| {
-                    (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1))
-                });
-                super::kda::kda_layer(&x, &w, &cfg, &mut st.0, &mut st.1, 1, t)?
+                let mut st = self.kda[l]
+                    .take()
+                    .unwrap_or_else(|| (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1)));
+                let y = self.kda_mixer(l, &x, t, &w, &cfg, &mut st);
+                self.kda[l] = Some(st);
+                y?
             } else {
                 let w = self.mla_weights(l)?;
                 let q_resid = w.gemv_q_a(&x, t);
@@ -406,6 +449,110 @@ fn mhc_post_all(
         super::mhc::mhc_post(&mixes[i], &y[i * n..(i + 1) * n], &streams, &mut outs)?;
     }
     Ok(())
+}
+
+/// One KDA layer with W4's CUDA conv + delta core (feature `cuda`). Projections, gates and
+/// the gated output norm stay on the host (the reference's f32 `matmul`). Prefill runs
+/// 64-token GPU chunks (the kernel's fixed size), a single-token window runs the GPU decode
+/// step, and any other tail runs the CPU core on the same state. `x` `[t][hidden]` in,
+/// `[t][hidden]` out; `conv` / `state` are updated in place.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn kda_gpu(
+    x: &[f32],
+    t: usize,
+    w: &KdaLayerW,
+    cfg: &KdaConfig,
+    k: &super::kda_cuda::cuda::Kernels,
+    gpu: &tang_moe::gpu::Gpu,
+    conv: &mut ConvState,
+    state: &mut KdaState,
+) -> Result<Vec<f32>> {
+    use super::kda::{matmul, sigmoid};
+    use super::kda_cuda::cuda;
+    let (nh, hd) = (cfg.heads, cfg.head_dim);
+    let hidden = w.hidden;
+    ensure!(x.len() == t * hidden, "layer input");
+    // projections, stacked q|k|v per token (the reference's layout)
+    let qp = matmul(&w.q, nh * hd, hidden, x, t);
+    let kp = matmul(&w.k, nh * hd, hidden, x, t);
+    let vp = matmul(&w.v, nh * hd, hidden, x, t);
+    let ch = 3 * nh * hd;
+    let mut qkv = vec![0f32; t * ch];
+    for i in 0..t {
+        qkv[i * ch..i * ch + nh * hd].copy_from_slice(&qp[i * nh * hd..(i + 1) * nh * hd]);
+        qkv[i * ch + nh * hd..i * ch + 2 * nh * hd]
+            .copy_from_slice(&kp[i * nh * hd..(i + 1) * nh * hd]);
+        qkv[i * ch + 2 * nh * hd..(i + 1) * ch]
+            .copy_from_slice(&vp[i * nh * hd..(i + 1) * nh * hd]);
+    }
+    // gates: gpre (pre-exp, per key dim) and beta (post-sigmoid, per head)
+    let fg = super::kda::ForgetGateW {
+        f_a: w.f_a.clone(),
+        f_b: w.f_b.clone(),
+        dt_bias: w.dt_bias.clone(),
+        decay_rate: w.decay_rate.clone(),
+    };
+    let (b, c) = (1usize, 64usize);
+    let gpre = super::kda::forget_gate(x, &fg, cfg, t);
+    let beta = super::kda::beta_gate(x, &w.b_proj, cfg, b, t);
+    let mut y = vec![0f32; t * nh * hd];
+    let mut off = 0usize;
+    if t == 1 {
+        let o = cuda::decode(gpu, k, cfg, &qkv, &w.conv, &gpre, &beta, conv, state, b)?;
+        y.copy_from_slice(&o);
+        off = 1;
+    }
+    while off + c <= t {
+        let o = cuda::prefill(
+            gpu,
+            k,
+            cfg,
+            &qkv[off * ch..(off + c) * ch],
+            &w.conv,
+            &gpre[off * nh * hd..(off + c) * nh * hd],
+            &beta[off * nh..(off + c) * nh],
+            conv,
+            state,
+            b,
+            c,
+            c,
+        )?;
+        y[off * nh * hd..(off + c) * nh * hd].copy_from_slice(&o);
+        off += c;
+    }
+    // a tail shorter than one chunk: the CPU core on the same state objects
+    if off < t {
+        let rem = t - off;
+        let yc = super::kda::conv1d_prefill(&qkv[off * ch..t * ch], &w.conv, conv, cfg, b, rem)?;
+        let oc = super::kda::kda_chunk(
+            &yc,
+            &gpre[off * nh * hd..t * nh * hd],
+            &beta[off * nh..t * nh],
+            state,
+            cfg,
+            b,
+            rem,
+            c,
+        )?;
+        y[off * nh * hd..t * nh * hd].copy_from_slice(&oc);
+    }
+    // gated output norm (host, same as the reference), then o_proj
+    let ga = matmul(&w.g_a, hd, hidden, x, t);
+    let g2 = matmul(&w.g_b, nh * hd, hd, &ga, t);
+    for i in 0..t {
+        for h in 0..nh {
+            let dst = &mut y[i * nh * hd + h * hd..i * nh * hd + (h + 1) * hd];
+            crate::flash::reference::rms_norm_mul(dst, &w.o_norm, cfg.eps);
+            for (yj, gj) in dst
+                .iter_mut()
+                .zip(&g2[i * nh * hd + h * hd..i * nh * hd + (h + 1) * hd])
+            {
+                *yj *= sigmoid(*gj);
+            }
+        }
+    }
+    Ok(matmul(&w.o_proj, hidden, nh * hd, &y, t))
 }
 
 pub(crate) fn argmax(v: &[f32]) -> u32 {
@@ -607,13 +754,14 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// R3 (FFN part): the engine with every FFN on the GPU equals the CPU engine on the tiny
-    /// model, prefill + decode. Pod: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
+    /// R3 (FFN + KDA): the engine with every FFN and the KDA conv + core on the GPU equals
+    /// the CPU engine on the tiny model: 150-token prefill (2 GPU chunks + a CPU tail), GPU
+    /// decode steps, then a short window. Pod: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
     /// --no-default-features --features cuda --lib glm5::engine -- --nocapture`
     /// (`TANG_GPUS=2 TANG_SPLIT_AT=2` exercises the split).
     #[cfg(feature = "cuda")]
     #[test]
-    fn engine_gpu_ffn_matches_cpu() {
+    fn engine_gpu_matches_cpu() {
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             eprintln!("skip: tiny fixture absent");
             return;
@@ -626,7 +774,18 @@ mod tests {
         assert!(gpu.use_gpu().unwrap(), "GPU FFNs did not load");
         let nv = cpu.m.hp.n_vocab;
         let mut worst = 0f32;
-        for w in [&ids[..20], &ids[20..21], &ids[21..22], &ids[22..30]] {
+        // seq2 (2052 tokens) for a window ≥ 64: two GPU prefill chunks + a CPU tail, then
+        // single tokens (the GPU decode step), then a short window (CPU tail only)
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        let _ = &ids;
+        for w in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]] {
             let a = cpu.window(w).unwrap();
             let b = gpu.window(w).unwrap();
             for p in 0..w.len() {
@@ -640,7 +799,7 @@ mod tests {
                 worst = worst.max((x - y).abs());
             }
         }
-        eprintln!("GPU FFN vs CPU: logits max abs {worst:.3e}");
+        eprintln!("GPU (FFN + KDA) vs CPU: logits max abs {worst:.3e}");
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 

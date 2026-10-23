@@ -316,7 +316,7 @@ pub mod cuda {
     use super::super::kda::{ConvState, KdaConfig, KdaState};
     use anyhow::{ensure, Result};
     use tang_moe::gpu::{DevBuf, Gpu, Stream};
-    use tang_moe::{args, launch};
+    use tang_moe::{args, gpu::launch};
     use cudarc::driver::sys;
 
     /// All KDA kernels, NVRTC-compiled once.

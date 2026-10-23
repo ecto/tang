@@ -205,7 +205,7 @@ fn silu(x: f32) -> f32 {
 }
 
 #[inline]
-fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
@@ -240,7 +240,7 @@ fn rms_norm_mul(x: &mut [f32], w: &[f32], eps: f32) {
 }
 
 /// `Y[t] = W X[t]`: `W` `[rows][cols]` row-major, `X` `[t][cols]`; → `[t][rows]`.
-fn matmul(w: &[f32], rows: usize, cols: usize, x: &[f32], t: usize) -> Vec<f32> {
+pub(crate) fn matmul(w: &[f32], rows: usize, cols: usize, x: &[f32], t: usize) -> Vec<f32> {
     assert_eq!(w.len(), rows * cols, "weight");
     assert_eq!(x.len(), t * cols, "input");
     let mut y = vec![0f32; t * rows];
