@@ -196,6 +196,7 @@ pub struct Glm5Engine {
     dsa: Vec<DsaCache>,
     cache_weights: bool,
     kda_w: Vec<Option<(KdaLayerW, KdaConfig)>>,
+    hc_w: Vec<Option<super::mhc::MhcWeights>>,
     mla_w: Vec<Option<MlaWeights>>,
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
@@ -218,6 +219,7 @@ impl Glm5Engine {
             dsa: vec![DsaCache::default(); nl],
             cache_weights,
             kda_w: (0..nl).map(|_| None).collect(),
+            hc_w: (0..nl * 2).map(|_| None).collect(),
             mla_w: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
@@ -270,6 +272,19 @@ impl Glm5Engine {
         let w = self.m.kda_weights(l)?;
         if self.cache_weights {
             self.kda_w[l] = Some(w.clone());
+        }
+        Ok(w)
+    }
+
+    /// mHC mixer weights for layer `l` (cached when `cache_weights`; see the field note).
+    fn hc_weights(&mut self, l: usize, prefix: &str, hp: &super::mhc::MhcHparams) -> Result<super::mhc::MhcWeights> {
+        let idx = l * 2 + if prefix == "hc_ffn" { 1 } else { 0 };
+        if let Some(w) = &self.hc_w[idx] {
+            return Ok(w.clone());
+        }
+        let w = super::mhc::MhcWeights::from_gguf(&self.m.g, l, prefix, self.m.hp.n_embd, hp)?;
+        if self.cache_weights {
+            self.hc_w[idx] = Some(w.clone());
         }
         Ok(w)
     }
@@ -453,7 +468,7 @@ impl Glm5Engine {
 
         for l in 0..hp.n_layer {
             // ---- attention half
-            let w_attn = super::mhc::MhcWeights::from_gguf(&self.m.g, l, "hc_attn", n, &mhp)?;
+            let w_attn = self.hc_weights(l, "hc_attn", &mhp)?;
             let (mut x, mixes) = self.mhc_pre(l, &w_attn, &r, t)?;
             self.m.norm_all(&mut x, l, "attn_norm.weight")?;
             let y = if hp.is_kda[l] {
@@ -471,7 +486,7 @@ impl Glm5Engine {
             self.mhc_post(l, &mixes, &y, &mut r, t)?;
 
             // ---- FFN half
-            let w_ffn = super::mhc::MhcWeights::from_gguf(&self.m.g, l, "hc_ffn", n, &mhp)?;
+            let w_ffn = self.hc_weights(l, "hc_ffn", &mhp)?;
             let (mut x, mixes) = self.mhc_pre(l, &w_ffn, &r, t)?;
             self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
             let y = self.ffn(l, &x, t)?;
