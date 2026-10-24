@@ -134,8 +134,10 @@ extern "C" __global__ void kda_step(const float* __restrict__ QKV,
     __syncthreads();
     float qs = 0.0f, ks = 0.0f;
     for (unsigned int a = 0; a < D; a++) { qs += q[a] * q[a]; ks += k[a] * k[a]; }
-    qv = q[x] * rsqrtf(qs + 1e-6f) * rsqrtf((float)D);
-    kv = k[x] * rsqrtf(ks + 1e-6f);
+    qs = rsqrtf(qs + 1e-6f); ks = rsqrtf(ks + 1e-6f);
+    float scale = rsqrtf((float)D);
+    q[x] *= qs * scale; k[x] *= ks;      // now q[]/k[] hold the normed values for ALL threads
+    __syncthreads();
     // ---- delta rule: one thread owns value column x ----
     // pass 1: sk[x] = Σ_a k[a]·S[a][x] with S[a][x] *= exp(G[a]) first
     float p = 0.0f;
@@ -143,7 +145,7 @@ extern "C" __global__ void kda_step(const float* __restrict__ QKV,
         float* sp = S + ((u64)h * D + a) * D + x;
         float s = (*sp) * expf(G[h * D + a]);
         *sp = s;
-        p = __fmaf_rn(kv, s, p);
+        p = __fmaf_rn(k[a], s, p);
     }
     sk[x] = p;
     __syncthreads();
@@ -152,9 +154,9 @@ extern "C" __global__ void kda_step(const float* __restrict__ QKV,
     float o = 0.0f;
     for (unsigned int a = 0; a < D; a++) {
         float* sp = S + ((u64)h * D + a) * D + x;
-        float s = __fmaf_rn(kv, delta, *sp);
+        float s = __fmaf_rn(k[a], delta, *sp);
         *sp = s;
-        o = __fmaf_rn(qv, s, o);
+        o = __fmaf_rn(q[a], s, o);
     }
     O[h * D + x] = o;
 }
@@ -172,17 +174,18 @@ pub const PREFILL_SRC: &str = r#"
 typedef unsigned long long u64;
 
 // One float per thread → the block sum (D is a power of two; naive tree over shared red).
+// Each phase reads only values written before the previous __syncthreads().
 __device__ __forceinline__ float block_red(float* red, unsigned int a, float p, unsigned int D) {
-    volatile float* r = red;
-    r[a] = p;
+    red[a] = p;
     __syncthreads();
     for (unsigned int s2 = D >> 1; s2 > 0; s2 >>= 1) {
+        float other = 0.0f;
+        if (a < s2) other = red[a + s2];
         __syncthreads();
-        if (a < s2) r[a] = r[a] + r[a + s2];
-        else r[a] = r[a];
+        if (a < s2) red[a] += other;
         __syncthreads();
     }
-    float v = r[0];
+    float v = red[0];
     __syncthreads();
     return v;
 }
@@ -229,7 +232,11 @@ extern "C" __global__ void __launch_bounds__(1024) kda_prefill(
             gc[i * D + a] = i > 0 ? gv + gc[(i - 1) * D + a] : gv;
         }
         __syncthreads();
-        // A0: strictly lower, beta on row i only
+        // A0: strictly lower, beta on row i only. A is uninitialized shared memory — zero
+        // it first (the CPU's `a` starts as zeros; the fixpoint reads row m's diagonal,
+        // which must be 0 until the final +I).
+        for (unsigned int i = 0; i < n; i++)
+            for (unsigned int j = a; j < C; j += D) A[i * C + j] = 0.0f;
         __syncthreads();
         for (unsigned int i = 1; i < n; i++) {
             for (unsigned int j = 0; j < i; j++) {
@@ -242,13 +249,17 @@ extern "C" __global__ void __launch_bounds__(1024) kda_prefill(
             }
         }
         __syncthreads();
-        // HF's triangular fixpoint (serial in one thread; naive)
+        // HF's triangular fixpoint (serial in one thread; naive): row i finalises from a
+        // SNAPSHOT of A0's row i taken BEFORE this i-iteration, against the already-final
+        // rows m < i — entries m < j are still A0 here (the CPU ref snapshots `row` too).
         if (a == 0) {
             for (unsigned int i = 1; i < n; i++) {
+                float row[64];
+                for (unsigned int m = 0; m < i; m++) row[m] = A[i * C + m];
                 for (unsigned int j = 0; j < i; j++) {
                     float s = 0.0f;
-                    for (unsigned int m = 0; m < i; m++) s += A[i * C + m] * A[m * C + j];
-                    A[i * C + j] += s;
+                    for (unsigned int m = 0; m < i; m++) s += row[m] * A[m * C + j];
+                    A[i * C + j] = row[j] + s;
                 }
             }
             for (unsigned int i = 0; i < n; i++) A[i * C + i] += 1.0f;
@@ -502,58 +513,80 @@ mod tests {
         }
     }
 
-    /// GPU prefill (conv + chunk 64) vs the CPU reference on the HF fixture.
+    /// GPU prefill (conv + chunk 64) vs the CPU reference on the HF fixture, at several
+    /// window lengths so the state handoff across chunk boundaries is exercised.
     #[test]
     fn glm5_kda_prefill_gpu_vs_cpu() {
         let Some(g) = Gpu::for_test() else { return };
         let cfg = cfg();
-        let (b, t) = (1usize, 100usize);
         let (nh, hd) = (cfg.heads, cfg.head_dim);
-        let q = loadf("q");
-        let k = loadf("k");
-        let v = loadf("v");
-        let ch = 3 * nh * hd;
-        // the fixture's q/k/v are pre-projection; the fixture test path feeds qkv straight
-        // into the core — here we feed the conv, so rebuild the layer's qkv from q/k/v (the
-        // fixture generator wrote conv_w and the raw conv input; use conv_x + conv_out).
         let x = loadf("conv_x");
         let wconv = loadf("conv_w");
         let gpre = loadf("g");
         let beta = loadf("beta");
-        let mut conv = ConvState::zeros(&cfg, b);
-        // g in the fixture is pre-exp; beta post-sigmoid — as the CPU core takes them
-        let _ = (q, k, v, t);
         let kers = load(&g, &cfg).unwrap();
-        let mut state = KdaState::zeros(&cfg, b);
-        let og = prefill(&g, &kers, &cfg, &x, &wconv, &gpre, &beta, &mut conv, &mut state, b, t, 64)
-            .unwrap();
-        // CPU reference
+        for t in [1usize, 63, 64, 65, 100] {
+            let b = 1usize;
+            let mut conv = ConvState::zeros(&cfg, b);
+            let mut state = KdaState::zeros(&cfg, b);
+            let og = prefill(&g, &kers, &cfg, &x[..t * cfg.conv_dim()], &wconv, &gpre[..t * nh * hd],
+                &beta[..t * nh], &mut conv, &mut state, b, t, 64).unwrap();
+            let mut conv2 = ConvState::zeros(&cfg, b);
+            let mut state2 = KdaState::zeros(&cfg, b);
+            let y = kda::conv1d_prefill(&x[..t * cfg.conv_dim()], &wconv, &mut conv2, &cfg, b, t).unwrap();
+            let oc = kda::kda_chunk(&y, &gpre[..t * nh * hd], &beta[..t * nh], &mut state2, &cfg, b, t, 64).unwrap();
+            let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+            let es: f32 = state.0.iter().zip(&state2.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+            let ec: f32 = conv.0.iter().zip(&conv2.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+            println!("T={t}: out {e:.3e} state {es:.3e} conv {ec:.3e}");
+            assert!(e < 1e-4, "T={t} out {e}");
+            assert!(es < 1e-4, "T={t} state {es}");
+            assert!(ec < 1e-4, "T={t} conv {ec}");
+        }
+    }
+
+    /// Cross-chunk isolation: seed both sides with the CPU's state after 64 tokens, then
+    /// run tokens 64..65 through the FULL T=65 window on GPU (two chunks in one launch).
+    #[test]
+    fn glm5_kda_chunk1_gpu_vs_cpu() {
+        let Some(g) = Gpu::for_test() else { return };
+        let cfg = cfg();
+        let (nh, hd) = (cfg.heads, cfg.head_dim);
+        let x = loadf("conv_x");
+        let wconv = loadf("conv_w");
+        let gpre = loadf("g");
+        let beta = loadf("beta");
+        let b = 1usize;
+        // CPU state after the first 64 tokens
         let mut conv2 = ConvState::zeros(&cfg, b);
         let mut state2 = KdaState::zeros(&cfg, b);
-        let y = kda::conv1d_prefill(&x, &wconv, &mut conv2, &cfg, b, t).unwrap();
-        let oc = kda::kda_chunk(&y, &gpre, &beta, &mut state2, &cfg, b, t, 64).unwrap();
-        let e: f32 = og
-            .iter()
-            .zip(&oc)
-            .map(|(a, c)| (a - c).abs())
-            .fold(0.0f32, f32::max);
-        let es: f32 = state
-            .0
-            .iter()
-            .zip(&state2.0)
-            .map(|(a, c)| (a - c).abs())
-            .fold(0.0f32, f32::max);
-        let ec: f32 = conv
-            .0
-            .iter()
-            .zip(&conv2.0)
-            .map(|(a, c)| (a - c).abs())
-            .fold(0.0f32, f32::max);
-        println!("prefill GPU vs CPU: out {e:.3e} state {es:.3e} conv {ec:.3e}");
-        assert!(e < 1e-4, "out {e}");
+        let y0 = kda::conv1d_prefill(&x[..64 * cfg.conv_dim()], &wconv, &mut conv2, &cfg, b, 64).unwrap();
+        let _ = kda::kda_chunk(&y0, &gpre[..64 * nh * hd], &beta[..64 * nh], &mut state2, &cfg, b, 64, 64).unwrap();
+        let kers = load(&g, &cfg).unwrap();
+        let t = 65usize;
+        // GPU: full T=65 (2 chunks), state/conv seeded with the CPU's after-64 values
+        let mut conv = conv2.clone();
+        let mut state = KdaState(state2.0.clone());
+        let og = prefill(&g, &kers, &cfg, &x[..t * cfg.conv_dim()], &wconv,
+            &gpre[..t * nh * hd], &beta[..t * nh], &mut conv, &mut state, b, t, 64).unwrap();
+        let mut conv3 = conv2.clone();
+        let mut state3 = KdaState(state2.0.clone());
+        let y = kda::conv1d_prefill(&x[..t * cfg.conv_dim()], &wconv, &mut conv3, &cfg, b, t).unwrap();
+        let oc = kda::kda_chunk(&y, &gpre[..t * nh * hd], &beta[..t * nh], &mut state3, &cfg, b, t, 64).unwrap();
+        for ti in 63..t {
+            let mut et = 0f32;
+            for j in 0..nh * hd {
+                et = et.max((og[ti * nh * hd + j] - oc[ti * nh * hd + j]).abs());
+            }
+            println!("  t={ti} err={et:.3e}");
+        }
+        let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        let es: f32 = state.0.iter().zip(&state3.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        println!("chunk-cross: out {e:.3e} state {es:.3e}");
         assert!(es < 1e-4, "state {es}");
-        assert!(ec < 1e-4, "conv {ec}");
+        assert!(e < 1e-4, "out {e}");
     }
+
 
     /// GPU decode step (fused conv + delta rule) vs the CPU reference, 3 tokens chained.
     #[test]
