@@ -24,7 +24,7 @@ sleep 2; log "results server: $(curl -s -m 5 localhost:8001/ | head -c 80)"
   && touch $W/MODEL_OK ) &
 curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.94.0 >/dev/null 2>&1 || die_pod "rustup failed"
 export PATH=/root/.cargo/bin:$PATH
-git clone -q --filter=blob:none https://github.com/ecto/tang.git $W/tang && cd $W/tang && git checkout -q 68de36dd || die_pod "checkout failed"
+git clone -q --filter=blob:none https://github.com/ecto/tang.git $W/tang && cd $W/tang && git checkout -q a7a02708 || die_pod "checkout failed"
 log "building tang-llm (cuda)"
 cargo build -q --release -p tang-llm --no-default-features --features cuda >"$R/build.log" 2>&1 || { tail -40 "$R/build.log"; die_pod "build failed"; }
 BIN=$W/tang/target/release/tang-llm; log "build done"
@@ -46,7 +46,7 @@ TANG_REQUIRE_CUDA=1 TANG_GPUS=2 TANG_SPLIT_AT=2 cargo test -q --release -p tang-
 log "engine split tests rc=$? | $(grep -E 'test result' $R/engine-split.log | tail -1)"
 
 # 4. FIRST TOKENS (the headline)
-export TANG_GPUS=2 TANG_GLM5_CACHE=1
+export TANG_GPUS=2 TANG_GLM5_PROF=1
 log "flash-generate (haiku)"
 ( timeout 900 $BIN flash-generate "$G" --prompt "Write a haiku about the sea." -n 32 --temp 0 -v --out /root/g2.ids >"$R/haiku.log" 2>&1; echo "haiku rc=$?"; echo "=== HAIKU IDS: $(head -c 120 /root/g2.ids 2>/dev/null)"; tail -8 "$R/haiku.log" ) > >(tee -a "$R/pod.log" >&2) 2>&1
 log "haiku rc=$?"; echo "=== HAIKU LOG TAIL"; tail -25 "$R/haiku.log"; echo "=== HAIKU IDS: $(cat /root/g2.ids 2>/dev/null)"
