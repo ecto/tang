@@ -370,6 +370,205 @@ pub mod cuda {
         Ok(s)
     }
 
+    /// One KDA layer's resident device side: the conv history, recurrent state and conv
+    /// weights stay on the GPU for the layer's whole life; the per-call uploads are the
+    /// token's qkv row(s) and gates only, and the only read-back is the pre-norm output
+    /// (the gated norm + o_proj run on the host). No per-call allocations, one persistent
+    /// stream — the 117 ms/layer decode profile was 2× 4 MiB state uploads + 3 sync
+    /// read-backs + a fresh stream per call, not the kernel.
+    pub struct DevKda {
+        pub wconv: DevBuf,
+        pub h0: DevBuf,
+        pub st: DevBuf,
+        /// preallocated: chunk-64 x/g/beta/o/scratch for prefill, reused for decode
+        pub xb: DevBuf,
+        pub gb: DevBuf,
+        pub bb: DevBuf,
+        pub ob: DevBuf,
+        pub yb: DevBuf,
+        pub scr: DevBuf,
+        pub s: Stream,
+        ch_dim: usize,
+        nh: usize,
+        hd: usize,
+        chunk: usize,
+    }
+
+    impl DevKda {
+        /// Allocate everything once. `conv` / `state` are the CPU-side values to seed with
+        /// (from the tiny-model / GGUF load or a CPU fallback window); they stay the source
+        /// of truth on the host ONLY for read-back via [`Self::read_conv`] /
+        /// [`Self::read_state`].
+        pub fn new(
+            g: &Gpu,
+            k: &Kernels,
+            cfg: &KdaConfig,
+            wconv: &[f32],
+            conv: &ConvState,
+            state: &KdaState,
+            slots: usize,
+        ) -> Result<Self> {
+            let ch_dim = cfg.conv_dim();
+            let (nh, hd) = (cfg.heads, cfg.head_dim);
+            let chunk = 64usize;
+            g.bind()?;
+            // fail fast if the weights are the wrong shape
+            anyhow::ensure!(wconv.len() == ch_dim * cfg.d_conv, "conv weight shape");
+            let s = Stream::new()?;
+            g.bind()?;
+            Ok(DevKda {
+                wconv: DevBuf::from_slice(wconv)?,
+                h0: DevBuf::from_slice(&conv.0)?,
+                st: DevBuf::from_slice(&state.0)?,
+                xb: DevBuf::zeroed(slots * chunk * ch_dim * 4)?,
+                gb: DevBuf::zeroed(slots * chunk * nh * hd * 4)?,
+                bb: DevBuf::zeroed(slots * chunk * nh * 4)?,
+                ob: DevBuf::zeroed(slots * chunk * nh * hd * 4)?,
+                yb: DevBuf::zeroed(slots * chunk * ch_dim * 4)?,
+                scr: DevBuf::zeroed(slots * nh * 6 * chunk * hd * 4)?,
+                s,
+                ch_dim,
+                nh,
+                hd,
+                chunk,
+            })
+        }
+
+        /// The one-token decode step: upload the qkv row + gates, launch, read `o` back.
+        /// `conv`/`state` host copies are updated on the host too (cheap, keeps them in
+        /// sync for CPU fallback), but nothing is read back from the device.
+        pub fn decode(
+            &mut self,
+            k: &Kernels,
+            cfg: &KdaConfig,
+            x: &[f32],
+            gpre: &[f32],
+            beta: &[f32],
+            conv: &mut ConvState,
+            state: &mut KdaState,
+            b: usize,
+        ) -> Result<Vec<f32>> {
+            let (nh, hd, ch_dim) = (self.nh, self.hd, self.ch_dim);
+            anyhow::ensure!(x.len() == b * ch_dim, "decode x shape");
+            self.s.sync()?;
+            self.xb.write(0, x)?;
+            self.gb.write(0, gpre)?;
+            self.bb.write(0, beta)?;
+            unsafe {
+                launch(
+                    k.step,
+                    (nh as u32, b as u32, 1),
+                    (hd as u32, 1, 1),
+                    (3 * hd * 4) as u32,
+                    &self.s,
+                    args![
+                        self.xb.ptr, self.h0.ptr, self.wconv.ptr, self.gb.ptr, self.bb.ptr,
+                        self.st.ptr, self.ob.ptr
+                    ],
+                )?;
+            }
+            self.s.sync()?;
+            // conv history shift on the host (the device copy is not read back; the host's
+            // is authoritative for CPU fallback — note the device's H0 is now stale until
+            // the next write, so the shift must ALSO run on the device; done via
+            // conv_commit with T=1 below to keep the two in sync).
+            let m = cfg.d_conv - 1;
+            let mut next = conv.0.clone();
+            for bi in 0..b {
+                for c in 0..ch_dim {
+                    for s2 in 0..m {
+                        next[(bi * ch_dim + c) * m + s2] = if s2 + 1 < m {
+                            conv.0[(bi * ch_dim + c) * m + s2 + 1]
+                        } else {
+                            x[bi * ch_dim + c]
+                        };
+                    }
+                }
+            }
+            conv.0 = next;
+            // device H0: same shift via the commit kernel (T=1)
+            unsafe {
+                launch(
+                    k.conv_commit,
+                    (ch_dim.div_ceil(256) as u32, b as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.h0.ptr, self.xb.ptr, ch_dim as u32, 1u32],
+                )?;
+            }
+            self.s.sync()?;
+            Ok(self.ob.read::<f32>(0, b * nh * hd)?)
+        }
+
+        /// Prefill `t ≤ chunk` tokens (chunk ≤ 64): conv + chunked core, device-resident.
+        /// `t` may be < the buffer's chunk; only `t` rows are uploaded/read.
+        #[allow(clippy::too_many_arguments)]
+        pub fn prefill(
+            &mut self,
+            k: &Kernels,
+            cfg: &KdaConfig,
+            x: &[f32],
+            gpre: &[f32],
+            beta: &[f32],
+            conv: &mut ConvState,
+            state: &mut KdaState,
+            b: usize,
+            t: usize,
+        ) -> Result<Vec<f32>> {
+            let (nh, hd, ch_dim) = (self.nh, self.hd, self.ch_dim);
+            let chunk = self.chunk;
+            anyhow::ensure!(t <= chunk && chunk == 64, "chunk window");
+            self.s.sync()?;
+            self.xb.write(0, x)?;
+            self.gb.write(0, gpre)?;
+            self.bb.write(0, beta)?;
+            unsafe {
+                launch(
+                    k.conv,
+                    (ch_dim.div_ceil(256) as u32, b as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.xb.ptr, ch_dim as u32, self.h0.ptr, self.wconv.ptr, self.yb.ptr, t as u32],
+                )?;
+                launch(
+                    k.conv_commit,
+                    (ch_dim.div_ceil(256) as u32, b as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.h0.ptr, self.xb.ptr, ch_dim as u32, t as u32],
+                )?;
+                launch(
+                    k.prefill,
+                    (nh as u32, b as u32, 1),
+                    (hd as u32, 1, 1),
+                    ((chunk * chunk + hd) * 4) as u32,
+                    &self.s,
+                    args![
+                        self.yb.ptr, t as u32, ch_dim as u32, self.gb.ptr, (nh * hd) as u32,
+                        self.bb.ptr, nh as u32, self.st.ptr, self.ob.ptr, self.scr.ptr, chunk as u32
+                    ],
+                )?;
+            }
+            self.s.sync()?;
+            Ok(self.ob.read::<f32>(0, b * t * nh * hd)?)
+        }
+
+        /// Read the conv history back (for a CPU fallback window or a checkpoint).
+        pub fn read_conv(&self, conv: &mut ConvState) -> Result<()> {
+            conv.0 = self.h0.read(0, conv.0.len())?;
+            Ok(())
+        }
+
+        /// Read the recurrent state back (for a CPU fallback window or a checkpoint).
+        pub fn read_state(&self, state: &mut KdaState) -> Result<()> {
+            state.0 = self.st.read(0, state.0.len())?;
+            Ok(())
+        }
+    }
+
     /// Prefill: conv + chunked core, both on GPU, against the CPU reference path.
     /// `x` = pre-conv stacked projections `[b][t][conv_dim]`; returns (o, state, conv).
     pub fn prefill(
@@ -492,7 +691,7 @@ pub mod cuda {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::super::kda::{self, ConvState, KdaConfig, KdaState};
-    use super::cuda::{decode, load, prefill};
+    use super::cuda::{decode, load, prefill, DevKda};
     use tang_moe::gpu::Gpu;
 
     fn loadf(name: &str) -> Vec<f32> {
@@ -587,6 +786,59 @@ mod tests {
         assert!(e < 1e-4, "out {e}");
     }
 
+
+    /// The resident `DevKda` path: 3 chained decodes + a 64-token prefill, all with no
+    /// per-call allocations, vs the CPU reference. States must match to 1e-4.
+    #[test]
+    fn glm5_kda_resident_gpu_vs_cpu() {
+        let Some(g) = Gpu::for_test() else { return };
+        let cfg = cfg();
+        let (b, nh, hd, ch_dim) = (1usize, cfg.heads, cfg.head_dim, cfg.conv_dim());
+        let x = loadf("conv_x");
+        let wconv = loadf("conv_w");
+        let gpre = loadf("g");
+        let beta = loadf("beta");
+        let kers = load(&g, &cfg).unwrap();
+        let mut convg = ConvState::zeros(&cfg, b);
+        let mut stateg = KdaState::zeros(&cfg, b);
+        let mut dev = DevKda::new(&g, &kers, &cfg, &wconv, &convg, &stateg, b).unwrap();
+        let mut convc = ConvState::zeros(&cfg, b);
+        let mut statec = KdaState::zeros(&cfg, b);
+        // 3 chained decodes
+        for ti in 0..3 {
+            let row = &x[ti * ch_dim..(ti + 1) * ch_dim];
+            let og = dev
+                .decode(&kers, &cfg, row, &gpre[ti * nh * hd..(ti + 1) * nh * hd],
+                    &beta[ti * nh..(ti + 1) * nh], &mut convg, &mut stateg, b)
+                .unwrap();
+            let yc = kda::conv1d_decode(row, &wconv, &mut convc, &cfg, b).unwrap();
+            let oc = kda::kda_decode(&yc, &gpre[ti * nh * hd..(ti + 1) * nh * hd],
+                &beta[ti * nh..(ti + 1) * nh], &mut statec, &cfg, b).unwrap();
+            let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+            assert!(e < 1e-4, "decode token {ti}: {e}");
+        }
+        // then a 64-token prefill on the same resident state
+        let t = 64usize;
+        let og = dev
+            .prefill(&kers, &cfg, &x[3 * ch_dim..(3 + t) * ch_dim],
+                &gpre[3 * nh * hd..(3 + t) * nh * hd], &beta[3 * nh..(3 + t) * nh],
+                &mut convg, &mut stateg, b, t)
+            .unwrap();
+        let yc = kda::conv1d_prefill(&x[3 * ch_dim..(3 + t) * ch_dim], &wconv, &mut convc, &cfg, b, t).unwrap();
+        let oc = kda::kda_chunk(&yc, &gpre[3 * nh * hd..(3 + t) * nh * hd],
+            &beta[3 * nh..(3 + t) * nh], &mut statec, &cfg, b, t, 64).unwrap();
+        let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        println!("resident prefill err {e:.3e}");
+        assert!(e < 1e-4, "prefill {e}");
+        // read-back must agree with the CPU's states
+        dev.read_state(&mut stateg).unwrap();
+        dev.read_conv(&mut convg).unwrap();
+        let es: f32 = stateg.0.iter().zip(&statec.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        let ec: f32 = convg.0.iter().zip(&convc.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        println!("resident states: state {es:.3e} conv {ec:.3e}");
+        assert!(es < 1e-4, "state {es}");
+        assert!(ec < 1e-4, "conv {ec}");
+    }
 
     /// GPU decode step (fused conv + delta rule) vs the CPU reference, 3 tokens chained.
     #[test]
