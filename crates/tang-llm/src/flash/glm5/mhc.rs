@@ -801,7 +801,7 @@ mod tests {
             ctx: dev.cuda_context().clone(),
         };
         gpu.bind().unwrap();
-        let stream = Stream::new().unwrap(); // own non-blocking stream, dropped at the end
+        let stream = Stream::blocking().unwrap(); // own blocking stream (stages host fixtures), dropped at the end
         let k = MhcKernels::new(&gpu).unwrap();
         let w = weights();
         let n = w.n;
@@ -942,7 +942,7 @@ mod tests {
             ctx: dev.cuda_context().clone(),
         };
         gpu.bind().unwrap();
-        let stream = Stream::new().unwrap();
+        let stream = Stream::blocking().unwrap();
         let k = MhcKernels::new(&gpu).unwrap();
         let r = dev.upload_f32(&streams);
         let yb = dev.upload_f32(&y);
@@ -1038,5 +1038,94 @@ mod tests {
                 post_us[reps / 2]
             );
         }
+    }
+
+    /// Regression test for the stream-ordering race in eval/tree/stream-blocking.md
+    /// (frog/tree-eval 1b69a838): a synchronous `DevBuf` upload (legacy default stream)
+    /// must be ordered before a kernel launched on a blocking stream. With a
+    /// non-blocking data-path stream this flaked: the kernel read its input before the
+    /// HtoD landed. Stages fresh host data, launches `mhc_pre`, reads back, and repeats —
+    /// every rep must match the CPU reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mhc_cuda_stream_ordering() {
+        use tang_compute::{ComputeBuffer, ComputeDevice, CudaComputeDevice};
+        use tang_moe::gpu::{DevBuf, Gpu, Stream};
+
+        let (t, n) = (1, 4096);
+        let mut st = 0xDEADBEEFCAFEBABEu64;
+        let w = MhcWeights::from_slices(
+            (0..24 * 4 * n).map(|_| rnd(&mut st)).collect(),
+            (0..24).map(|_| rnd(&mut st) * 0.5).collect(),
+            [0.5f32, 0.5, 0.5].to_vec(),
+            n,
+            &MhcHparams::REAL,
+        )
+        .unwrap();
+        let streams: Vec<f32> = (0..t * 4 * n).map(|_| rnd(&mut st) * 0.1).collect();
+
+        let rs: Vec<&[f32]> = (0..4)
+            .map(|s| {
+                let o = s * n;
+                &streams[o..o + n]
+            })
+            .collect();
+        let cpu = mhc_pre(&w, &rs).unwrap();
+
+        let dev = match std::panic::catch_unwind(CudaComputeDevice::new) {
+            Ok(Ok(d)) => d,
+            _ if std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1") => {
+                panic!("TANG_REQUIRE_CUDA=1 but no CUDA device")
+            }
+            _ => {
+                eprintln!("no CUDA device: skipping");
+                return;
+            }
+        };
+        let gpu = Gpu {
+            ctx: dev.cuda_context().clone(),
+        };
+        gpu.bind().unwrap();
+        // The data-path stream the engine path uses: blocking, so the legacy-stream HtoD
+        // of every from_slice below is ordered before the kernel.
+        let stream = Stream::blocking().unwrap();
+        let k = MhcKernels::new(&gpu).unwrap();
+        let mut last_x = 0f32;
+        for rep in 0..10 {
+            // Fresh staging each rep, exactly the shape that raced before.
+            let rb = DevBuf::from_slice(&streams).unwrap();
+            let fnb = DevBuf::from_slice(&w.f).unwrap();
+            let base = DevBuf::from_slice(&w.b).unwrap();
+            let scale = DevBuf::from_slice(&w.s).unwrap();
+            let xb = DevBuf::zeroed(t * n * 4).unwrap();
+            let postb = DevBuf::zeroed(t * 4 * 4).unwrap();
+            let combb = DevBuf::zeroed(t * 16 * 4).unwrap();
+            unsafe {
+                k.pre(
+                    &stream,
+                    rb.ptr,
+                    fnb.ptr,
+                    base.ptr,
+                    scale.ptr,
+                    xb.ptr,
+                    postb.ptr,
+                    combb.ptr,
+                    t,
+                    n,
+                    w.iters,
+                    w.eps,
+                    w.rms_eps,
+                )
+                .unwrap();
+            }
+            stream.sync().unwrap();
+            let gx: Vec<f32> = xb.read(0, t * n).unwrap();
+            for i in 0..n {
+                let err = (gx[i] - cpu.x[i]).abs();
+                assert!(err <= 1e-4, "rep {rep}: stream-ordering race, x[{i}] err {err}");
+                last_x = last_x.max(err);
+            }
+        }
+        eprintln!("mhc stream-ordering: 10 reps, max abs err {last_x:.3e}");
     }
 }
