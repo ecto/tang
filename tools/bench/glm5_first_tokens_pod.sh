@@ -24,7 +24,7 @@ sleep 2; log "results server: $(curl -s -m 5 localhost:8001/ | head -c 80)"
   && touch $W/MODEL_OK ) &
 curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.94.0 >/dev/null 2>&1 || die_pod "rustup failed"
 export PATH=/root/.cargo/bin:$PATH
-git clone -q --filter=blob:none https://github.com/ecto/tang.git $W/tang && cd $W/tang && git checkout -q cf4b132a || die_pod "checkout failed"
+git clone -q --filter=blob:none https://github.com/ecto/tang.git $W/tang && cd $W/tang && git checkout -q cbbed9bd || die_pod "checkout failed"
 log "building tang-llm (cuda)"
 cargo build -q --release -p tang-llm --no-default-features --features cuda >"$R/build.log" 2>&1 || { tail -40 "$R/build.log"; die_pod "build failed"; }
 BIN=$W/tang/target/release/tang-llm; log "build done"
