@@ -40,7 +40,8 @@ cp -r $W/tang/crates/tang-llm/tests/fixtures/glm5/* /private/tmp/glm5-tiny/
 log "fixtures: $(ls /private/tmp/glm5-tiny | wc -l) dirs"
 log "kernel tests (tiny, cuda)"
 TANG_REQUIRE_CUDA=1 cargo test -q --release -p tang-llm --no-default-features --features cuda --lib glm5 -- --nocapture >"$R/kernels-tiny.log" 2>&1
-log "kernel tests rc=$? | $(grep -E 'test result' $R/kernels-tiny.log | tail -1)"; grep -A4 panicked "$R/kernels-tiny.log" | head -60
+log "kernel tests rc=$? | $(grep -E 'test result' $R/kernels-tiny.log | tail -1)"
+export RUST_BACKTRACE=1; grep -A4 panicked "$R/kernels-tiny.log" | head -60
 TANG_REQUIRE_CUDA=1 TANG_GPUS=2 TANG_SPLIT_AT=2 cargo test -q --release -p tang-llm --no-default-features --features cuda --lib glm5::engine -- --nocapture >"$R/engine-split.log" 2>&1
 log "engine split tests rc=$? | $(grep -E 'test result' $R/engine-split.log | tail -1)"
 
