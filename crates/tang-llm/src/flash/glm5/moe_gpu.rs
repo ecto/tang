@@ -55,6 +55,7 @@ fn ggml_id(t: &TensorInfo) -> Result<u32> {
     Ok(match t.ty {
         GgmlType::F32 => 0,
         GgmlType::F16 => 1,
+        GgmlType::Q5_0 => 6,
         GgmlType::Q8_0 => 8,
         GgmlType::Q4K => 12,
         GgmlType::Q5K => 13,

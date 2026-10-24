@@ -176,8 +176,8 @@ max 10, up clamped to [-10, 10], then `silu(gate) * up`.
 |---|---|---|---|---|
 | `blk.N.ffn_gate_inp.weight` | [288, 4096] | **F32** | `mlp.gate.weight` | router |
 | `blk.N.exp_probs_b.bias` | [288] | F32 | `mlp.gate.e_score_correction_bias` | noaux_tc bias |
-| `blk.N.ffn_gate_exps.weight` | [4096, 2048, 288] | **Q4_K** (43 layers) / Q5_K (layer 11) | `mlp.experts.gate_proj` stacked [288, 2048, 4096] | gate per expert |
-| `blk.N.ffn_up_exps.weight` | [4096, 2048, 288] | Q4_K (43) / Q5_K (11) | `mlp.experts.up_proj` stacked | up per expert |
+| `blk.N.ffn_gate_exps.weight` | [4096, 2048, 288] | **Q4_K** (40 layers: 3–10, 13–43, 45) / Q5_K (layer 11) | `mlp.experts.gate_proj` stacked [288, 2048, 4096] | gate per expert |
+| `blk.N.ffn_up_exps.weight` | [4096, 2048, 288] | Q4_K (40) / Q5_K (11) | `mlp.experts.up_proj` stacked | up per expert |
 | `blk.N.ffn_down_exps.weight` | [2048, 4096, 288] | **Q5_K** (40 layers) / Q6_K (layers 11, 12, 44) | `mlp.experts.down_proj` stacked [288, 4096, 2048] | down per expert |
 | `blk.N.ffn_gate_shexp.weight` | [2048, 4096] | Q8_0 | `mlp.shared_experts.gate_proj.weight` | shared expert |
 | `blk.N.ffn_up_shexp.weight` | [2048, 4096] | Q8_0 | `mlp.shared_experts.up_proj.weight` | |
