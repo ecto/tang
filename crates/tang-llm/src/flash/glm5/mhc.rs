@@ -591,6 +591,182 @@ impl MhcKernels {
     }
 }
 
+/// mHC with its weights **resident on the device**: one `DevBuf` per weight set (upload
+/// once), a reusable stream, and a persistent scratch pool sized to the largest window, so
+/// a per-call `mhc_pre`/`mhc_post` is kernel time + one small `r`/`y` transfer instead of
+/// 7 `cuMemAlloc` + 1.6 MB of pageable HtoD + read-backs (the pod-13 profile's shape:
+/// 90 per-window `from_slice(w.f)` calls at 1.6 MB each — the DevMoe fix pattern).
+///
+/// One per (device, weights) pair; built once per layer at engine construction. The scratch
+/// is shared per instance: `pre`/`post` on the same instance must not overlap (the engine
+/// calls them serially on one layer's block, so they don't).
+#[cfg(feature = "cuda")]
+pub struct MhcGpu {
+    k: MhcKernels,
+    s: tang_moe::gpu::Stream,
+    /// Weights for the two blocks per layer, device-resident: `[attn, ffn]`.
+    w: [DevWeights; 2],
+    n: usize,
+    iters: u32,
+    eps: f32,
+    rms_eps: f32,
+    /// Scratch, sized to `max_t` tokens: r `[max_t][4][n]` (the pre/post input state), rout
+    /// `[max_t][4][n]` (post's output — must not alias r), y `[max_t][n]`, x `[max_t][n]`,
+    /// post `[max_t][4]`, comb `[max_t][16]`.
+    r: tang_moe::gpu::DevBuf,
+    rout: tang_moe::gpu::DevBuf,
+    y: tang_moe::gpu::DevBuf,
+    x: tang_moe::gpu::DevBuf,
+    post: tang_moe::gpu::DevBuf,
+    comb: tang_moe::gpu::DevBuf,
+    max_t: usize,
+}
+
+#[cfg(feature = "cuda")]
+struct DevWeights {
+    fn_: tang_moe::gpu::DevBuf,
+    base: tang_moe::gpu::DevBuf,
+    scale: tang_moe::gpu::DevBuf,
+}
+
+#[cfg(feature = "cuda")]
+impl MhcGpu {
+    /// Upload `w`'s two blocks' weights (attention first, then FFN), allocate the scratch
+    /// for `max_t` tokens. `Gpu::bind` first. Weights stay resident for the engine's life:
+    /// ~1.6 MB × 2 per layer × 45 layers ≈ 146 MB at the real model, nothing at decode
+    /// time.
+    pub fn new(gpu: &tang_moe::gpu::Gpu, ws: [&MhcWeights; 2], max_t: usize) -> Result<Self> {
+        let up = |v: &[f32]| {
+            tang_moe::gpu::DevBuf::from_slice(v).map_err(|e| anyhow::anyhow!("mhc upload: {e}"))
+        };
+        let dw = |w: &MhcWeights| -> Result<DevWeights> {
+            Ok(DevWeights {
+                fn_: up(&w.f)?,
+                base: up(&w.b)?,
+                scale: up(&w.s)?,
+            })
+        };
+        let n = ws[0].n;
+        if ws.iter().any(|w| w.n != n) {
+            bail!("mhc: mixed hidden sizes in the two blocks");
+        }
+        let (iters, eps, rms_eps) = (ws[0].iters, ws[0].eps, ws[0].rms_eps);
+        Ok(Self {
+            k: MhcKernels::new(gpu)?,
+            s: tang_moe::gpu::Stream::blocking().map_err(|e| anyhow::anyhow!("mhc stream: {e}"))?,
+            w: [dw(ws[0])?, dw(ws[1])?],
+            n,
+            iters,
+            eps,
+            rms_eps,
+            r: tang_moe::gpu::DevBuf::alloc(max_t * 4 * n * 4)
+                .map_err(|e| anyhow::anyhow!("mhc scratch r: {e}"))?,
+            rout: tang_moe::gpu::DevBuf::alloc(max_t * 4 * n * 4)
+                .map_err(|e| anyhow::anyhow!("mhc scratch rout: {e}"))?,
+            y: tang_moe::gpu::DevBuf::alloc(max_t * n * 4)
+                .map_err(|e| anyhow::anyhow!("mhc scratch y: {e}"))?,
+            x: tang_moe::gpu::DevBuf::alloc(max_t * n * 4)
+                .map_err(|e| anyhow::anyhow!("mhc scratch x: {e}"))?,
+            post: tang_moe::gpu::DevBuf::alloc(max_t * 4 * 4)
+                .map_err(|e| anyhow::anyhow!("mhc scratch post: {e}"))?,
+            comb: tang_moe::gpu::DevBuf::alloc(max_t * 16 * 4)
+                .map_err(|e| anyhow::anyhow!("mhc scratch comb: {e}"))?,
+            max_t,
+        })
+    }
+
+    /// The resident block weights' fn row (for tests).
+    #[cfg(test)]
+    fn wfn_len(&self, block: usize) -> usize {
+        self.w[block].fn_.len
+    }
+
+    /// [`mhc_pre`](super::super::glm5::mhc) for `t` tokens: upload `r` (the only per-call
+    /// HtoD, `t·4n·4` bytes ≤ 256 KB at a 4096-token window), launch, and read back
+    /// `x`/`post`/`comb`. `block` is 0 (attention) or 1 (FFN).
+    pub fn pre(&self, block: usize, r: &[f32], t: usize) -> Result<MixSet> {
+        if block > 1 || r.len() != t * 4 * self.n || t > self.max_t {
+            bail!("mhc pre: block {block}, {} values, t {t}", r.len());
+        }
+        let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("mhc pre: {e}");
+        self.r.write(0, r).map_err(gerr)?;
+        let w = &self.w[block];
+        unsafe {
+            self.k
+                .pre(
+                    &self.s,
+                    self.r.ptr,
+                    w.fn_.ptr,
+                    w.base.ptr,
+                    w.scale.ptr,
+                    self.x.ptr,
+                    self.post.ptr,
+                    self.comb.ptr,
+                    t,
+                    self.n,
+                    self.iters,
+                    self.eps,
+                    self.rms_eps,
+                )
+                .map_err(|e| anyhow::anyhow!("mhc pre launch: {e}"))?;
+        }
+        self.s.sync().map_err(gerr)?;
+        let n = self.n;
+        let x: Vec<f32> = self.x.read(0, t * n).map_err(gerr)?;
+        let post: Vec<f32> = self.post.read(0, t * 4).map_err(gerr)?;
+        let comb: Vec<f32> = self.comb.read(0, t * 16).map_err(gerr)?;
+        Ok(MixSet {
+            x,
+            post,
+            comb,
+            t,
+            n,
+        })
+    }
+
+    /// [`mhc_post`](super::super::glm5::mhc) for `t` tokens from a [`MixSet`]: upload
+    /// `y`/`post`/`comb`, launch, read the 4 streams back. The device `r` (pre-block
+    /// state) was overwritten by the caller's data only in host memory here — this path
+    /// re-uploads it as `r_in`, `t·4n·4` bytes.
+    pub fn post(&self, mix: &MixSet, y: &[f32], r_in: &[f32], t: usize) -> Result<Vec<f32>> {
+        if y.len() != t * self.n
+            || r_in.len() != t * 4 * self.n
+            || mix.t != t
+            || mix.n != self.n
+            || t > self.max_t
+        {
+            bail!("mhc post shapes: y {}, r {}, t {t}", y.len(), r_in.len());
+        }
+        let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("mhc post: {e}");
+        self.y.write(0, y).map_err(gerr)?;
+        self.r.write(0, r_in).map_err(gerr)?;
+        self.post.write(0, &mix.post).map_err(gerr)?;
+        self.comb.write(0, &mix.comb).map_err(gerr)?;
+        unsafe {
+            self.k
+                .post(&self.s, self.y.ptr, self.r.ptr, self.post.ptr, self.comb.ptr, self.rout.ptr, t, self.n)
+                .map_err(|e| anyhow::anyhow!("mhc post launch: {e}"))?;
+        }
+        self.s.sync().map_err(gerr)?;
+        self.rout.read(0, t * 4 * self.n).map_err(gerr)
+    }
+}
+
+/// The device `pre`'s outputs, host-side: the block input, the per-token `post` weights
+/// (`[t][4]`) and `comb` (`[t][16]`, `src*4+dst`) — `mhc_post`'s inputs, kept flat so the
+/// post upload needs no repacking.
+#[cfg(feature = "cuda")]
+pub struct MixSet {
+    /// `[t][n]`.
+    pub x: Vec<f32>,
+    /// `[t][4]`.
+    pub post: Vec<f32>,
+    /// `[t][16]` (`src*4+dst`).
+    pub comb: Vec<f32>,
+    t: usize,
+    n: usize,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -1127,5 +1303,157 @@ mod tests {
             }
         }
         eprintln!("mhc stream-ordering: 10 reps, max abs err {last_x:.3e}");
+    }
+
+    /// The staging-vs-resident micro-bench (the pod-13 sprint task): per-call cost of the
+    /// engine's current shape — a new blocking stream, 7 `DevBuf::from_slice`/`zeroed`
+    /// allocs (incl. the 1.6 MB f32 weights), launch, sync, read-backs — against
+    /// [`MhcGpu`], which keeps the weights resident and reuses a scratch pool (per-call:
+    /// one small HtoD + kernel + small read-backs). Both paths checked against the CPU
+    /// reference first; then 30 timed reps each (events, median). Real-model shape
+    /// (n = 4096, t = 1 decode, t = 64 prefill window).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mhc_cuda_resident_bench() {
+        use tang_compute::{ComputeBuffer, ComputeDevice, CudaComputeDevice};
+        use tang_moe::gpu::{DevBuf, Event, Gpu, Stream};
+
+        let dev = match std::panic::catch_unwind(CudaComputeDevice::new) {
+            Ok(Ok(d)) => d,
+            _ if std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1") => {
+                panic!("TANG_REQUIRE_CUDA=1 but no CUDA device")
+            }
+            _ => {
+                eprintln!("no CUDA device: skipping");
+                return;
+            }
+        };
+        let gpu = Gpu {
+            ctx: dev.cuda_context().clone(),
+        };
+        gpu.bind().unwrap();
+        let n = 4096usize;
+        let mut st = 0xABCDEF0123456789u64;
+        let w = MhcWeights::from_slices(
+            (0..24 * 4 * n).map(|_| rnd(&mut st)).collect(),
+            (0..24).map(|_| rnd(&mut st) * 0.5).collect(),
+            [0.5f32, 0.5, 0.5].to_vec(),
+            n,
+            &MhcHparams::REAL,
+        )
+        .unwrap();
+        let resident = MhcGpu::new(&gpu, [&w, &w], 64).unwrap();
+        assert_eq!(resident.wfn_len(0), 24 * 4 * n * 4);
+
+        for t in [1usize, 64] {
+            let streams: Vec<f32> = (0..t * 4 * n).map(|_| rnd(&mut st) * 0.1).collect();
+            let y: Vec<f32> = (0..t * n).map(|_| rnd(&mut st) * 0.1).collect();
+            // CPU reference of token 0 only (the parity target for the bench's checks).
+            let rs: Vec<&[f32]> = (0..4)
+                .map(|s| {
+                    let o = s * n;
+                    &streams[o..o + n]
+                })
+                .collect();
+            let cpu = mhc_pre(&w, &rs).unwrap();
+
+            // --- the staging path (the engine's current mhc_pre_gpu shape) ---
+            let stage_pre = || -> anyhow::Result<()> {
+                let s = Stream::blocking()?;
+                let rb = DevBuf::from_slice(&streams)?;
+                let fb = DevBuf::from_slice(&w.f)?;
+                let bb = DevBuf::from_slice(&w.b)?;
+                let sb = DevBuf::from_slice(&w.s)?;
+                let xb = DevBuf::zeroed(t * n * 4)?;
+                let pb = DevBuf::zeroed(t * 4 * 4)?;
+                let cb = DevBuf::zeroed(t * 16 * 4)?;
+                unsafe {
+                    resident.k.pre(
+                        &s, rb.ptr, fb.ptr, bb.ptr, sb.ptr, xb.ptr, pb.ptr, cb.ptr, t, n,
+                        w.iters, w.eps, w.rms_eps,
+                    )?;
+                }
+                s.sync()?;
+                let _ = xb.read::<f32>(0, t * n)?;
+                let _ = pb.read::<f32>(0, t * 4)?;
+                let _ = cb.read::<f32>(0, t * 16)?;
+                Ok(())
+            };
+
+            // --- the resident path ---
+            let res_pre = || -> anyhow::Result<MixSet> { resident.pre(0, &streams, t) };
+
+            // correctness first (resident vs CPU, token 0 only)
+            let got = resident.pre(0, &streams, t).unwrap();
+            for i in 0..n {
+                assert!((got.x[i] - cpu.x[i]).abs() <= 1e-4, "resident pre x[{i}]");
+            }
+            // resident post vs CPU (per-token CPU post, the token-major streams; token 0)
+            let mut outs = vec![vec![0f32; n]; 4];
+            {
+                let rsi: Vec<&[f32]> = (0..4)
+                    .map(|s| {
+                        let o = s * n;
+                        &streams[o..o + n]
+                    })
+                    .collect();
+                let mut o = {
+                    let [o0, o1, o2, o3] = outs.as_mut_slice() else {
+                        unreachable!()
+                    };
+                    [
+                        o0.as_mut_slice(),
+                        o1.as_mut_slice(),
+                        o2.as_mut_slice(),
+                        o3.as_mut_slice(),
+                    ]
+                };
+                mhc_post(&cpu, &y[0..n], &rsi, &mut o).unwrap();
+            }
+            let outv = resident.post(&got, &y, &streams, t).unwrap();
+            for d in 0..4 {
+                for i in 0..n {
+                    let (a, b) = (outv[d * n + i], outs[d][i]);
+                    assert!((a - b).abs() <= 1e-4, "resident post [{d}][{i}]: {a} vs {b}");
+                }
+            }
+
+            // --- timing: 30 reps, median, events around the whole per-call body ---
+            const REPS: usize = 30;
+            let bench = |f: &mut dyn FnMut() -> anyhow::Result<()>| -> Vec<f32> {
+                let e0 = Event::new(true).unwrap();
+                let e1 = Event::new(true).unwrap();
+                let mut ms = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    e0.record(&resident.s).unwrap();
+                    f().unwrap();
+                    e1.record(&resident.s).unwrap();
+                    e1.sync().unwrap();
+                    ms.push(e1.since(&e0).unwrap());
+                }
+                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                ms
+            };
+            // stage path uses its own stream internally; wall-clock (Instant) instead
+            let wall = |f: &mut dyn FnMut() -> anyhow::Result<()>| -> Vec<f32> {
+                let mut ms = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    let t0 = std::time::Instant::now();
+                    f().unwrap();
+                    ms.push(t0.elapsed().as_secs_f32() * 1e3);
+                }
+                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                ms
+            };
+            let mut s1 = || stage_pre();
+            let stg = wall(&mut s1);
+            let mut r1 = || res_pre().map(|_: MixSet| ());
+            let res = bench(&mut r1);
+            eprintln!(
+                "mhc resident-bench n={n} t={t}: staging median {:.0} µs, resident median {:.0} µs",
+                stg[REPS / 2] * 1e3,
+                res[REPS / 2] * 1e3
+            );
+        }
     }
 }
