@@ -275,7 +275,14 @@ minus hc_*, plus fresh eh_proj [H, 2H] -> GGUF ne [2H, H]).
   2052-token sequence, `meta.json` (ids, shapes). All little-endian f32.
 - GGUFs: `/private/tmp/glm5-tiny/glm5-tiny-f32.gguf` (177 tensors, 46 blocks, matches the
   real tensor set minus quant), `-q8_0`, `-q4_k_m`.
-- Compare tool: `crates/tang-llm/scripts/glm5_compare.py` (TANG_DUMP_DIR format below).
+- Compare tools: `crates/tang-llm/scripts/glm5_compare.py` (per-layer dumps, TANG_DUMP_DIR
+  format below) and `crates/tang-llm/scripts/glm5_compare_gen.py` (R2b greedy-parity suite:
+  per-prompt PASS/FAIL + first-divergence index; `--print-runner` emits the tang-llm
+  flash-generate loop).
+- R2b prompt suite: `tests/fixtures/glm5/prompts/` — 25 prompts (5 lengths x 5 kinds:
+  code/prose/mixed/unicode/tool-JSON), HF fp32 greedy expected ids in `prompts.json` and
+  per-prompt `<name>.ids` / `<name>.expected`. Suite decode is deterministic (asserted
+  twice per prompt) and indexer tie-free (asserted; long prompts use a variant marker).
 - llama.cpp CPU build (for extra sanity runs): `/private/tmp/glm5-harness-llama/build-cpu/bin/`
   (llama-cli, llama-quantize, llama-perplexity, llama-server).
 
