@@ -2377,6 +2377,65 @@ pub mod cuda {
             .fold(0f32, f32::max);
         eprintln!("glm5 mla cuda: resident-flow vs upload pool maxerr {e2:.3e}");
         assert!(e2 < 1e-5, "resident pool flow maxerr {e2}");
+
+        // RESET → prefill → decode: a NEW sequence through the SAME MlaCuda. This is the
+        // pod-14 flag: a wrong contiguity re-base would silently serve the old sequence's
+        // rows. Sequence B uses x reversed so its cache content differs from A's.
+        let x_b: Vec<f32> = (0..t)
+            .rev()
+            .flat_map(|i| x[i * w.hidden..(i + 1) * w.hidden].to_vec())
+            .collect();
+        let mut lat_b = vec![0u16; t * w.kv_lora];
+        let mut idx_k_b = vec![0f32; t * w.idx_dim];
+        let mut idx_g_b = vec![0f32; t * w.idx_dim];
+        let mut valid_b = vec![0u8; t];
+        cu.kv_append(&w.kv_a, &w.kv_a_norm, &x_b, t, 0, &mut lat_b, &stream)
+            .unwrap();
+        cu.idx_append(
+            &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, &x_b, t, 0,
+            &mut idx_k_b, &mut idx_g_b, &mut valid_b, &stream,
+        )
+        .unwrap();
+        // the reset broke contiguity (lat_rows was t+1, pos0 is 0): the append must have
+        // re-based from the caller's mirror, i.e. served B's rows, not A's
+        assert_eq!(cu.lat_rows.get(), t, "re-base after reset");
+        assert_eq!(cu.idx_rows.get(), t, "re-base after reset (idx)");
+        let mut out_b_resident = vec![0f32; w.n_head * w.v_head];
+        cu.attend(
+            &wk, &wv, &q, &lat_b, t, 1, t - 1, Some(&sel[..width]), &mut out_b_resident, &stream,
+        )
+        .unwrap();
+        let mut out_b_upload = vec![0f32; w.n_head * w.v_head];
+        cu2.attend(
+            &wk, &wv, &q, &lat_b, t, 1, t - 1, Some(&sel[..width]), &mut out_b_upload, &stream,
+        )
+        .unwrap();
+        let e3: f32 = out_b_resident
+            .iter()
+            .zip(&out_b_upload)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!("glm5 mla cuda: reset→prefill→decode resident vs upload maxerr {e3:.3e}");
+        assert!(e3 < 1e-5, "reset flow attend maxerr {e3}");
+        // and the latent row served must be B's (x reversed ⇒ token t-1's latent differs
+        // from A's row t-1 unless the re-base silently kept A's data)
+        let a_last: Vec<f32> = lat_mirror[(t - 1) * w.kv_lora..t * w.kv_lora]
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
+        let b_last: Vec<f32> = lat_b[(t - 1) * w.kv_lora..t * w.kv_lora]
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
+        let diff_ab: f32 = a_last
+            .iter()
+            .zip(&b_last)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "glm5 mla cuda: reset check — A vs B last-row latent maxdiff {diff_ab:.3e} (nonzero ⇒ the test actually exercises different data)"
+        );
+        assert!(diff_ab > 1e-3, "sequences A and B must differ for this test to be meaningful");
     }
 }
 
