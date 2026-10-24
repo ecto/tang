@@ -134,13 +134,34 @@ impl Drop for Module {
 pub struct Stream(pub sys::CUstream);
 
 impl Stream {
-    /// A non-blocking stream (doesn't synchronise with the legacy default stream; capturable).
+    /// A non-blocking stream: does not synchronise with the legacy default stream, so it is
+    /// capturable ([`Graph::capture`] requires it) — but a preceding synchronous
+    /// `DevBuf::write`/`from_slice` HtoD is NOT ordered before work on it. Never use for
+    /// data-path work that consumes host-staged buffers: use [`Stream::blocking`].
     pub fn new() -> Result<Self> {
         let mut s: sys::CUstream = std::ptr::null_mut();
         ck!(sys::cuStreamCreate(
             &mut s,
             sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32
         ))?;
+        Ok(Stream(s))
+    }
+
+    /// A blocking stream (flags 0): orders against the legacy default stream, so a
+    /// preceding synchronous `DevBuf::write`/`from_slice` HtoD is guaranteed visible to
+    /// kernels launched on it. `DevBuf::write`/`from_slice` copy with the synchronous
+    /// `cuMemcpyHtoD_v2`, which the driver enqueues on the legacy default stream — a
+    /// `CU_STREAM_NON_BLOCKING` stream does not order against it, so a kernel launched
+    /// right after an upload could read the buffer before the copy lands: rare,
+    /// position-varying wrong outputs that stick via carried state (observed on mew as
+    /// engine-vs-CPU parity flipping run-to-run, 13/170 → 161/170; see frog/tree-eval
+    /// `eval/tree/stream-blocking.md`). Use this for every stream that reads host-staged
+    /// buffers.
+    pub fn blocking() -> Result<Self> {
+        let mut s: sys::CUstream = std::ptr::null_mut();
+        unsafe {
+            ck!(sys::cuStreamCreate(&mut s, 0))?;
+        }
         Ok(Stream(s))
     }
 

@@ -1685,7 +1685,7 @@ pub mod cuda {
         let q_resid = super::tests::load("ref_q_resid", &[t, w.q_lora]);
         let k_lat = super::tests::load("ref_k_pass", &[t, w.kv_lora]);
         g.bind().unwrap();
-        let stream = Stream::new().unwrap();
+        let stream = Stream::blocking().unwrap();
         let cu = MlaCuda::new(&w).unwrap();
 
         // kv_append parity (bf16 cache)

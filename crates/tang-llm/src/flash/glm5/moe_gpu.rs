@@ -316,7 +316,7 @@ pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) ->
 /// Convenience for tests and W1's first wiring: host `x` in, host `y` out.
 pub fn ffn_host(k: &Kernels, m: &DevMoe, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
     ensure!(x.len() == t_len * m.p.hidden, "ffn_host: x size");
-    let s = Stream::new()?;
+    let s = Stream::blocking()?;
     let xd = DevBuf::from_slice(x)?;
     let yd = DevBuf::zeroed(x.len() * 4)?;
     ffn(k, &s, m, xd.ptr, yd.ptr, t_len)?;

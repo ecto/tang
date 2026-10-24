@@ -365,7 +365,7 @@ pub mod cuda {
     }
 
     fn sincos(g: &Gpu) -> Result<Stream> {
-        let s = Stream::new()?;
+        let s = Stream::blocking()?;
         g.bind()?;
         Ok(s)
     }

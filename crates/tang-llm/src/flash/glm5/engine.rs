@@ -719,7 +719,7 @@ fn dsa_gpu(
     c: &mut DsaCache,
 ) -> Result<Vec<f32>> {
     let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla cuda: {e}");
-    let s = tang_moe::gpu::Stream::new().map_err(gerr)?;
+    let s = tang_moe::gpu::Stream::blocking().map_err(gerr)?;
     let (n, dl, idd) = (w.hidden, w.kv_lora, w.idx_dim);
     let kv_len = pos0 + t;
     ensure!(x.len() == t * n, "layer input");
@@ -805,7 +805,7 @@ fn mhc_pre_gpu(
     use tang_moe::gpu::{DevBuf, Stream};
     let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mhc cuda: {e}");
     ensure!(r.len() == t * 4 * n, "mhc streams");
-    let s = Stream::new().map_err(gerr)?;
+    let s = Stream::blocking().map_err(gerr)?;
     let rb = DevBuf::from_slice(r).map_err(gerr)?;
     let fb = DevBuf::from_slice(&w.f).map_err(gerr)?;
     let bb = DevBuf::from_slice(&w.b).map_err(gerr)?;
@@ -858,7 +858,7 @@ fn mhc_post_gpu(
             comb.extend_from_slice(row);
         }
     }
-    let s = Stream::new().map_err(gerr)?;
+    let s = Stream::blocking().map_err(gerr)?;
     let yb = DevBuf::from_slice(y).map_err(gerr)?;
     let rin = DevBuf::from_slice(r).map_err(gerr)?;
     let pb = DevBuf::from_slice(&post).map_err(gerr)?;
