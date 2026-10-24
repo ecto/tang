@@ -201,6 +201,8 @@ pub struct Glm5Engine {
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
+    /// W0's R3 bisector: per-layer dump sink, no-op without TANG_DUMP_DIR (dump.rs).
+    pub dump: Option<super::dump::DumpSink>,
     /// The FFNs on the GPU, when a CUDA build finds one ([`Glm5Engine::use_gpu`]).
     #[cfg(feature = "cuda")]
     pub gpu: Option<GpuFfn>,
@@ -223,6 +225,7 @@ impl Glm5Engine {
             mla_w: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
+            dump: super::dump::DumpSink::open(),
             #[cfg(feature = "cuda")]
             gpu: None,
         })
@@ -491,6 +494,12 @@ impl Glm5Engine {
             self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
             let y = self.ffn(l, &x, t)?;
             self.mhc_post(l, &mixes, &y, &mut r, t)?;
+            // W0's R3 bisector: dump the last position's post-FFN streams (no-op
+            // without TANG_DUMP_DIR; lives in dump.rs).
+            if let Some(d) = self.dump.as_mut() {
+                let row = &r[(t - 1) * hc * n..t * hc * n];
+                d.layer(l, pos0 + t - 1, row);
+            }
         }
 
         // ---- head: unweighted stream mean, output norm, lm_head
@@ -512,6 +521,16 @@ impl Glm5Engine {
         let head = self.head.as_ref().unwrap();
         let logits = head.apply(&h, t, false);
         self.tokens.extend_from_slice(ids);
+        // W0's R3 bisector: write the dump (no-op without TANG_DUMP_DIR).
+        if let Some(d) = self.dump.as_mut() {
+            let last_row = t - 1;
+            d.finish(
+                &self.tokens,
+                &h[last_row * n..(last_row + 1) * n],
+                &logits[(t - 1) * hp.n_vocab..t * hp.n_vocab],
+                hp.n_vocab,
+            )?;
+        }
         if self.verbose {
             eprintln!(
                 "glm5: window t={t} at {pos0}: {:.2} s",
