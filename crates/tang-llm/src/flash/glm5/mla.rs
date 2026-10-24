@@ -1103,7 +1103,10 @@ pub mod cuda {
         let cg = DevBuf::from_slice(cache_gate)?;
         let apd = DevBuf::from_slice(i_ape)?;
         let vd = DevBuf::from_slice(&vec![1u8; kv_len])?; // valid flags live with the cache
-        let pd = DevBuf::zeroed(pool_keys.len())?;
+        // pool_keys is f32 [n_pool][hd]: zeroed takes BYTES, so the buffer must be len*4.
+        // (The pods 6–8 crash: zeroed(len) + read::<T>(0, len) = a 4× undersized buffer,
+        // tripping `off + bytes <= len` in DevBuf::read whatever T is.)
+        let pd = DevBuf::zeroed(pool_keys.len() * std::mem::size_of::<f32>())?;
         let f = self.m.func("idx_pool_keys")?;
         let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
         let mut hd_ = hd as i32;
@@ -1118,7 +1121,10 @@ pub mod cuda {
                 tang_moe::args![ck.ptr, cg.ptr, apd.ptr, vd.ptr, pd.ptr, kvlen, fk, npl, hd_, kp_],
             )?
         };
-        pool_keys.copy_from_slice(&pd.read(0, pool_keys.len())?);
+        // pool_keys is f32 [n_pool][hd]; read ELEMENTS of f32 (a read::<i32> here asks 4x
+        // the allocation and trips `off + bytes <= len` — the pods 6–8 crash, frame
+        // DevBuf::read::<i32> from MlaCuda::idx_pool)
+        pool_keys.copy_from_slice(&pd.read::<f32>(0, pool_keys.len())?);
         Ok(())
     }
 
@@ -1224,7 +1230,7 @@ pub mod cuda {
         let hwd = DevBuf::from_slice(&hw)?;
         let pkd = DevBuf::from_slice(pool_keys)?;
         let vd = DevBuf::from_slice(valid)?;
-        let sd = DevBuf::from_slice(&vec![-1i32; sel.len()])?;
+        let sd = DevBuf::zeroed_elems::<i32>(sel.len())?;
         let f = self.m.func("idx_select")?;
         let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
         let (mut fk, mut npl) = (first_key as i32, n_pool as i32);
@@ -1280,7 +1286,7 @@ pub mod cuda {
             let wvd = DevBuf::from_slice(wv)?;
             let qd = DevBuf::from_slice(q)?;
             let ld = DevBuf::from_slice(lat)?;
-            let od = DevBuf::zeroed(out_v.len())?;
+            let od = DevBuf::zeroed_elems::<f32>(out_v.len())?;
             let sd = sel.map(DevBuf::from_slice).transpose()?;
             let f = self.m.func("mla_attn_naive")?;
             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
