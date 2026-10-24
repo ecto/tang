@@ -862,4 +862,181 @@ mod tests {
             eprintln!("mhc cuda parity (b{b} s{s}): max abs err {max:.3e}");
         }
     }
+
+    /// Deterministic pseudo-random f32 in [-1, 1) from an integer state (xorshift-ish; no
+    /// external rng dep). Different `seed`s give independent sequences.
+    fn rnd(state: &mut u64) -> f32 {
+        // xorshift64*
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        let m = (state.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32;
+        m / (1u32 << 23) as f32 - 1.0
+    }
+
+    /// Real-model shapes (n = 4096, hn = 16384, the kernel streams 512 strided columns per
+    /// lane; the tiny fixtures are n = 64): CPU reference vs the CUDA kernels on a synthetic
+    /// case, batch 1 token and 8 tokens. Skips without a GPU unless `TANG_REQUIRE_CUDA=1`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mhc_cuda_real_shape() {
+        use tang_compute::{ComputeBuffer, ComputeDevice, CudaComputeDevice};
+        use tang_moe::gpu::{Gpu, Stream};
+
+        let (t, n) = (8, 4096);
+        let mut st = 0x9E3779B97F4A7C15u64;
+        let w = MhcWeights::from_slices(
+            (0..24 * 4 * n).map(|_| rnd(&mut st)).collect(),
+            (0..24).map(|_| rnd(&mut st) * 0.5).collect(),
+            [0.5f32, 0.5, 0.5].to_vec(),
+            n,
+            &MhcHparams::REAL,
+        )
+        .unwrap();
+        // streams [t][4][n], y [t][n]
+        let streams: Vec<f32> = (0..t * 4 * n).map(|_| rnd(&mut st) * 0.1).collect();
+        let y: Vec<f32> = (0..t * n).map(|_| rnd(&mut st) * 0.1).collect();
+
+        // CPU reference over the same buffers.
+        let mut cpu_x = Vec::with_capacity(t * n);
+        let mut cpu_out = Vec::with_capacity(t * 4 * n);
+        for tok in 0..t {
+            let rs: Vec<&[f32]> = (0..4)
+                .map(|s| {
+                    let o = tok * 4 * n + s * n;
+                    &streams[o..o + n]
+                })
+                .collect();
+            let mix = mhc_pre(&w, &rs).unwrap();
+            cpu_x.extend_from_slice(&mix.x);
+            let yt = &y[tok * n..(tok + 1) * n];
+            let mut outs = vec![vec![0f32; n]; 4];
+            let mut outs = {
+                let [o0, o1, o2, o3] = outs.as_mut_slice() else {
+                    unreachable!()
+                };
+                [
+                    o0.as_mut_slice(),
+                    o1.as_mut_slice(),
+                    o2.as_mut_slice(),
+                    o3.as_mut_slice(),
+                ]
+            };
+            mhc_post(&mix, yt, &rs, &mut outs).unwrap();
+            for o in outs {
+                cpu_out.extend_from_slice(o);
+            }
+        }
+
+        let dev = match std::panic::catch_unwind(CudaComputeDevice::new) {
+            Ok(Ok(d)) => d,
+            _ if std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1") => {
+                panic!("TANG_REQUIRE_CUDA=1 but no CUDA device")
+            }
+            _ => {
+                eprintln!("no CUDA device: skipping");
+                return;
+            }
+        };
+        let gpu = Gpu {
+            ctx: dev.cuda_context().clone(),
+        };
+        gpu.bind().unwrap();
+        let stream = Stream::new().unwrap();
+        let k = MhcKernels::new(&gpu).unwrap();
+        let r = dev.upload_f32(&streams);
+        let yb = dev.upload_f32(&y);
+        let fnb = dev.upload_f32(&w.f);
+        let base = dev.upload_f32(&w.b);
+        let scale = dev.upload_f32(&w.s);
+        let x = dev.upload_f32(&vec![0f32; t * n]);
+        let post = dev.upload_f32(&vec![0f32; t * 4]);
+        let comb = dev.upload_f32(&vec![0f32; t * 16]);
+        let out = dev.upload_f32(&vec![0f32; t * 4 * n]);
+        let a = |v: &tang_compute::cuda::CudaBuffer| dev.buffer_addr(v);
+        unsafe {
+            k.pre(
+                &stream,
+                a(&r),
+                a(&fnb),
+                a(&base),
+                a(&scale),
+                a(&x),
+                a(&post),
+                a(&comb),
+                t,
+                n,
+                w.iters,
+                w.eps,
+                w.rms_eps,
+            )
+            .unwrap();
+            k.post(&stream, a(&yb), a(&r), a(&post), a(&comb), a(&out), t, n)
+                .unwrap();
+        }
+        stream.sync().unwrap();
+        let mut max = 0f32;
+        let gx = x.to_vec();
+        for (g, c) in gx.iter().zip(&cpu_x) {
+            max = max.max((*g - *c).abs());
+        }
+        let gout = out.to_vec();
+        for (g, c) in gout.iter().zip(&cpu_out) {
+            max = max.max((*g - *c).abs());
+        }
+        // The mixes GEMV is 16k-long f32 dots: CPU f64-sumsq vs GPU f32 differ a little more
+        // than the tiny case; 1e-4 stays the gate.
+        assert!(max <= 1e-4, "cuda real-shape parity: max abs err {max} > 1e-4");
+        eprintln!("mhc cuda real-shape (n={n}, t={t}): max abs err {max:.3e}");
+
+        // Micro-bench: events timing of pre and post at batch 1 and 8, 50 reps each, the
+        // median rep reported (first launches compile nothing extra but warm the L2).
+        for (label, tb) in [("b1", 1usize), ("b8", 8usize)] {
+            let reps = 50;
+            let mut pre_us = Vec::with_capacity(reps);
+            let mut post_us = Vec::with_capacity(reps);
+            let e0 = tang_moe::gpu::Event::new(true).unwrap();
+            let e1 = tang_moe::gpu::Event::new(true).unwrap();
+            for _ in 0..reps {
+                e0.record(&stream).unwrap();
+                unsafe {
+                    k.pre(
+                        &stream,
+                        a(&r),
+                        a(&fnb),
+                        a(&base),
+                        a(&scale),
+                        a(&x),
+                        a(&post),
+                        a(&comb),
+                        tb,
+                        n,
+                        w.iters,
+                        w.eps,
+                        w.rms_eps,
+                    )
+                    .unwrap();
+                }
+                e1.record(&stream).unwrap();
+                e1.sync().unwrap();
+                pre_us.push(e1.since(&e0).unwrap_or(0.0).max(0.0) * 1e3);
+                e0.record(&stream).unwrap();
+                unsafe {
+                    k.post(&stream, a(&yb), a(&r), a(&post), a(&comb), a(&out), tb, n)
+                        .unwrap();
+                }
+                e1.record(&stream).unwrap();
+                e1.sync().unwrap();
+                post_us.push(e1.since(&e0).unwrap_or(0.0).max(0.0) * 1e3);
+            }
+            // medians
+            pre_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            post_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "mhc bench n={n} {label}: pre median {:.1} µs, post median {:.1} µs",
+                pre_us[reps / 2],
+                post_us[reps / 2]
+            );
+        }
+    }
 }
