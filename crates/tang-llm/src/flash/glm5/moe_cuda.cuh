@@ -67,6 +67,13 @@ __device__ float g5_deq(unsigned ty, const unsigned char* row, int j) {
         const unsigned char* b = row + (j / 32) * 34;
         return g5_h2f(g5_u16(b)) * (float)(signed char)b[2 + j % 32];
     }
+    if (ty == 6) {  // Q5_0: 32 per block, 22 B: f16 d, 32 high bits, 16 nibble bytes
+        const unsigned char* b = row + (j / 32) * 22;
+        const unsigned qh = g5_u32(b + 2);
+        const int e = j % 32, l = e & 15;
+        const int q = ((e < 16 ? b[6 + l] : b[6 + l] >> 4) & 0xF) | (((qh >> (e < 16 ? l : l + 16)) & 1) << 4);
+        return g5_h2f(g5_u16(b)) * (float)(q - 16);
+    }
     if (ty == 12 || ty == 13) {  // Q4_K 144 B / Q5_K 176 B: f16 d, f16 dmin, scales[12], (qh[32]), qs[128]
         const unsigned char* b = row + (j / 256) * (ty == 12 ? 144 : 176);
         const int e = j % 256, c = e / 64, w = e % 64, hi = w / 32, l = w % 32;

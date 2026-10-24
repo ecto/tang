@@ -194,9 +194,14 @@ def quant(g, gguf_py):
     from gguf import GGMLQuantizationType as Q
     from gguf import quants
 
-    n = 512  # elements: 2 K-quant blocks, 16 Q8_0 blocks
+    n = 512  # elements: 2 K-quant blocks, 16 Q8_0/Q5_0 blocks
     # (name, ggml id, block elements, block bytes, f16 field offsets inside a block)
-    kinds = [("f16", Q.F16, 1, 2, []), ("q8_0", Q.Q8_0, 32, 34, [0]), ("q4_k", Q.Q4_K, 256, 144, [0, 2]),
+    # Q5_0: ggml's high bit for element j + 16 is bit j + 16 of qh — the C mask
+    # ((qh >> (j + 12)) & 0x10) reads bit j + 16, not j + 12 (verified against the real tiny
+    # GGUF's Q5_0 experts vs HF f32, and bit-exact vs gguf-py). The expected values are built
+    # here straight from that formula.
+    kinds = [("f16", Q.F16, 1, 2, []), ("q8_0", Q.Q8_0, 32, 34, [0]), ("q5_0", Q.Q5_0, 32, 22, [0]),
+             ("q4_k", Q.Q4_K, 256, 144, [0, 2]),
              ("q5_k", Q.Q5_K, 256, 176, [0, 2]), ("q6_k", Q.Q6_K, 256, 210, [208])]
     for name, qt, be, bb, f16s in kinds:
         nb = n // be
@@ -207,7 +212,17 @@ def quant(g, gguf_py):
             for off in f16s:
                 v = np.float16(0.001 + 0.05 * float(torch.rand(1, generator=g)))
                 raw[b * bb + off: b * bb + off + 2] = np.frombuffer(v.tobytes(), dtype=np.uint8)
-        want = quants.dequantize(raw, qt).astype(np.float32).reshape(-1)
+        if name == "q5_0":
+            want = np.empty(n, dtype=np.float32)
+            for b in range(nb):
+                blk = raw[b * bb: (b + 1) * bb]
+                d = float(np.frombuffer(blk[:2].tobytes(), dtype="<f2")[0])
+                qh = int(np.frombuffer(blk[2:6].tobytes(), dtype="<u4")[0])
+                for j in range(16):
+                    want[b * 32 + j] = (((int(blk[6 + j]) & 0xF) | ((qh >> j) & 1) << 4) - 16) * d
+                    want[b * 32 + j + 16] = (((int(blk[6 + j]) >> 4) | ((qh >> (j + 16)) & 1) << 4) - 16) * d
+        else:
+            want = quants.dequantize(raw, qt).astype(np.float32).reshape(-1)
         assert want.size == n and np.isfinite(want).all(), name
         save_u8(f"quant_{name}_raw", raw)
         save(f"quant_{name}_want", torch.from_numpy(want))

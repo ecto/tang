@@ -124,8 +124,9 @@ static double route_err(const std::vector<unsigned>& ids, const std::vector<floa
 int main(int argc, char** argv) {
     DIR = argc > 1 ? argv[1] : "crates/tang-llm/tests/fixtures/glm5/moe";
 
-    // 1. decoders vs gguf-py, on rows of 512 elements (2 K-quant blocks, 16 Q8_0 blocks)
-    const struct { const char* name; unsigned ty; } q[] = {{"f16", 1}, {"q8_0", 8}, {"q4_k", 12}, {"q5_k", 13}, {"q6_k", 14}};
+    // 1. decoders vs gguf-py, on rows of 512 elements (2 K-quant blocks, 16 Q8_0/Q5_0 blocks;
+    // the Q5_0 fixture's expected values come from the ggml formula — see glm5_moe_fixtures.py)
+    const struct { const char* name; unsigned ty; } q[] = {{"f16", 1}, {"q8_0", 8}, {"q5_0", 6}, {"q4_k", 12}, {"q5_k", 13}, {"q6_k", 14}};
     for (auto& k : q) {
         auto raw = rd(std::string("quant_") + k.name + "_raw");
         auto want = rf(std::string("quant_") + k.name + "_want");

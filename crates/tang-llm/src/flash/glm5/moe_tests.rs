@@ -339,11 +339,14 @@ fn sentinel_expert_is_skipped() {
 
 // ---- weight formats ----------------------------------------------------------------------------
 
-/// tang's GGUF decoders vs llama.cpp's gguf-py on random blocks of every type the MoE meets
-/// (the CUDA decoders are checked on the same bytes by scripts/glm5_moe_cuda_host.sh).
+/// tang's GGUF decoders against the fixture expected values on random blocks of every type the
+/// MoE meets. For all but Q5_0 the expected values are llama.cpp gguf-py's dequantisation; Q5_0's
+/// come from the ggml formula, because gguf-py's Q5_0 emits a different element order than ggml
+/// (see glm5_moe_fixtures.py — verified against the real tiny GGUF's Q5_0 experts vs HF f32).
+/// The CUDA decoders are checked on the same bytes by scripts/glm5_moe_cuda_host.sh.
 #[test]
-fn decoders_match_gguf_py() {
-    for name in ["f16", "q8_0", "q4_k", "q5_k", "q6_k"] {
+fn decoders_match_expected() {
+    for name in ["f16", "q8_0", "q5_0", "q4_k", "q5_k", "q6_k"] {
         let id = entry(&format!("quant_{name}_raw"))["ggml_type"]
             .as_u64()
             .unwrap() as u32;
@@ -358,7 +361,7 @@ fn decoders_match_gguf_py() {
         let err = max_err(&got, want);
         assert!(
             err <= 1e-6 * max_abs(want).max(1.0),
-            "{name}: tang vs gguf-py max abs err {err}"
+            "{name}: tang decoder max abs err {err}"
         );
     }
 }
