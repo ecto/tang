@@ -233,6 +233,12 @@ impl DevBuf {
         Ok(b)
     }
 
+    /// `zeroed_elems::<T>(n)` zeroes n elements of T (n * size_of::<T>() bytes) — the
+    /// clearer form for "a kernel will write n floats here" buffers.
+    pub fn zeroed_elems<T>(n: usize) -> Result<Self> {
+        Self::zeroed(n * std::mem::size_of::<T>())
+    }
+
     pub fn from_slice<T: Copy>(data: &[T]) -> Result<Self> {
         let b = Self::alloc(std::mem::size_of_val(data))?;
         b.write(0, data)?;
