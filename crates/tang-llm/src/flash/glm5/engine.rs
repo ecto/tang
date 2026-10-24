@@ -194,10 +194,9 @@ pub struct Glm5Engine {
     pub tokens: Vec<u32>,
     kda: Vec<Option<(ConvState, KdaState)>>,
     dsa: Vec<DsaCache>,
-    cache_weights: bool,
-    kda_w: Vec<Option<(KdaLayerW, KdaConfig)>>,
-    hc_w: Vec<Option<super::mhc::MhcWeights>>,
-    mla_w: Vec<Option<MlaWeights>>,
+    kda_w: Vec<Option<std::sync::Arc<(KdaLayerW, KdaConfig)>>>,
+    hc_w: Vec<Option<std::sync::Arc<super::mhc::MhcWeights>>>,
+    mla_w: Vec<Option<std::sync::Arc<MlaWeights>>>,
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
@@ -212,14 +211,11 @@ impl Glm5Engine {
     pub fn open(path: &Path) -> Result<Self> {
         let m = Glm5Ref::open(path)?;
         let nl = m.hp.n_layer;
-        let cache_weights = m.hp.n_embd <= 1024
-            || std::env::var("TANG_GLM5_CACHE").is_ok_and(|v| v == "1");
         Ok(Self {
             m,
             tokens: Vec::new(),
             kda: (0..nl).map(|_| None).collect(),
             dsa: vec![DsaCache::default(); nl],
-            cache_weights,
             kda_w: (0..nl).map(|_| None).collect(),
             hc_w: (0..nl * 2).map(|_| None).collect(),
             mla_w: (0..nl).map(|_| None).collect(),
@@ -268,38 +264,45 @@ impl Glm5Engine {
         }
     }
 
-    fn kda_weights(&mut self, l: usize) -> Result<(KdaLayerW, KdaConfig)> {
+    /// Layer `l`'s KDA weights, loaded once and shared (dequantising 268 MB per window is
+    /// the engine's original per-token cost).
+    fn kda_weights(&mut self, l: usize) -> Result<std::sync::Arc<(KdaLayerW, KdaConfig)>> {
         if let Some(w) = &self.kda_w[l] {
             return Ok(w.clone());
         }
-        let w = self.m.kda_weights(l)?;
-        if self.cache_weights {
-            self.kda_w[l] = Some(w.clone());
-        }
+        let w = std::sync::Arc::new(self.m.kda_weights(l)?);
+        self.kda_w[l] = Some(w.clone());
         Ok(w)
     }
 
     /// mHC mixer weights for layer `l` (cached when `cache_weights`; see the field note).
-    fn hc_weights(&mut self, l: usize, prefix: &str, hp: &super::mhc::MhcHparams) -> Result<super::mhc::MhcWeights> {
+    fn hc_weights(
+        &mut self,
+        l: usize,
+        prefix: &str,
+        hp: &super::mhc::MhcHparams,
+    ) -> Result<std::sync::Arc<super::mhc::MhcWeights>> {
         let idx = l * 2 + if prefix == "hc_ffn" { 1 } else { 0 };
         if let Some(w) = &self.hc_w[idx] {
             return Ok(w.clone());
         }
-        let w = super::mhc::MhcWeights::from_gguf(&self.m.g, l, prefix, self.m.hp.n_embd, hp)?;
-        if self.cache_weights {
-            self.hc_w[idx] = Some(w.clone());
-        }
+        let w = std::sync::Arc::new(super::mhc::MhcWeights::from_gguf(
+            &self.m.g,
+            l,
+            prefix,
+            self.m.hp.n_embd,
+            hp,
+        )?);
+        self.hc_w[idx] = Some(w.clone());
         Ok(w)
     }
 
-    fn mla_weights(&mut self, l: usize) -> Result<MlaWeights> {
+    fn mla_weights(&mut self, l: usize) -> Result<std::sync::Arc<MlaWeights>> {
         if let Some(w) = &self.mla_w[l] {
             return Ok(w.clone());
         }
-        let w = self.m.mla_weights(l)?;
-        if self.cache_weights {
-            self.mla_w[l] = Some(w.clone());
-        }
+        let w = std::sync::Arc::new(self.m.mla_weights(l)?);
+        self.mla_w[l] = Some(w.clone());
         Ok(w)
     }
 
@@ -448,6 +451,12 @@ impl Glm5Engine {
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
         let w0 = Instant::now();
+        let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
+        let mut stage = |name: &str, t0: &std::time::Instant| {
+            if prof {
+                eprintln!("glm5: prof {name}: {:.1} ms", t0.elapsed().as_secs_f32() * 1e3);
+            }
+        };
         let hp = self.m.hp.clone();
         let (n, hc, t) = (hp.n_embd, hp.hc, ids.len());
         let pos0 = self.tokens.len();
@@ -469,31 +478,51 @@ impl Glm5Engine {
             rms_eps: hp.eps,
         };
 
+        let mut t_embd = Instant::now();
         for l in 0..hp.n_layer {
             // ---- attention half
+            let t0 = Instant::now();
             let w_attn = self.hc_weights(l, "hc_attn", &mhp)?;
             let (mut x, mixes) = self.mhc_pre(l, &w_attn, &r, t)?;
             self.m.norm_all(&mut x, l, "attn_norm.weight")?;
+            stage("mhc_pre+norm(attn)", &t0);
+            let t1 = Instant::now();
             let y = if hp.is_kda[l] {
-                let (w, cfg) = self.kda_weights(l)?;
+                let t_w = Instant::now();
+                let wc = self.kda_weights(l)?;
+                stage("kda weights", &t_w);
+                let (w, cfg) = (wc.0.clone(), wc.1);
+                let t_m = Instant::now();
                 let mut st = self.kda[l]
                     .take()
                     .unwrap_or_else(|| (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1)));
                 let y = self.kda_mixer(l, &x, t, &w, &cfg, &mut st);
                 self.kda[l] = Some(st);
+                stage("kda mixer", &t_m);
                 y?
             } else {
+                let t_w = Instant::now();
                 let w = self.mla_weights(l)?;
-                self.dsa_layer(l, &w, &x, t, pos0)?
+                stage("mla weights", &t_w);
+                let t_m = Instant::now();
+                let y = self.dsa_layer(l, &w, &x, t, pos0)?;
+                stage("mla mixer", &t_m);
+                y
             };
+            let t2 = Instant::now();
             self.mhc_post(l, &mixes, &y, &mut r, t)?;
+            stage("mhc_post(attn)", &t2);
 
             // ---- FFN half
+            let t3 = Instant::now();
             let w_ffn = self.hc_weights(l, "hc_ffn", &mhp)?;
             let (mut x, mixes) = self.mhc_pre(l, &w_ffn, &r, t)?;
             self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
             let y = self.ffn(l, &x, t)?;
+            let t4 = Instant::now();
             self.mhc_post(l, &mixes, &y, &mut r, t)?;
+            stage("ffn", &t3);
+            stage("mhc_post(ffn)", &t4);
             // W0's R3 bisector: dump the last position's post-FFN streams (no-op
             // without TANG_DUMP_DIR; lives in dump.rs).
             if let Some(d) = self.dump.as_mut() {
@@ -502,7 +531,9 @@ impl Glm5Engine {
             }
         }
 
+        stage("layers", &t_embd);
         // ---- head: unweighted stream mean, output norm, lm_head
+        let t5 = Instant::now();
         let mut h = vec![0f32; t * n];
         for i in 0..t {
             for c in 0..hc {
@@ -520,6 +551,7 @@ impl Glm5Engine {
         }
         let head = self.head.as_ref().unwrap();
         let logits = head.apply(&h, t, false);
+        stage("head", &t5);
         self.tokens.extend_from_slice(ids);
         // W0's R3 bisector: write the dump (no-op without TANG_DUMP_DIR).
         if let Some(d) = self.dump.as_mut() {

@@ -70,7 +70,7 @@ use anyhow::{ensure, Result};
 /// `d_conv` = `ssm.conv_kernel` (4), `gate_lower_bound` = `kda.gate_lower_bound`
 /// (`Some(-5.0)` on GLM-5.3-Flash; `None` selects the Qwen3-Next softplus form),
 /// `eps` = the model's rms_norm_eps (1e-5).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct KdaConfig {
     pub heads: usize,
     pub head_dim: usize,
