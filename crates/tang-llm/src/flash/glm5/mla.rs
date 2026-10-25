@@ -1455,7 +1455,7 @@ pub mod cuda {
             let grow = lru.entries[i]
                 .lat_d
                 .as_ref()
-                .is_none_or(|b| b.len() < need);
+                .is_none_or(|b| b.len < need);
             if grow {
                 lru.entries[i].lat_d = Some(DevBuf::alloc(need * 2 + 64 * self.dl * 2)?);
                 lru.entries[i].lat_rows = 0;
@@ -1471,7 +1471,7 @@ pub mod cuda {
             let grow_k = lru.entries[i]
                 .idk_d
                 .as_ref()
-                .is_none_or(|b| b.len() < need);
+                .is_none_or(|b| b.len < need);
             if grow_k {
                 lru.entries[i].idk_d = Some(DevBuf::alloc(need * 2 + 64 * hd * 4)?);
                 lru.entries[i].idx_rows = 0;
@@ -1479,7 +1479,7 @@ pub mod cuda {
             let grow_g = lru.entries[i]
                 .idg_d
                 .as_ref()
-                .is_none_or(|b| b.len() < need);
+                .is_none_or(|b| b.len < need);
             if grow_g {
                 lru.entries[i].idg_d = Some(DevBuf::alloc(need * 2 + 64 * hd * 4)?);
                 lru.entries[i].idx_rows = 0;
@@ -1487,7 +1487,7 @@ pub mod cuda {
             let grow_v = lru.entries[i]
                 .val_d
                 .as_ref()
-                .is_none_or(|b| b.len() < rows);
+                .is_none_or(|b| b.len < rows);
             if grow_v {
                 lru.entries[i].val_d = Some(DevBuf::alloc(rows * 2 + 64)?);
                 lru.entries[i].idx_rows = 0;
@@ -1502,7 +1502,7 @@ pub mod cuda {
             let grow = lru.entries[i]
                 .pool_d
                 .as_ref()
-                .is_none_or(|b| b.len() < need);
+                .is_none_or(|b| b.len < need);
             if grow {
                 lru.entries[i].pool_d = Some(DevBuf::alloc(need * 2 + 64 * self.idxd * 4)?);
                 lru.entries[i].pool_upto = 0;
@@ -1515,22 +1515,22 @@ pub mod cuda {
             macro_rules! grow {
                 ($cell:expr, $elems:expr) => {{
                     let mut b = $cell.borrow_mut();
-                    if b.len() < $elems * std::mem::size_of::<f32>() {
+                    if b.len < $elems * std::mem::size_of::<f32>() {
                         *b = DevBuf::zeroed_elems::<f32>($elems * 2 + 64)?;
                     }
                 }};
             }
-            if self.q_d.borrow().len() < t * self.nh * self.dk * 4 {
+            if self.q_d.borrow().len < t * self.nh * self.dk * 4 {
                 let mut b = self.q_d.borrow_mut();
                 *b = DevBuf::zeroed_elems::<f32>(t * self.nh * self.dk * 2 + 64)?;
             }
-            if self.o_d.borrow().len() < t * self.nh * self.dv * 4 {
+            if self.o_d.borrow().len < t * self.nh * self.dv * 4 {
                 let mut b = self.o_d.borrow_mut();
                 *b = DevBuf::zeroed_elems::<f32>(t * self.nh * self.dv * 2 + 64)?;
             }
             {
                 let mut b = self.s_d.borrow_mut();
-                if b.len() < t * width * 4 {
+                if b.len < t * width * 4 {
                     *b = DevBuf::zeroed_elems::<i32>(t * width * 2 + 64)?;
                 }
             }
@@ -1539,7 +1539,7 @@ pub mod cuda {
             grow!(self.iq_d, t * self.idxh * self.idxd);
             {
                 let mut b = self.sd_out.borrow_mut();
-                if b.len() < t * width * 4 {
+                if b.len < t * width * 4 {
                     *b = DevBuf::zeroed_elems::<i32>(t * width * 2 + 64)?;
                 }
             }
