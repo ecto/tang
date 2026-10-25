@@ -139,6 +139,8 @@ int main() {
         for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", y[r]);
         std::printf("\nref_w[0..7]:");
         for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
+        { float direct = 0.f; for (unsigned j = 0; j < COLS; j++) direct += ref_w[j] * x[j];
+          std::printf("\ndirect dot ref_w[0..4095].x[0..4095] = %.4f", (double)direct); }
         std::printf("\nx[0..7]:");
         for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", x[j]);
         std::printf("\nref    y[0..7]:");
