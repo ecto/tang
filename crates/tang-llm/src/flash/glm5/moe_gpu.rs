@@ -322,3 +322,29 @@ pub fn ffn_host(k: &Kernels, m: &DevMoe, x: &[f32], t_len: usize) -> Result<Vec<
     ffn(k, &s, m, xd.ptr, yd.ptr, t_len)?;
     Ok(yd.read::<f32>(0, x.len())?)
 }
+
+/// The KDA projection kernels ([`super::K5_SRC`] = the MoE source + `kda_k5.cuh`, so
+/// `g5_dot`/`g5_deq` are in scope): `gemv` (one thread per output), `gate` (the forget
+/// gate's finish: dt_bias + the safe-gate/softplus form), `beta` (the β GEMV + sigmoid),
+/// `norm` (the gated output norm). Compiled once per arch; one instance serves every
+/// KDA layer.
+pub struct Kernels5 {
+    _m: Module,
+    pub gemv: Func,
+    pub gate: Func,
+    pub beta: Func,
+    pub norm: Func,
+}
+
+impl Kernels5 {
+    pub fn new(g: &Gpu) -> Result<Self> {
+        let m = g.module(super::K5_SRC)?;
+        Ok(Kernels5 {
+            gemv: m.func("k5_gemv")?,
+            gate: m.func("k5_gate_finish")?,
+            beta: m.func("k5_beta")?,
+            norm: m.func("k5_gated_norm")?,
+            _m: m,
+        })
+    }
+}

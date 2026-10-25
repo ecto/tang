@@ -443,6 +443,10 @@ pub fn ffn(p: &MoeParams, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
 /// executed on the fixtures by `scripts/glm5_moe_cuda_host.sh`.
 pub const SRC: &str = include_str!("moe_cuda.cuh");
 
+/// The KDA projection kernels ([`kda_dev::K5_SRC`]), appended to [`SRC`] at compile so
+/// `g5_dot`/`g5_deq` are in scope for them.
+pub const K5_SRC: &str = concat!(include_str!("moe_cuda.cuh"), "\n", include_str!("kda_k5.cuh"));
+
 #[cfg(feature = "cuda")]
 #[path = "moe_gpu.rs"]
 pub mod gpu;
