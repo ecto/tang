@@ -303,7 +303,10 @@ impl DevLayer {
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
         let beta_h = self.bb.read::<f32>(0, t * nh)?;
-        let mut dummy_state = KdaState(Vec::new());
+        // W4's core decode/prefill index state.head(cfg, slot, h) on the host even when the
+        // device owns the state — hand it a correctly-sized zero buffer so the indexing is
+        // in-bounds (the values are ignored: the device-side state is authoritative).
+        let mut dummy_state = KdaState(vec![0f32; self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim]);
         let mut o = vec![0f32; t * di];
         if t == 1 {
             o.copy_from_slice(&self.core.decode(
