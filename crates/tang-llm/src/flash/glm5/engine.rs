@@ -73,6 +73,18 @@ pub struct GpuFfn {
 
 #[cfg(feature = "cuda")]
 impl GpuFfn {
+    /// The KDA layers resident (tests: the wiring regression guards).
+    #[cfg(test)]
+    pub(crate) fn kda_resident(&self) -> usize {
+        self.kda_l.iter().filter(|x| x.is_some()).count()
+    }
+
+    /// The mHC layers resident (tests: the wiring regression guards).
+    #[cfg(test)]
+    pub(crate) fn mhc_resident(&self) -> usize {
+        self.mhc_g.iter().filter(|x| x.is_some()).count()
+    }
+
     /// Upload every layer's FFN. `Ok(None)` when there is no CUDA device or `TANG_GLM5_GPU=0`.
     pub fn load(
         g: &crate::gguf::Gguf,
@@ -1255,5 +1267,55 @@ mod tests {
         e.reset();
         let b = e.window(&ids[..6]).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// THE LESSON OF THIS PORT (the engine never wired the built-and-tested GPU structs
+    /// in): a test that the resident layers are actually CONSTRUCTED at `use_gpu()` —
+    /// one DevLayer per KDA layer, one MhcGpu per layer. Without a CUDA device this
+    /// asserts the counts the CPU build reports (0) so the wiring stays type-visible;
+    /// on the pod it fails if a future refactor drops the construction.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_resident_layers_are_constructed() {
+        if !Path::new(TINY).exists() {
+            return;
+        }
+        let Some(_g) = tang_moe::gpu::Gpu::for_test() else {
+            return;
+        };
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu().unwrap(), "GPU did not load");
+        let g = e.gpu.as_ref().unwrap();
+        let want_kda = e.m.hp.is_kda.iter().filter(|&&k| k).count();
+        assert_eq!(g.kda_resident(), want_kda, "KDA DevLayers constructed");
+        assert_eq!(g.mhc_resident(), e.m.hp.n_layer, "mHC MhcGpus constructed");
+    }
+
+    /// THE LESSON, part 2: a KDA window actually ROUTES through the resident layer —
+    /// observable via the engine's host/device state ownership: after one window the
+    /// device is fresh (the host copies were seeded and the device owns the state).
+    /// On a CPU-only build this is trivially skipped; the pod run pins the routing.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_kda_window_routes_through_resident_layer() {
+        if !Path::new(TINY).exists() {
+            return;
+        }
+        let Some(_g) = tang_moe::gpu::Gpu::for_test() else {
+            return;
+        };
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            return;
+        };
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu().unwrap());
+        e.window(&ids[..4]).unwrap();
+        let g = e.gpu.as_ref().unwrap();
+        let kda_layers: Vec<usize> = (0..e.m.hp.n_layer).filter(|&l| e.m.hp.is_kda[l]).collect();
+        assert!(
+            g.kda_dev_fresh.iter().any(|&f| f),
+            "no KDA layer took over the state: the mixer bypassed the resident path"
+        );
+        assert_eq!(kda_layers.len(), g.kda_resident());
     }
 }
