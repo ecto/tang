@@ -67,6 +67,72 @@ static float rnd() {
 }
 
 int main() {
+
+// ---- REAL-MODEL GEOMETRY CHECK (the bug pod 20's garbage ids exposed):
+// the fixture shapes passed while the real KdaLayerW layout failed. attn_q is
+// [8192, 4096] Q8_0 (d_inner=8192 outputs, hidden=4096 inputs). Run k5_gemv on
+// REAL geometry with synthetic Q8_0 weights whose dequant values are exact, and
+// compare against a CPU dot over the same encoded bytes. This splits "kernel
+// wrong at real shapes" from "wiring wrong".
+{
+    const unsigned ROWS = 8192, COLS = 4096, T = 1;
+    // Q8_0: 32 elements per 34-byte block (f16 d + int8 qs[32]).
+    const unsigned blocks = COLS / 32;
+    const unsigned row_bytes = blocks * 34;
+    std::vector<unsigned char> w(ROWS * row_bytes);
+    std::vector<float> ref_w(ROWS * COLS);
+    std::vector<float> x(T * COLS);
+    unsigned seed = 7;
+    auto rnd = [&]() { seed = seed * 1103515245 + 12345; return (seed >> 16) % 2000 / 1000.0f - 1.0f; };
+    for (unsigned r = 0; r < ROWS; r++) {
+        for (unsigned b = 0; b < blocks; b++) {
+            // block scale encodes a value; qs are 0/1 so dequant == scale exactly
+            float d = rnd();
+            unsigned short h;
+            // f16 encode d approximately via the kernel's own g5_h2f inverse: use ldexp
+            // bit trick — reuse the reference path instead: pick d as an exact f16 value
+            d = (float)(int)(rnd() * 4); // small integers are exact in f16
+            h = 0;
+            // encode d as f16 via the standard conversion for exact small ints
+            unsigned short bits = 0;
+            if (d >= 0 && d < 32) bits = (unsigned short)((int(d) + 15) << 10); // d in [1,16)
+            if (d == 0) bits = 0;
+            // rewrite d from bits so dequant is exact
+            unsigned e = (bits >> 10) & 0x1F;
+            int m = (int)e - 15;
+            d = (m >= 0) ? (float)(1 << m) : 0.5f * (float)(1 << (-m));
+            unsigned char *blk = &w[(unsigned long long)r * row_bytes + b * 34];
+            blk[0] = (unsigned char)(bits & 0xFF);
+            blk[1] = (unsigned char)(bits >> 8);
+            for (unsigned j = 0; j < 32; j++) {
+                blk[2 + j] = (b + j) % 2; // dequant = d * ±1 — exact
+                ref_w[(unsigned long long)r * COLS + b * 32 + j] = d * ((b + j) % 2 ? 1.0f : -1.0f);
+            }
+        }
+    }
+    for (auto &v : x) v = rnd();
+    // CPU reference dot
+    std::vector<float> ref(T * ROWS);
+    for (unsigned r = 0; r < ROWS; r++) {
+        float acc = 0.f;
+        for (unsigned j = 0; j < COLS; j++) acc += ref_w[(unsigned long long)r * COLS + j] * x[j];
+        ref[r] = acc;
+    }
+    // device path
+    G5W gw{ (unsigned long long)(size_t)w.data(), (unsigned long long)ROWS * row_bytes, row_bytes, 8 };
+    std::vector<float> y(T * ROWS, 0.f);
+    // emulated k5_gemv grid
+    for (unsigned i = 0; i < T * ROWS; i++) {
+        unsigned t = i / ROWS, r = i % ROWS;
+        y[(unsigned long long)t * ROWS + r] = g5_dot(gw, 0, r, x.data() + (unsigned long long)t * COLS, COLS);
+    }
+    float maxerr = 0.f;
+    for (unsigned i = 0; i < T * ROWS; i++) maxerr = std::max(maxerr, std::abs(y[i] - ref[i]));
+    std::printf("real-geometry k5_gemv (8192x4096 Q8_0): max abs err %.6g\n", (double)maxerr);
+    if (maxerr > 1e-3) { std::puts("REAL-GEOMETRY K5_GEMV: FAIL"); std::exit(1); }
+    std::puts("REAL-GEOMETRY K5_GEMV: ok");
+}
+
     // fixture-layer geometry (meta.json: hidden 48, nh 4, hd 16, lb -5)
     const int HID = 48, NH = 4, HD = 16, DI = NH * HD, T = 100;
     const float LB = -5.0f, EPS = 1e-5f;
