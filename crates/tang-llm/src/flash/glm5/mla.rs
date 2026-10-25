@@ -1260,24 +1260,12 @@ pub mod cuda {
         /// W_k/W_v decompress matrices, resident: [nh][dl*dk] / [nh][dv*dl] f32.
         wk_d: DevBuf,
         wv_d: DevBuf,
-        /// bf16 latent cache, resident. Grows by realloc; rows [0..lat_rows) valid.
-        lat_d: std::cell::RefCell<DevBuf>,
-        lat_rows: std::cell::Cell<usize>,
-        /// indexer token rows, resident: [rows][idx_dim] f32 each for k and gate,
-        /// plus the valid bytes.
-        idk_d: std::cell::RefCell<DevBuf>,
-        idg_d: std::cell::RefCell<DevBuf>,
-        val_d: std::cell::RefCell<DevBuf>,
-        idx_rows: std::cell::Cell<usize>,
-        /// pooled keys, resident: [cap_pools][idx_dim]; pools [0..pool_upto) valid.
-        pool_d: std::cell::RefCell<DevBuf>,
-        pool_upto: std::cell::Cell<usize>,
-        /// the last externally-passed latent slice, resident: (buffer, host ptr, len) —
-        /// lets a caller that re-uploads its whole cache hit a stable path when its host
-        /// vec didn't move (fingerprint by ptr+len; engine's c.lat16 reallocates on growth,
-        /// but between growths it's stable — and kv_append's resident writes make the
-        /// upload unnecessary anyway when the fingerprint holds).
-        lat_in_d: std::cell::RefCell<Option<(DevBuf, u64, usize)>>,
+        /// Per-sequence device caches, LRU-keyed by the caller's sequence id
+        /// ([`MlaCuda::set_seq`]; default id 0 = single-sequence behavior, no engine
+        /// churn until W1 wires ids). Holds the bf16 latent cache, the indexer token
+        /// rows, the pooled keys and their watermarks. Eviction frees the buffers; a
+        /// re-entry re-uploads the caller's mirror once (4 MB/layer) and re-bases.
+        seqs: std::cell::RefCell<SeqLru>,
         /// persistent scratch: q [cap_t][nh*dk] f32, out [cap_t][nh*dv] f32,
         /// sel [cap_t][width] i32, folded q' [cap_t][nh*dl] f32, hw [cap_t][nh].
         q_d: std::cell::RefCell<DevBuf>,
@@ -1287,6 +1275,96 @@ pub mod cuda {
         hw_d: std::cell::RefCell<DevBuf>,
         iq_d: std::cell::RefCell<DevBuf>,
         sd_out: std::cell::RefCell<DevBuf>,
+    }
+
+    /// One sequence's resident device caches (see [`MlaCuda::seqs`]).
+    struct SeqState {
+        id: u64,
+        /// bf16 latent cache, resident. Grows by realloc; rows [0..lat_rows) valid.
+        lat_d: Option<DevBuf>,
+        lat_rows: usize,
+        /// indexer token rows, resident: [rows][idx_dim] f32 each for k and gate,
+        /// plus the valid bytes.
+        idk_d: Option<DevBuf>,
+        idg_d: Option<DevBuf>,
+        val_d: Option<DevBuf>,
+        idx_rows: usize,
+        /// pooled keys, resident: pools [0..pool_upto) valid.
+        pool_d: Option<DevBuf>,
+        pool_upto: usize,
+        /// LRU clock: bumped on every `set_seq` touch of this entry.
+        tick: u64,
+    }
+
+    /// A tiny LRU over sequence ids (LRU cap 4; a batched server rarely has more hot
+    /// sequences per layer than the running decode set).
+    struct SeqLru {
+        entries: Vec<SeqState>,
+        active: u64,
+        tick: u64,
+    }
+
+    impl SeqLru {
+        fn new() -> Self {
+            SeqLru {
+                // id 0 pre-created: single-sequence callers (tests, current engine) see
+                // exactly the pre-LRU behavior with zero churn
+                entries: vec![SeqState {
+                    id: 0,
+                    lat_d: None,
+                    lat_rows: 0,
+                    idk_d: None,
+                    idg_d: None,
+                    val_d: None,
+                    idx_rows: 0,
+                    pool_d: None,
+                    pool_upto: 0,
+                    tick: 0,
+                }],
+                active: 0,
+                tick: 1,
+            }
+        }
+
+        fn active_idx(&mut self) -> usize {
+            let i = self.entries.iter().position(|e| e.id == self.active).unwrap();
+            self.tick += 1;
+            self.entries[i].tick = self.tick;
+            i
+        }
+
+        /// Switch to `id`, creating or evicting as needed; returns the active entry.
+        fn switch(&mut self, id: u64) -> usize {
+            if let Some(i) = self.entries.iter().position(|e| e.id == id) {
+                self.active = id;
+                return self.active_idx();
+            }
+            self.active = id;
+            if self.entries.len() >= 4 {
+                // evict least-recently-touched entry that is NOT the new id
+                let victim = self
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.tick)
+                    .map(|(i, _)| i)
+                    .unwrap();
+                self.entries.remove(victim);
+            }
+            self.entries.push(SeqState {
+                id,
+                lat_d: None,
+                lat_rows: 0,
+                idk_d: None,
+                idg_d: None,
+                val_d: None,
+                idx_rows: 0,
+                pool_d: None,
+                pool_upto: 0,
+                tick: 0,
+            });
+            self.active_idx()
+        }
     }
 
     impl MlaCuda {
@@ -1337,20 +1415,7 @@ pub mod cuda {
                 ikn_d: std::cell::RefCell::new(None),
                 ikb_d: std::cell::RefCell::new(None),
                 ape_d: std::cell::RefCell::new(None),
-                lat_d: std::cell::RefCell::new(DevBuf::alloc(1024 * w.kv_lora * 2)?),
-                lat_rows: std::cell::Cell::new(0),
-                idk_d: std::cell::RefCell::new(DevBuf::alloc(
-                    1024 * w.idx_dim * std::mem::size_of::<f32>(),
-                )?),
-                idg_d: std::cell::RefCell::new(DevBuf::alloc(
-                    1024 * w.idx_dim * std::mem::size_of::<f32>(),
-                )?),
-                val_d: std::cell::RefCell::new(DevBuf::alloc(1024)?),
-                idx_rows: std::cell::Cell::new(0),
-                pool_d: std::cell::RefCell::new(DevBuf::alloc(
-                    (1024 / w.kpool + 1) * w.idx_dim * std::mem::size_of::<f32>(),
-                )?),
-                pool_upto: std::cell::Cell::new(0),
+                seqs: std::cell::RefCell::new(SeqLru::new()),
                 q_d: std::cell::RefCell::new(DevBuf::zeroed_elems::<f32>(
                     cap_t * w.n_head * w.qk_nope,
                 )?),
@@ -1370,57 +1435,77 @@ pub mod cuda {
                 sd_out: std::cell::RefCell::new(DevBuf::zeroed_elems::<i32>(
                     cap_t * (w.topk + w.kpool - 1),
                 )?),
-                lat_in_d: std::cell::RefCell::new(None),
             })
         }
 
-        /// Grow a resident cache to `rows` (u16-byte rows for lat, elements for the f32
-        /// caches). Realloc zeroes the resident state (watermarks reset by the caller).
+        /// Make `id` the active sequence for this layer's resident caches. Default id 0
+        /// (no call = single-sequence behavior). A batched server calls this once per
+        /// window with the request's id; interleaved sequences keep their caches warm
+        /// (LRU cap 4 per layer) instead of paying a ~4 MB mirror re-upload per switch.
+        pub fn set_seq(&self, id: u64) {
+            self.seqs.borrow_mut().switch(id);
+        }
+
+        /// Grow the ACTIVE sequence's latent cache to `rows` (bf16 rows). Realloc
+        /// invalidates the watermark (the caller re-bases from its mirror).
         fn ensure_lat(&self, rows: usize) -> Result<(), gpu::Error> {
-            let mut lat = self.lat_d.borrow_mut();
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
             let need = rows * self.dl * 2;
-            if lat.len() < need {
-                let grown = DevBuf::alloc(need * 2 + 64 * self.dl * 2)?;
-                *lat = grown;
-                self.lat_rows.set(0);
+            let grow = lru.entries[i]
+                .lat_d
+                .as_ref()
+                .is_none_or(|b| b.len() < need);
+            if grow {
+                lru.entries[i].lat_d = Some(DevBuf::alloc(need * 2 + 64 * self.dl * 2)?);
+                lru.entries[i].lat_rows = 0;
             }
             Ok(())
         }
 
         fn ensure_idx(&self, rows: usize) -> Result<(), gpu::Error> {
             let hd = self.idxd;
-            {
-                let mut k = self.idk_d.borrow_mut();
-                let need = rows * hd * std::mem::size_of::<f32>();
-                if k.len() < need {
-                    *k = DevBuf::alloc(need * 2 + 64 * hd * 4)?;
-                    self.idx_rows.set(0);
-                }
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            let need = rows * hd * std::mem::size_of::<f32>();
+            let grow_k = lru.entries[i]
+                .idk_d
+                .as_ref()
+                .is_none_or(|b| b.len() < need);
+            if grow_k {
+                lru.entries[i].idk_d = Some(DevBuf::alloc(need * 2 + 64 * hd * 4)?);
+                lru.entries[i].idx_rows = 0;
             }
-            {
-                let mut g = self.idg_d.borrow_mut();
-                let need = rows * hd * std::mem::size_of::<f32>();
-                if g.len() < need {
-                    *g = DevBuf::alloc(need * 2 + 64 * hd * 4)?;
-                    self.idx_rows.set(0);
-                }
+            let grow_g = lru.entries[i]
+                .idg_d
+                .as_ref()
+                .is_none_or(|b| b.len() < need);
+            if grow_g {
+                lru.entries[i].idg_d = Some(DevBuf::alloc(need * 2 + 64 * hd * 4)?);
+                lru.entries[i].idx_rows = 0;
             }
-            {
-                let mut v = self.val_d.borrow_mut();
-                if v.len() < rows {
-                    *v = DevBuf::alloc(rows * 2 + 64)?;
-                    self.idx_rows.set(0);
-                }
+            let grow_v = lru.entries[i]
+                .val_d
+                .as_ref()
+                .is_none_or(|b| b.len() < rows);
+            if grow_v {
+                lru.entries[i].val_d = Some(DevBuf::alloc(rows * 2 + 64)?);
+                lru.entries[i].idx_rows = 0;
             }
             Ok(())
         }
 
         fn ensure_pool(&self, n_pool: usize) -> Result<(), gpu::Error> {
-            let mut p = self.pool_d.borrow_mut();
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
             let need = n_pool * self.idxd * std::mem::size_of::<f32>();
-            if p.len() < need {
-                *p = DevBuf::alloc(need * 2 + 64 * self.idxd * 4)?;
-                self.pool_upto.set(0);
+            let grow = lru.entries[i]
+                .pool_d
+                .as_ref()
+                .is_none_or(|b| b.len() < need);
+            if grow {
+                lru.entries[i].pool_d = Some(DevBuf::alloc(need * 2 + 64 * self.idxd * 4)?);
+                lru.entries[i].pool_upto = 0;
             }
             Ok(())
         }
@@ -1481,12 +1566,19 @@ pub mod cuda {
             // written here, in order, for the CURRENT sequence (a reset or a foreign
             // sequence breaks it). On mismatch: full re-upload from the caller's mirror
             // (authoritative — the engine keeps it up to date from our read-backs).
-            let contiguous = self.lat_rows.get() == pos0;
-            if !contiguous && pos0 > 0 {
-                self.lat_d
-                    .borrow()
-                    .write(0, &cache[..pos0 * self.dl])?;
-            }
+            let (lat_ptr, contiguous) = {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                let contiguous = lru.entries[i].lat_rows == pos0;
+                if !contiguous && pos0 > 0 {
+                    lru.entries[i]
+                        .lat_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &cache[..pos0 * self.dl])?;
+                }
+                (lru.entries[i].lat_d.as_ref().unwrap().ptr, contiguous)
+            };
             // resident kv_a/kv_a_norm: they never change per layer; stage once
             // (fingerprinted by length; the MlaWeights is fixed per MlaCuda)
             let a = {
@@ -1508,7 +1600,7 @@ pub mod cuda {
             let (mut tt, mut hid, mut dl) = (t as i32, self.hid as i32, self.dl as i32);
             let mut eps = self.eps;
             // write straight into the resident cache at row pos0
-            let y_ptr = self.lat_d.borrow().ptr + (pos0 * self.dl * 2) as u64;
+            let y_ptr = lat_ptr + (pos0 * self.dl * 2) as u64;
             unsafe {
                 gpu::launch(
                     f,
@@ -1521,9 +1613,17 @@ pub mod cuda {
             };
             stream.sync()?;
             // refresh the engine's host mirror for just the new rows (1 KB for t=1)
-            let rows: Vec<u16> = self.lat_d.borrow().read(pos0 * self.dl, t * self.dl)?;
+            let rows: Vec<u16> = {
+                let lru = self.seqs.borrow();
+                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                lru.entries[i].lat_d.as_ref().unwrap().read(pos0 * self.dl, t * self.dl)?
+            };
             cache[pos0 * self.dl..(pos0 + t) * self.dl].copy_from_slice(&rows);
-            self.lat_rows.set(pos0 + t);
+            {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                lru.entries[i].lat_rows = pos0 + t;
+            }
             Ok(())
         }
 
@@ -1548,24 +1648,56 @@ pub mod cuda {
         self.ensure_pool(n_pool)?;
         // resident idk/idg are authoritative only when idx_append wrote every row of the
         // current sequence contiguously; else fall back to uploading the caller's mirrors
-        if self.idx_rows.get() != kv_len {
-            let hd0 = self.idxd;
-            self.ensure_idx(kv_len)?;
-            self.idk_d.borrow().write(0, &cache_k[..kv_len * hd0])?;
-            self.idg_d.borrow().write(0, &cache_gate[..kv_len * hd0])?;
-            self.val_d.borrow().write(0, &vec![1u8; kv_len])?;
-            self.idx_rows.set(kv_len);
-            self.pool_upto.set(0); // pools must be recomputed for the new data
+        {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            if lru.entries[i].idx_rows != kv_len {
+                drop(lru);
+                self.ensure_idx(kv_len)?;
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                let hd0 = self.idxd;
+                lru.entries[i]
+                    .idk_d
+                    .as_ref()
+                    .unwrap()
+                    .write(0, &cache_k[..kv_len * hd0])?;
+                lru.entries[i]
+                    .idg_d
+                    .as_ref()
+                    .unwrap()
+                    .write(0, &cache_gate[..kv_len * hd0])?;
+                lru.entries[i]
+                    .val_d
+                    .as_ref()
+                    .unwrap()
+                    .write(0, &vec![1u8; kv_len])?;
+                lru.entries[i].idx_rows = kv_len;
+                lru.entries[i].pool_upto = 0; // pools must be recomputed for the new data
+            }
         }
         // INCREMENTAL: pools [0..watermark) are already computed in the resident pool_d
         // (a pool key depends only on its own kpool cache rows, which are immutable once
         // written), so only pools [watermark..n_pool) run the kernel. The kernel reads
         // the RESIDENT idk_d/idg_d (staged by idx_append) — no cache re-upload per window.
-        if kv_len < self.pool_upto.get().saturating_sub(1) * kp + kp {
-            // cache shrank (new sequence): recompute everything
-            self.pool_upto.set(0);
+        {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            if kv_len < lru.entries[i].pool_upto.saturating_sub(1) * kp + kp {
+                // cache shrank (new sequence): recompute everything
+                lru.entries[i].pool_upto = 0;
+            }
         }
-        let from = self.pool_upto.get().min(n_pool);
+        let from = {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            let f = lru.entries[i].pool_upto.min(n_pool);
+            lru.entries[i].tick = {
+                lru.tick += 1;
+                lru.tick
+            };
+            f
+        };
         if from < n_pool {
             // i_ape is a per-layer constant; stage once
             let apd = {
@@ -1576,16 +1708,19 @@ pub mod cuda {
                 a.as_ref().unwrap().ptr
             };
             let (ck_ptr, cg_ptr, vd_ptr) = {
-                let k = self.idk_d.borrow();
-                let g = self.idg_d.borrow();
-                let v = self.val_d.borrow();
+                let lru = self.seqs.borrow();
+                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
                 (
-                    k.ptr + (first_key * hd * 4) as u64,
-                    g.ptr + (first_key * hd * 4) as u64,
-                    v.ptr + first_key as u64,
+                    lru.entries[i].idk_d.as_ref().unwrap().ptr + (first_key * hd * 4) as u64,
+                    lru.entries[i].idg_d.as_ref().unwrap().ptr + (first_key * hd * 4) as u64,
+                    lru.entries[i].val_d.as_ref().unwrap().ptr + first_key as u64,
                 )
             };
-            let pd_ptr = self.pool_d.borrow().ptr + (from * hd * 4) as u64;
+            let pd_ptr = {
+                let lru = self.seqs.borrow();
+                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                lru.entries[i].pool_d.as_ref().unwrap().ptr + (from * hd * 4) as u64
+            };
             let f = self.m.func("idx_pool_keys")?;
             let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
             let mut hd_ = hd as i32;
@@ -1600,11 +1735,17 @@ pub mod cuda {
                     tang_moe::args![ck_ptr, cg_ptr, apd, vd_ptr, pd_ptr, kvlen, fk, npl, hd_, kp_],
                 )?
             };
-            self.pool_upto.set(n_pool);
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            lru.entries[i].pool_upto = n_pool;
         }
         stream.sync()?;
         // hand the engine its full host copy (256 KB at the real geometry — acceptable)
-        let full: Vec<f32> = self.pool_d.borrow().read::<f32>(0, pool_keys.len())?;
+        let full: Vec<f32> = {
+            let lru = self.seqs.borrow();
+            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+            lru.entries[i].pool_d.as_ref().unwrap().read::<f32>(0, pool_keys.len())?
+        };
         pool_keys.copy_from_slice(&full);
         Ok(())
     }
@@ -1633,13 +1774,35 @@ pub mod cuda {
         assert!(cache_k.len() >= (pos0 + t) * hd);
         assert!(cache_gate.len() >= (pos0 + t) * hd);
         self.ensure_idx(pos0 + t)?;
-        let contiguous = self.idx_rows.get() == pos0;
-        if !contiguous && pos0 > 0 {
-            let hd0 = self.idxd;
-            self.idk_d.borrow().write(0, &cache_k[..pos0 * hd0])?;
-            self.idg_d.borrow().write(0, &cache_gate[..pos0 * hd0])?;
-            self.val_d.borrow().write(0, &valid[..pos0])?;
-        }
+        let (ck_ptr, cg_ptr, vd_ptr, contiguous) = {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            let contiguous = lru.entries[i].idx_rows == pos0;
+            if !contiguous && pos0 > 0 {
+                let hd0 = self.idxd;
+                lru.entries[i]
+                    .idk_d
+                    .as_ref()
+                    .unwrap()
+                    .write(0, &cache_k[..pos0 * hd0])?;
+                lru.entries[i]
+                    .idg_d
+                    .as_ref()
+                    .unwrap()
+                    .write(0, &cache_gate[..pos0 * hd0])?;
+                lru.entries[i]
+                    .val_d
+                    .as_ref()
+                    .unwrap()
+                    .write(0, &valid[..pos0])?;
+            }
+            (
+                lru.entries[i].idk_d.as_ref().unwrap().ptr,
+                lru.entries[i].idg_d.as_ref().unwrap().ptr,
+                lru.entries[i].val_d.as_ref().unwrap().ptr,
+                contiguous,
+            )
+        };
         // resident indexer weights (per-layer constants) — i_wk and i_gate are big
         // [idx_dim*hidden] f32; stage once, not per window
         let wkd = {
@@ -1671,16 +1834,6 @@ pub mod cuda {
             b.as_ref().unwrap().ptr
         };
         let xd = DevBuf::from_slice(x)?;
-        let (ck_ptr, cg_ptr, vd_ptr) = {
-            let k = self.idk_d.borrow();
-            let g = self.idg_d.borrow();
-            let v = self.val_d.borrow();
-            (
-                k.ptr + (pos0 * hd * 4) as u64,
-                g.ptr + (pos0 * hd * 4) as u64,
-                v.ptr + pos0 as u64,
-            )
-        };
         let f = self.m.func("idx_key_append")?;
         let (mut tt, mut p0) = (t as i32, pos0 as i32);
         let (mut hid, mut hd_) = (self.hid as i32, hd as i32);
@@ -1696,13 +1849,23 @@ pub mod cuda {
         };
         stream.sync()?;
         // refresh the engine's host mirror for just the new rows (512 B for t=1)
-        let nk: Vec<f32> = self.idk_d.borrow().read(pos0 * hd, t * hd)?;
-        let ng: Vec<f32> = self.idg_d.borrow().read(pos0 * hd, t * hd)?;
-        let nv: Vec<u8> = self.val_d.borrow().read(pos0, t)?;
+        let (nk, ng, nv) = {
+            let lru = self.seqs.borrow();
+            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+            (
+                lru.entries[i].idk_d.as_ref().unwrap().read(pos0 * hd, t * hd)?,
+                lru.entries[i].idg_d.as_ref().unwrap().read(pos0 * hd, t * hd)?,
+                lru.entries[i].val_d.as_ref().unwrap().read(pos0, t)?,
+            )
+        };
         cache_k[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&nk);
         cache_gate[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&ng);
         valid[pos0..pos0 + t].copy_from_slice(&nv);
-        self.idx_rows.set(pos0 + t);
+        {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            lru.entries[i].idx_rows = pos0 + t;
+        }
         Ok(())
     }
 
@@ -1766,9 +1929,29 @@ pub mod cuda {
         // pool keys: always the RESIDENT pool_d. Every caller builds its slice from the
         // immediately preceding idx_pool host copy (engine and tests both do), so pool_d
         // holds exactly these values — reading it skips the 256 KB re-upload per window.
-        assert_eq!(pool_keys.len() * 4 <= self.pool_d.borrow().len(), "pool buffer sizing");
-        let pkd_ptr = self.pool_d.borrow().ptr;
-        let vd_ptr = self.val_d.borrow().ptr;
+        assert!(
+            pool_keys.len() * 4
+                <= self
+                    .seqs
+                    .borrow()
+                    .entries
+                    .iter()
+                    .find(|e| e.id == self.seqs.borrow().active)
+                    .and_then(|e| e.pool_d.as_ref())
+                    .map(|b| b.len())
+                    .unwrap_or(0),
+            "pool buffer sizing"
+        );
+        let pkd_ptr = {
+            let lru = self.seqs.borrow();
+            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+            lru.entries[i].pool_d.as_ref().unwrap().ptr
+        };
+        let vd_ptr = {
+            let lru = self.seqs.borrow();
+            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+            lru.entries[i].val_d.as_ref().unwrap().ptr
+        };
         let sd_ptr = self.sd_out.borrow().ptr;
         let f = self.m.func("idx_select")?;
         let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
@@ -1856,18 +2039,24 @@ pub mod cuda {
             let wvd_ptr = self.wv_d.ptr;
             // latent cache: RESIDENT when kv_append wrote every row of this sequence
             // here (lat_rows == n_kv). Otherwise (test flow: caller-built caches) upload.
-            let ld_ptr = if self.lat_rows.get() == n_kv && lat.len() == n_kv * self.dl {
-                self.lat_d.borrow().ptr
-            } else {
-                // upload and KEEP the buffer alive for the launch (DevBuf frees on drop)
-                let mut st = self.lat_in_d.borrow_mut();
-                let keep = st.as_ref().is_some_and(|(_, _, len)| *len == lat.len());
-                if !keep {
-                    *st = Some((DevBuf::from_slice(lat)?, lat.as_ptr() as u64, lat.len()));
+            let ld_ptr = {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                let resident_ok = lru.entries[i].lat_rows == n_kv && lat.len() == n_kv * self.dl;
+                if resident_ok {
+                    lru.entries[i].lat_d.as_ref().unwrap().ptr
                 } else {
-                    st.as_ref().unwrap().0.write(0, lat)?;
+                    // upload into the sequence's own lat buffer (it may be shorter than
+                    // n_kv if kv_append never ran for this sequence) and keep it alive
+                    drop(lru);
+                    self.ensure_lat(n_kv)?;
+                    let mut lru = self.seqs.borrow_mut();
+                    let i = lru.active_idx();
+                    let buf = lru.entries[i].lat_d.as_ref().unwrap();
+                    buf.write(0, lat)?;
+                    lru.entries[i].lat_rows = n_kv;
+                    buf.ptr
                 }
-                st.as_ref().unwrap().0.ptr
             };
             let qd = DevBuf::from_slice(q)?; // t rows — small
             let od_ptr = self.o_d.borrow().ptr;
@@ -1928,17 +2117,22 @@ pub mod cuda {
             self.ensure_scratch(t)?;
             let wkd_ptr = self.wk_d.ptr;
             let wvd_ptr = self.wv_d.ptr;
-            let ld_ptr = if self.lat_rows.get() == n_kv && lat.len() == n_kv * self.dl {
-                self.lat_d.borrow().ptr
-            } else {
-                let mut st = self.lat_in_d.borrow_mut();
-                let keep = st.as_ref().is_some_and(|(_, _, len)| *len == lat.len());
-                if !keep {
-                    *st = Some((DevBuf::from_slice(lat)?, lat.as_ptr() as u64, lat.len()));
+            let ld_ptr = {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                let resident_ok = lru.entries[i].lat_rows == n_kv && lat.len() == n_kv * self.dl;
+                if resident_ok {
+                    lru.entries[i].lat_d.as_ref().unwrap().ptr
                 } else {
-                    st.as_ref().unwrap().0.write(0, lat)?;
+                    drop(lru);
+                    self.ensure_lat(n_kv)?;
+                    let mut lru = self.seqs.borrow_mut();
+                    let i = lru.active_idx();
+                    let buf = lru.entries[i].lat_d.as_ref().unwrap();
+                    buf.write(0, lat)?;
+                    lru.entries[i].lat_rows = n_kv;
+                    buf.ptr
                 }
-                st.as_ref().unwrap().0.ptr
             };
             let qd = DevBuf::from_slice(q)?;
             let qad_ptr = self.qa_d.borrow().ptr;
@@ -2380,7 +2574,9 @@ pub mod cuda {
 
         // RESET → prefill → decode: a NEW sequence through the SAME MlaCuda. This is the
         // pod-14 flag: a wrong contiguity re-base would silently serve the old sequence's
-        // rows. Sequence B uses x reversed so its cache content differs from A's.
+        // rows. Sequence B gets its own LRU id — under batched serving this is the
+        // interleave case, and it must NOT evict or reuse A's resident rows.
+        cu.set_seq(7); // sequence B's id; A stays resident under id 0
         let x_b: Vec<f32> = (0..t)
             .rev()
             .flat_map(|i| x[i * w.hidden..(i + 1) * w.hidden].to_vec())
@@ -2398,8 +2594,13 @@ pub mod cuda {
         .unwrap();
         // the reset broke contiguity (lat_rows was t+1, pos0 is 0): the append must have
         // re-based from the caller's mirror, i.e. served B's rows, not A's
-        assert_eq!(cu.lat_rows.get(), t, "re-base after reset");
-        assert_eq!(cu.idx_rows.get(), t, "re-base after reset (idx)");
+        let (lat_rows_b, idx_rows_b) = {
+            let lru = cu.seqs.borrow();
+            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+            (lru.entries[i].lat_rows, lru.entries[i].idx_rows)
+        };
+        assert_eq!(lat_rows_b, t, "re-base after reset");
+        assert_eq!(idx_rows_b, t, "re-base after reset (idx)");
         let mut out_b_resident = vec![0f32; w.n_head * w.v_head];
         cu.attend(
             &wk, &wv, &q, &lat_b, t, 1, t - 1, Some(&sel[..width]), &mut out_b_resident, &stream,
@@ -2436,6 +2637,22 @@ pub mod cuda {
             "glm5 mla cuda: reset check — A vs B last-row latent maxdiff {diff_ab:.3e} (nonzero ⇒ the test actually exercises different data)"
         );
         assert!(diff_ab > 1e-3, "sequences A and B must differ for this test to be meaningful");
+
+        // INTERLEAVE: switch back to A — its resident state must still be warm (same
+        // rows, no re-upload), and an attend must match a fresh-MlaCuda reference.
+        cu.set_seq(0);
+        cu.kv_append(&w.kv_a, &w.kv_a_norm, x2, 1, t, &mut lat_mirror, &stream)
+            .unwrap(); // A's decode row t (contiguous again: lat_rows was t)
+        let mut out_a2 = vec![0f32; w.n_head * w.v_head];
+        cu.attend(&wk, &wv, &q, &lat_mirror, kv2, 1, t, Some(&sel[..width]), &mut out_a2, &stream)
+            .unwrap();
+        let e4: f32 = out_a2
+            .iter()
+            .zip(&out_upload)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!("glm5 mla cuda: interleave back-to-A attend maxerr {e4:.3e}");
+        assert!(e4 < 1e-5, "interleave A attend maxerr {e4}");
     }
 }
 
