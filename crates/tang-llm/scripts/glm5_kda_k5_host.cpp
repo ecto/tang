@@ -67,6 +67,80 @@ static float rnd() {
 }
 
 int main() {
+
+// ---- REAL-MODEL GEOMETRY CHECK (the bug pod 20's garbage ids exposed):
+// the fixture shapes passed while the real KdaLayerW layout failed. attn_q is
+// [8192, 4096] Q8_0 (d_inner=8192 outputs, hidden=4096 inputs). Run k5_gemv on
+// REAL geometry with synthetic Q8_0 weights whose dequant values are exact, and
+// compare against a CPU dot over the same encoded bytes. This splits "kernel
+// wrong at real shapes" from "wiring wrong".
+{
+    const unsigned ROWS = 8192, COLS = 4096, T = 1;
+    // Q8_0: 32 elements per 34-byte block (f16 d + int8 qs[32]).
+    const unsigned blocks = COLS / 32;
+    const unsigned row_bytes = blocks * 34;
+    std::vector<unsigned char> w(ROWS * row_bytes);
+    std::vector<float> ref_w(ROWS * COLS);
+    std::vector<float> x(T * COLS);
+    unsigned seed = 7;
+    auto rnd = [&]() { seed = seed * 1103515245 + 12345; return (seed >> 16) % 2000 / 1000.0f - 1.0f; };
+    for (unsigned r = 0; r < ROWS; r++) {
+        for (unsigned b = 0; b < blocks; b++) {
+            // d = an exact positive f16 power of two in [1, 8]; qs = int8 ±1 so dequant is exact
+            float d = (float)(1 << (b % 4));
+            unsigned bits = (unsigned short)(((b % 4) + 15) << 10);
+            unsigned char *blk = &w[(unsigned long long)r * row_bytes + b * 34];
+            blk[0] = (unsigned char)(bits & 0xFF);
+            blk[1] = (unsigned char)(bits >> 8);
+            for (unsigned j = 0; j < 32; j++) {
+                blk[2 + j] = (signed char)((j % 2) ? 1 : -1);
+                ref_w[(unsigned long long)r * COLS + b * 32 + j] = d * (float)((signed char)blk[2 + j]);
+            }
+        }
+    }
+    for (auto &v : x) v = rnd();
+    // CPU reference dot
+    std::vector<float> ref(T * ROWS);
+    for (unsigned r = 0; r < ROWS; r++) {
+        float acc = 0.f;
+        for (unsigned j = 0; j < COLS; j++) acc += ref_w[(unsigned long long)r * COLS + j] * x[j];
+        ref[r] = acc;
+    }
+    // device path
+    G5W gw{ (unsigned long long)(size_t)w.data(), (unsigned long long)ROWS * row_bytes, row_bytes, 8 };
+    std::vector<float> y(T * ROWS, 0.f);
+    // emulated k5_gemv grid
+    for (unsigned i = 0; i < T * ROWS; i++) {
+        unsigned t = i / ROWS, r = i % ROWS;
+        y[(unsigned long long)t * ROWS + r] = g5_dot(gw, 0, r, x.data() + (unsigned long long)t * COLS, COLS);
+    }
+    // first-block dump: kernel dequant vs reference, elements 0..7 of row 0
+    {
+        const unsigned char *row0 = &w[0];
+        std::printf("row0 block0 bytes:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %02x", row0[j]);
+        std::printf("\nkernel deq[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", g5_deq(8, row0, j));
+        std::printf("\nref    deq[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
+        std::printf("\nkernel y[0..7]:");
+        for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", y[r]);
+        std::printf("\nref_w[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
+        { float direct = 0.f; for (unsigned j = 0; j < COLS; j++) direct += ref_w[j] * x[j];
+          std::printf("\ndirect dot ref_w[0..4095].x[0..4095] = %.4f", (double)direct); }
+        std::printf("\nx[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", x[j]);
+        std::printf("\nref    y[0..7]:");
+        for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", ref[r]);
+    }
+    float maxerr = 0.f;
+    for (unsigned i = 0; i < T * ROWS; i++) maxerr = std::max(maxerr, std::abs(y[i] - ref[i]));
+    std::printf("real-geometry k5_gemv (8192x4096 Q8_0): max abs err %.6g\n", (double)maxerr);
+    if (maxerr > 1e-3) { std::puts("REAL-GEOMETRY K5_GEMV: FAIL"); std::exit(1); }
+    std::puts("REAL-GEOMETRY K5_GEMV: ok");
+}
+
     // fixture-layer geometry (meta.json: hidden 48, nh 4, hd 16, lb -5)
     const int HID = 48, NH = 4, HD = 16, DI = NH * HD, T = 100;
     const float LB = -5.0f, EPS = 1e-5f;
