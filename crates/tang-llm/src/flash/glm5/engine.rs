@@ -422,12 +422,18 @@ impl Glm5Engine {
                     // past the resident scratch: sync the state to the host and run the
                     // staged path (which keeps both copies fresh), then seed forward
                     if g.kda_dev_fresh[l] {
+                        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+                            eprintln!("kda wiring: read_back layer {l} (window {t} > max_t)");
+                        }
                         dev.read_back(&mut st.0, &mut st.1)?;
                         g.kda_dev_fresh[l] = false;
                     }
                     return kda_gpu(x, t, w, cfg, &g.kda_kernels[d], &g.devs[d].0, &mut st.0, &mut st.1);
                 }
                 if !g.kda_dev_fresh[l] {
+                    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+                        eprintln!("kda wiring: seed layer {l} (host -> device)");
+                    }
                     dev.seed(&st.0, &st.1)?;
                     g.kda_dev_fresh[l] = true;
                 }
