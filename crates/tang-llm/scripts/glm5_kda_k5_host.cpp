@@ -126,6 +126,17 @@ int main() {
         unsigned t = i / ROWS, r = i % ROWS;
         y[(unsigned long long)t * ROWS + r] = g5_dot(gw, 0, r, x.data() + (unsigned long long)t * COLS, COLS);
     }
+    // first-block dump: kernel dequant vs reference, elements 0..7 of row 0
+    {
+        const unsigned char *row0 = &w[0];
+        std::printf("row0 block0 bytes:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %02x", row0[j]);
+        std::printf("\nkernel deq[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", g5_deq(8, row0, j));
+        std::printf("\nref    deq[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
+        std::printf("\nkernel y[0]=%.4f ref[0]=%.4f\n", (double)y[0], (double)ref[0]);
+    }
     float maxerr = 0.f;
     for (unsigned i = 0; i < T * ROWS; i++) maxerr = std::max(maxerr, std::abs(y[i] - ref[i]));
     std::printf("real-geometry k5_gemv (8192x4096 Q8_0): max abs err %.6g\n", (double)maxerr);
