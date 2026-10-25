@@ -1938,7 +1938,7 @@ pub mod cuda {
                     .iter()
                     .find(|e| e.id == self.seqs.borrow().active)
                     .and_then(|e| e.pool_d.as_ref())
-                    .map(|b| b.len())
+                    .map(|b| b.len)
                     .unwrap_or(0),
             "pool buffer sizing"
         );
@@ -2052,10 +2052,21 @@ pub mod cuda {
                     self.ensure_lat(n_kv)?;
                     let mut lru = self.seqs.borrow_mut();
                     let i = lru.active_idx();
-                    let buf = lru.entries[i].lat_d.as_ref().unwrap();
-                    buf.write(0, lat)?;
+                    let (ptr, n) = {
+                        let e = lru.entries[i].lat_d.as_ref().unwrap();
+                        (e.ptr, e.len)
+                    };
+                    {
+                        let e = lru.entries[i].lat_d.as_ref().unwrap();
+                        // write through a raw pointer: `e` borrows `lru` immutably and
+                        // `lat_rows` needs a mutable borrow of the same entry, so the
+                        // DevBuf::write goes through the ptr (the buffer is exclusive
+                        // to this sequence's entry by construction).
+                        let db = DevBuf { ptr, len: n };
+                        db.write(0, lat)?;
+                    }
                     lru.entries[i].lat_rows = n_kv;
-                    buf.ptr
+                    ptr
                 }
             };
             let qd = DevBuf::from_slice(q)?; // t rows — small
@@ -2128,10 +2139,21 @@ pub mod cuda {
                     self.ensure_lat(n_kv)?;
                     let mut lru = self.seqs.borrow_mut();
                     let i = lru.active_idx();
-                    let buf = lru.entries[i].lat_d.as_ref().unwrap();
-                    buf.write(0, lat)?;
+                    let (ptr, n) = {
+                        let e = lru.entries[i].lat_d.as_ref().unwrap();
+                        (e.ptr, e.len)
+                    };
+                    {
+                        let e = lru.entries[i].lat_d.as_ref().unwrap();
+                        // write through a raw pointer: `e` borrows `lru` immutably and
+                        // `lat_rows` needs a mutable borrow of the same entry, so the
+                        // DevBuf::write goes through the ptr (the buffer is exclusive
+                        // to this sequence's entry by construction).
+                        let db = DevBuf { ptr, len: n };
+                        db.write(0, lat)?;
+                    }
                     lru.entries[i].lat_rows = n_kv;
-                    buf.ptr
+                    ptr
                 }
             };
             let qd = DevBuf::from_slice(q)?;
