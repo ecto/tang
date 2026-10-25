@@ -135,7 +135,10 @@ int main() {
         for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", g5_deq(8, row0, j));
         std::printf("\nref    deq[0..7]:");
         for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
-        std::printf("\nkernel y[0]=%.4f ref[0]=%.4f\n", (double)y[0], (double)ref[0]);
+        std::printf("\nkernel y[0..7]:");
+        for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", y[r]);
+        std::printf("\nref    y[0..7]:");
+        for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", ref[r]);
     }
     float maxerr = 0.f;
     for (unsigned i = 0; i < T * ROWS; i++) maxerr = std::max(maxerr, std::abs(y[i] - ref[i]));
