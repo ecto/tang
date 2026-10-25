@@ -61,8 +61,9 @@ pub struct GpuFfn {
     kda_kernels: Vec<super::kda_cuda::cuda::Kernels>,
     /// W3's MLA + indexer kernels per device (`TANG_GLM5_GPU_MLA=0`: DSA stays on the CPU).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
-    /// W2's mHC pre/post kernels per device (`TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
-    mhc_k: Vec<Option<super::mhc::MhcKernels>>,
+    /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
+    /// scratch pool on the device; `TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
+    mhc_g: Vec<Option<super::mhc::MhcGpu>>,
     layers: Vec<super::moe::gpu::DevMoe>,
     dev_of: Vec<usize>,
     pub split: usize,
@@ -92,7 +93,12 @@ impl GpuFfn {
         let mhc_on = hp.hc == 4
             && hp.n_embd % 32 == 0
             && !std::env::var("TANG_GLM5_GPU_MHC").is_ok_and(|v| v == "0");
-        let mut mhc_k = Vec::new();
+        let mhp = super::mhc::MhcHparams {
+            streams: hp.hc,
+            sinkhorn_iters: hp.hc_sinkhorn_iters as u32,
+            hc_eps: hp.hc_eps,
+            rms_eps: hp.eps,
+        };
         if std::env::var("TANG_GLM5_GPU").is_ok_and(|v| v == "0") {
             return Ok(None);
         }
@@ -117,11 +123,7 @@ impl GpuFfn {
                 ),
                 _ => None,
             });
-            mhc_k.push(if mhc_on {
-                Some(super::mhc::MhcKernels::new(&gpu)?)
-            } else {
-                None
-            });
+            let _ = &mhc_on; // the resident layers are built in the per-layer loop below
             devs.push((gpu, k));
         }
         let split = if devs.len() < 2 {
@@ -151,9 +153,25 @@ impl GpuFfn {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(512);
         let mut kda_l: Vec<Option<super::kda_dev::DevLayer>> = Vec::new();
+        let mut mhc_g: Vec<Option<super::mhc::MhcGpu>> = Vec::new();
         {
             let t_k = Instant::now();
             for l in 0..n_layer {
+                // mHC resident: both blocks' weights (attn + ffn) on the layer's device
+                if mhc_on {
+                    let d = usize::from(l >= split);
+                    devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+                    let wa = super::mhc::MhcWeights::from_gguf(g, l, "hc_attn", hp.n_embd, &mhp)
+                        .with_context(|| format!("mhc blk.{l}.hc_attn"))?;
+                    let wf = super::mhc::MhcWeights::from_gguf(g, l, "hc_ffn", hp.n_embd, &mhp)
+                        .with_context(|| format!("mhc blk.{l}.hc_ffn"))?;
+                    mhc_g.push(
+                        Some(super::mhc::MhcGpu::new(&devs[d].0, [&wa, &wf], max_t))
+                            .with_context(|| format!("mhc layer {l} resident on GPU {d}"))?,
+                    );
+                } else {
+                    mhc_g.push(None);
+                }
                 if !hp.is_kda[l] || !kda_on {
                     kda_l.push(None);
                     continue;
@@ -224,7 +242,7 @@ impl GpuFfn {
             kda_dev_fresh,
             kda_kernels: kda_kernels,
             mla_k,
-            mhc_k,
+            mhc_g,
             layers,
             dev_of,
             split,
@@ -491,10 +509,27 @@ impl Glm5Engine {
         let (hc, n) = (self.m.hp.hc, self.m.hp.n_embd);
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
-            let d = g.dev_of[l];
-            if let Some(k) = &g.mhc_k[d] {
-                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                return mhc_pre_gpu(k, w, r, t, n);
+            if let Some(m) = &g.mhc_g[l] {
+                g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                let mix = m.pre(0, r, t)?;
+                // MixSet -> Vec<Mix> (the CPU post path's input shape; the resident post
+                // keeps the MixSet and avoids the repack below)
+                let mixes = (0..t)
+                    .map(|i| {
+                        let mut m2 = super::mhc::Mix {
+                            x: mix.x[i * n..(i + 1) * n].to_vec(),
+                            post: [0f32; 4],
+                            comb: [[0f32; 4]; 4],
+                        };
+                        m2.post.copy_from_slice(&mix.post[i * 4..(i + 1) * 4]);
+                        for src in 0..4 {
+                            m2.comb[src]
+                                .copy_from_slice(&mix.comb[i * 16 + src * 4..i * 16 + src * 4 + 4]);
+                        }
+                        m2
+                    })
+                    .collect();
+                return Ok((mix.x, mixes));
             }
         }
         let _ = l;
@@ -513,10 +548,11 @@ impl Glm5Engine {
         let (hc, n) = (self.m.hp.hc, self.m.hp.n_embd);
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
-            let d = g.dev_of[l];
-            if let Some(k) = &g.mhc_k[d] {
-                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                return mhc_post_gpu(k, mixes, y, r, t, n);
+            if let Some(m) = &g.mhc_g[l] {
+                g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                let out = m.post_mixes(mixes, y, r, t)?;
+                r.copy_from_slice(&out);
+                return Ok(());
             }
         }
         let _ = l;

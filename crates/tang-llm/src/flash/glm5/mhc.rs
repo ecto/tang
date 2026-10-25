@@ -724,6 +724,30 @@ impl MhcGpu {
         })
     }
 
+    /// [`mhc_post`](super::super::glm5::mhc) from the engine's `Vec<Mix>` form: repack
+    /// the per-token post/comb flat and delegate to [`Self::post`].
+    pub fn post_mixes(&self, mixes: &[Mix], y: &[f32], r_in: &[f32], t: usize) -> Result<Vec<f32>> {
+        if mixes.len() != t {
+            bail!("mhc post_mixes: {} mixes, t {t}", mixes.len());
+        }
+        let mut post = Vec::with_capacity(t * 4);
+        let mut comb = Vec::with_capacity(t * 16);
+        for m in mixes {
+            post.extend_from_slice(&m.post);
+            for row in &m.comb {
+                comb.extend_from_slice(row);
+            }
+        }
+        let mix = MixSet {
+            x: Vec::new(),
+            post,
+            comb,
+            t,
+            n: self.n,
+        };
+        self.post(&mix, y, r_in, t)
+    }
+
     /// [`mhc_post`](super::super::glm5::mhc) for `t` tokens from a [`MixSet`]: upload
     /// `y`/`post`/`comb`, launch, read the 4 streams back. The device `r` (pre-block
     /// state) was overwritten by the caller's data only in host memory here — this path
