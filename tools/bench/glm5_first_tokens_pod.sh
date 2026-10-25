@@ -11,6 +11,12 @@ gql(){ curl -s -m 20 -H 'Content-Type: application/json' -H "Authorization: Bear
 die_pod(){ log "TERMINATE: $1"
   for i in 1 2 3; do gql "mutation { podTerminate(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) }" >>"$R/pod.log" 2>&1; sleep 30; done
   sleep 600; exit 0; }
+# Phantom-create guard (pod 14: the API accepted the create, no worker claimed it).
+# Poll our own log file's existence + mtime instead of GraphQL (no key juggling):
+# the script itself writes pod.log every few seconds; if it was never claimed, no log.
+if [ ! -s "$R/pod.log" ]; then
+  log "PHANTOM CREATE GUARD: empty log at start (should never happen)"; sleep 300; exit 0
+fi
 ( sleep $((HARD_MIN*60)); die_pod "hard deadline ${HARD_MIN}m" ) &
 log "pod $RUNPOD_POD_ID; self-terminate auth: $(gql "query { pod(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) { id } }" | head -c 120)"
 
