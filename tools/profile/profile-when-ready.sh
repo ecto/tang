@@ -43,7 +43,7 @@ echo "$(date -u +%FT%TZ) build ok" >> "$LOG"
 BIN=$HOME/tang-scratch/target/release/tang-llm
 G=$(find ~/tang-scratch/glm53/UD-Q4_K_XL -name '*-00001-of-*.gguf' | head -1)
 echo "$(date -u +%FT%TZ) profiling $G" >> "$LOG"
-TANG_GLM5_PROF=1 TANG_GPUS=2 timeout 1800 $BIN flash-generate "$G" \
+TANG_GLM5_PROF=1 TANG_GPUS=2 TANG_GLM5_GPU_FFN=0 timeout 1800 $BIN flash-generate "$G" \
   --prompt "Write a haiku about the sea." -n 8 --temp 0 -v \
   > ~/tang-scratch/profile-run.log 2>&1
 RC=$?
