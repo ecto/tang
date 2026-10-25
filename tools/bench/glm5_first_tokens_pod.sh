@@ -47,6 +47,13 @@ log "engine split tests rc=$? | $(grep -E 'test result' $R/engine-split.log | ta
 
 # 4. FIRST TOKENS (the headline)
 export TANG_GPUS=2 TANG_GLM5_PROF=1
+# EARLY EVIDENCE: one 1-token tiny-fixture window so a fast death still leaves prof lines
+TINY=$(find $W/tang/crates/tang-llm/tests/fixtures/glm5 -name '*.gguf' | head -1)
+if [ -n "$TINY" ]; then
+  log "smoke: tiny 1-token window"
+  TANG_GPUS=2 TANG_GLM5_PROF=1 timeout 120 $BIN flash-generate "$TINY" --prompt-ids 1000 1001 -n 2 --temp 0 -v >"$R/smoke.log" 2>&1
+  echo "SMOKE rc=$?"; grep -E "prof|window|tok/s" "$R/smoke.log" | head -8
+fi
 log "flash-generate (haiku)"
 ( timeout 900 $BIN flash-generate "$G" --prompt "Write a haiku about the sea." -n 32 --temp 0 -v --out /root/g2.ids >"$R/haiku.log" 2>&1; echo "haiku rc=$?"; echo "=== HAIKU IDS: $(head -c 120 /root/g2.ids 2>/dev/null)"; tail -8 "$R/haiku.log" ) > >(tee -a "$R/pod.log" >&2) 2>&1
 log "haiku rc=$?"; echo "=== HAIKU LOG TAIL"; tail -25 "$R/haiku.log"; echo "=== HAIKU IDS: $(cat /root/g2.ids 2>/dev/null)"
