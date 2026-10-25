@@ -105,8 +105,8 @@ int main() {
             blk[0] = (unsigned char)(bits & 0xFF);
             blk[1] = (unsigned char)(bits >> 8);
             for (unsigned j = 0; j < 32; j++) {
-                blk[2 + j] = (b + j) % 2; // dequant = d * ±1 — exact
-                ref_w[(unsigned long long)r * COLS + b * 32 + j] = d * ((b + j) % 2 ? 1.0f : -1.0f);
+                blk[2 + j] = (signed char)((j % 2) ? 1 : -1); // int8 VALUE ±1 (Q8_0 qs are values, not sign bits)
+                ref_w[(unsigned long long)r * COLS + b * 32 + j] = d * (float)((signed char)blk[2 + j]);
             }
         }
     }
