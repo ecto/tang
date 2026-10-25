@@ -50,8 +50,15 @@ struct DsaCache {
 #[cfg(feature = "cuda")]
 pub struct GpuFfn {
     devs: Vec<(tang_moe::gpu::Gpu, super::moe::gpu::Kernels)>,
-    /// W4's KDA kernels per device (`TANG_GLM5_GPU_KDA=0`: KDA stays on the CPU).
-    kda_k: Vec<Option<super::kda_cuda::cuda::Kernels>>,
+    /// The resident KDA layers ([`super::kda_dev::DevLayer`], W4's DevKda core + the
+    /// projections as device GEMVs), one per KDA layer, `None` when
+    /// `TANG_GLM5_GPU_KDA=0`. The free-kernel path (`kda_gpu`) stays as the fallback for
+    /// windows past `max_t`.
+    kda_l: Vec<Option<super::kda_dev::DevLayer>>,
+    /// Per KDA layer: does the device hold the live state (vs the engine's host copies)?
+    kda_dev_fresh: Vec<bool>,
+    /// W4's staged KDA kernels per device (the >512-token fallback path).
+    kda_kernels: Vec<super::kda_cuda::cuda::Kernels>,
     /// W3's MLA + indexer kernels per device (`TANG_GLM5_GPU_MLA=0`: DSA stays on the CPU).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
     /// W2's mHC pre/post kernels per device (`TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
@@ -79,7 +86,7 @@ impl GpuFfn {
             eps: hp.eps,
         };
         let kda_on = !std::env::var("TANG_GLM5_GPU_KDA").is_ok_and(|v| v == "0");
-        let mut kda_k = Vec::new();
+        let mut kda_kernels = Vec::new();
         let mla_on = !std::env::var("TANG_GLM5_GPU_MLA").is_ok_and(|v| v == "0");
         let mut mla_k = Vec::new();
         let mhc_on = hp.hc == 4
@@ -102,11 +109,7 @@ impl GpuFfn {
             };
             gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU {ord}: {e}"))?;
             let k = super::moe::gpu::Kernels::new(&gpu)?;
-            kda_k.push(if kda_on && hp.is_kda.iter().any(|&b| b) {
-                Some(super::kda_cuda::cuda::load(&gpu, &kda_cfg)?)
-            } else {
-                None
-            });
+            kda_kernels.push(k);
             mla_k.push(match (mla_on, mla_sample) {
                 (true, Some(w)) => Some(
                     super::mla::cuda::MlaCuda::new_at(w, ord)
@@ -139,6 +142,52 @@ impl GpuFfn {
             }
             best
         };
+        // the resident KDA layers: one DevLayer per KDA layer on its device. Weights
+        // upload in GGUF storage format; scratch is sized to the largest engine window
+        // (the engine's chunk, 512 at serve, never exceeds 4096; 64 covers the profile's
+        // prefill windows and decode, and the <64 tail falls to the CPU path).
+        let max_t = std::env::var("TANG_GLM5_KDA_MAXT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        let mut kda_l: Vec<Option<super::kda_dev::DevLayer>> = Vec::new();
+        {
+            let t_k = Instant::now();
+            for l in 0..n_layer {
+                if !hp.is_kda[l] || !kda_on {
+                    kda_l.push(None);
+                    continue;
+                }
+                let d = usize::from(l >= split);
+                devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+                let layer = super::kda_dev::DevLayer::new_gguf(
+                    &devs[d].0,
+                    g,
+                    l,
+                    &kda_cfg,
+                    hp.n_embd,
+                    &super::kda::ConvState::zeros(&kda_cfg, 1),
+                    &super::kda::KdaState::zeros(&kda_cfg, 1),
+                    max_t,
+                )
+                .with_context(|| format!("KDA layer {l} resident on GPU {d}"))?;
+                kda_l.push(Some(layer));
+                if kda_l.iter().filter(|x| x.is_some()).count() % 8 == 0 {
+                    eprintln!(
+                        "glm5: {} KDA layers resident ({:.0} s)",
+                        kda_l.iter().filter(|x| x.is_some()).count(),
+                        t_k.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            eprintln!(
+                "glm5: {} KDA layers resident on the GPU(s) ({:.0} s)",
+                kda_l.iter().filter(|x| x.is_some()).count(),
+                t_k.elapsed().as_secs_f64()
+            );
+        }
+        let kda_dev_fresh = vec![false; n_layer];
+
         let t0 = Instant::now();
         let ffn_on = !std::env::var("TANG_GLM5_GPU_FFN").is_ok_and(|v| v == "0");
         let mut layers = Vec::with_capacity(if ffn_on { n_layer } else { 0 });
@@ -171,7 +220,9 @@ impl GpuFfn {
         );
         Ok(Some(Self {
             devs,
-            kda_k,
+            kda_l,
+            kda_dev_fresh,
+            kda_kernels: kda_kernels,
             mla_k,
             mhc_k,
             layers,
@@ -310,9 +361,13 @@ impl Glm5Engine {
         Ok(w)
     }
 
-    /// KDA layer `l`'s mixer: W4's GPU conv + core when loaded, else the CPU reference.
+    /// KDA layer `l`'s mixer: the resident [`super::kda_dev::DevLayer`] when loaded (the
+    /// device holds the state; the host copies sync only across a CPU fallback), W4's
+    /// staged free-function path when the window exceeds the resident scratch, else the
+    /// CPU reference.
+    #[allow(clippy::too_many_arguments)]
     fn kda_mixer(
-        &self,
+        &mut self,
         l: usize,
         x: &[f32],
         t: usize,
@@ -322,14 +377,31 @@ impl Glm5Engine {
     ) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
-            let d = g.dev_of[l];
-            if let Some(k) = &g.kda_k[d] {
-                let gpu = &g.devs[d].0;
-                gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                return kda_gpu(x, t, w, cfg, k, gpu, &mut st.0, &mut st.1);
+            if let Some(dev) = &mut g.kda_l[l] {
+                if t > 512 {
+                    // past the resident scratch: sync the state to the host and run the
+                    // staged path (which keeps both copies fresh), then seed forward
+                    if g.kda_dev_fresh[l] {
+                        g.devs[g.dev_of[l]]
+                            .0
+                            .bind()
+                            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                        dev.read_back(&mut st.0, &mut st.1)?;
+                        g.kda_dev_fresh[l] = false;
+                    }
+                    let gpu = &g.devs[g.dev_of[l]].0;
+                    gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                    return kda_gpu(x, t, w, cfg, &g.kda_kernels[g.dev_of[l]], gpu, &mut st.0, &mut st.1);
+                }
+                g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                if !g.kda_dev_fresh[l] {
+                    dev.seed(&st.0, &st.1)?;
+                    g.kda_dev_fresh[l] = true;
+                }
+                let y = dev.window(x, t, &mut st.0)?;
+                return Ok(y);
             }
         }
-        let _ = l;
         super::kda::kda_layer(x, w, cfg, &mut st.0, &mut st.1, 1, t)
     }
 
@@ -495,12 +567,14 @@ impl Glm5Engine {
                 let t_w = Instant::now();
                 let wc = self.kda_weights(l)?;
                 stage("kda weights", &t_w);
-                let (w, cfg) = (wc.0.clone(), wc.1);
+                // no wc.0.clone(): the free-function paths only read the weights, and the
+                // resident path doesn't touch them at all — pass the Arc's ref
+                let (w, cfg) = (&wc.0, wc.1);
                 let t_m = Instant::now();
                 let mut st = self.kda[l]
                     .take()
                     .unwrap_or_else(|| (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1)));
-                let y = self.kda_mixer(l, &x, t, &w, &cfg, &mut st);
+                let y = self.kda_mixer(l, &x, t, w, &cfg, &mut st);
                 self.kda[l] = Some(st);
                 stage("kda mixer", &t_m);
                 y?
