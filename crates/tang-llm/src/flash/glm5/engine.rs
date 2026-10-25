@@ -140,9 +140,10 @@ impl GpuFfn {
             best
         };
         let t0 = Instant::now();
-        let mut layers = Vec::with_capacity(n_layer);
-        let mut dev_of = Vec::with_capacity(n_layer);
-        for l in 0..n_layer {
+        let ffn_on = !std::env::var("TANG_GLM5_GPU_FFN").is_ok_and(|v| v == "0");
+        let mut layers = Vec::with_capacity(if ffn_on { n_layer } else { 0 });
+        let mut dev_of = vec![0usize; n_layer];
+        for l in 0..(if ffn_on { n_layer } else { 0 }) {
             let d = usize::from(l >= split);
             devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
             let p = super::moe::MoeParams::from_gguf(g, l)?;
@@ -243,7 +244,10 @@ impl Glm5Engine {
     fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
-            return g.ffn(l, x, t);
+            if l < g.layers.len() {
+                return g.ffn(l, x, t);
+            }
+            // TANG_GLM5_GPU_FFN=0: no FFNs resident; fall through to the CPU MoE path.
         }
         if self.m.hp.is_dense(l) {
             self.m.dense_ffn(l, x, t)
