@@ -17,6 +17,8 @@ pub mod kda_cuda;
 pub mod mhc;
 pub mod mla;
 pub mod moe;
+#[cfg(feature = "cuda")]
+pub mod serve_glue;
 
 use crate::gguf::Gguf;
 use anyhow::{bail, ensure, Context, Result};

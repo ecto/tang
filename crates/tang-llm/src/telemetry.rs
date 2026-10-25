@@ -64,6 +64,10 @@ mod imp {
     #[inline(always)]
     pub fn step(_: &StepStats) {}
 
+    /// One engine forward window's wall time and width (nothing without the feature).
+    #[inline(always)]
+    pub fn glm5_window(_: usize, _: f64) {}
+
     #[inline(always)]
     pub fn queue_depth(_: impl FnOnce() -> usize) {}
 }
@@ -91,6 +95,7 @@ mod imp {
         hit_ratio: Histogram<f64>,
         queue_depth: Gauge<u64>,
         tok_s: Histogram<f64>,
+        glm5_window: Histogram<f64>,
         /// `kind` = decode | mixed | prefill, built once.
         kinds: [[KeyValue; 1]; 3],
     }
@@ -154,6 +159,14 @@ mod imp {
                 .with_description("A request's decode tokens per second")
                 .with_boundaries(vec![
                     5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0,
+                ])
+                .build(),
+            glm5_window: meter
+                .f64_histogram("tang_llm.glm5.window")
+                .with_unit("s")
+                .with_description("One GLM-5 engine window's wall time, by token count")
+                .with_boundaries(vec![
+                    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
                 ])
                 .build(),
             kinds: [
@@ -364,6 +377,22 @@ mod imp {
         if let Some(mean) = s.prefill_tokens.checked_div(s.prefill_chunks) {
             inst.chunk_tokens.record(mean as u64, &[]);
         }
+    }
+
+    /// One GLM-5 engine window: its token count and wall seconds (the engine's own
+    /// per-stage timers live inside `Glm5Engine`; this is the serve-side view).
+    pub fn glm5_window(tokens: usize, secs: f64) {
+        let Some(inst) = INST.get() else { return };
+        if secs <= 0.0 {
+            return;
+        }
+        let bucket = match tokens {
+            0..=1 => "decode",
+            2..=64 => "prefill_small",
+            _ => "prefill",
+        };
+        inst.glm5_window
+            .record(secs, &[KeyValue::new("kind", bucket)]);
     }
 
     /// Requests waiting, sampled between steps.
