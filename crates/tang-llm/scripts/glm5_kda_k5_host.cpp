@@ -137,6 +137,10 @@ int main() {
         for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
         std::printf("\nkernel y[0..7]:");
         for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", y[r]);
+        std::printf("\nref_w[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", ref_w[j]);
+        std::printf("\nx[0..7]:");
+        for (unsigned j = 0; j < 8; j++) std::printf(" %.4f", x[j]);
         std::printf("\nref    y[0..7]:");
         for (unsigned r = 0; r < 8; r++) std::printf(" %.4f", ref[r]);
     }
