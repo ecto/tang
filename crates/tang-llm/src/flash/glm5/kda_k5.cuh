@@ -6,7 +6,7 @@ extern "C" __global__ void k5_gemv(const G5W w, unsigned e, const float* x, floa
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = i / ROWS, r = i % ROWS;
     if (t >= T) return;
-    y[(u64)t * ystride + r] = g5_dot(w, e, r, x + (u64)t * COLS, COLS);
+    y[(unsigned long long)t * ystride + r] = g5_dot(w, e, r, x + (unsigned long long)t * COLS, COLS);
 }
 
 // g1 in place: g1[i] = gate_form(g1[i] + dt[chan]) over nh*hd per token.
@@ -33,8 +33,8 @@ extern "C" __global__ void k5_beta(const G5W bp, const float* x, float* beta,
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = i / NH, h = i % NH;
     if (t >= T) return;
-    float a = g5_dot(bp, 0u, h, x + (u64)t * HID, HID);
-    beta[(u64)t * NH + h] = 1.f / (1.f + expf(-a));
+    float a = g5_dot(bp, 0u, h, x + (unsigned long long)t * HID, HID);
+    beta[(unsigned long long)t * NH + h] = 1.f / (1.f + expf(-a));
 }
 
 // y[t][c] = rms_norm(o[t][h..])[c] * on[c] * sigmoid(g2[t][c]), h = c / HD.
@@ -45,7 +45,7 @@ extern "C" __global__ void k5_gated_norm(const float* o, const float* on, const 
     if (i >= T * NH * HD) return;
     unsigned t = i / (NH * HD), c = i % (NH * HD);
     unsigned h = c / HD, j = c % HD;
-    const float* ot = o + ((u64)t * NH + h) * HD;
+    const float* ot = o + ((unsigned long long)t * NH + h) * HD;
     double s = 0.0; // the host's rms_norm_mul: f64 sum of squares
     for (unsigned d = 0; d < HD; d++) { double v = (double)ot[d]; s += v * v; }
     float r = (float)(1.0 / sqrt((s / (double)HD) + (double)EPS));
