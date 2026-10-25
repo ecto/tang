@@ -375,6 +375,15 @@ fn main() -> Result<()> {
     if cmd == "flash-ref" {
         return tang_llm::flash::reference::cli(&args[1..]);
     }
+    if cmd == "glm5-ref" {
+        return tang_llm::flash::glm5::forward::cli(&args[1..]);
+    }
+    // GLM-5.3-Flash (`glm5-next`) runs on its own engine, on any build.
+    if matches!(cmd, "flash-generate" | "flash-bench")
+        && tang_llm::flash::glm5::engine::is_glm5(&dir)
+    {
+        return tang_llm::flash::glm5::engine::cli(&args[1..], cmd == "flash-bench");
+    }
     #[cfg(feature = "cuda")]
     match cmd {
         "flash-mtp-prefix" => return tang_llm::flash::cli::mtp_prefix(&args[1..]),

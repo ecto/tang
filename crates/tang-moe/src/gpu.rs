@@ -52,7 +52,13 @@ pub struct Gpu {
 impl Gpu {
     /// Device 0's primary context. Errors (instead of panicking) when there is no driver.
     pub fn new() -> Result<Self> {
-        let ctx = std::panic::catch_unwind(|| CudaContext::new(0))
+        Gpu::at(0)
+    }
+
+    /// Device `ordinal`'s primary context (device 0 for [`Gpu::new`]). Errors (instead of
+    /// panicking) when there is no driver, or no such device.
+    pub fn at(ordinal: usize) -> Result<Self> {
+        let ctx = std::panic::catch_unwind(|| CudaContext::new(ordinal))
             .map_err(|_| Error("no CUDA driver".into()))??;
         Ok(Gpu { ctx })
     }
@@ -128,13 +134,34 @@ impl Drop for Module {
 pub struct Stream(pub sys::CUstream);
 
 impl Stream {
-    /// A non-blocking stream (doesn't synchronise with the legacy default stream; capturable).
+    /// A non-blocking stream: does not synchronise with the legacy default stream, so it is
+    /// capturable ([`Graph::capture`] requires it) — but a preceding synchronous
+    /// `DevBuf::write`/`from_slice` HtoD is NOT ordered before work on it. Never use for
+    /// data-path work that consumes host-staged buffers: use [`Stream::blocking`].
     pub fn new() -> Result<Self> {
         let mut s: sys::CUstream = std::ptr::null_mut();
         ck!(sys::cuStreamCreate(
             &mut s,
             sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32
         ))?;
+        Ok(Stream(s))
+    }
+
+    /// A blocking stream (flags 0): orders against the legacy default stream, so a
+    /// preceding synchronous `DevBuf::write`/`from_slice` HtoD is guaranteed visible to
+    /// kernels launched on it. `DevBuf::write`/`from_slice` copy with the synchronous
+    /// `cuMemcpyHtoD_v2`, which the driver enqueues on the legacy default stream — a
+    /// `CU_STREAM_NON_BLOCKING` stream does not order against it, so a kernel launched
+    /// right after an upload could read the buffer before the copy lands: rare,
+    /// position-varying wrong outputs that stick via carried state (observed on mew as
+    /// engine-vs-CPU parity flipping run-to-run, 13/170 → 161/170; see frog/tree-eval
+    /// `eval/tree/stream-blocking.md`). Use this for every stream that reads host-staged
+    /// buffers.
+    pub fn blocking() -> Result<Self> {
+        let mut s: sys::CUstream = std::ptr::null_mut();
+        unsafe {
+            ck!(sys::cuStreamCreate(&mut s, 0))?;
+        }
         Ok(Stream(s))
     }
 
@@ -209,6 +236,12 @@ pub struct DevBuf {
 }
 
 impl DevBuf {
+    /// GOTCHA (cost a glm5 first-tokens pod): `alloc`/`zeroed` take BYTES, but `read::<T>`/
+    /// `write::<T>` take ELEMENT counts. Calling `zeroed(n * size_of::<T>())` and then
+    /// `read::<T>` is fine, but passing an element count to `zeroed` (or bytes to `read`)
+    /// leaves the buffer 4× (or 4× too small) and the kernel writes past the allocation —
+    /// the assert fires later, in an unrelated read. When in doubt: `alloc_bytes(n * size)` +
+    /// `read::<T>(0, n)` never mix.
     pub fn alloc(len: usize) -> Result<Self> {
         let mut p: sys::CUdeviceptr = 0;
         ck!(sys::cuMemAlloc_v2(&mut p, len.max(1)))?;
@@ -219,6 +252,12 @@ impl DevBuf {
         let b = Self::alloc(len)?;
         ck!(sys::cuMemsetD8_v2(b.ptr, 0, len.max(1)))?;
         Ok(b)
+    }
+
+    /// `zeroed_elems::<T>(n)` zeroes n elements of T (n * size_of::<T>() bytes) — the
+    /// clearer form for "a kernel will write n floats here" buffers.
+    pub fn zeroed_elems<T>(n: usize) -> Result<Self> {
+        Self::zeroed(n * std::mem::size_of::<T>())
     }
 
     pub fn from_slice<T: Copy>(data: &[T]) -> Result<Self> {
