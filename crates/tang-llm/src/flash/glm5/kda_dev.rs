@@ -347,7 +347,15 @@ impl DevLayer {
             // read it back, run the CPU chunk, seed the result forward (tails < 64 only)
             if off < t {
                 let rem = t - off;
-                let (mut hconv, mut hstate) = (conv.clone(), KdaState(Vec::new()));
+                let (mut hconv, mut hstate) = (
+                    conv.clone(),
+                    KdaState(vec![
+                        0f32;
+                        self.cfg.heads
+                            * self.cfg.head_dim
+                            * self.cfg.head_dim
+                    ],
+                ));
                 self.read_back(&mut hconv, &mut hstate)?;
                 let yc = super::kda::conv1d_prefill(
                     &qkv_h[off * 3 * di..t * 3 * di],
