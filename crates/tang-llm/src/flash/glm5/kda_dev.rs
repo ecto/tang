@@ -119,6 +119,10 @@ pub struct DevLayer {
 /// stay quantised on the device; the kernel dequantises element-wise). `rows × cols` in
 /// HF orientation (`[out][in]`), which for GGUF ne dims `[cols, rows]` is
 /// `rows = n_rows()`, `cols = row_len()`.
+fn grid(n: usize) -> (u32, u32, u32) {
+    (n.div_ceil(128) as u32, 1, 1)
+}
+
 fn dev_w(g: &crate::gguf::Gguf, name: &str) -> Result<super::moe::gpu::DevW> {
     let t = g.info(name).with_context(|| format!("k5 {name}"))?;
     super::moe::gpu::upload(&super::moe::W::Gguf(g, t), 1, t.n_rows(), t.row_len())
@@ -143,6 +147,7 @@ impl DevLayer {
         let (nh, hd) = (cfg.heads, cfg.head_dim);
         let d_inner = nh * hd;
         let t = |s: &str| format!("blk.{l}.{s}");
+        let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("k5 upload: {e}");
         let kers = super::kda_cuda::cuda::load(g, cfg)?;
         let gv = super::moe::gpu::Kernels5::new(g)?;
         let upf = |name: &str| -> Result<DevBuf> {
@@ -152,7 +157,8 @@ impl DevLayer {
                 "{}: want F32 for the small vectors",
                 t(name)
             );
-            DevBuf::from_slice(gguf.tensor_f32(&t(name))?)
+            let v = gguf.tensor_f32(&t(name))?;
+            DevBuf::from_slice(&v).map_err(gerr)
         };
         let conv_w = {
             // the converter splits HF's fused qkv conv per q|k|v; the CPU loader stacks
@@ -166,7 +172,8 @@ impl DevLayer {
         let rate = {
             // GGUF `ssm_a` = `-exp(A_log)`; the gate's `rate` = `exp(A_log)` = `−ssm_a`
             let r = gguf.tensor_f32(&t("ssm_a"))?;
-            DevBuf::from_slice(r.iter().map(|&a| -a).collect::<Vec<f32>>())
+            let neg: Vec<f32> = r.iter().map(|&a| -a).collect();
+            DevBuf::from_slice(&neg).map_err(gerr)
         };
         let slots = 1;
         Ok(Self {
@@ -181,19 +188,19 @@ impl DevLayer {
             ga: dev_w(gguf, &t("ssm_g_a.weight"))?,
             gb: dev_w(gguf, &t("ssm_g_b.weight"))?,
             dt: upf("ssm_dt.bias")?,
-            rate,
+            rate: rate?,
             on: upf("ssm_norm.weight")?,
-            xb: DevBuf::zeroed_elems::<f32>(max_t * hidden)?,
-            qkvb: DevBuf::zeroed_elems::<f32>(max_t * 3 * d_inner)?,
-            g1b: DevBuf::zeroed_elems::<f32>(max_t * hd)?,
-            gb_out: DevBuf::zeroed_elems::<f32>(max_t * d_inner)?,
-            bb: DevBuf::zeroed_elems::<f32>(max_t * nh)?,
-            ob: DevBuf::zeroed_elems::<f32>(max_t * d_inner)?,
-            g2a: DevBuf::zeroed_elems::<f32>(max_t * hd)?,
-            g2b: DevBuf::zeroed_elems::<f32>(max_t * d_inner)?,
-            yb: DevBuf::zeroed_elems::<f32>(max_t * d_inner)?,
-            outb: DevBuf::zeroed_elems::<f32>(max_t * hidden)?,
-            s: Stream::blocking()?,
+            xb: DevBuf::zeroed_elems::<f32>(max_t * hidden).map_err(gerr)?,
+            qkvb: DevBuf::zeroed_elems::<f32>(max_t * 3 * d_inner).map_err(gerr)?,
+            g1b: DevBuf::zeroed_elems::<f32>(max_t * hd).map_err(gerr)?,
+            gb_out: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
+            bb: DevBuf::zeroed_elems::<f32>(max_t * nh).map_err(gerr)?,
+            ob: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
+            g2a: DevBuf::zeroed_elems::<f32>(max_t * hd).map_err(gerr)?,
+            g2b: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
+            yb: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
+            outb: DevBuf::zeroed_elems::<f32>(max_t * hidden).map_err(gerr)?,
+            s: Stream::blocking().map_err(gerr)?,
             kers,
             gv,
             cfg: *cfg,

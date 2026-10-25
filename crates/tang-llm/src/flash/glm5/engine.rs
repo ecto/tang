@@ -57,8 +57,10 @@ pub struct GpuFfn {
     kda_l: Vec<Option<super::kda_dev::DevLayer>>,
     /// Per KDA layer: does the device hold the live state (vs the engine's host copies)?
     kda_dev_fresh: Vec<bool>,
-    /// W4's staged KDA kernels per device (the >512-token fallback path).
+    /// W4's staged KDA kernels per device (the >max_t fallback path).
     kda_kernels: Vec<super::kda_cuda::cuda::Kernels>,
+    /// The resident scratch's window cap (TANG_GLM5_KDA_MAXT, default 512).
+    max_t: usize,
     /// W3's MLA + indexer kernels per device (`TANG_GLM5_GPU_MLA=0`: DSA stays on the CPU).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
     /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
@@ -114,8 +116,13 @@ impl GpuFfn {
                 Err(e) => bail!("TANG_GPUS={ngpu}: CUDA device {ord}: {e}"),
             };
             gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU {ord}: {e}"))?;
-            let k = super::moe::gpu::Kernels::new(&gpu)?;
-            kda_kernels.push(k);
+            kda_kernels.push(if kda_on && hp.is_kda.iter().any(|&b| b) {
+                super::kda_cuda::cuda::load(&gpu, &kda_cfg)?
+            } else {
+                // the staged fallback is only reachable when some KDA layer exists; a
+                // placeholder keeps the vec indexed — an Err surfaces if it is ever used
+                super::kda_cuda::cuda::load(&gpu, &kda_cfg)?
+            });
             mla_k.push(match (mla_on, mla_sample) {
                 (true, Some(w)) => Some(
                     super::mla::cuda::MlaCuda::new_at(w, ord)
@@ -124,7 +131,8 @@ impl GpuFfn {
                 _ => None,
             });
             let _ = &mhc_on; // the resident layers are built in the per-layer loop below
-            devs.push((gpu, k));
+            let mk = super::moe::gpu::Kernels::new(&gpu)?;
+            devs.push((gpu, mk));
         }
         let split = if devs.len() < 2 {
             n_layer
@@ -165,10 +173,9 @@ impl GpuFfn {
                         .with_context(|| format!("mhc blk.{l}.hc_attn"))?;
                     let wf = super::mhc::MhcWeights::from_gguf(g, l, "hc_ffn", hp.n_embd, &mhp)
                         .with_context(|| format!("mhc blk.{l}.hc_ffn"))?;
-                    mhc_g.push(
-                        Some(super::mhc::MhcGpu::new(&devs[d].0, [&wa, &wf], max_t))
-                            .with_context(|| format!("mhc layer {l} resident on GPU {d}"))?,
-                    );
+                    let mh = super::mhc::MhcGpu::new(&devs[d].0, [&wa, &wf], max_t)
+                        .with_context(|| format!("mhc layer {l} resident on GPU {d}"))?;
+                    mhc_g.push(Some(mh));
                 } else {
                     mhc_g.push(None);
                 }
@@ -241,6 +248,7 @@ impl GpuFfn {
             kda_l,
             kda_dev_fresh,
             kda_kernels: kda_kernels,
+            max_t,
             mla_k,
             mhc_g,
             layers,
@@ -394,24 +402,19 @@ impl Glm5Engine {
         st: &mut (ConvState, KdaState),
     ) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
-        if let Some(g) = &self.gpu {
+        if let Some(g) = self.gpu.as_mut() {
             if let Some(dev) = &mut g.kda_l[l] {
-                if t > 512 {
+                let d = g.dev_of[l];
+                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                if t > g.max_t {
                     // past the resident scratch: sync the state to the host and run the
                     // staged path (which keeps both copies fresh), then seed forward
                     if g.kda_dev_fresh[l] {
-                        g.devs[g.dev_of[l]]
-                            .0
-                            .bind()
-                            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                         dev.read_back(&mut st.0, &mut st.1)?;
                         g.kda_dev_fresh[l] = false;
                     }
-                    let gpu = &g.devs[g.dev_of[l]].0;
-                    gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                    return kda_gpu(x, t, w, cfg, &g.kda_kernels[g.dev_of[l]], gpu, &mut st.0, &mut st.1);
+                    return kda_gpu(x, t, w, cfg, &g.kda_kernels[d], &g.devs[d].0, &mut st.0, &mut st.1);
                 }
-                g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 if !g.kda_dev_fresh[l] {
                     dev.seed(&st.0, &st.1)?;
                     g.kda_dev_fresh[l] = true;
@@ -509,6 +512,7 @@ impl Glm5Engine {
         let (hc, n) = (self.m.hp.hc, self.m.hp.n_embd);
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
+            if t <= g.max_t {
             if let Some(m) = &g.mhc_g[l] {
                 g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 let mix = m.pre(0, r, t)?;
@@ -531,6 +535,7 @@ impl Glm5Engine {
                     .collect();
                 return Ok((mix.x, mixes));
             }
+            }
         }
         let _ = l;
         mhc_pre_all(w, r, t, hc, n)
@@ -548,11 +553,13 @@ impl Glm5Engine {
         let (hc, n) = (self.m.hp.hc, self.m.hp.n_embd);
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
+            if t <= g.max_t {
             if let Some(m) = &g.mhc_g[l] {
                 g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 let out = m.post_mixes(mixes, y, r, t)?;
                 r.copy_from_slice(&out);
                 return Ok(());
+            }
             }
         }
         let _ = l;
@@ -936,87 +943,6 @@ fn dsa_gpu(
         }
     }
     Ok(out)
-}
-
-/// W2's mHC pre on the GPU for `t` tokens (feature `cuda`), host-staged: `r` `[t][4][n]` in;
-/// the collapsed inputs `[t][n]` and each token's post/comb out (as the CPU [`super::mhc::Mix`]).
-#[cfg(feature = "cuda")]
-fn mhc_pre_gpu(
-    k: &super::mhc::MhcKernels,
-    w: &super::mhc::MhcWeights,
-    r: &[f32],
-    t: usize,
-    n: usize,
-) -> Result<(Vec<f32>, Vec<super::mhc::Mix>)> {
-    use tang_moe::gpu::{DevBuf, Stream};
-    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mhc cuda: {e}");
-    ensure!(r.len() == t * 4 * n, "mhc streams");
-    let s = Stream::blocking().map_err(gerr)?;
-    let rb = DevBuf::from_slice(r).map_err(gerr)?;
-    let fb = DevBuf::from_slice(&w.f).map_err(gerr)?;
-    let bb = DevBuf::from_slice(&w.b).map_err(gerr)?;
-    let sb = DevBuf::from_slice(&w.s).map_err(gerr)?;
-    let xb = DevBuf::zeroed_elems::<f32>(t * n).map_err(gerr)?;
-    let pb = DevBuf::zeroed_elems::<f32>(t * 4).map_err(gerr)?;
-    let cb = DevBuf::zeroed_elems::<f32>(t * 16).map_err(gerr)?;
-    unsafe {
-        k.pre(&s, rb.ptr, fb.ptr, bb.ptr, sb.ptr, xb.ptr, pb.ptr, cb.ptr, t, n, w.iters, w.eps, w.rms_eps)?;
-    }
-    s.sync().map_err(gerr)?;
-    let x: Vec<f32> = xb.read(0, t * n).map_err(gerr)?;
-    let post: Vec<f32> = pb.read(0, t * 4).map_err(gerr)?;
-    let comb: Vec<f32> = cb.read(0, t * 16).map_err(gerr)?;
-    let mixes = (0..t)
-        .map(|i| {
-            let mut m = super::mhc::Mix {
-                x: x[i * n..(i + 1) * n].to_vec(),
-                post: [0f32; 4],
-                comb: [[0f32; 4]; 4],
-            };
-            m.post.copy_from_slice(&post[i * 4..(i + 1) * 4]);
-            for src in 0..4 {
-                m.comb[src].copy_from_slice(&comb[i * 16 + src * 4..i * 16 + src * 4 + 4]);
-            }
-            m
-        })
-        .collect();
-    Ok((x, mixes))
-}
-
-/// W2's mHC post on the GPU for `t` tokens (feature `cuda`), host-staged; updates `r` in place.
-#[cfg(feature = "cuda")]
-fn mhc_post_gpu(
-    k: &super::mhc::MhcKernels,
-    mixes: &[super::mhc::Mix],
-    y: &[f32],
-    r: &mut [f32],
-    t: usize,
-    n: usize,
-) -> Result<()> {
-    use tang_moe::gpu::{DevBuf, Stream};
-    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mhc cuda: {e}");
-    ensure!(r.len() == t * 4 * n && y.len() == t * n && mixes.len() == t, "mhc post shapes");
-    let mut post = Vec::with_capacity(t * 4);
-    let mut comb = Vec::with_capacity(t * 16);
-    for m in mixes {
-        post.extend_from_slice(&m.post);
-        for row in &m.comb {
-            comb.extend_from_slice(row);
-        }
-    }
-    let s = Stream::blocking().map_err(gerr)?;
-    let yb = DevBuf::from_slice(y).map_err(gerr)?;
-    let rin = DevBuf::from_slice(r).map_err(gerr)?;
-    let pb = DevBuf::from_slice(&post).map_err(gerr)?;
-    let cb = DevBuf::from_slice(&comb).map_err(gerr)?;
-    let out = DevBuf::zeroed_elems::<f32>(t * 4 * n).map_err(gerr)?;
-    unsafe {
-        k.post(&s, yb.ptr, rin.ptr, pb.ptr, cb.ptr, out.ptr, t, n)?;
-    }
-    s.sync().map_err(gerr)?;
-    let o: Vec<f32> = out.read(0, t * 4 * n).map_err(gerr)?;
-    r.copy_from_slice(&o);
-    Ok(())
 }
 
 pub(crate) fn argmax(v: &[f32]) -> u32 {
