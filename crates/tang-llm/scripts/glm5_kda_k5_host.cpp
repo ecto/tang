@@ -86,26 +86,14 @@ int main() {
     auto rnd = [&]() { seed = seed * 1103515245 + 12345; return (seed >> 16) % 2000 / 1000.0f - 1.0f; };
     for (unsigned r = 0; r < ROWS; r++) {
         for (unsigned b = 0; b < blocks; b++) {
-            // block scale encodes a value; qs are 0/1 so dequant == scale exactly
-            float d = rnd();
-            unsigned short h;
-            // f16 encode d approximately via the kernel's own g5_h2f inverse: use ldexp
-            // bit trick — reuse the reference path instead: pick d as an exact f16 value
-            d = (float)(int)(rnd() * 4); // small integers are exact in f16
-            h = 0;
-            // encode d as f16 via the standard conversion for exact small ints
-            unsigned short bits = 0;
-            if (d >= 0 && d < 32) bits = (unsigned short)((int(d) + 15) << 10); // d in [1,16)
-            if (d == 0) bits = 0;
-            // rewrite d from bits so dequant is exact
-            unsigned e = (bits >> 10) & 0x1F;
-            int m = (int)e - 15;
-            d = (m >= 0) ? (float)(1 << m) : 0.5f * (float)(1 << (-m));
+            // d = an exact positive f16 power of two in [1, 8]; qs = int8 ±1 so dequant is exact
+            float d = (float)(1 << (b % 4));
+            unsigned bits = (unsigned short)(((b % 4) + 15) << 10);
             unsigned char *blk = &w[(unsigned long long)r * row_bytes + b * 34];
             blk[0] = (unsigned char)(bits & 0xFF);
             blk[1] = (unsigned char)(bits >> 8);
             for (unsigned j = 0; j < 32; j++) {
-                blk[2 + j] = (signed char)((j % 2) ? 1 : -1); // int8 VALUE ±1 (Q8_0 qs are values, not sign bits)
+                blk[2 + j] = (signed char)((j % 2) ? 1 : -1);
                 ref_w[(unsigned long long)r * COLS + b * 32 + j] = d * (float)((signed char)blk[2 + j]);
             }
         }
