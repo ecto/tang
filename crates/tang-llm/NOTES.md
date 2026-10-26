@@ -4,6 +4,34 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 (final) — THE TREE VERDICT: all-GPU = the CPU oracle, 8/8 ids
+
+Pod tree-verdict-b300-4 (0izjldh4haq9c1, B300 188 GB, EUR-IS-1), branch head 43f12709
+content, source tar md5-verified pod-side (0a4f803d…; kda_dev.rs 0e414ba0… = local),
+BUILD_RC=0, all-GPU, shadow off:
+
+```
+glm5: 11 DSA layers resident (MLA, one per layer), 45 mHC layers resident
+glm5: 45 of 45 FFNs on the GPU
+prompt: 20 tokens, prefill 22.91 s (0.9 tok/s)
+ids: 785 1196 6801 264 6386 38038 911 279   ← the CPU oracle exactly, 8/8
+decode: 7 tokens in 13.45 s (0.52 tok/s)
+text: The user wants a haiku about the
+```
+
+With all four fixes in (KDA byte offsets, DSA per-layer MLA, mHC block index, teardown),
+the wired GPU path matches the CPU engine on the real model. Every GPU-resident path —
+KDA, DSA/MLA, mHC, FFN/MoE — has now been exercised at real weights in a matching run.
+
+These tok/s are the NAIVE kernels (one thread per output GEMV, scalar core), i.e. a
+correctness number, not the engine's speed. The speed work is the pre-existing kernel
+plan; the verdict removes "is the GPU path even correct" from it.
+
+Ops note: this pod's RunPod ssh proxy gives a PTY shell only from macOS OpenSSH 10.3
+(command execution rejected: "Your SSH client doesn't support PTY"; pasted data garbles).
+What worked: a `cloudflared` quick tunnel from the Mac to a local HTTP server, the pod
+curls the 11 MB source tarball from the trycloudflare URL (md5-checked both sides).
+
 ## 2026-10-26 (later) — B300 all-GPU verdict: GPU mHC ran the wrong block's weights
 
 B300 (pod 0izjldh4haq9c1, branch 43f12709 = main 89ac0bc9), load log: 34 KDA, "11 DSA
