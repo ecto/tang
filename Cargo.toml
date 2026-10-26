@@ -26,6 +26,7 @@ members = [
     "crates/tang-llm",
     "crates/tang-otel",
     "crates/tang-moe",
+    "crates/tang-verify",
     "crates/tang-llm-ios",
     "crates/cram-codec",
     "crates/cram-codec-wasm",
@@ -91,6 +92,7 @@ xz2 = "0.1"
 brotli = "8"
 crc32fast = "1"
 tang-moe = { version = "0.1", path = "crates/tang-moe" }
+tang-verify = { version = "0.1", path = "crates/tang-verify" }
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }
 tokio = { version = "1", features = ["full"] }

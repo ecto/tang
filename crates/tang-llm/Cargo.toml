@@ -15,7 +15,7 @@ include = ["src/**/*", "README.md", "CUDA.md", "docs/**/*"]
 default = []
 metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
-cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc"]
+cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc", "tang-verify/cuda"]
 
 # OpenTelemetry traces and metrics (see docs/observability.md). Off by default. On: OTLP/JSON
 # lines to a file (crates/tang-otel); OTLP/HTTP only with TANG_OTEL_LIVE=1 / `serve --otel-live`.
@@ -26,6 +26,8 @@ mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
 [dependencies]
 tang-compute = { workspace = true }
 cram-codec = { workspace = true }
+# kernel verification harness (shadow checks, NaN poisoning, attribution; docs/kernel-verify.md)
+tang-verify = { workspace = true }
 tang-ad = { workspace = true, optional = true }
 tang-train = { workspace = true, optional = true }
 tang-tensor = { workspace = true, optional = true }

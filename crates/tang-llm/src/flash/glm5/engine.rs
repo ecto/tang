@@ -491,14 +491,14 @@ impl Glm5Engine {
                 dbg.prime(l, &st.0, &st.1);
                 let (mut c_in, mut s_in) = (st.0.clone(), st.1.clone());
                 dev.read_back(&mut c_in, &mut s_in)?;
-                dev.debug = true;
+                dev.probe = Some(dbg.probe());
                 let y = dev.window(x, t, &mut st.0);
-                dev.debug = false;
+                let probe = dev.probe.take();
                 let y = y?;
-                let taps = dev.taps.take().unwrap_or_default();
+                let taps = probe.map(|p| p.taps).unwrap_or_default();
                 let (mut c_out, mut s_out) = (st.0.clone(), st.1.clone());
                 dev.read_back(&mut c_out, &mut s_out)?;
-                dbg.check(l, x, t, w, cfg, &taps, &st.0, &c_out, &s_out, Some(&s_in))?;
+                dbg.check(l, x, t, w, cfg, taps, &st.0, &c_out, &s_out, Some(&s_in))?;
                 return Ok(y);
             }
         }
@@ -1158,13 +1158,9 @@ mod tests {
     /// the GLM-5.3 GPU bugs for a cycle (the "tiny fixture passes" that never ran). With
     /// `TANG_REQUIRE_CUDA=1` a skip is a FAILURE instead; without it, the skip prints a
     /// loud banner. `reason` says what's missing.
+    /// (Now [`tang_verify::skip_or_fail`], shared by every kernel test.)
     fn skip_or_fail(reason: &str) {
-        let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
-        let msg = format!("SKIP: {reason} (set TANG_REQUIRE_CUDA=1 to make this a failure)");
-        if required {
-            panic!("{msg} — but TANG_REQUIRE_CUDA=1");
-        }
-        eprintln!("==================== {msg} ====================");
+        tang_verify::skip_or_fail(reason)
     }
 
     fn seq1() -> Option<Vec<u32>> {
