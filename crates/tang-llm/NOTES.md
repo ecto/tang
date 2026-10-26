@@ -4,6 +4,65 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 (night) — fused KDA decode + CUDA graph: real-model ids gate passed
+
+Branch `frog/glm5-cuda-graphs`, merged with the integration (`frog/glm5-forward`
+c274b66a: PF2, fused mHC, tang-verify, gemv8 on o_proj + f_a/g_a). H200 (`/root/w-graphs`),
+source md5-checked both sides, `Compiling tang-llm` in every build log.
+
+### The gate (real GLM-5.3, "Write a haiku about the sea." -n 8 --temp 0)
+
+Env for all four: `TANG_GLM5_GEMV8=1 TANG_GLM5_KDA_PF2=1 TANG_GLM5_GPU_FFN=0` (KDA, DSA,
+mHC resident; FFN on the CPU — the full model OOMs the 141 GB H200 at FFN layer 32, and
+this engine has no per-layer FFN knob; the all-GPU verdict was a 188 GB B300).
+
+| run | ids |
+|---|---|
+| naive (control) | 785 1196 6801 264 6386 38038 911 279 |
+| `TANG_GLM5_KDA_FUSED=1` | 785 1196 6801 264 6386 38038 911 279 |
+| `TANG_GLM5_KDA_GRAPH=1` | 785 1196 6801 264 6386 38038 911 279 |
+| fused + `KDA_DEBUG=1 WINDOWS=2 TOL=2e-2` | same; **68/68 windows clean**, worst rel 1.105e-2 (w1 l44 `out`) |
+
+w1 is the first decode token, i.e. the fused step under the probe. The 1e-2 band is the
+int8 gemv8 activations vs the CPU's f32, the same band as the naive gemv8 path. Tok/s
+of these runs are CPU-FFN numbers (prefill 267 s), not speed.
+
+### Two bugs the merge exposed (both found by `kda_decode_real_bench`, bit-equality assert)
+
+1. **Mixed kernels per matrix.** The integration moved f_a/g_a onto `k5_gemv8` in the
+   naive path; the fused `k5d_proj` still ran them on `g5_dot` (f32 dequant). The two round
+   differently and the forget gate amplifies it through the state: 262143/262144 outputs
+   and 1048481/1048576 state values differed, conv bit-equal. Fix: `k5d_proj` takes a SKIP
+   mask; f_a/g_a go through `k5_gemv8` on both paths (the per-matrix Q8_0 rule).
+2. **Stale int8 codes (my fix for 1, first version).** The f_a/g_a gemv8 launches went
+   BEFORE the `k5_q8` pre-pass, so they read xq8 still holding the previous step's o_proj
+   codes (yb, d_inner wide): 262144/262144 outputs differed. Fix: launch them after it.
+   The xq8 question from the brief, answered: `k5_q8` is INSIDE the captured region, the
+   graph re-quantises x every replay; the graph is keyed on the gemv8 flag.
+
+Also: `decode_fast` moved onto the `tang_verify::Probe` API (poison list, taps, host conv
+shift only under a probe); fused o_proj on gemv8 with its own yb quantise (finish()'s rule).
+After both fixes the bench is **bit-identical**: fused and graph vs naive, 0 differing bits
+in output, state and conv (64 steps, real layer 0).
+
+### Per-layer bench (real layer 0, T=1, GEMV8=1, PF2=1, 56 steps timed)
+
+| path | µs/step |
+|---|---|
+| naive | 1550 |
+| fused | 1543 |
+| graph | 1537 |
+
+Fused stage GPU time: proj 1410, gate2 54, step 24, o_proj 38 µs. The old 6908 → 4035 µs
+win (pre-gemv8, pre-PF2) is gone: PF2's device-resident decode already removed the host
+round trips the fused step targeted, so the graph now buys ~1%. 92% of the layer is the
+projection GEMVs — that, not launch overhead, is the next speed step.
+FUSED/GRAPH stay default-off.
+
+Ops: `cargo build` of the whole workspace fails on CUDA 12.8 (crates/tang pins cudarc 0.12);
+build `-p tang-llm` only. Don't hold the GPU flock around builds — other sessions'
+90-minute runs queue on it.
+
 ## 2026-10-26 (speed step 4) — fused, device-resident mHC: 170.8 → 10.5 ms per decode step (3090)
 
 `TANG_GLM5_MHC_FUSED=1` (default off), `mhc_fused.rs`. The 4 residual streams stay on
