@@ -581,9 +581,12 @@ impl Glm5Engine {
     }
 
     /// mHC pre for layer `l`'s block: W2's GPU kernel when loaded, else the CPU reference.
+    /// `block`: 0 = the attention half (`hc_attn` weights), 1 = the FFN half (`hc_ffn`) —
+    /// it selects the resident weights; `w` is the same block's host copy (CPU path).
     fn mhc_pre(
         &self,
         l: usize,
+        block: usize,
         w: &super::mhc::MhcWeights,
         r: &[f32],
         t: usize,
@@ -594,7 +597,9 @@ impl Glm5Engine {
             if t <= g.max_t {
             if let Some(m) = &g.mhc_g[l] {
                 g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                let mix = m.pre(0, r, t)?;
+                // the block index, NOT a constant: `pre(0, ..)` ran the FFN half's mix
+                // with the attention half's hc weights (the GLM-5.3 all-GPU divergence)
+                let mix = m.pre(block, r, t)?;
                 // MixSet -> Vec<Mix> (the CPU post path's input shape; the resident post
                 // keeps the MixSet and avoids the repack below)
                 let mixes = (0..t)
@@ -681,7 +686,7 @@ impl Glm5Engine {
             // ---- attention half
             let t0 = Instant::now();
             let w_attn = self.hc_weights(l, "hc_attn", &mhp)?;
-            let (mut x, mixes) = self.mhc_pre(l, &w_attn, &r, t)?;
+            let (mut x, mixes) = self.mhc_pre(l, 0, &w_attn, &r, t)?;
             self.m.norm_all(&mut x, l, "attn_norm.weight")?;
             stage("mhc_pre+norm(attn)", &t0);
             let t1 = Instant::now();
@@ -716,7 +721,7 @@ impl Glm5Engine {
             // ---- FFN half
             let t3 = Instant::now();
             let w_ffn = self.hc_weights(l, "hc_ffn", &mhp)?;
-            let (mut x, mixes) = self.mhc_pre(l, &w_ffn, &r, t)?;
+            let (mut x, mixes) = self.mhc_pre(l, 1, &w_ffn, &r, t)?;
             self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
             let y = self.ffn(l, &x, t)?;
             let t4 = Instant::now();
