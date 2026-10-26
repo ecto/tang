@@ -30,9 +30,31 @@ impl End {
     }
 }
 
+/// One span of a finished tree (GLM-5's per-window trace, `flash::glm5::trace`): `parent`
+/// indexes an earlier entry of the same slice (`None`: the root).
+#[derive(Debug, Clone)]
+pub struct TreeSpan {
+    pub name: &'static str,
+    pub parent: Option<usize>,
+    pub start: std::time::SystemTime,
+    pub end: std::time::SystemTime,
+    pub ints: Vec<(&'static str, i64)>,
+    pub floats: Vec<(&'static str, f64)>,
+}
+
 #[cfg(not(feature = "otel"))]
 mod imp {
     use super::*;
+
+    /// Is telemetry installed? (Never without the feature.)
+    #[inline(always)]
+    pub fn enabled() -> bool {
+        false
+    }
+
+    /// Emit a finished span tree (nothing without the feature).
+    #[inline(always)]
+    pub fn glm5_tree(_: &[TreeSpan], _phase: &'static str) {}
 
     /// Exporters to flush on drop (none without the feature).
     pub struct Guard;
@@ -96,6 +118,7 @@ mod imp {
         queue_depth: Gauge<u64>,
         tok_s: Histogram<f64>,
         glm5_window: Histogram<f64>,
+        glm5_stage: Histogram<f64>,
         /// `kind` = decode | mixed | prefill, built once.
         kinds: [[KeyValue; 1]; 3],
     }
@@ -167,6 +190,14 @@ mod imp {
                 .with_description("One GLM-5 engine window's wall time, by token count")
                 .with_boundaries(vec![
                     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+                ])
+                .build(),
+            glm5_stage: meter
+                .f64_histogram("tang_llm.glm5.stage.gpu")
+                .with_unit("ms")
+                .with_description("GPU time of one GLM-5 stage instance (TANG_GLM5_TRACE)")
+                .with_boundaries(vec![
+                    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 100.0,
                 ])
                 .build(),
             kinds: [
@@ -393,6 +424,46 @@ mod imp {
         };
         inst.glm5_window
             .record(secs, &[KeyValue::new("kind", bucket)]);
+    }
+
+    /// Is telemetry installed ([`init`] / [`install`] ran)?
+    pub fn enabled() -> bool {
+        INST.get().is_some()
+    }
+
+    /// Emit a finished span tree: one trace per root (a GLM-5 window), each child under
+    /// its parent, with explicit start/end times; every non-root span's GPU ms also feeds
+    /// `tang_llm.glm5.stage.gpu` by stage name and `phase` (decode | prefill).
+    pub fn glm5_tree(spans: &[TreeSpan], phase: &'static str) {
+        let Some(inst) = INST.get() else { return };
+        let t = &inst.tracer;
+        let mut live: Vec<opentelemetry_sdk::trace::Span> = Vec::with_capacity(spans.len());
+        for (i, sp) in spans.iter().enumerate() {
+            let mut attrs: Vec<KeyValue> = Vec::with_capacity(sp.ints.len() + sp.floats.len() + 1);
+            attrs.push(KeyValue::new("phase", phase));
+            attrs.extend(sp.ints.iter().map(|&(k, v)| KeyValue::new(k, v)));
+            attrs.extend(sp.floats.iter().map(|&(k, v)| KeyValue::new(k, v)));
+            let cx = match sp.parent.filter(|&p| p < i) {
+                Some(p) => Context::new().with_remote_span_context(live[p].span_context().clone()),
+                None => Context::new(),
+            };
+            let s = t
+                .span_builder(sp.name)
+                .with_kind(SpanKind::Internal)
+                .with_start_time(sp.start)
+                .with_attributes(attrs)
+                .start_with_context(t, &cx);
+            if sp.parent.is_some() {
+                if let Some(&(_, ms)) = sp.floats.iter().find(|(k, _)| *k == "gpu.ms") {
+                    inst.glm5_stage
+                        .record(ms, &[KeyValue::new("stage", sp.name), KeyValue::new("phase", phase)]);
+                }
+            }
+            live.push(s);
+        }
+        for (s, sp) in live.iter_mut().zip(spans) {
+            s.end_with_timestamp(sp.end);
+        }
     }
 
     /// Requests waiting, sampled between steps.
