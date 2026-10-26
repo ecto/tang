@@ -199,7 +199,7 @@ impl DevLayer {
         // synchronous HtoD on the legacy stream; self.s is BLOCKING, so the launches (or
         // the graph) below are ordered after it
         self.xb.write(0, x)?;
-        if self.debug && super::super::kda_debug::poison_on() {
+        if super::super::kda_debug::poison_on() {
             let nan = |n: usize| vec![f32::NAN; n];
             self.qkvb.write(0, &nan(3 * di))?;
             self.g1b.write(0, &nan(self.hd))?;
@@ -235,7 +235,7 @@ impl DevLayer {
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, hidden)?;
-        if self.debug {
+        if super::super::kda_debug::poison_on() {
             let qkv_h = self.qkvb.read::<f32>(0, 3 * di)?;
             // the host conv shift (DevKda::decode's side effect), for the conv_host check
             let m = self.cfg.d_conv - 1;
@@ -247,17 +247,17 @@ impl DevLayer {
                 }
             }
             conv.0 = next;
-            let tp = super::super::kda_debug::KdaTaps {
-                qkv_pre: qkv_h,
-                g: self.gb_out.read::<f32>(0, di)?,
-                beta: self.bb.read::<f32>(0, nh)?,
-                o: self.ob.read::<f32>(0, di)?,
-                g2: self.g2b.read::<f32>(0, di)?,
-                y_norm: self.yb.read::<f32>(0, di)?,
-                out: out.clone(),
-                ..Default::default()
-            };
-            self.taps = Some(tp);
+            // the engine's shadow check reads the taps through the probe's `Taps` (the
+            // `tang_verify` harness form; the same names kda_debug::tap defines)
+            let mut taps = tang_verify::Taps::new();
+            taps.put(super::super::kda_debug::tap::QKV, qkv_h);
+            taps.put(super::super::kda_debug::tap::G, self.gb_out.read::<f32>(0, di)?);
+            taps.put(super::super::kda_debug::tap::BETA, self.bb.read::<f32>(0, nh)?);
+            taps.put(super::super::kda_debug::tap::O, self.ob.read::<f32>(0, di)?);
+            taps.put(super::super::kda_debug::tap::G2, self.g2b.read::<f32>(0, di)?);
+            taps.put(super::super::kda_debug::tap::Y_NORM, self.yb.read::<f32>(0, di)?);
+            taps.put(super::super::kda_debug::tap::OUT, out.clone());
+            self.probe = Some(tang_verify::Probe { poison: false, taps });
         }
         Ok(out)
     }
