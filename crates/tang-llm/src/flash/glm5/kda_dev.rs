@@ -870,30 +870,31 @@ mod gemv8_tests {
         let (y0, t0) = run(&mut layer, false);
         let (y1, t1) = run(&mut layer, true);
         let di = cfg.heads * cfg.head_dim;
-        for (sec, name) in [(0, "q"), (1, "k"), (2, "v")] {
-            let a = super::super::kda_debug::section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, sec);
-            let b = super::super::kda_debug::section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, sec);
-            let s = super::super::kda_debug::stat(&b, &a, 1e-2);
-            eprintln!("qkv.{name}: rel {:.3e} max {:.3e} nonfinite {} zeros {}/{}", s.rel_l2, s.max_abs, s.nonfinite_gpu, s.zeros_gpu, s.zeros_cpu);
+        // the q|k|v sections of the stacked QKV tap, the verifier's way
+        let sec = |tv: &tang_verify::Taps, s: usize| -> Vec<f32> {
+            let qkv = tap(tv, super::super::kda_debug::tap::QKV);
+            (0..t).flat_map(|r| qkv[r * 3 * di + s * di..r * 3 * di + (s + 1) * di].iter().copied()).collect()
+        };
+        for (s, name) in [(0, "q"), (1, "k"), (2, "v")] {
+            let a = sec(&t0, s);
+            let b = sec(&t1, s);
+            let st = tang_verify::stat(&b, &a, 1e-2);
+            eprintln!("qkv.{name}: rel {:.3e} max {:.3e} nonfinite {} zeros {}/{}", st.rel_l2, st.max_abs, st.nonfinite_gpu, st.zeros_gpu, st.zeros_cpu);
             // int8 activations vs f32: the fe_gemv8 band, not bitwise
-            assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 qkv.{name} diverges: {s:?}");
+            assert!(st.nonfinite_gpu == 0 && st.rel_l2 < 1e-2, "gemv8 qkv.{name} diverges: {st:?}");
         }
         // f_a (gate) and g_a (g2) now on gemv8 too; o_proj covers the layer output
         for (name, a, b) in [("g", tap(&t0, super::super::kda_debug::tap::G), tap(&t1, super::super::kda_debug::tap::G)), ("g2", tap(&t0, super::super::kda_debug::tap::G2), tap(&t1, super::super::kda_debug::tap::G2))] {
-            let s = super::super::kda_debug::stat(&b, &a, 1e-2);
-            eprintln!("{name}: rel {:.3e} max {:.3e} nonfinite {}", s.rel_l2, s.max_abs, s.nonfinite_gpu);
-            assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 {name} diverges: {s:?}");
+            let st = tang_verify::stat(&b, &a, 1e-2);
+            eprintln!("{name}: rel {:.3e} max {:.3e} nonfinite {}", st.rel_l2, st.max_abs, st.nonfinite_gpu);
+            assert!(st.nonfinite_gpu == 0 && st.rel_l2 < 1e-2, "gemv8 {name} diverges: {st:?}");
         }
-        let s = super::super::kda_debug::stat(&y1, &y0, 1e-2);
-        eprintln!("layer out: rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
+        let st = tang_verify::stat(&y1, &y0, 1e-2);
+        eprintln!("layer out: rel {:.3e} max {:.3e}", st.rel_l2, st.max_abs);
         // a hollow A/B (both runs on the naive kernel) gives EXACTLY 0 — int8 activations
         // always leave some noise, so 0 means gemv8 never ran
-        let sq = super::super::kda_debug::stat(
-            &super::super::kda_debug::section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, 0),
-            &super::super::kda_debug::section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, 0),
-            1e-2,
-        );
+        let sq = tang_verify::stat(&sec(&t1, 0), &sec(&t0, 0), 1e-2);
         assert!(sq.rel_l2 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
-        assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 2e-2, "gemv8 layer output diverges: {s:?}");
+        assert!(st.nonfinite_gpu == 0 && st.rel_l2 < 2e-2, "gemv8 layer output diverges: {st:?}");
     }
 }

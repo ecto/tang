@@ -10,11 +10,17 @@
 // k5d_proj: every GEMV over the token's x, one thread per output row.
 // rows [0, 3DI): q | k | v -> QKV (the stacked layout); [3DI, 3DI+HD): f_a -> G1;
 // [.., +NH): beta (sigmoid) -> B; [.., +HD): g_a -> G2A. R0 = the first row this launch
-// covers (3*DI when k5_gemv8 already wrote q/k/v). Grid ceil((3DI+2HD+NH-R0)/128).
+// covers (3*DI when k5_gemv8 already wrote q/k/v). SKIP bit0: f_a is on k5_gemv8 (the
+// naive path's per-matrix rule, kda_dev window()) — skip it here, the gemv8 launch wrote
+// it; bit1: same for g_a. The f32-dequant g5_dot and gemv8's int8 dp4a round DIFFERENTLY,
+// so a group must use the same kernel on both paths or the outputs diverge (the forget
+// gate then amplifies the difference through the state — the first real-weights run).
+// Grid ceil((3DI+2HD+NH-R0)/128).
 extern "C" __global__ void k5d_proj(const G5W wq, const G5W wk, const G5W wv, const G5W fa,
                                     const G5W bp, const G5W ga, const float* x, float* qkv,
                                     float* g1, float* beta, float* g2a, unsigned DI,
-                                    unsigned HD, unsigned NH, unsigned HID, unsigned R0) {
+                                    unsigned HD, unsigned NH, unsigned HID, unsigned R0,
+                                    unsigned SKIP) {
     unsigned i = R0 + blockIdx.x * blockDim.x + threadIdx.x;
     if (i < DI) { qkv[i] = g5_dot(wq, 0u, i, x, HID); return; }
     i -= DI;
@@ -22,11 +28,11 @@ extern "C" __global__ void k5d_proj(const G5W wq, const G5W wk, const G5W wv, co
     i -= DI;
     if (i < DI) { qkv[2 * DI + i] = g5_dot(wv, 0u, i, x, HID); return; }
     i -= DI;
-    if (i < HD) { g1[i] = g5_dot(fa, 0u, i, x, HID); return; }
+    if (i < HD) { if (!(SKIP & 1u)) g1[i] = g5_dot(fa, 0u, i, x, HID); return; }
     i -= HD;
     if (i < NH) { float a = g5_dot(bp, 0u, i, x, HID); beta[i] = 1.f / (1.f + expf(-a)); return; }
     i -= NH;
-    if (i < HD) { g2a[i] = g5_dot(ga, 0u, i, x, HID); }
+    if (i < HD) { if (!(SKIP & 2u)) g2a[i] = g5_dot(ga, 0u, i, x, HID); }
 }
 
 // k5d_gate2: the two hd-input GEMVs. rows [0, DI): f_b(g1) + dt_bias + the gate form

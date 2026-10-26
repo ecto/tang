@@ -108,7 +108,20 @@ impl DevLayer {
         let f = std::mem::size_of::<f32>() as u64;
         let qkv = self.qkvb.ptr;
         let rows = 3 * di + 2 * hd + nh;
+        // the per-matrix gemv8 rule (kda_dev window()): f_a / g_a go through k5_gemv8 when
+        // Q8_0 — their f32-dequant g5_dot rounds differently, so k5d_proj must SKIP exactly
+        // the groups gemv8 wrote (the forget gate amplifies any mismatch into the state)
+        let g8f = gemv8 && self.fa.w.ty == 8;
+        let g8ga = gemv8 && self.ga.w.ty == 8;
+        let skip = (g8f as u32) | ((g8ga as u32) << 1);
         unsafe {
+            if g8f {
+                // x's codes are still in xq8 from the q/k/v pre-pass
+                self.gemv8_launch(&self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, 1)?;
+            }
+            if g8ga {
+                self.gemv8_launch(&self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, 1)?;
+            }
             let r0 = if gemv8 {
                 // the dequant-reuse GEMV for q/k/v (kda_dev's TANG_GLM5_GEMV8 path, T = 1)
                 launch(
@@ -146,7 +159,7 @@ impl DevLayer {
                 s,
                 args![self.wq.w, self.wk.w, self.wv.w, self.fa.w, self.bproj.w, self.ga.w,
                     self.xb.ptr, qkv, self.g1b.ptr, self.bb.ptr, self.g2a.ptr, di as u32,
-                    hd as u32, nh as u32, hidden as u32, r0 as u32],
+                    hd as u32, nh as u32, hidden as u32, r0 as u32, skip],
             )?;
             mark(1)?;
             launch(
