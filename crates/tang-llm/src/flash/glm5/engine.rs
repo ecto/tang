@@ -392,7 +392,6 @@ impl GpuFfn {
     /// not per slot — it re-enables through `enable_mhc_fused` if the caller wants it.
     fn resize_slots(&mut self, slots: usize, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
         use tang_moe::gpu::Gpu;
-        self.mhc_f = None;
         let kda_cfg = KdaConfig {
             heads: hp.n_head,
             head_dim: hp.kda_head_dim,
@@ -422,7 +421,7 @@ impl GpuFfn {
             .with_context(|| format!("KDA layer {l} resident on GPU {d} ({slots} slots)"))?;
             self.kda_l[l] = Some(layer);
         }
-        self.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+        self.kda_dev_fresh.iter_mut().for_each(|row| row.fill(false));
         for cu in self.mla_k.iter().flatten() {
             cu.set_slots(slots);
         }
@@ -430,6 +429,11 @@ impl GpuFfn {
             "glm5: KDA layers resized to {slots} sequence slots ({:.0} s)",
             t0.elapsed().as_secs_f64()
         );
+        // fused mHC is per-window stateless in the streams' values but sized at load;
+        // rebuild it (the fused instance held no sequence state)
+        if self.mhc_g.iter().all(|m| m.is_some()) && self.devs.len() == 1 {
+            self.enable_mhc_fused(g, hp)?;
+        }
         Ok(())
     }
 
