@@ -51,3 +51,85 @@ extern "C" __global__ void k5_gated_norm(const float* o, const float* on, const 
     float r = (float)(1.0 / sqrt((s / (double)HD) + (double)EPS));
     y[i] = ot[j] * r * on[j] / (1.f + expf(-g2[i]));
 }
+
+
+
+
+// ---------------------------------------------------------------------------
+// k5_gemv8: the dequant-reuse GEMV for Q8_0 rows (docs/models/glm5-speed-plan.md step 1)
+// — the Flash engine's fe_gemv8 shape (kernels.rs gemv8_body) cut down to the G5W view's
+// one-type matrices. SCOPE: the KDA projections, all Q8_0 in the UD-Q4_K_XL GGUF
+// (attn_q/k/v/output, ssm_f_a/f_b, ssm_beta, ssm_g_a/g_b). The MoE experts (Q4_K/Q5_K)
+// stay on g5_expert_gu for now.
+//
+// Block 128 = K5_WARPS warps, ONE row per warp (grid.x covers ROWS/K5_WARPS blocks,
+// grid.y = T). The row is staged into shared memory with aligned uint4 loads (the whole
+// 8.7 KB row in flight vs the naive one-thread serial read); then the 32 lanes walk it
+// in 8-element steps: e0 = lane*8 + 256*i, each step dp4a's 8 contiguous row bytes
+// (Q8_0: block at e0/32, values at bytes 2 + e0%32 .. +8) against 8 int8 activation
+// codes, scaled by that block's f16 d and the activation block's d. Shared use: 4 warps
+// x 8.7 KB = 34.8 KB (under the 48 KB default; two rows a warp would need a dynamic-
+// smem opt-in — later, if the measure says so).
+//
+// Activations: xq = fe_q8's layout — plain int8 codes [T][COLS], f32 per-32 scales
+// [T][COLS/32], d = amax/127. NOT the f32 serial rounding: parity is the engine test's
+// 1e-3 bar + the real-model ids (fe_gemv8's bar). F32 rows never come through here
+// (the small per-layer f32 tensors are not GEMV weights).
+#ifndef K5_HOST_CHECK
+#define K5_WARPS 4
+
+// int -> float via a magic add (kernels.rs i2f): exact for |q| < 2^22.
+__device__ __forceinline__ float k5_i2f(int q) { return __int_as_float(0x4B400000 + q) - 12582912.0f; }
+
+// x [T][COLS] f32 -> xq: plain int8 codes [T][COLS] then per-32 f32 scales [T][COLS/32]
+// (fe_q8's rule: d = amax/127 over each 32, round half away). Grid (COLS/32, T), block 32.
+extern "C" __global__ void k5_q8(const float* x, unsigned char* xq, unsigned COLS, unsigned T) {
+    const unsigned t = blockIdx.y, c = blockIdx.x, lane = threadIdx.x;
+    const float v = x[(size_t)t * COLS + c * 32 + lane];
+    float amax = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
+    xq[(size_t)t * COLS + c * 32 + lane] = (unsigned char)(signed char)q;
+    if (lane == 0) ((float*)(xq + (size_t)T * COLS))[t * (COLS / 32) + c] = d;
+}
+
+extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
+    const G5W w, unsigned e, const unsigned char* xq, const float* xd,
+    float* y, unsigned ystride, unsigned T, unsigned ROWS, unsigned COLS) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    extern __shared__ uint4 dsm[]; // per warp: 2 rows of ceil(row_bytes/16) uint4s
+    const unsigned rb = w.row_bytes;
+    const int row16 = (int)((rb + 15) >> 4);
+    const unsigned long long mbase = w.base + (unsigned long long)e * w.estride;
+    const int t = (int)blockIdx.y;
+    if (t >= (int)T) return;
+    const unsigned char* xrow = xq + (size_t)t * COLS;
+
+    {
+        const unsigned row = blockIdx.x * K5_WARPS + warp;
+        if (row >= ROWS) return;
+        const unsigned char* src = (const unsigned char*)(mbase + (unsigned long long)row * rb);
+        uint4* sm = dsm + (size_t)warp * row16;
+        const unsigned long long a = (unsigned long long)src & ~15ull;
+        const int delta = (int)((unsigned long long)src - a);
+        const int n16 = (delta + (int)rb + 15) >> 4;
+        for (int i = lane; i < n16; i += 32) sm[i] = __ldg((const uint4*)a + i);
+        const unsigned char* rowp = (const unsigned char*)sm + delta;
+        float acc = 0.f;
+        for (int e0 = lane * 8; e0 < (int)COLS; e0 += 256) {
+            const unsigned char* b = rowp + (e0 / 32) * 34;
+            const float dw = g5_h2f(g5_u16(b));
+            const unsigned long long q = *(const unsigned long long*)(b + 2 + (e0 % 32));
+            const int w0 = (int)(unsigned)q, w1 = (int)(unsigned)(q >> 32);
+            const uint2 xv = *(const uint2*)(xrow + e0);
+            const float dx = xd[(size_t)t * (COLS / 32) + e0 / 32];
+            const int s = __dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0));
+            acc = fmaf(dx * dw, k5_i2f(s), acc);
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) y[(unsigned long long)t * ystride + row] = acc;
+        __syncwarp();
+    }
+}
+#endif // K5_HOST_CHECK
