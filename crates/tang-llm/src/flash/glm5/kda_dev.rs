@@ -113,6 +113,11 @@ pub struct DevLayer {
     nh: usize,
     hd: usize,
     max_t: usize,
+    /// `TANG_GLM5_KDA_PF2=1` (read at load): the device-resident core — conv in place on
+    /// `qkvb`, the parallel chunked prefill ([`super::kda_cuda::PF2_SRC`]) for any `t`
+    /// (no CPU tail), the decode step from device pointers; qkv/g/beta never visit the
+    /// host. Off: the original host-staged path (64-chunks on the device + CPU tail).
+    pf2: bool,
     /// `TANG_GLM5_KDA_DEBUG`: when set by the engine for this window, [`Self::window`]
     /// poisons its scratch with NaN first and leaves every intermediate in [`Self::taps`]
     /// for the shadow check ([`super::kda_debug`]).
@@ -181,8 +186,13 @@ impl DevLayer {
             DevBuf::from_slice(&neg).map_err(gerr)
         };
         let slots = 1;
+        let pf2 = std::env::var("TANG_GLM5_KDA_PF2").is_ok_and(|v| v == "1");
+        let mut core = DevKda::new(g, &kers, cfg, &conv_w, conv, state, slots)?;
+        if pf2 {
+            core.enable_pf2(max_t)?;
+        }
         Ok(Self {
-            core: DevKda::new(g, &kers, cfg, &conv_w, conv, state, slots)?,
+            core,
             wq: dev_w(gguf, &t("attn_q.weight"))?,
             wk: dev_w(gguf, &t("attn_k.weight"))?,
             wv: dev_w(gguf, &t("attn_v.weight"))?,
@@ -215,6 +225,7 @@ impl DevLayer {
             nh,
             hd,
             max_t,
+            pf2,
             debug: false,
             taps: None,
         })
@@ -267,12 +278,18 @@ impl DevLayer {
             self.g2b.write(0, &nan(t * di))?;
             self.yb.write(0, &nan(t * di))?;
             self.outb.write(0, &nan(t * hidden))?;
+            self.ob.write(0, &nan(t * di))?;
+            if self.pf2 {
+                self.core.ws.write(0, &nan(self.core.ws_elems()))?;
+            }
             // the core's own scratch (conv output, core output) for the device paths
             let c = t.min(64);
             self.core.yb.write(0, &nan(c * 3 * di))?;
             self.core.ob.write(0, &nan(c * di))?;
         }
         let mut tp = self.debug.then(super::kda_debug::KdaTaps::default);
+        let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
+        let t_win = std::time::Instant::now();
         // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di FLOATS).
         // The device pointer is a BYTE address: the offsets must be scaled by
         // size_of::<f32>(). Unscaled (the GLM-5.3 staging bug, Oct 2026) k landed di/4 and
@@ -333,7 +350,24 @@ impl DevLayer {
                     nh as u32],
             )?;
         }
+        if self.pf2 {
+            if prof {
+                self.s.sync()?;
+                eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
+            }
+            let t_core = std::time::Instant::now();
+            self.core_pf2(t, conv, tp.as_mut())?;
+            if prof {
+                self.s.sync()?;
+                eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
+            }
+            return self.finish(t, None, tp);
+        }
         self.s.sync()?;
+        if prof {
+            eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
+        }
+        let t_core = std::time::Instant::now();
         // the core (W4's launchers stage their inputs from host): qkv, g, beta
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
@@ -439,13 +473,79 @@ impl DevLayer {
                 *conv = hconv;
             }
         }
+        self.ob.write(0, &o)?;
+        if prof {
+            eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
+        }
+        self.finish(t, Some(o), tp)
+    }
+
+    /// The PF2 core on the device: qkv (pre-conv, in `qkvb`), g (`gb_out`) and beta (`bb`)
+    /// straight from the projection kernels into the core, the core output into `ob` —
+    /// all on the layer stream, no host round trip. Under the shadow check the inputs and
+    /// the conv output (in place in `qkvb`) are read back as taps, and the host conv copy
+    /// is mirrored from the device (this path doesn't maintain it: the device is
+    /// authoritative and `read_back` syncs it before any CPU use).
+    fn core_pf2(
+        &mut self,
+        t: usize,
+        conv: &mut ConvState,
+        mut tp: Option<&mut super::kda_debug::KdaTaps>,
+    ) -> Result<()> {
+        let (nh, di) = (self.nh, self.d_inner);
+        if let Some(tp) = tp.as_mut() {
+            self.s.sync()?;
+            tp.qkv_pre = self.qkvb.read::<f32>(0, t * 3 * di)?;
+            tp.g = self.gb_out.read::<f32>(0, t * di)?;
+            tp.beta = self.bb.read::<f32>(0, t * nh)?;
+        }
+        if t == 1 {
+            self.core.decode_dev(&self.kers, &self.s, self.qkvb.ptr, self.gb_out.ptr, self.bb.ptr, self.ob.ptr)?;
+        } else {
+            self.core.prefill_dev(
+                &self.kers,
+                &self.s,
+                self.qkvb.ptr,
+                3 * di,
+                self.gb_out.ptr,
+                di,
+                self.bb.ptr,
+                nh,
+                self.ob.ptr,
+                t,
+            )?;
+        }
+        if let Some(tp) = tp.as_mut() {
+            self.s.sync()?;
+            if t > 1 {
+                tp.conv_out = self.qkvb.read::<f32>(0, t * 3 * di)?;
+            }
+            self.core.read_conv(conv)?;
+        }
+        Ok(())
+    }
+
+    /// The gated output norm + o_proj from the core output in `ob` (`o`: the host copy
+    /// when the host-staged path produced it), then the taps.
+    fn finish(
+        &mut self,
+        t: usize,
+        o: Option<Vec<f32>>,
+        tp: Option<super::kda_debug::KdaTaps>,
+    ) -> Result<Vec<f32>> {
+        let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
+        let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
+        let t_out = std::time::Instant::now();
         // gated output norm (device) then o_proj
         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
             // the core output pre-norm (the CPU tail path's `o`): y-divergence with a
             // matching o pins the bug to the gated norm or the o_proj GEMV
+            let o = match &o {
+                Some(o) => o.clone(),
+                None => self.ob.read::<f32>(0, t * di)?,
+            };
             eprintln!("kda gpu o[0..8]: {:?}", &o[..8.min(o.len())]);
         }
-        self.ob.write(0, &o)?;
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
             launch(
@@ -486,9 +586,15 @@ impl DevLayer {
             )?;
         }
         self.s.sync()?;
+        if prof {
+            eprintln!("glm5: prof kda out: {:.2} ms", t_out.elapsed().as_secs_f32() * 1e3);
+        }
         let out = self.outb.read::<f32>(0, t * hidden)?;
         if let Some(mut tp) = tp {
-            tp.o = o;
+            tp.o = match o {
+                Some(o) => o,
+                None => self.ob.read::<f32>(0, t * di)?,
+            };
             tp.g2 = self.g2b.read::<f32>(0, t * di)?;
             tp.y_norm = self.yb.read::<f32>(0, t * di)?;
             tp.out = out.clone();
@@ -500,5 +606,105 @@ impl DevLayer {
             eprintln!("kda gpu y[0..8]: {:?}", &out[..8.min(out.len())]);
         }
         Ok(out)
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::super::kda::{ConvState, KdaState};
+    use super::DevLayer;
+
+    fn rel(a: &[f32], b: &[f32]) -> f64 {
+        let (mut d, mut n) = (0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            d += ((x - y) as f64).powi(2);
+            n += (*y as f64).powi(2);
+        }
+        if a.iter().any(|x| !x.is_finite()) {
+            return f64::INFINITY;
+        }
+        (d / n.max(1e-30)).sqrt()
+    }
+
+    /// Real GLM-5.3 KDA layer 0 (`TANG_GLM5_BENCH_GGUF` = the first shard), one resident
+    /// `DevLayer` per path: the original host-staged core (64-chunks + CPU tail) vs PF2.
+    /// Times whole windows (proj + core + out, `TANG_GLM5_PROF=1` prints the split) at
+    /// 20 / 512 / 2048 tokens, checks PF2's layer output against the original path's at
+    /// every length, and both against the CPU `kda_layer` at 20 (the oracle). Each
+    /// window starts from the state the previous one left (a running prefill).
+    /// Ignored: `TANG_GLM5_BENCH_GGUF=… cargo test … -- --ignored glm5_kda_layer_bench_real`.
+    #[test]
+    #[ignore]
+    fn glm5_kda_layer_bench_real() {
+        let Ok(path) = std::env::var("TANG_GLM5_BENCH_GGUF") else {
+            eprintln!("SKIP: TANG_GLM5_BENCH_GGUF unset");
+            return;
+        };
+        let g = tang_moe::gpu::Gpu::for_test().expect("CUDA GPU");
+        g.bind().unwrap();
+        let r = super::super::forward::Glm5Ref::open(std::path::Path::new(&path)).unwrap();
+        let l = 0usize;
+        let (w, cfg) = r.kda_weights(l).unwrap();
+        let hidden = r.hp.n_embd;
+        let max_t = 2048usize;
+        let mk = |pf2: bool| {
+            // DevLayer reads the flag at load
+            std::env::set_var("TANG_GLM5_KDA_PF2", if pf2 { "1" } else { "0" });
+            let d = DevLayer::new_gguf(&g, &r.g, l, &cfg, hidden, &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1), max_t).unwrap();
+            std::env::remove_var("TANG_GLM5_KDA_PF2");
+            d
+        };
+        let (mut old, mut new) = (mk(false), mk(true));
+        let (mut c_old, mut c_new) = (ConvState::zeros(&cfg, 1), ConvState::zeros(&cfg, 1));
+        let (mut c_cpu, mut s_cpu) = (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for t in [20usize, 512, 2048] {
+            // a normed-hidden-like input: uniform with unit RMS
+            let x: Vec<f32> = (0..t * hidden)
+                .map(|_| {
+                    seed ^= seed >> 12;
+                    seed ^= seed << 25;
+                    seed ^= seed >> 27;
+                    ((seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 3.46
+                })
+                .collect();
+            let t0 = std::time::Instant::now();
+            let y_old = old.window(&x, t, &mut c_old).unwrap();
+            let ms_old = t0.elapsed().as_secs_f64() * 1e3;
+            // PF2: best of 3 from the same state (read back, re-seed): the first window
+            // pays the module's first-launch costs
+            let (mut c0, mut s0) = (c_new.clone(), KdaState::zeros(&cfg, 1));
+            new.read_back(&mut c0, &mut s0).unwrap();
+            let mut best = f64::MAX;
+            let mut y_new = Vec::new();
+            for _ in 0..3 {
+                new.seed(&c0, &s0).unwrap();
+                let t1 = std::time::Instant::now();
+                y_new = new.window(&x, t, &mut c_new).unwrap();
+                best = best.min(t1.elapsed().as_secs_f64() * 1e3);
+            }
+            let e = rel(&y_new, &y_old);
+            // the states the two paths carry forward
+            let (mut co, mut so) = (c_old.clone(), KdaState::zeros(&cfg, 1));
+            old.read_back(&mut co, &mut so).unwrap();
+            let (mut cn, mut sn) = (c_new.clone(), KdaState::zeros(&cfg, 1));
+            new.read_back(&mut cn, &mut sn).unwrap();
+            let es = rel(&sn.0, &so.0);
+            let ec = rel(&cn.0, &co.0);
+            println!(
+                "kda layer {l} T={t}: window old {ms_old:.1} ms, pf2 {best:.2} ms ({:.0}x); x34 layers: old {:.0} ms, pf2 {:.0} ms; pf2 vs old: out rel {e:.2e} state {es:.2e} conv {ec:.2e}",
+                ms_old / best,
+                ms_old * 34.0,
+                best * 34.0
+            );
+            assert!(e < 1e-3 && es < 1e-3 && ec < 1e-6, "pf2 diverges from the original path at T={t}");
+            if t == 20 {
+                let y_cpu = super::super::kda::kda_layer(&x, &w, &cfg, &mut c_cpu, &mut s_cpu, 1, t).unwrap();
+                let (ecpu, escpu) = (rel(&y_new, &y_cpu), rel(&sn.0, &s_cpu.0));
+                println!("kda layer {l} T={t}: pf2 vs CPU kda_layer: out rel {ecpu:.2e} state {escpu:.2e}");
+                assert!(ecpu < 1e-3 && escpu < 1e-3, "pf2 vs CPU at T={t}");
+            }
+        }
     }
 }

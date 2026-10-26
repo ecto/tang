@@ -324,6 +324,248 @@ extern "C" __global__ void __launch_bounds__(1024) kda_prefill(
 }
 "#;
 
+/// Chunk length of the parallel prefill ([`PF2_SRC`]), HF's / `kda_chunk`'s 64.
+pub const PF_C: usize = 64;
+/// Threads per block of the parallel prefill kernels.
+pub const PF_NT: usize = 256;
+/// Widest value-column slice one `kda_pf_state` block owns (its shared S slice).
+pub const PF_VS: usize = 32;
+
+/// Floats of one `(chunk, head)` workspace slot of the parallel prefill: KP, VP, QG, KG
+/// `[C][D]`, AQK `[C][C]`, GL `[D]` (see [`PF2_SRC`]).
+pub fn pf_slot(d: usize) -> usize {
+    4 * PF_C * d + PF_C * PF_C + d
+}
+
+/// The parallel prefill (`TANG_GLM5_KDA_PF2=1`): the same math as `kda_prefill` /
+/// `kda_chunk`, split the way FLA's chunked kernels are — everything of a chunk that does
+/// NOT depend on the recurrent state runs fully parallel over (chunk, head), and only the
+/// state-carrying matmuls stay serial over chunks:
+///
+/// - `kda_conv_ip`: conv + SiLU **in place** on the stacked qkv (one thread per channel
+///   keeps its last `d_conv − 1` inputs in registers), committing the new history to `H0`
+///   in the same pass — no separate conv output buffer, no commit kernel. The fma order is
+///   `kda_conv`'s exactly.
+/// - `kda_pf_intra`, grid `(chunks, H)`, block [`PF_NT`]: l2-norms (a warp per row), the
+///   per-key-dim gate cumsum, the gram pair `A0[i][j] = −β_i Σ_a k_i k_j e^{G_i−G_j}` and
+///   `Aqk[i][j] = Σ_a q_i k_j e^{G_i−G_j}` (one warp per row, lanes over the key dim, the
+///   shared exp computed once for both), the triangular fixpoint (row by row, a warp per
+///   output, lanes over the inner index), then `KP = A·(k⊙β⊙e^G)`, `VP = A·(v⊙β)`,
+///   `QG = q⊙e^G`, `KG = k⊙e^{G_last−G}` into the workspace slot.
+/// - `kda_pf_state`, grid `(H, D / VS)`, block [`PF_NT`]: the block owns value columns
+///   `[x0, x0+VS)` of one head's state, staged in shared memory across the chunks, and per
+///   chunk does `VN = VP − KP·S`, `O = QG·S + Aqk·VN`, `S ← e^{G_last}⊙S + KGᵀ·VN`.
+///
+/// Any `T` (no multiple-of-64 requirement): a chunk's rows past `T` are simply not
+/// computed — the CPU's zero padding makes them inert (k = v = β = 0, G carried), so
+/// `G_last = G[n−1]` and every pad term vanishes.
+///
+/// Workspace slot layout (floats): `KP[C][D] VP[C][D] QG[C][D] KG[C][D] AQK[C][C] GL[D]`,
+/// slot index `chunk_in_group · H + h`. During `kda_pf_intra` the planes double as
+/// temporaries (QG ← q̂, KG ← k̂, KP ← G, VP ← k̂⊙β⊙e^G) — each reuse is fenced by a
+/// `__syncthreads` or is the same thread rewriting its own element.
+pub const PF2_SRC: &str = r#"
+typedef unsigned long long u64;
+#define PF_C 64
+#define PF_NT 256
+#define PF_VS 32
+#define PF_SLOT (4 * PF_C * KDA_D + PF_C * PF_C + KDA_D)
+
+__device__ __forceinline__ float pf_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// conv + SiLU in place over X [T][stride] (the KDA_CONV channels at each row's start), H0
+// [chan][KC-1] oldest first, committed at the end. One thread per channel.
+extern "C" __global__ void kda_conv_ip(float* X, unsigned int stride, float* H0,
+                                       const float* __restrict__ W, unsigned int T) {
+    unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= KDA_CONV) return;
+    float w[KDA_KC], hs[KDA_KC - 1];
+    for (unsigned int i = 0; i < KDA_KC; i++) w[i] = W[ch * KDA_KC + i];
+    for (unsigned int s = 0; s < KDA_KC - 1; s++) hs[s] = H0[ch * (KDA_KC - 1) + s];
+    for (unsigned int t = 0; t < T; t++) {
+        float xv = X[(u64)t * stride + ch];
+        float acc = 0.0f;
+        for (unsigned int i = 0; i < KDA_KC - 1; i++) acc = __fmaf_rn(w[i], hs[i], acc);
+        acc = __fmaf_rn(w[KDA_KC - 1], xv, acc);
+        for (unsigned int s = 0; s + 1 < KDA_KC - 1; s++) hs[s] = hs[s + 1];
+        hs[KDA_KC - 2] = xv;
+        X[(u64)t * stride + ch] = acc / (1.0f + expf(-acc));
+    }
+    for (unsigned int s = 0; s < KDA_KC - 1; s++) H0[ch * (KDA_KC - 1) + s] = hs[s];
+}
+
+// Y: conv output [T][ystride] (q | k | v at 0, H*D, 2*H*D). Chunk c0 + blockIdx.x, head
+// blockIdx.y; slot blockIdx.x * gridDim.y + h.
+extern "C" __global__ void __launch_bounds__(PF_NT) kda_pf_intra(
+        const float* __restrict__ Y, unsigned int ystride,
+        const float* __restrict__ G, unsigned int gstride,
+        const float* __restrict__ BETA, unsigned int bstride,
+        float* WS, unsigned int c0, unsigned int T) {
+    const unsigned int D = KDA_D, C = PF_C, NW = PF_NT / 32;
+    unsigned int h = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    unsigned int o0 = (c0 + blockIdx.x) * C;
+    if (o0 >= T) return;
+    unsigned int n = min(C, T - o0);
+    float* ws = WS + (u64)(blockIdx.x * gridDim.y + h) * PF_SLOT;
+    float* KP = ws;
+    float* VP = ws + C * D;
+    float* QG = ws + 2 * C * D;
+    float* KG = ws + 3 * C * D;
+    float* AQK = ws + 4 * C * D;
+    float* GL = AQK + C * C;
+    __shared__ float A[PF_C * PF_C];
+    __shared__ float row[PF_C];
+    __shared__ float sb[PF_C];
+    for (unsigned int e = tid; e < C * C; e += PF_NT) A[e] = 0.0f;
+    if (tid < n) sb[tid] = BETA[(u64)(o0 + tid) * bstride + h];
+    // 1. l2 norms (+ 1/sqrt(D) on q), a warp per row: QG <- q^, KG <- k^
+    for (unsigned int i = warp; i < n; i += NW) {
+        const float* yr = Y + (u64)(o0 + i) * ystride;
+        float qs = 0.0f, ks = 0.0f;
+        for (unsigned int a = lane; a < D; a += 32) {
+            float q = yr[h * D + a], k = yr[KDA_H * D + h * D + a];
+            qs += q * q;
+            ks += k * k;
+        }
+        qs = pf_warp_sum(qs);
+        ks = pf_warp_sum(ks);
+        for (unsigned int a = lane; a < D; a += 32) {
+            QG[i * D + a] = yr[h * D + a] * rsqrtf(qs + 1e-6f) * rsqrtf((float)D);
+            KG[i * D + a] = yr[KDA_H * D + h * D + a] * rsqrtf(ks + 1e-6f);
+        }
+    }
+    // 2. within-chunk gate cumsum, a thread per key dim: KP <- G
+    if (tid < D) {
+        float acc = 0.0f;
+        for (unsigned int i = 0; i < n; i++) {
+            acc += G[(u64)(o0 + i) * gstride + h * D + tid];
+            KP[i * D + tid] = acc;
+        }
+    }
+    __syncthreads();
+    // 3. the gram pair, a warp per row i, lanes over the key dim
+    for (unsigned int i = warp; i < n; i += NW) {
+        for (unsigned int j = 0; j <= i; j++) {
+            float kk = 0.0f, qk = 0.0f;
+            for (unsigned int a = lane; a < D; a += 32) {
+                float e = expf(KP[i * D + a] - KP[j * D + a]);
+                float kj = KG[j * D + a];
+                kk += KG[i * D + a] * kj * e;
+                qk += QG[i * D + a] * kj * e;
+            }
+            kk = pf_warp_sum(kk);
+            qk = pf_warp_sum(qk);
+            if (lane == 0) {
+                if (j < i) A[i * C + j] = -kk * sb[i];
+                AQK[i * C + j] = qk;
+            }
+        }
+    }
+    __syncthreads();
+    // 4. per key dim (own column only): QG = q^ e^G, VP <- k^ b e^G, KG = k^ e^(Gl - G)
+    if (tid < D) {
+        float gl = KP[(n - 1) * D + tid];
+        for (unsigned int i = 0; i < n; i++) {
+            float g = KP[i * D + tid], qn = QG[i * D + tid], kn = KG[i * D + tid];
+            QG[i * D + tid] = qn * expf(g);
+            VP[i * D + tid] = kn * sb[i] * expf(g);
+            KG[i * D + tid] = kn * expf(gl - g);
+        }
+        GL[tid] = gl;
+    }
+    // 5. HF's triangular fixpoint: row i from a snapshot of A0's row i against the final
+    //    rows m < i (A[m][j] = 0 for m <= j, so the m-sum starts at j+1)
+    for (unsigned int i = 1; i < n; i++) {
+        __syncthreads();
+        if (tid < i) row[tid] = A[i * C + tid];
+        __syncthreads();
+        for (unsigned int j = warp; j < i; j += NW) {
+            float s = 0.0f;
+            for (unsigned int m = j + 1 + lane; m < i; m += 32) s += row[m] * A[m * C + j];
+            s = pf_warp_sum(s);
+            if (lane == 0) A[i * C + j] = row[j] + s;
+        }
+    }
+    __syncthreads();
+    if (tid < n) A[tid * C + tid] += 1.0f;
+    __syncthreads();
+    // 6. KP = A (k^ b e^G)   (KP's G temporaries were consumed in 4.)
+    for (unsigned int e = tid; e < n * D; e += PF_NT) {
+        unsigned int i = e / D, a = e % D;
+        float s = 0.0f;
+        for (unsigned int j = 0; j <= i; j++) s = __fmaf_rn(A[i * C + j], VP[j * D + a], s);
+        KP[i * D + a] = s;
+    }
+    __syncthreads();
+    // 7. VP = A (v b)
+    for (unsigned int e = tid; e < n * D; e += PF_NT) {
+        unsigned int i = e / D, x = e % D;
+        float s = 0.0f;
+        for (unsigned int j = 0; j <= i; j++)
+            s = __fmaf_rn(A[i * C + j], Y[(u64)(o0 + j) * ystride + 2 * KDA_H * D + h * D + x] * sb[j], s);
+        VP[i * D + x] = s;
+    }
+}
+
+// The state-carrying half: head blockIdx.x, value columns [x0, x0 + VS), chunks
+// c0 .. c0 + nchunks (slot cc * KDA_H + h). S [H][D][D], O [T][H*D].
+extern "C" __global__ void __launch_bounds__(PF_NT) kda_pf_state(
+        const float* WS, float* __restrict__ S, float* __restrict__ O,
+        unsigned int c0, unsigned int nchunks, unsigned int T, unsigned int VS) {
+    const unsigned int D = KDA_D, C = PF_C;
+    unsigned int h = blockIdx.x, x0 = blockIdx.y * VS, tid = threadIdx.x;
+    __shared__ float Ss[KDA_D * PF_VS];
+    __shared__ float VN[PF_C * PF_VS];
+    float* Sg = S + (u64)h * D * D;
+    for (unsigned int e = tid; e < D * VS; e += PF_NT) Ss[e] = Sg[(e / VS) * D + x0 + e % VS];
+    __syncthreads();
+    for (unsigned int cc = 0; cc < nchunks; cc++) {
+        unsigned int o0 = (c0 + cc) * C;
+        if (o0 >= T) break;
+        unsigned int n = min(C, T - o0);
+        const float* ws = WS + (u64)(cc * KDA_H + h) * PF_SLOT;
+        const float* KP = ws;
+        const float* VP = ws + C * D;
+        const float* QG = ws + 2 * C * D;
+        const float* KG = ws + 3 * C * D;
+        const float* AQK = ws + 4 * C * D;
+        const float* GL = AQK + C * C;
+        // VN = VP - KP S ; O = QG S   (the OLD state)
+        for (unsigned int e = tid; e < n * VS; e += PF_NT) {
+            unsigned int i = e / VS, xl = e % VS;
+            float p = 0.0f, q = 0.0f;
+            for (unsigned int a = 0; a < D; a++) {
+                float s = Ss[a * VS + xl];
+                p = __fmaf_rn(KP[i * D + a], s, p);
+                q = __fmaf_rn(QG[i * D + a], s, q);
+            }
+            VN[i * VS + xl] = VP[i * D + x0 + xl] - p;
+            O[(u64)(o0 + i) * (KDA_H * D) + h * D + x0 + xl] = q;
+        }
+        __syncthreads();
+        // O += Aqk VN (same thread, same element as above)
+        for (unsigned int e = tid; e < n * VS; e += PF_NT) {
+            unsigned int i = e / VS, xl = e % VS;
+            u64 oi = (u64)(o0 + i) * (KDA_H * D) + h * D + x0 + xl;
+            float o = O[oi];
+            for (unsigned int c = 0; c <= i; c++) o = __fmaf_rn(AQK[i * C + c], VN[c * VS + xl], o);
+            O[oi] = o;
+        }
+        // S <- e^Gl S + KG^T VN
+        for (unsigned int e = tid; e < D * VS; e += PF_NT) {
+            unsigned int a = e / VS, xl = e % VS;
+            float s = Ss[e] * expf(GL[a]);
+            for (unsigned int c = 0; c < n; c++) s = __fmaf_rn(KG[c * D + a], VN[c * VS + xl], s);
+            Ss[e] = s;
+        }
+        __syncthreads();
+    }
+    for (unsigned int e = tid; e < D * VS; e += PF_NT) Sg[(e / VS) * D + x0 + e % VS] = Ss[e];
+}
+"#;
 
 // ---------------------------------------------------------------------------
 // cuda-gated launcher + parity tests
@@ -342,16 +584,21 @@ pub mod cuda {
         pub conv_commit: sys::CUfunction,
         pub step: sys::CUfunction,
         pub prefill: sys::CUfunction,
+        /// the parallel prefill ([`super::PF2_SRC`])
+        pub conv_ip: sys::CUfunction,
+        pub pf_intra: sys::CUfunction,
+        pub pf_state: sys::CUfunction,
         pub _mod: tang_moe::gpu::Module,
     }
 
     pub fn load(g: &Gpu, cfg: &KdaConfig) -> Result<Kernels> {
         let src = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             super::prelude(cfg),
             super::CONV_SRC,
             super::STEP_SRC,
-            super::PREFILL_SRC
+            super::PREFILL_SRC,
+            super::PF2_SRC
         );
         g.bind()?;
         let m = g.module(&src)?;
@@ -360,6 +607,9 @@ pub mod cuda {
             conv_commit: m.func("kda_conv_commit")?,
             step: m.func("kda_step")?,
             prefill: m.func("kda_prefill")?,
+            conv_ip: m.func("kda_conv_ip")?,
+            pf_intra: m.func("kda_pf_intra")?,
+            pf_state: m.func("kda_pf_state")?,
             _mod: m,
         })
     }
@@ -387,6 +637,10 @@ pub mod cuda {
         pub ob: DevBuf,
         pub yb: DevBuf,
         pub scr: DevBuf,
+        /// The parallel prefill's workspace: `pf_groups` chunks × heads slots of
+        /// [`super::pf_slot`] floats (1 byte until [`Self::enable_pf2`]).
+        pub ws: DevBuf,
+        pf_groups: usize,
         pub s: Stream,
         ch_dim: usize,
         nh: usize,
@@ -430,6 +684,8 @@ pub mod cuda {
                 ob: DevBuf::zeroed(slots * chunk * nh * hd * 4)?,
                 yb: DevBuf::zeroed(slots * chunk * ch_dim * 4)?,
                 scr: DevBuf::zeroed(slots * nh * 6 * chunk * hd * 4)?,
+                ws: DevBuf::zeroed(1)?,
+                pf_groups: 0,
                 s,
                 ch_dim,
                 nh,
@@ -560,6 +816,113 @@ pub mod cuda {
             Ok(self.ob.read::<f32>(0, b * t * nh * hd)?)
         }
 
+        /// Allocate the parallel prefill's workspace for windows up to `max_t` tokens:
+        /// `min(4, ⌈max_t/64⌉)` chunks are in flight per group (9.5 MB per chunk at the
+        /// real 64 × 128 heads), longer windows loop groups.
+        pub fn enable_pf2(&mut self, max_t: usize) -> Result<()> {
+            let groups = max_t.div_ceil(super::PF_C).clamp(1, 4);
+            if groups <= self.pf_groups {
+                return Ok(());
+            }
+            ensure!(self.hd <= super::PF_NT, "pf2: head_dim {} > {}", self.hd, super::PF_NT);
+            let vs = self.hd.min(super::PF_VS);
+            ensure!(self.hd % vs == 0, "pf2: head_dim {} not a multiple of {vs}", self.hd);
+            self.ws = DevBuf::zeroed_elems::<f32>(groups * self.nh * super::pf_slot(self.hd))?;
+            self.pf_groups = groups;
+            Ok(())
+        }
+
+        /// The workspace's size in floats (the debug path NaN-poisons it).
+        pub fn ws_elems(&self) -> usize {
+            self.pf_groups * self.nh * super::pf_slot(self.hd)
+        }
+
+        /// Device-resident prefill of `t ≥ 1` tokens (any length, one slot): conv in place
+        /// on `qkv` (`[t][stride]`, pre-conv q|k|v → post-conv, history committed to h0),
+        /// then the parallel chunked core writing `o` `[t][H·D]` and the device state. All
+        /// launches go on `s` (the caller's stream — no host sync, no host staging).
+        pub fn prefill_dev(
+            &self,
+            k: &Kernels,
+            s: &Stream,
+            qkv: u64,
+            stride: usize,
+            g: u64,
+            gstride: usize,
+            beta: u64,
+            bstride: usize,
+            o: u64,
+            t: usize,
+        ) -> Result<()> {
+            ensure!(self.pf_groups > 0, "pf2 workspace not allocated (enable_pf2)");
+            ensure!(t >= 1, "empty prefill");
+            let (nh, hd, ch_dim) = (self.nh, self.hd, self.ch_dim);
+            let vs = hd.min(super::PF_VS);
+            let nc = t.div_ceil(super::PF_C);
+            unsafe {
+                launch(
+                    k.conv_ip,
+                    (ch_dim.div_ceil(256) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    args![qkv, stride as u32, self.h0.ptr, self.wconv.ptr, t as u32],
+                )?;
+                let mut c0 = 0usize;
+                while c0 < nc {
+                    let ng = (nc - c0).min(self.pf_groups);
+                    launch(
+                        k.pf_intra,
+                        (ng as u32, nh as u32, 1),
+                        (super::PF_NT as u32, 1, 1),
+                        0,
+                        s,
+                        args![
+                            qkv, stride as u32, g, gstride as u32, beta, bstride as u32,
+                            self.ws.ptr, c0 as u32, t as u32
+                        ],
+                    )?;
+                    launch(
+                        k.pf_state,
+                        (nh as u32, (hd / vs) as u32, 1),
+                        (super::PF_NT as u32, 1, 1),
+                        0,
+                        s,
+                        args![self.ws.ptr, self.st.ptr, o, c0 as u32, ng as u32, t as u32, vs as u32],
+                    )?;
+                    c0 += ng;
+                }
+            }
+            Ok(())
+        }
+
+        /// Device-resident decode step (one token, one slot): `qkv` the raw `[conv_dim]`
+        /// row, `g` `[H·D]` pre-exp, `beta` `[H]`; writes `o` `[H·D]`, the state, and
+        /// shifts the device conv history. Launches on `s`; the host conv copy is NOT
+        /// touched (the device is authoritative; `read_conv` syncs it when needed).
+        pub fn decode_dev(&self, k: &Kernels, s: &Stream, qkv: u64, g: u64, beta: u64, o: u64) -> Result<()> {
+            let (nh, hd, ch_dim) = (self.nh, self.hd, self.ch_dim);
+            unsafe {
+                launch(
+                    k.step,
+                    (nh as u32, 1, 1),
+                    (hd as u32, 1, 1),
+                    (3 * hd * 4) as u32,
+                    s,
+                    args![qkv, self.h0.ptr, self.wconv.ptr, g, beta, self.st.ptr, o],
+                )?;
+                launch(
+                    k.conv_commit,
+                    (ch_dim.div_ceil(256) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    args![self.h0.ptr, qkv, ch_dim as u32, 1u32],
+                )?;
+            }
+            Ok(())
+        }
+
         /// Read the conv history back (for a CPU fallback window or a checkpoint).
         pub fn read_conv(&self, conv: &mut ConvState) -> Result<()> {
             conv.0 = self.h0.read(0, conv.0.len())?;
@@ -637,6 +1000,39 @@ pub mod cuda {
         Ok(o.read::<f32>(0, b * t * nh * hd)?)
     }
 
+    /// The parallel prefill through a resident [`DevKda`] (`enable_pf2` + `prefill_dev`)
+    /// from host data, any `t`: returns (o, conv-output) and updates `conv`/`state` from
+    /// the device. The parity tests' entry point to the exact engine path.
+    pub fn prefill2(
+        g: &Gpu,
+        k: &Kernels,
+        cfg: &KdaConfig,
+        x: &[f32],
+        wconv: &[f32],
+        gpre: &[f32],
+        beta: &[f32],
+        conv: &mut ConvState,
+        state: &mut KdaState,
+        t: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (nh, hd, ch_dim) = (cfg.heads, cfg.head_dim, cfg.conv_dim());
+        ensure!(x.len() == t * ch_dim, "prefill2 x shape");
+        let mut dev = DevKda::new(g, k, cfg, wconv, conv, state, 1)?;
+        dev.enable_pf2(t)?;
+        let s = sincos(g)?;
+        let xb = DevBuf::from_slice(x)?;
+        let gb = DevBuf::from_slice(gpre)?;
+        let bb = DevBuf::from_slice(beta)?;
+        let o = DevBuf::from_slice(&vec![f32::NAN; t * nh * hd])?;
+        // NaN-poison the workspace: a row the core reads but nothing wrote can't hide
+        dev.ws.write(0, &vec![f32::NAN; dev.ws_elems()])?;
+        dev.prefill_dev(k, &s, xb.ptr, ch_dim, gb.ptr, nh * hd, bb.ptr, nh, o.ptr, t)?;
+        s.sync()?;
+        dev.read_conv(conv)?;
+        dev.read_state(state)?;
+        Ok((o.read::<f32>(0, t * nh * hd)?, xb.read::<f32>(0, t * ch_dim)?))
+    }
+
     /// One decode step: fused conv + delta rule on GPU, vs the CPU path.
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
@@ -695,8 +1091,134 @@ pub mod cuda {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::super::kda::{self, ConvState, KdaConfig, KdaState};
-    use super::cuda::{decode, load, prefill, DevKda};
+    use super::cuda::{decode, load, prefill, prefill2, DevKda};
     use tang_moe::gpu::Gpu;
+
+    /// `Gpu::for_test`, but a missing GPU fails under `TANG_REQUIRE_CUDA=1` (the silent
+    /// skip is how GPU bugs survived review before — engine.rs `skip_or_fail`).
+    fn gpu() -> Option<Gpu> {
+        let g = Gpu::for_test();
+        if g.is_none() {
+            assert!(
+                !std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1"),
+                "no CUDA GPU but TANG_REQUIRE_CUDA=1"
+            );
+            eprintln!("==================== SKIP: no CUDA GPU ====================");
+        }
+        g
+    }
+
+    /// Deterministic pseudo-random data (xorshift64*), uniform in [lo, hi).
+    fn synth(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                let u = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32;
+                lo + (hi - lo) * u
+            })
+            .collect()
+    }
+
+    fn max_err(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "length");
+        a.iter().zip(b).map(|(x, y)| if x.is_finite() { (x - y).abs() } else { f32::INFINITY }).fold(0.0, f32::max)
+    }
+
+    fn max_abs(a: &[f32]) -> f32 {
+        a.iter().map(|x| x.abs()).fold(0.0, f32::max)
+    }
+
+    /// One parallel-prefill (PF2) window vs the CPU `conv1d_prefill` + `kda_chunk` from the
+    /// same (possibly non-zero) initial conv + recurrent state: o, conv output, state and
+    /// conv history must agree to `tol` relative to each tensor's max magnitude.
+    #[allow(clippy::too_many_arguments)]
+    fn pf2_case(
+        g: &Gpu,
+        kers: &super::cuda::Kernels,
+        cfg: &KdaConfig,
+        x: &[f32],
+        wconv: &[f32],
+        gpre: &[f32],
+        beta: &[f32],
+        conv0: &ConvState,
+        state0: &KdaState,
+        t: usize,
+        tol: f32,
+    ) {
+        let (nh, hd, ch) = (cfg.heads, cfg.head_dim, cfg.conv_dim());
+        let (x, gpre, beta) = (&x[..t * ch], &gpre[..t * nh * hd], &beta[..t * nh]);
+        let (mut convg, mut stateg) = (conv0.clone(), KdaState(state0.0.clone()));
+        let (og, yg) = prefill2(g, kers, cfg, x, wconv, gpre, beta, &mut convg, &mut stateg, t).unwrap();
+        let (mut convc, mut statec) = (conv0.clone(), KdaState(state0.0.clone()));
+        let yc = kda::conv1d_prefill(x, wconv, &mut convc, cfg, 1, t).unwrap();
+        let oc = kda::kda_chunk(&yc, gpre, beta, &mut statec, cfg, 1, t, 64).unwrap();
+        let rel = |e: f32, r: &[f32]| e / max_abs(r).max(1e-6);
+        let (eo, ey, es, ec) = (
+            rel(max_err(&og, &oc), &oc),
+            rel(max_err(&yg, &yc), &yc),
+            rel(max_err(&stateg.0, &statec.0), &statec.0),
+            rel(max_err(&convg.0, &convc.0), &convc.0),
+        );
+        println!(
+            "pf2 H={nh} D={hd} T={t}: rel out {eo:.3e} conv_out {ey:.3e} state {es:.3e} conv {ec:.3e} (|o| {:.3e} |S| {:.3e})",
+            max_abs(&oc),
+            max_abs(&statec.0)
+        );
+        assert!(eo < tol, "T={t} out {eo}");
+        assert!(ey < tol, "T={t} conv_out {ey}");
+        assert!(es < tol, "T={t} state {es}");
+        assert!(ec < tol, "T={t} conv {ec}");
+    }
+
+    /// PF2 on the HF fixture (H=4, D=16), every tail shape the fixture's 100 tokens allow,
+    /// from zeros and from the state after 37 tokens (a non-trivial S and conv history).
+    #[test]
+    fn glm5_kda_pf2_fixture_vs_cpu() {
+        let Some(g) = gpu() else { return };
+        let cfg = cfg();
+        let (nh, hd, ch) = (cfg.heads, cfg.head_dim, cfg.conv_dim());
+        let (x, wconv, gpre, beta) = (loadf("conv_x"), loadf("conv_w"), loadf("g"), loadf("beta"));
+        let kers = load(&g, &cfg).unwrap();
+        let (z0, s0) = (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
+        for t in [1usize, 2, 3, 17, 63, 64, 65, 100] {
+            pf2_case(&g, &kers, &cfg, &x, &wconv, &gpre, &beta, &z0, &s0, t, 1e-4);
+        }
+        // seeded: the CPU's state after the first 37 tokens, then the rest
+        let (mut c1, mut s1) = (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
+        let y = kda::conv1d_prefill(&x[..37 * ch], &wconv, &mut c1, &cfg, 1, 37).unwrap();
+        kda::kda_chunk(&y, &gpre[..37 * nh * hd], &beta[..37 * nh], &mut s1, &cfg, 1, 37, 64).unwrap();
+        for t in [1usize, 17, 63] {
+            pf2_case(&g, &kers, &cfg, &x[37 * ch..], &wconv, &gpre[37 * nh * hd..], &beta[37 * nh..], &c1, &s1, t, 1e-4);
+        }
+    }
+
+    /// PF2 on synthetic data at the fixture's shape AND the real model's head shape
+    /// (D = 128: 4 value slices per head, all 8 warps on the key dim), for the tail lengths
+    /// 1, 17, 63, 65, 127, 150 and a multi-group window (300 = 5 chunks > 4 in flight),
+    /// from a random non-zero state + conv history.
+    #[test]
+    fn glm5_kda_pf2_synth_vs_cpu() {
+        let Some(g) = gpu() else { return };
+        for (heads, head_dim) in [(4usize, 16usize), (3, 128)] {
+            let cfg = KdaConfig { heads, head_dim, ..cfg() };
+            let (nh, hd, ch) = (cfg.heads, cfg.head_dim, cfg.conv_dim());
+            let tmax = 300usize;
+            let x = synth(tmax * ch, 1, -1.5, 1.5);
+            let wconv = synth(ch * cfg.d_conv, 2, -0.6, 0.6);
+            // pre-exp gates in (lb, 0) like lb·σ(·): mostly mild decay, some strong
+            let gpre: Vec<f32> = synth(tmax * nh * hd, 3, 0.0, 1.0).iter().map(|u| -5.0 * u * u * u * u).collect();
+            let beta = synth(tmax * nh, 4, 0.05, 0.95);
+            let conv0 = ConvState(synth(ConvState::zeros(&cfg, 1).0.len(), 5, -1.0, 1.0));
+            let state0 = KdaState(synth(nh * hd * hd, 6, -0.3, 0.3));
+            let kers = load(&g, &cfg).unwrap();
+            for t in [1usize, 17, 63, 64, 65, 127, 150, 300] {
+                pf2_case(&g, &kers, &cfg, &x, &wconv, &gpre, &beta, &conv0, &state0, t, 2e-4);
+            }
+        }
+    }
 
     fn loadf(name: &str) -> Vec<f32> {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/glm5/kda/",);
@@ -713,6 +1235,71 @@ mod tests {
             d_conv: 4,
             gate_lower_bound: Some(-5.0),
             eps: 1e-5,
+        }
+    }
+
+    /// Core-only timing at the real GLM-5.3 shape (64 heads × 128, conv 4), per layer:
+    /// the original window flow (host-staged 64-chunks through `DevKda::prefill` + the CPU
+    /// `kda_chunk` tail, exactly `DevLayer::window`'s old core) vs PF2 (`prefill_dev`, data
+    /// already on the device). Ignored by default; run with `-- --ignored glm5_kda_pf2_bench`.
+    #[test]
+    #[ignore]
+    fn glm5_kda_pf2_bench() {
+        let Some(g) = gpu() else { return };
+        let cfg = KdaConfig::glm53();
+        let (nh, hd, ch) = (cfg.heads, cfg.head_dim, cfg.conv_dim());
+        let kers = load(&g, &cfg).unwrap();
+        let tmax = 2048usize;
+        let x = synth(tmax * ch, 1, -1.5, 1.5);
+        let wconv = synth(ch * cfg.d_conv, 2, -0.6, 0.6);
+        let gpre: Vec<f32> = synth(tmax * nh * hd, 3, 0.0, 1.0).iter().map(|u| -5.0 * u * u * u * u).collect();
+        let beta = synth(tmax * nh, 4, 0.05, 0.95);
+        let (c0, s0) = (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
+        let s = tang_moe::gpu::Stream::blocking().unwrap();
+        for t in [20usize, 64, 512, 2048] {
+            let (xs, gs, bs) = (&x[..t * ch], &gpre[..t * nh * hd], &beta[..t * nh]);
+            // old: 64-chunks on the device from host data, CPU tail
+            let mut dev = DevKda::new(&g, &kers, &cfg, &wconv, &c0, &s0, 1).unwrap();
+            let mut conv = c0.clone();
+            let mut dummy = KdaState::zeros(&cfg, 1);
+            let t_old = std::time::Instant::now();
+            let mut off = 0;
+            while off + 64 <= t {
+                dev.prefill(&kers, &cfg, &xs[off * ch..(off + 64) * ch], &gs[off * nh * hd..(off + 64) * nh * hd],
+                    &bs[off * nh..(off + 64) * nh], &mut conv, &mut dummy, 1, 64).unwrap();
+                off += 64;
+            }
+            if off < t {
+                let (mut hc, mut hs) = (conv.clone(), KdaState::zeros(&cfg, 1));
+                dev.read_conv(&mut hc).unwrap();
+                dev.read_state(&mut hs).unwrap();
+                let y = kda::conv1d_prefill(&xs[off * ch..], &wconv, &mut hc, &cfg, 1, t - off).unwrap();
+                kda::kda_chunk(&y, &gs[off * nh * hd..], &bs[off * nh..], &mut hs, &cfg, 1, t - off, 64).unwrap();
+                dev.h0.write(0, &hc.0).unwrap();
+                dev.st.write(0, &hs.0).unwrap();
+            }
+            let old_ms = t_old.elapsed().as_secs_f64() * 1e3;
+            // PF2: inputs device-resident (the engine's projections write them there)
+            let mut dev2 = DevKda::new(&g, &kers, &cfg, &wconv, &c0, &s0, 1).unwrap();
+            dev2.enable_pf2(t.min(512)).unwrap();
+            let xb = tang_moe::gpu::DevBuf::from_slice(xs).unwrap();
+            let gb = tang_moe::gpu::DevBuf::from_slice(gs).unwrap();
+            let bb = tang_moe::gpu::DevBuf::from_slice(bs).unwrap();
+            let ob = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(t * nh * hd).unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                xb.write(0, xs).unwrap(); // the conv runs in place: restore the input
+                let t0 = std::time::Instant::now();
+                dev2.prefill_dev(&kers, &s, xb.ptr, ch, gb.ptr, nh * hd, bb.ptr, nh, ob.ptr, t).unwrap();
+                s.sync().unwrap();
+                best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "pf2 bench T={t}: old core {old_ms:.2} ms/layer, pf2 {best:.3} ms/layer ({:.0}x) — x34 layers: old {:.0} ms, pf2 {:.1} ms",
+                old_ms / best,
+                old_ms * 34.0,
+                best * 34.0
+            );
         }
     }
 
