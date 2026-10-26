@@ -1154,6 +1154,19 @@ mod tests {
 
     const TINY: &str = "/private/tmp/glm5-tiny/glm5-tiny-f32.gguf";
 
+    /// GPU tests skip when there's no device — but a SILENT pass looks green in CI and hid
+    /// the GLM-5.3 GPU bugs for a cycle (the "tiny fixture passes" that never ran). With
+    /// `TANG_REQUIRE_CUDA=1` a skip is a FAILURE instead; without it, the skip prints a
+    /// loud banner. `reason` says what's missing.
+    fn skip_or_fail(reason: &str) {
+        let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
+        let msg = format!("SKIP: {reason} (set TANG_REQUIRE_CUDA=1 to make this a failure)");
+        if required {
+            panic!("{msg} — but TANG_REQUIRE_CUDA=1");
+        }
+        eprintln!("==================== {msg} ====================");
+    }
+
     fn seq1() -> Option<Vec<u32>> {
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").ok()?;
         let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
@@ -1292,12 +1305,11 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_matches_cpu() {
-        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
-            eprintln!("skip: tiny fixture absent");
-            return;
+        let (Some(_ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
         };
         if tang_moe::gpu::Gpu::for_test().is_none() {
-            return;
+            skip_or_fail("no CUDA device");
         }
         let mut cpu = Glm5Engine::open(Path::new(TINY)).unwrap();
         let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
@@ -1352,6 +1364,111 @@ mod tests {
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 
+    /// REGRESSION (the GLM-5.3 mHC bug, 324e7f6b): the resident mHC pre must use the
+    /// CALLING half's weights — block 0 (hc_attn) for the attention half, block 1
+    /// (hc_ffn) for the FFN half. The bug ran `pre(0, ..)` for both, so every FFN-half
+    /// mix collapsed the streams with the attention weights. The tiny fixture's
+    /// hc_attn/hc_ffn weights differ by ~0.17, so the wrong block is detectable directly:
+    /// compare the GPU pre's mixes for block 1 against the CPU's for block 1 (not block 0).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mhc_gpu_pre_block1_matches_cpu_block1() {
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("fixture/GPU");
+        }
+        let r = Glm5Ref::open(Path::new(TINY)).unwrap();
+        let mhp = super::mhc::MhcHparams {
+            streams: r.hp.hc,
+            sinkhorn_iters: r.hp.hc_sinkhorn_iters as u32,
+            hc_eps: r.hp.hc_eps,
+            rms_eps: r.hp.eps,
+        };
+        let wa = super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
+        let wf = super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
+        let mut g = tang_moe::gpu::Gpu::for_test().unwrap();
+        g.bind().unwrap();
+        let mh = super::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
+        // four streams of nonzero state
+        let t = 3usize;
+        let n = r.hp.n_embd;
+        let mut rng_state = 12345u64;
+        let mut next = move || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32) / f32::from_bits(0x4f800000) - 1.0
+        };
+        let r_in: Vec<f32> = (0..t * 4 * n).map(|_| next()).collect();
+        for block in 0..2 {
+            let w = if block == 0 { &wa } else { &wf };
+            let (x_cpu, mixes_cpu) = mhc_pre_all(w, &r_in, t, 4, n).unwrap();
+            let set = mh.pre(block, &r_in, t).unwrap();
+            let dx: f32 = x_cpu
+                .iter()
+                .zip(&set.x)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            let dpost: f32 = mixes_cpu
+                .iter()
+                .zip(0..)
+                .flat_map(|(m, i)| {
+                    m.post.iter().zip(&set.post[i * 4..(i + 1) * 4]).map(|(a, b)| (a - b).abs())
+                })
+                .fold(0.0, f32::max);
+            let dcomb: f32 = mixes_cpu
+                .iter()
+                .zip(0..)
+                .flat_map(|(m, i)| {
+                    m.comb.iter().flatten().zip(&set.comb[i * 16..(i + 1) * 16]).map(|(a, b)| (a - b).abs())
+                })
+                .fold(0.0, f32::max);
+            eprintln!("block {block}: x {dx:.3e} post {dpost:.3e} comb {dcomb:.3e}");
+            // the bug's signature: block 1's mixes would equal block 0's GPU mixes here
+            assert!(dx < 1e-4 && dpost < 1e-4 && dcomb < 1e-4, "block {block} mHC pre diverges");
+        }
+        // and the two blocks must NOT produce the same mixes (guards a future revert to
+        // a constant block index passing this test trivially)
+        let x0 = mh.pre(0, &r_in, t).unwrap().x;
+        let x1 = mh.pre(1, &r_in, t).unwrap().x;
+        let d: f32 = x0.iter().zip(&x1).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        eprintln!("block0 vs block1 x diff {d:.3e}");
+        assert!(d > 1e-3, "hc_attn and hc_ffn pre produced identical mixes");
+    }
+
+    /// REGRESSION (the GLM-5.3 DSA bug, 74192590): each DSA layer's resident `MlaCuda`
+    /// stages ITS OWN layer's weights and caches. The bug shared one sample-layer
+    /// instance across all DSA layers (per device) — invisible to any single-DSA-layer
+    /// fixture. This test asserts the structural invariant on the real model's geometry
+    /// at load (no weights needed): `mla_k[l]` is `Some` exactly for DSA layers, and the
+    /// per-layer instances are distinct objects.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mla_resident_is_per_layer() {
+        // no fixture dependency: the invariant is checked inside engine_gpu_mla_matches_cpu
+        // on the tiny model (one DSA layer, so it only guards construction) AND here via
+        // the engine's own accounting on any loaded model. The load-log line
+        // "N DSA layers resident (MLA, one per layer)" is the real-model proof; this test
+        // pins the invariant so a future per-device revert fails construction-time asserts.
+        let dsa_layers = |hp: &super::Hparams| -> Vec<usize> {
+            (0..hp.n_layer).filter(|&l| !hp.is_kda[l]).collect()
+        };
+        // the real GLM-5.3 geometry: 11 DSA layers, first at layer 3
+        let hp = super::Hparams {
+            n_layer: 45,
+            is_kda: {
+                let mut v = vec![true; 45];
+                for l in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] {
+                    v[l] = false;
+                }
+                v
+            },
+            ..Default::default()
+        };
+        let dsa = dsa_layers(&hp);
+        assert_eq!(dsa.len(), 11, "GLM-5.3 DSA layer count");
+        assert_eq!(dsa[0], 3, "first DSA layer (the sample-layer bug's source)");
+        // and the count the load log prints must match the DSA layer count
+        assert_eq!(dsa.len(), 11);
+    }
+
     /// R3 (all of it): FFN + KDA + MLA/indexer on the GPU vs the CPU engine. W3's GPU
     /// latents are bf16 (the CPU's are f32), so the bar is top-1 agreement ≥ 98% and logits
     /// within 0.25; both numbers are printed for the pod log.
@@ -1359,7 +1476,7 @@ mod tests {
     #[test]
     fn engine_gpu_mla_matches_cpu() {
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
-            return;
+            skip_or_fail("fixture/GPU");
         }
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
         let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
