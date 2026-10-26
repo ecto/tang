@@ -427,6 +427,12 @@ impl DevLayer {
             )?;
         }
         self.s.sync()?;
-        Ok(self.outb.read::<f32>(0, t * hidden)?)
+        let out = self.outb.read::<f32>(0, t * hidden)?;
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the layer OUTPUT (post gated-norm + o_proj): pins the divergence to the
+            // core (ob/yb) or the output path (norm/wo) when x already matches
+            eprintln!("kda gpu y[0..8]: {:?}", &out[..8.min(out.len())]);
+        }
+        Ok(out)
     }
 }
