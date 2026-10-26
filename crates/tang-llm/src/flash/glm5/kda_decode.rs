@@ -170,46 +170,73 @@ impl DevLayer {
                     self.yb.ptr, self.cfg.eps],
             )?;
             mark(3)?;
-            launch(
-                self.gv.gemv,
-                grid(hidden),
-                (128, 1, 1),
-                0,
-                s,
-                args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, 1u32,
-                    hidden as u32, di as u32],
-            )?;
+            // o_proj: gemv8 quantises yb (d_inner wide) first — the SAME xq8 the q/k/v
+            // pre-pass used (nothing reads x's codes after the q/k/v GEMVs, so overwriting
+            // them here is safe; kda_dev's finish() does the same)
+            let g8o = gemv8 && self.wo.w.ty == 8;
+            if g8o {
+                launch(
+                    self.gv.q8,
+                    ((di / 32) as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    s,
+                    args![self.yb.ptr, self.xq8.ptr, di as u32, self.max_t as u32],
+                )?;
+                let codes = self.xq8.ptr;
+                let scales = codes + (self.max_t * di) as u64;
+                let smem = (super::K5_WARPS * ((self.wo.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
+                launch(
+                    self.gv.gemv8,
+                    (hidden.div_ceil(super::K5_WARPS) as u32, 1, 1),
+                    (128, 1, 1),
+                    smem,
+                    s,
+                    args![self.wo.w, 0u32, codes, scales, self.outb.ptr, hidden as u32, 1u32,
+                        hidden as u32, di as u32],
+                )?;
+            } else {
+                launch(
+                    self.gv.gemv,
+                    grid(hidden),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, 1u32,
+                        hidden as u32, di as u32],
+                )?;
+            }
             mark(4)?;
         }
         Ok(())
     }
 
     /// One decode token through the fused step (`mode` Fused or Graph). Same contract as
-    /// [`DevLayer::window`] at `t = 1`, including the debug taps.
+    /// [`DevLayer::window`] at `t = 1`, including the shadow-check probe (the poisoned
+    /// buffers get their taps read out of the device, `out`/`conv_host` put on the host).
     pub(super) fn decode_fast(&mut self, x: &[f32], conv: &mut ConvState, mode: Mode) -> Result<Vec<f32>> {
         ensure!(x.len() == self.hidden, "k5 decode input");
         ensure!(mode != Mode::Naive, "decode_fast: naive mode");
         let (nh, di, hidden) = (self.nh, self.d_inner, self.hidden);
-        // kda_dev's rule: the layer's gemv8 toggle, and only when q/k/v are all Q8_0 (the
-        // kernel reads 34-byte Q8_0 blocks; the f32 tiny fixture must take k5_gemv)
-        let gemv8 = self.gemv8 && [&self.wq, &self.wk, &self.wv].iter().all(|w| w.w.ty == 8);
+        // kda_dev's per-matrix rule (the x pre-pass): gemv8 only when q/k/v are all Q8_0
+        // (the kernel reads 34-byte Q8_0 blocks; the f32 tiny fixture must take k5_gemv)
+        let g8 = |w: &super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
+        let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv);
         // the core's prefill path uses its own stream: make sure it has drained (it syncs
         // at the end of every call, so this is free; it keeps the ordering explicit)
         self.core.s.sync()?;
         // synchronous HtoD on the legacy stream; self.s is BLOCKING, so the launches (or
         // the graph) below are ordered after it
         self.xb.write(0, x)?;
-        if self.debug && super::super::kda_debug::poison_on() {
-            let nan = |n: usize| vec![f32::NAN; n];
-            self.qkvb.write(0, &nan(3 * di))?;
-            self.g1b.write(0, &nan(self.hd))?;
-            self.gb_out.write(0, &nan(di))?;
-            self.bb.write(0, &nan(nh))?;
-            self.g2a.write(0, &nan(self.hd))?;
-            self.g2b.write(0, &nan(di))?;
-            self.ob.write(0, &nan(di))?;
-            self.yb.write(0, &nan(di))?;
-            self.outb.write(0, &nan(hidden))?;
+        let mut tp = self.probe.take();
+        if let Some(p) = &tp {
+            // NaN-fill every output scratch this window writes (whole buffers): a region
+            // no kernel touches then reads NaN in the shadow check, not a plausible 0.0.
+            // (The PF2 workspace `core.ws` is prefill-only, not touched at t = 1.)
+            p.poison(&[
+                &self.qkvb, &self.g1b, &self.gb_out, &self.bb, &self.g2a, &self.g2b, &self.yb,
+                &self.outb, &self.ob,
+            ])?;
         }
         match mode {
             Mode::Graph if self.fast.as_ref().and_then(|f| f.graph.as_ref()).is_some_and(|g| g.1 == gemv8) => {
@@ -235,30 +262,33 @@ impl DevLayer {
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, hidden)?;
-        if self.debug {
-            let qkv_h = self.qkvb.read::<f32>(0, 3 * di)?;
-            // the host conv shift (DevKda::decode's side effect), for the conv_host check
-            let m = self.cfg.d_conv - 1;
-            let ch = 3 * di;
-            let mut next = conv.0.clone();
-            for c in 0..ch {
-                for s2 in 0..m {
-                    next[c * m + s2] = if s2 + 1 < m { conv.0[c * m + s2 + 1] } else { qkv_h[c] };
-                }
+        let Some(mut p) = tp else {
+            // no probe: keep the pre-probe behavior — the host conv copy is NOT shifted
+            // (that would cost a qkv read-back per token per layer; nothing reads it while
+            // the device is fresh — `read_back` syncs it before any CPU use)
+            return Ok(out);
+        };
+        use super::kda_debug::tap;
+        // the host conv shift (DevKda::decode's side effect), from qkv PRE-conv (the same
+        // qkv the step kernel consumed)
+        let qkv_h = self.qkvb.read::<f32>(0, 3 * di)?;
+        let m = self.cfg.d_conv - 1;
+        let ch = 3 * di;
+        let mut next = conv.0.clone();
+        for c in 0..ch {
+            for s2 in 0..m {
+                next[c * m + s2] = if s2 + 1 < m { conv.0[c * m + s2 + 1] } else { qkv_h[c] };
             }
-            conv.0 = next;
-            let tp = super::super::kda_debug::KdaTaps {
-                qkv_pre: qkv_h,
-                g: self.gb_out.read::<f32>(0, di)?,
-                beta: self.bb.read::<f32>(0, nh)?,
-                o: self.ob.read::<f32>(0, di)?,
-                g2: self.g2b.read::<f32>(0, di)?,
-                y_norm: self.yb.read::<f32>(0, di)?,
-                out: out.clone(),
-                ..Default::default()
-            };
-            self.taps = Some(tp);
         }
+        *conv = next;
+        p.put(tap::QKV, qkv_h);
+        p.put(tap::G, self.gb_out.read::<f32>(0, di)?);
+        p.put(tap::BETA, self.bb.read::<f32>(0, nh)?);
+        p.put(tap::O, self.ob.read::<f32>(0, di)?);
+        p.put(tap::G2, self.g2b.read::<f32>(0, di)?);
+        p.put(tap::Y_NORM, self.yb.read::<f32>(0, di)?);
+        p.put(tap::OUT, out.clone());
+        self.probe = Some(p);
         Ok(out)
     }
 }

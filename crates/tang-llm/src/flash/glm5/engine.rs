@@ -71,6 +71,10 @@ pub struct GpuFfn {
     /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
     /// scratch pool on the device; `TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
     mhc_g: Vec<Option<super::mhc::MhcGpu>>,
+    /// The fused, device-resident mHC ([`super::mhc_fused::MhcFused`]):
+    /// `TANG_GLM5_MHC_FUSED=1`, single device, every layer's `MhcGpu` resident. `None`:
+    /// the per-call [`Self::mhc_g`] path.
+    pub(crate) mhc_f: Option<super::mhc_fused::MhcFused>,
     layers: Vec<super::moe::gpu::DevMoe>,
     dev_of: Vec<usize>,
     pub split: usize,
@@ -89,6 +93,7 @@ impl Drop for GpuFfn {
         }
         self.kda_l.clear();
         self.mla_k.clear();
+        self.mhc_f = None;
         self.mhc_g.clear();
         self.layers.clear();
         self.kda_kernels.clear();
@@ -266,6 +271,9 @@ impl GpuFfn {
             );
         }
         let kda_dev_fresh = vec![false; n_layer];
+        let mhc_fused = mhc_on
+            && devs.len() == 1
+            && std::env::var("TANG_GLM5_MHC_FUSED").is_ok_and(|v| v == "1");
 
         let t0 = Instant::now();
         let ffn_on = !std::env::var("TANG_GLM5_GPU_FFN").is_ok_and(|v| v == "0");
@@ -297,7 +305,7 @@ impl GpuFfn {
                 String::new()
             }
         );
-        Ok(Some(Self {
+        let mut f = Self {
             devs,
             kda_l,
             kda_dev_fresh,
@@ -305,10 +313,39 @@ impl GpuFfn {
             max_t,
             mla_k,
             mhc_g,
+            mhc_f: None,
             layers,
             dev_of,
             split,
-        }))
+        };
+        if mhc_fused {
+            f.enable_mhc_fused(g, hp)?;
+        }
+        Ok(Some(f))
+    }
+
+    /// Build the fused mHC ([`Self::mhc_f`]; `load` does when `TANG_GLM5_MHC_FUSED=1`).
+    /// Single device only; the windows it serves need every layer's `MhcGpu` resident.
+    pub(crate) fn enable_mhc_fused(&mut self, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
+        ensure!(self.devs.len() == 1, "fused mHC: single device only");
+        self.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0: {e}"))?;
+        let norms = (0..hp.n_layer)
+            .map(|l| -> Result<[Vec<f32>; 2]> {
+                Ok([
+                    g.tensor_f32(&super::t(l, "attn_norm.weight"))?,
+                    g.tensor_f32(&super::t(l, "ffn_norm.weight"))?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.mhc_f = Some(super::mhc_fused::MhcFused::new(
+            &self.devs[0].0,
+            hp.n_embd,
+            self.max_t,
+            norms,
+            hp.eps,
+        )?);
+        eprintln!("glm5: mHC fused (device-resident streams, {} layers)", hp.n_layer);
+        Ok(())
     }
 
     /// Layer `l`'s FFN on its GPU: host `x` `[t][hidden]` in, host `y` out.
@@ -396,6 +433,13 @@ impl Glm5Engine {
         self.tokens.clear();
         for s in &mut self.kda {
             *s = None;
+        }
+        // the resident KDA layers hold the live state on the device: without this the
+        // next sequence's first window skipped the seed and continued the OLD sequence's
+        // conv + recurrent state (the host copies above are the fresh zeros it must get)
+        #[cfg(feature = "cuda")]
+        if let Some(g) = self.gpu.as_mut() {
+            g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
         }
         for c in &mut self.dsa {
             *c = DsaCache::default();
@@ -491,14 +535,14 @@ impl Glm5Engine {
                 dbg.prime(l, &st.0, &st.1);
                 let (mut c_in, mut s_in) = (st.0.clone(), st.1.clone());
                 dev.read_back(&mut c_in, &mut s_in)?;
-                dev.debug = true;
+                dev.probe = Some(dbg.probe());
                 let y = dev.window(x, t, &mut st.0);
-                dev.debug = false;
+                let probe = dev.probe.take();
                 let y = y?;
-                let taps = dev.taps.take().unwrap_or_default();
+                let taps = probe.map(|p| p.taps).unwrap_or_default();
                 let (mut c_out, mut s_out) = (st.0.clone(), st.1.clone());
                 dev.read_back(&mut c_out, &mut s_out)?;
-                dbg.check(l, x, t, w, cfg, &taps, &st.0, &c_out, &s_out, Some(&s_in))?;
+                dbg.check(l, x, t, w, cfg, taps, &st.0, &c_out, &s_out, Some(&s_in))?;
                 return Ok(y);
             }
         }
@@ -650,6 +694,100 @@ impl Glm5Engine {
         mhc_post_all(mixes, y, r, t, hc, n)
     }
 
+    /// Start a fused-mHC window when it applies ([`GpuFfn::mhc_f`]): uploads the embedded
+    /// streams. `false`: this window runs the per-call path (no fused instance, a window
+    /// past the scratch, or the per-layer dump, which reads the host streams).
+    fn mhc_fused_begin(&mut self, r: &[f32], t: usize) -> Result<bool> {
+        #[cfg(feature = "cuda")]
+        if self.dump.is_none() {
+            if let Some(g) = self.gpu.as_mut() {
+                let all = g.mhc_g.iter().all(|m| m.is_some());
+                if let (true, Some(f)) = (all, g.mhc_f.as_mut()) {
+                    if t <= f.max_t() {
+                        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                        f.begin(r, t)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        let _ = (r, t);
+        Ok(false)
+    }
+
+    /// One half block's mHC pre followed by its RMSNorm (block 0: `attn_norm`, block 1:
+    /// `ffn_norm`). Fused: one device pass, the streams stay resident and `r` is not read
+    /// (the mixes stay on the device too, so the returned `Vec<Mix>` is empty).
+    #[allow(clippy::too_many_arguments)]
+    fn mhc_pre_norm(
+        &mut self,
+        fused: bool,
+        l: usize,
+        block: usize,
+        w: &super::mhc::MhcWeights,
+        r: &[f32],
+        t: usize,
+    ) -> Result<(Vec<f32>, Vec<super::mhc::Mix>)> {
+        #[cfg(feature = "cuda")]
+        if fused {
+            let g = self.gpu.as_mut().context("fused mHC without a GPU")?;
+            g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            let mh = g.mhc_g[l].as_ref().context("fused mHC: layer not resident")?;
+            let f = g.mhc_f.as_mut().context("fused mHC: no instance")?;
+            // `block`, not a constant: it picks hc_attn/hc_ffn AND attn_norm/ffn_norm
+            return Ok((f.pre(mh, l, block, Some(w))?, Vec::new()));
+        }
+        let _ = fused;
+        let (mut x, mixes) = self.mhc_pre(l, block, w, r, t)?;
+        let norm = if block == 0 { "attn_norm.weight" } else { "ffn_norm.weight" };
+        self.m.norm_all(&mut x, l, norm)?;
+        Ok((x, mixes))
+    }
+
+    /// The half block's mHC post. Fused: uploads `y`; the next pre (or the head) applies it.
+    fn mhc_post_any(
+        &mut self,
+        fused: bool,
+        l: usize,
+        mixes: &[super::mhc::Mix],
+        y: &[f32],
+        r: &mut [f32],
+        t: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if fused {
+            let g = self.gpu.as_mut().context("fused mHC without a GPU")?;
+            g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            return g.mhc_f.as_mut().context("fused mHC: no instance")?.post(y);
+        }
+        let _ = fused;
+        self.mhc_post(l, mixes, y, r, t)
+    }
+
+    /// The head's unweighted stream mean `[t][n]`. Fused: the last post + mean on the device.
+    fn hc_head_all(&mut self, fused: bool, r: &[f32], t: usize) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if fused {
+            let g = self.gpu.as_mut().context("fused mHC without a GPU")?;
+            g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            return g.mhc_f.as_mut().context("fused mHC: no instance")?.end();
+        }
+        let _ = fused;
+        let (n, hc) = (self.m.hp.n_embd, self.m.hp.hc);
+        let mut h = vec![0f32; t * n];
+        for i in 0..t {
+            for c in 0..hc {
+                for j in 0..n {
+                    h[i * n + j] += r[(i * hc + c) * n + j];
+                }
+            }
+            for v in &mut h[i * n..(i + 1) * n] {
+                *v /= hc as f32;
+            }
+        }
+        Ok(h)
+    }
+
     /// Run `ids` after the tokens so far. Returns their logits `[ids.len()][n_vocab]`.
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
@@ -681,13 +819,13 @@ impl Glm5Engine {
             rms_eps: hp.eps,
         };
 
+        let fused = self.mhc_fused_begin(&r, t)?;
         let mut t_embd = Instant::now();
         for l in 0..hp.n_layer {
             // ---- attention half
             let t0 = Instant::now();
             let w_attn = self.hc_weights(l, "hc_attn", &mhp)?;
-            let (mut x, mixes) = self.mhc_pre(l, 0, &w_attn, &r, t)?;
-            self.m.norm_all(&mut x, l, "attn_norm.weight")?;
+            let (x, mixes) = self.mhc_pre_norm(fused, l, 0, &w_attn, &r, t)?;
             stage("mhc_pre+norm(attn)", &t0);
             let t1 = Instant::now();
             let y = if hp.is_kda[l] {
@@ -715,17 +853,17 @@ impl Glm5Engine {
                 y
             };
             let t2 = Instant::now();
-            self.mhc_post(l, &mixes, &y, &mut r, t)?;
+            self.mhc_post_any(fused, l, &mixes, &y, &mut r, t)?;
             stage("mhc_post(attn)", &t2);
 
             // ---- FFN half
             let t3 = Instant::now();
             let w_ffn = self.hc_weights(l, "hc_ffn", &mhp)?;
-            let (mut x, mixes) = self.mhc_pre(l, 1, &w_ffn, &r, t)?;
-            self.m.norm_all(&mut x, l, "ffn_norm.weight")?;
+            let (x, mixes) = self.mhc_pre_norm(fused, l, 1, &w_ffn, &r, t)?;
+            stage("mhc_pre+norm(ffn)", &t3);
             let y = self.ffn(l, &x, t)?;
             let t4 = Instant::now();
-            self.mhc_post(l, &mixes, &y, &mut r, t)?;
+            self.mhc_post_any(fused, l, &mixes, &y, &mut r, t)?;
             stage("ffn", &t3);
             stage("mhc_post(ffn)", &t4);
             // W0's R3 bisector: dump the last position's post-FFN streams (no-op
@@ -739,17 +877,7 @@ impl Glm5Engine {
         stage("layers", &t_embd);
         // ---- head: unweighted stream mean, output norm, lm_head
         let t5 = Instant::now();
-        let mut h = vec![0f32; t * n];
-        for i in 0..t {
-            for c in 0..hc {
-                for j in 0..n {
-                    h[i * n + j] += r[(i * hc + c) * n + j];
-                }
-            }
-            for v in &mut h[i * n..(i + 1) * n] {
-                *v /= hc as f32;
-            }
-        }
+        let mut h = self.hc_head_all(fused, &r, t)?;
         self.m.norm_all_exact(&mut h, "output_norm.weight")?;
         if self.head.is_none() {
             self.head = Some(self.m.head()?);
@@ -1158,13 +1286,9 @@ mod tests {
     /// the GLM-5.3 GPU bugs for a cycle (the "tiny fixture passes" that never ran). With
     /// `TANG_REQUIRE_CUDA=1` a skip is a FAILURE instead; without it, the skip prints a
     /// loud banner. `reason` says what's missing.
+    /// (Now [`tang_verify::skip_or_fail`], shared by every kernel test.)
     fn skip_or_fail(reason: &str) {
-        let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
-        let msg = format!("SKIP: {reason} (set TANG_REQUIRE_CUDA=1 to make this a failure)");
-        if required {
-            panic!("{msg} — but TANG_REQUIRE_CUDA=1");
-        }
-        eprintln!("==================== {msg} ====================");
+        tang_verify::skip_or_fail(reason)
     }
 
     fn seq1() -> Option<Vec<u32>> {
@@ -1305,7 +1429,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_matches_cpu() {
-        let (Some(_ids), true) = (seq1(), Path::new(TINY).exists()) else {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
             return;
         };
@@ -1366,6 +1490,65 @@ mod tests {
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 
+    /// The fused, device-resident mHC (`TANG_GLM5_MHC_FUSED=1`, [`super::mhc_fused`])
+    /// against the CPU engine on the tiny model: the same windows as
+    /// [`engine_gpu_matches_cpu`] (150-token prefill, decode steps, a short window), the
+    /// fused instance built explicitly so the test doesn't depend on the env.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_fused_mhc_matches_cpu() {
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("fixture/GPU");
+            return;
+        }
+        let mut cpu = Glm5Engine::open(Path::new(TINY)).unwrap();
+        let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(gpu.use_gpu().unwrap(), "GPU did not load");
+        {
+            let (g, hp) = (&gpu.m.g, gpu.m.hp.clone());
+            let gf = gpu.gpu.as_mut().unwrap();
+            for k in &mut gf.mla_k {
+                *k = None;
+            }
+            if gf.mhc_f.is_none() {
+                gf.enable_mhc_fused(g, &hp).unwrap();
+            }
+            // NaN in every fused output before each launch: an unwritten region can't pass
+            gf.mhc_f.as_mut().unwrap().set_poison(true);
+        }
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        let nv = cpu.m.hp.n_vocab;
+        let (mut worst, mut flips) = (0f32, 0usize);
+        for w in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]] {
+            let a = cpu.window(w).unwrap();
+            let b = gpu.window(w).unwrap();
+            for p in 0..w.len() {
+                let (ra, rb) = (&a[p * nv..(p + 1) * nv], &b[p * nv..(p + 1) * nv]);
+                if argmax(ra) != argmax(rb) {
+                    flips += 1;
+                    eprintln!("fused mHC: pos {p}: top-1 cpu {} gpu {}", argmax(ra), argmax(rb));
+                }
+            }
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        let ran = gpu.gpu.as_ref().unwrap().mhc_f.as_ref().unwrap().windows();
+        eprintln!("GPU (fused mHC + KDA + FFN) vs CPU: {flips} top-1 flips, logits max abs {worst:.3e}, {ran} fused windows");
+        // the windows that fit the scratch went through the fused path (all four at the
+        // default max_t; at TANG_GLM5_KDA_MAXT=64 the 150-token one runs the old path)
+        assert!(ran >= 3, "fused mHC ran {ran} windows");
+        assert_eq!(flips, 0, "top-1 flips");
+        assert!(worst <= 1e-3, "logits max abs {worst}");
+    }
+
     /// REGRESSION (the GLM-5.3 mHC bug, 324e7f6b): the resident mHC pre must use the
     /// CALLING half's weights — block 0 (hc_attn) for the attention half, block 1
     /// (hc_ffn) for the FFN half. The bug ran `pre(0, ..)` for both, so every FFN-half
@@ -1380,17 +1563,18 @@ mod tests {
             return;
         }
         let r = Glm5Ref::open(Path::new(TINY)).unwrap();
-        let mhp = super::super::mhc::MhcHparams {
+        let mhp = crate::flash::glm5::mhc::MhcHparams {
             streams: r.hp.hc,
             sinkhorn_iters: r.hp.hc_sinkhorn_iters as u32,
             hc_eps: r.hp.hc_eps,
             rms_eps: r.hp.eps,
         };
-        let wa = super::super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
-        let wf = super::super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
-        let g = tang_moe::gpu::Gpu::for_test().unwrap();
+        let wa = crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
+        let wf = crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
+        let mut g = tang_moe::gpu::Gpu::for_test().unwrap();
         g.bind().unwrap();
-        let mh = super::super::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
+        let mh = crate::flash::glm5::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
+
         // four streams of nonzero state
         let t = 3usize;
         let n = r.hp.n_embd;
@@ -1444,12 +1628,22 @@ mod tests {
     /// per-layer instances are distinct objects.
     #[test]
     fn mla_resident_is_per_layer() {
-        // the real GLM-5.3 geometry (HF config kda_layers): 11 DSA layers, the first at 3 —
-        // the sample layer the per-device bug froze for all of them. The load-time
-        // invariant (mla_k[l] is Some exactly on DSA layers) is asserted on a real engine
-        // in engine_gpu_mla_matches_cpu; this pins the geometry the bug class depends on.
-        let is_kda: Vec<bool> = (0..45).map(|l| l % 4 != 3).collect();
-        let dsa: Vec<usize> = (0..45).filter(|&l| !is_kda[l]).collect();
+        // no fixture dependency: the invariant is checked inside engine_gpu_mla_matches_cpu
+        // on the tiny model (one DSA layer, so it only guards construction) AND here via
+        // the engine's own accounting on any loaded model. The load-log line
+        // "N DSA layers resident (MLA, one per layer)" is the real-model proof; this test
+        // pins the invariant so a future per-device revert fails construction-time asserts.
+        // (Hparams has no Default; the layer-kind mask is all the invariant needs)
+        let dsa_layers = |is_kda: &[bool]| -> Vec<usize> {
+            (0..is_kda.len()).filter(|&l| !is_kda[l]).collect()
+        };
+        // the real GLM-5.3 geometry: 11 DSA layers, first at layer 3
+        let mut is_kda = vec![true; 45];
+        for l in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] {
+            is_kda[l] = false;
+        }
+        let dsa = dsa_layers(&is_kda);
+
         assert_eq!(dsa.len(), 11, "GLM-5.3 DSA layer count");
         assert_eq!(dsa[0], 3, "first DSA layer (the sample-layer bug's source)");
         assert!(dsa.len() > 1, "a single-DSA-layer geometry cannot see this bug class");
@@ -1520,6 +1714,30 @@ mod tests {
         e.reset();
         let b = e.window(&ids[..6]).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// reset() gives a fresh sequence on the GPU too: the resident KDA layers must be
+    /// re-seeded from the zeroed host state, not continue the last sequence's device state.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_reset_gpu() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("no CUDA device");
+            return;
+        }
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu().unwrap());
+        let a = e.window(&ids[..6]).unwrap();
+        e.window(&ids[6..9]).unwrap();
+        e.reset();
+        let b = e.window(&ids[..6]).unwrap();
+        let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        println!("engine_reset_gpu: max |a - b| {d:.3e}");
+        assert!(d < 1e-4, "after reset the GPU window differs from a fresh one: {d}");
     }
 
     /// THE LESSON OF THIS PORT (the engine never wired the built-and-tested GPU structs
