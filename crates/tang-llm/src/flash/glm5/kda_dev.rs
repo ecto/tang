@@ -306,13 +306,17 @@ impl DevLayer {
                     args![self.xb.ptr, self.xq8.ptr, hidden as u32, t as u32],
                 )?;
                 let codes = self.xq8.ptr;
-                let scales = codes + (max_t * hidden) as u64;
+                let scales = codes + (self.max_t * hidden) as u64;
                 for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    // dynamic shared memory: one staged row per warp, 16-byte granules
+                    // (the kernel's `extern __shared__ uint4 dsm[]`); 0 here wrote past
+                    // the allocation — CUDA_ERROR_ILLEGAL_ADDRESS on the first real run
+                    let smem = (K5_WARPS * (w.w.row_bytes as usize).div_ceil(16) * 16) as u32;
                     launch(
                         self.gv.gemv8,
                         (di.div_ceil(K5_WARPS) as u32, t as u32, 1),
                         (128, 1, 1),
-                        0,
+                        smem,
                         &self.s,
                         args![w.w, 0u32, codes, scales, qkv + off, (3 * di) as u32,
                             t as u32, di as u32, hidden as u32],

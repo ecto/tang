@@ -83,7 +83,8 @@ __device__ __forceinline__ float k5_i2f(int q) { return __int_as_float(0x4B40000
 
 // x [T][COLS] f32 -> xq: plain int8 codes [T][COLS] then per-32 f32 scales [T][COLS/32]
 // (fe_q8's rule: d = amax/127 over each 32, round half away). Grid (COLS/32, T), block 32.
-extern "C" __global__ void k5_q8(const float* x, unsigned char* xq, unsigned COLS, unsigned T) {
+// MAXT = the scratch's row cap (the codes array is sized MAXT rows; scales follow it).
+extern "C" __global__ void k5_q8(const float* x, unsigned char* xq, unsigned COLS, unsigned MAXT) {
     const unsigned t = blockIdx.y, c = blockIdx.x, lane = threadIdx.x;
     const float v = x[(size_t)t * COLS + c * 32 + lane];
     float amax = fabsf(v);
@@ -91,7 +92,7 @@ extern "C" __global__ void k5_q8(const float* x, unsigned char* xq, unsigned COL
     const float d = amax / 127.0f;
     const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
     xq[(size_t)t * COLS + c * 32 + lane] = (unsigned char)(signed char)q;
-    if (lane == 0) ((float*)(xq + (size_t)T * COLS))[t * (COLS / 32) + c] = d;
+    if (lane == 0) ((float*)(xq + (size_t)MAXT * COLS))[t * (COLS / 32) + c] = d;
 }
 
 extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
@@ -120,8 +121,11 @@ extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
         for (int e0 = lane * 8; e0 < (int)COLS; e0 += 256) {
             const unsigned char* b = rowp + (e0 / 32) * 34;
             const float dw = g5_h2f(g5_u16(b));
-            const unsigned long long q = *(const unsigned long long*)(b + 2 + (e0 % 32));
-            const int w0 = (int)(unsigned)q, w1 = (int)(unsigned)(q >> 32);
+            // Q8_0 blocks are 34 B: b + 2 + e0%32 is NOT 8-byte aligned — assemble the two
+            // 4-byte words from bytes (a direct u64 load faults: MISALIGNED/ILLEGAL_ADDRESS)
+            const unsigned char* qb = b + 2 + (e0 % 32);
+            const int w0 = (int)((unsigned)qb[0] | ((unsigned)qb[1] << 8) | ((unsigned)qb[2] << 16) | ((unsigned)qb[3] << 24));
+            const int w1 = (int)((unsigned)qb[4] | ((unsigned)qb[5] << 8) | ((unsigned)qb[6] << 16) | ((unsigned)qb[7] << 24));
             const uint2 xv = *(const uint2*)(xrow + e0);
             const float dx = xd[(size_t)t * (COLS / 32) + e0 / 32];
             const int s = __dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0));
