@@ -14,6 +14,7 @@ pub mod coder_kernels;
 #[cfg(feature = "cuda")]
 pub mod engine;
 pub mod fa2;
+pub mod glm5;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 pub mod mtp;
@@ -29,6 +30,8 @@ pub mod requant;
 pub mod sampler;
 #[cfg(feature = "cuda")]
 pub mod serve;
+#[cfg(feature = "cuda")]
+pub mod split;
 pub mod tokenize;
 
 use crate::gguf::{Gguf, TensorInfo};

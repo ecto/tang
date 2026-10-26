@@ -611,6 +611,10 @@ impl FlashServe {
             }
             c.warm()?;
             Box::new(c)
+        } else if super::glm5::engine::is_glm5(&s.gguf) {
+            // GLM-5.3-Flash (W6's serve glue): one greedy sequence, prefix reuse by replay.
+            let g = super::glm5::serve_glue::Glm5Serve::load(&s.gguf)?;
+            Box::new(g)
         } else {
             let mut e = Engine::load(&s.gguf, opts)?;
             eprintln!("{}", e.load_report);
@@ -683,7 +687,9 @@ impl FlashServe {
             } else {
                 "none"
             },
-            suffix: s.suffix && !e.use_mtp(),
+            // Suffix drafts need an engine whose verify can rewind cheaply; the glm5 glue
+            // cannot yet, and one-sequence serving has nothing to draft against anyway.
+            suffix: s.suffix && !e.use_mtp() && e.max_slots() > 1,
             dcfg: crate::draft::DraftConfig::new(&e.draft_cost()),
             dglobal: crate::draft::Global::new(1 << 20, None),
             dcalib: crate::draft::Calibration::default(),
