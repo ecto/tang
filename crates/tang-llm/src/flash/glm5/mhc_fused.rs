@@ -30,9 +30,10 @@
 //!
 //! `TANG_GLM5_MHC_DEBUG=1` shadows every pre/post on the CPU from the device's own `r`
 //! (each step is checked alone, no accumulated drift) and prints `mhcdbg` lines plus a
-//! `mhcdbg SUMMARY` at teardown.
+//! `mhcdbg SUMMARY` at teardown. It also NaN-poisons every kernel output (`x`, `post`,
+//! `comb`, `part`, `h`) before each launch, so a region no kernel wrote reads NaN, not
+//! a plausible stale value.
 
-use super::kda_debug::{stat, Stat};
 use super::mhc::{MhcGpu, MhcWeights, Mix};
 use anyhow::{anyhow, bail, Result};
 use tang_moe::gpu::{DevBuf, Gpu, Module, Stream};
@@ -208,6 +209,60 @@ extern "C" __global__ void mhcf_finish(const float* r, const float* part, int ch
 }
 "#;
 
+/// GPU-vs-CPU statistics of one tensor (local, so this file doesn't depend on where the
+/// shadow-check helpers live: kda_debug today, tang-verify after that branch lands).
+#[derive(Clone, Debug, Default)]
+struct Stat {
+    rel_l2: f64,
+    max_abs: f64,
+    max_idx: usize,
+    nonfinite_gpu: usize,
+    nonfinite_cpu: usize,
+    len_mismatch: bool,
+}
+
+impl Stat {
+    /// Off by more than `tol` relative L2, NaN/Inf the CPU doesn't have, or a length
+    /// mismatch.
+    fn bad(&self, tol: f64) -> bool {
+        self.len_mismatch || !(self.rel_l2 <= tol) || self.nonfinite_gpu > self.nonfinite_cpu
+    }
+}
+
+fn stat(gpu: &[f32], cpu: &[f32]) -> Stat {
+    let mut s = Stat {
+        len_mismatch: gpu.len() != cpu.len(),
+        ..Default::default()
+    };
+    let (mut d2, mut c2) = (0f64, 0f64);
+    for (i, (&g, &c)) in gpu.iter().zip(cpu).enumerate() {
+        s.nonfinite_gpu += usize::from(!g.is_finite());
+        s.nonfinite_cpu += usize::from(!c.is_finite());
+        let d = if g.is_finite() && c.is_finite() {
+            (g as f64 - c as f64).abs()
+        } else {
+            f64::INFINITY
+        };
+        if d > s.max_abs || i == 0 {
+            (s.max_abs, s.max_idx) = (d, i);
+        }
+        if d.is_finite() {
+            d2 += d * d;
+            c2 += c as f64 * c as f64;
+        }
+    }
+    s.rel_l2 = if s.nonfinite_gpu > s.nonfinite_cpu {
+        f64::INFINITY
+    } else if c2 > 1e-60 {
+        (d2 / c2).sqrt()
+    } else if d2 > 1e-60 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    s
+}
+
 /// The CPU shadow of the fused path (`TANG_GLM5_MHC_DEBUG=1`).
 struct Dbg {
     tol: f64,
@@ -295,6 +350,8 @@ pub struct MhcFused {
     pending: bool,
     /// Windows completed (`end` calls): the tests' "the fused path actually ran" check.
     windows: usize,
+    /// NaN-fill every output before its kernel (on with the shadow; tests set it).
+    poison: bool,
     dbg: Option<Dbg>,
 }
 
@@ -344,12 +401,24 @@ impl MhcFused {
             t: 0,
             pending: false,
             windows: 0,
+            poison: dbg.is_some(),
             dbg,
         })
     }
 
     pub fn max_t(&self) -> usize {
         self.max_t
+    }
+
+    /// NaN-poison every kernel output before its launch (see the module doc).
+    pub fn set_poison(&mut self, on: bool) {
+        self.poison = on;
+    }
+
+    /// Fill `buf`'s first `k` f32 with NaN (synchronous: the legacy-stream copy waits for
+    /// the blocking stream's earlier kernels and the next launch waits for it).
+    fn nan(buf: &DevBuf, k: usize) -> Result<()> {
+        buf.write(0, &vec![f32::NAN; k]).map_err(|e| anyhow!("mhc fused poison: {e}"))
     }
 
     /// Windows completed so far.
@@ -401,8 +470,18 @@ impl MhcFused {
             bail!("mhc fused pre: layer {l} block {block} t {}", self.t);
         }
         let ((fn_, base, scale), (iters, hc_eps, rms_eps)) = mh.dev_weights(block);
+        let (t, n) = (self.t, self.n);
+        if self.poison {
+            Self::nan(&self.part, t * self.ch * 25)?;
+            Self::nan(&self.x, t * n)?;
+        }
         self.part(fn_, 0)?;
         self.pending = false;
+        if self.poison {
+            // after the part kernel: it reads the previous half's post/comb
+            Self::nan(&self.post, t * 4)?;
+            Self::nan(&self.comb, t * 16)?;
+        }
         let f = self.module.func("mhcf_finish").map_err(|e| anyhow!("mhcf_finish: {e}"))?;
         let (r, part, nw, x, post, comb) =
             (self.r.ptr, self.part.ptr, self.norm[l][block].ptr, self.x.ptr, self.post.ptr, self.comb.ptr);
@@ -435,21 +514,20 @@ impl MhcFused {
         let comb: Vec<f32> = self.comb.read(0, t * 16).map_err(ge)?;
         let nw = self.norm_h[l][block].clone();
         let d = self.dbg.as_mut().unwrap();
-        let tol = d.tol;
         let half = if block == 0 { "attn" } else { "ffn" };
         if let (Some((mixes, r_in)), Some(y)) = (d.last.take(), d.y.take()) {
             let want = cpu_post(&mixes, &y, &r_in, n)?;
-            d.note(&format!("l{l} post-before-{half} r"), &stat(&r_dev, &want, tol));
+            d.note(&format!("l{l} post-before-{half} r"), &stat(&r_dev, &want));
         }
         let Some(w) = cpu_w else {
             bail!("mhcdbg: pre without the host weights");
         };
         let (x_cpu, mixes) = cpu_pre(w, &r_dev, &nw, self.norm_eps, n)?;
-        d.note(&format!("l{l} pre({half}) x"), &stat(x, &x_cpu, tol));
+        d.note(&format!("l{l} pre({half}) x"), &stat(x, &x_cpu));
         let pc: Vec<f32> = mixes.iter().flat_map(|m| m.post).collect();
         let cc: Vec<f32> = mixes.iter().flat_map(|m| m.comb.into_iter().flatten()).collect();
-        d.note(&format!("l{l} pre({half}) post"), &stat(&post, &pc, tol));
-        d.note(&format!("l{l} pre({half}) comb"), &stat(&comb, &cc, tol));
+        d.note(&format!("l{l} pre({half}) post"), &stat(&post, &pc));
+        d.note(&format!("l{l} pre({half}) comb"), &stat(&comb, &cc));
         d.last = Some((mixes, r_dev));
         Ok(())
     }
@@ -474,6 +552,9 @@ impl MhcFused {
         if !self.pending {
             bail!("mhc fused end: no pending post");
         }
+        if self.poison {
+            Self::nan(&self.h, self.t * self.n)?;
+        }
         self.part(0, self.h.ptr)?;
         self.pending = false;
         let ge = |e: tang_moe::gpu::Error| anyhow!("mhc fused end: {e}");
@@ -484,8 +565,7 @@ impl MhcFused {
             if let (Some((mixes, r_in)), Some(y)) = (d.last.take(), d.y.take()) {
                 let want = cpu_post(&mixes, &y, &r_in, n)?;
                 let r_dev: Vec<f32> = self.r.read(0, t * 4 * n).map_err(ge)?;
-                let tol = d.tol;
-                d.note("final post r", &stat(&r_dev, &want, tol));
+                d.note("final post r", &stat(&r_dev, &want));
                 let hw: Vec<f32> = (0..t * n)
                     .map(|i| {
                         let (ti, j) = (i / n, i % n);
@@ -496,7 +576,7 @@ impl MhcFused {
                         a / 4.0
                     })
                     .collect();
-                d.note("head mean h", &stat(&h, &hw, tol));
+                d.note("head mean h", &stat(&h, &hw));
             }
             eprintln!(
                 "mhcdbg window t={t}: {} checks so far, {} failed, worst rel {:.3e} ({})",
@@ -578,6 +658,7 @@ mod tests {
                 .collect();
             let mhs: Vec<MhcGpu> = ws.iter().map(|[a, f]| MhcGpu::new(&g, [a, f], 64).unwrap()).collect();
             let mut fz = MhcFused::new(&g, n, 64, norms.clone(), 1e-5).unwrap();
+            fz.set_poison(true);
             for &t in ts {
                 let r0: Vec<f32> = (0..t * 4 * n).map(|_| rnd(&mut st)).collect();
                 let ys: Vec<Vec<f32>> = (0..3).map(|_| (0..t * n).map(|_| rnd(&mut st) * 0.5).collect()).collect();
@@ -600,20 +681,20 @@ mod tests {
                 let mut worst = 0f64;
                 for (k, (l, b)) in [(0usize, 0usize), (0, 1), (1, 0)].into_iter().enumerate() {
                     let x = fz.pre(&mhs[l], l, b, Some(&ws[l][b])).unwrap();
-                    let s = stat(&x, &cx[k], 1e-3);
+                    let s = stat(&x, &cx[k]);
                     eprintln!("fused n={n} t={t} step {k} (l{l} b{b}): x rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
                     assert!(!s.bad(1e-4), "fused pre step {k} (layer {l} block {b}) diverges: {s:?}");
                     worst = worst.max(s.rel_l2);
                     fz.post(&ys[k]).unwrap();
                 }
                 let h = fz.end().unwrap();
-                let s = stat(&h, &h_cpu, 1e-3);
+                let s = stat(&h, &h_cpu);
                 eprintln!("fused n={n} t={t} head: rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
                 assert!(!s.bad(1e-4), "fused head diverges: {s:?}");
                 // the wrong block's weights must be visibly wrong (guards a constant index)
                 fz.begin(&r0, t).unwrap();
                 let x1 = fz.pre(&mhs[0], 0, 1, Some(&ws[0][1])).unwrap();
-                let s = stat(&x1, &cx[0], 1e-3);
+                let s = stat(&x1, &cx[0]);
                 assert!(s.rel_l2 > 1e-2, "block 1 reproduced block 0's x (rel {:.3e})", s.rel_l2);
                 fz.post(&ys[0]).unwrap();
                 fz.end().unwrap();
@@ -623,6 +704,7 @@ mod tests {
             if n != 4096 {
                 continue;
             }
+            fz.set_poison(false);
             for t in [1usize, 64] {
                 let r0: Vec<f32> = (0..t * 4 * n).map(|_| rnd(&mut st)).collect();
                 let y: Vec<f32> = (0..t * n).map(|_| rnd(&mut st)).collect();

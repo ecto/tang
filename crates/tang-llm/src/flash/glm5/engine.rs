@@ -1510,6 +1510,8 @@ mod tests {
             if gf.mhc_f.is_none() {
                 gf.enable_mhc_fused(g, &hp).unwrap();
             }
+            // NaN in every fused output before each launch: an unwritten region can't pass
+            gf.mhc_f.as_mut().unwrap().set_poison(true);
         }
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
         let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
