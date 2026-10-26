@@ -663,9 +663,6 @@ pub fn kda_layer(
     let vp = matmul(&w.v, nh * hd, hidden, x, b * t);
     let ch = 3 * nh * hd;
     let mut qkv = vec![0f32; b * t * ch];
-    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
-        eprintln!("kda cpu qkv[0..16]: {:?}", &qkv[..16.min(qkv.len())]);
-    }
     for i in 0..b * t {
         qkv[i * ch..i * ch + nh * hd].copy_from_slice(&qp[i * nh * hd..(i + 1) * nh * hd]);
         qkv[i * ch + nh * hd..i * ch + 2 * nh * hd].copy_from_slice(&kp[i * nh * hd..(i + 1) * nh * hd]);
@@ -690,6 +687,7 @@ pub fn kda_layer(
     );
     let beta = beta_gate(x, &w.b_proj, cfg, b, t);
     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        eprintln!("kda cpu qkv[0..16]: {:?}", &qkv[..16.min(qkv.len())]);
         eprintln!("kda cpu g[0..8]: {:?}", &g[..8.min(g.len())]);
         eprintln!("kda cpu beta[0..4]: {:?}", &beta[..4.min(beta.len())]);
     }
