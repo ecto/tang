@@ -312,7 +312,12 @@ impl DevLayer {
             // the staging probe (matches kda::kda_layer's CPU dump; layout/units equal):
             // qkv[0..16] (token 0), g[0..8], beta[0..4], the device state's first 8,
             // and the host conv copy's first 4
-            let st_h = self.core.st.read::<f32>(0, 8).unwrap_or_default();
+            let st_h = self.core.st.read::<f32>(0, 8).unwrap_or_else(|e| {
+                // surface read errors loudly: a silent empty vec here looks like a zero
+                // state and wasted a diagnosis cycle (every state line printed 0.0)
+                eprintln!("kda gpu state READ ERROR: {e}");
+                Vec::new()
+            });
             eprintln!(
                 "kda gpu qkv[0..16]: {:?}\n kda gpu g[0..8]: {:?}\n kda gpu beta[0..4]: {:?}\n kda gpu state[0..8]: {:?}\n kda gpu conv_host[0..4]: {:?}",
                 &qkv_h[..16.min(qkv_h.len())],
@@ -386,6 +391,11 @@ impl DevLayer {
             }
         }
         // gated output norm (device) then o_proj
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the core output pre-norm (the CPU tail path's `o`): y-divergence with a
+            // matching o pins the bug to the gated norm or the o_proj GEMV
+            eprintln!("kda gpu o[0..8]: {:?}", &o[..8.min(o.len())]);
+        }
         self.ob.write(0, &o)?;
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
