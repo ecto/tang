@@ -466,7 +466,7 @@ fn tiny_quantised_gguf_layers_close_to_hf() {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use crate::flash::glm5::kda_debug::stat;
+    use tang_verify::stat;
     use crate::flash::glm5::moe::gpu::{ffn as gpu_ffn, ffn_host, DevMoe, Kernels};
     use std::time::Instant;
     use tang_moe::gpu::{DevBuf, Gpu, Stream};
