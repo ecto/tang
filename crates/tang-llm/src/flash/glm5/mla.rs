@@ -2528,7 +2528,8 @@ pub mod cuda {
         let cu = MlaCuda::new(&w).unwrap();
 
         let width = w.select_width();
-        let mut lat_mirror = vec![0u16; t * w.kv_lora];
+        // +1 row: the decode append below writes row `t` of the mirror (pos0 = t)
+        let mut lat_mirror = vec![0u16; (t + 1) * w.kv_lora];
         let mut idx_k = vec![0f32; t * w.idx_dim];
         let mut idx_g = vec![0f32; t * w.idx_dim];
         let mut valid = vec![0u8; t];
