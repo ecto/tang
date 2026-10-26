@@ -34,6 +34,9 @@
 //! round-trip); tensor-core GEMV for prefill; CUDA graphs.
 #![allow(clippy::too_many_arguments)]
 use super::kda::{ConvState, KdaConfig, KdaState};
+
+/// warps per `k5_gemv8` block (the kernel's K5_WARPS; one row a warp).
+const K5_WARPS: usize = 4;
 use anyhow::{ensure, Context, Result};
 use tang_moe::gpu::{DevBuf, Gpu, Stream};
 use tang_moe::{args, gpu::launch};
@@ -99,6 +102,8 @@ pub struct DevLayer {
     g2b: DevBuf,
     yb: DevBuf,
     outb: DevBuf,
+    /// int8 activations for `k5_gemv8` (codes + scales; see the xq8 field).
+    xq8: DevBuf,
     /// The layer's persistent stream (reads host-staged buffers, hence blocking).
     s: Stream,
     kers: Kernels,
@@ -205,6 +210,10 @@ impl DevLayer {
             g2b: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
             yb: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
             outb: DevBuf::zeroed_elems::<f32>(max_t * hidden).map_err(gerr)?,
+            // TANG_GLM5_GEMV8: int8 codes [t][hidden] + f32 per-32 scales [t][hidden/32]
+            // (k5_q8's layout; the codes+scales in one buffer, scales after T*hidden codes)
+            xq8: DevBuf::zeroed_elems::<u8>(max_t * hidden + max_t * hidden.div_ceil(32) * 4)
+                .map_err(gerr)?,
             s: Stream::blocking().map_err(gerr)?,
             kers,
             gv,
@@ -280,19 +289,53 @@ impl DevLayer {
         // never written (zeros on a fresh buffer → the core output was exactly 0).
         let qkv = self.qkvb.ptr;
         let f = std::mem::size_of::<f32>() as u64;
+        // TANG_GLM5_GEMV8=1: the dequant-reuse GEMV (k5_gemv8, docs/models/glm5-speed-plan.md
+        // step 1) for the Q8_0 projections. x is quantised once per window (k5_q8), then
+        // every GEMV reads the int8 codes; one row per warp, the whole 8.7 KB row in
+        // flight through shared memory. The gates' small GEMVs (f_a: 128 outs, beta: 64)
+        // stay on k5_gemv — too few rows to amortise the staging.
+        let gemv8 = std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1");
         unsafe {
-            for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+            if gemv8 {
                 launch(
-                    self.gv.gemv,
-                    grid(t * di),
-                    (128, 1, 1),
+                    self.gv.q8,
+                    ((hidden / 32) as u32, t as u32, 1),
+                    (32, 1, 1),
                     0,
                     &self.s,
-                    args![
-                        w.w, 0u32, self.xb.ptr, qkv + off, (3 * di) as u32, t as u32,
-                        di as u32, hidden as u32
-                    ],
+                    args![self.xb.ptr, self.xq8.ptr, hidden as u32, t as u32],
                 )?;
+                let codes = self.xq8.ptr;
+                let scales = codes + (self.max_t * hidden) as u64;
+                for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    // dynamic shared memory: one staged row per warp, 16-byte granules
+                    // (the kernel's `extern __shared__ uint4 dsm[]`); 0 here wrote past
+                    // the allocation — CUDA_ERROR_ILLEGAL_ADDRESS on the first real run
+                    let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
+                    launch(
+                        self.gv.gemv8,
+                        (di.div_ceil(K5_WARPS) as u32, t as u32, 1),
+                        (128, 1, 1),
+                        smem,
+                        &self.s,
+                        args![w.w, 0u32, codes, scales, qkv + off, (3 * di) as u32,
+                            t as u32, di as u32, hidden as u32],
+                    )?;
+                }
+            } else {
+                for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    launch(
+                        self.gv.gemv,
+                        grid(t * di),
+                        (128, 1, 1),
+                        0,
+                        &self.s,
+                        args![
+                            w.w, 0u32, self.xb.ptr, qkv + off, (3 * di) as u32, t as u32,
+                            di as u32, hidden as u32
+                        ],
+                    )?;
+                }
             }
             // forget gate: f_a → g1, f_b: g1 → g (out of place), finish in place on g
             launch(

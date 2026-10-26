@@ -331,6 +331,8 @@ pub fn ffn_host(k: &Kernels, m: &DevMoe, x: &[f32], t_len: usize) -> Result<Vec<
 pub struct Kernels5 {
     _m: Module,
     pub gemv: Func,
+    pub gemv8: Func,
+    pub q8: Func,
     pub gate: Func,
     pub beta: Func,
     pub norm: Func,
@@ -341,6 +343,8 @@ impl Kernels5 {
         let m = g.module(super::K5_SRC)?;
         Ok(Kernels5 {
             gemv: m.func("k5_gemv")?,
+            gemv8: m.func("k5_gemv8")?,
+            q8: m.func("k5_q8")?,
             gate: m.func("k5_gate_finish")?,
             beta: m.func("k5_beta")?,
             norm: m.func("k5_gated_norm")?,
