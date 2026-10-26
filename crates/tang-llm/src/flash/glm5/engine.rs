@@ -1593,6 +1593,9 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     let path = PathBuf::from(it.next().context("first argument: the first GGUF shard")?);
     let (mut ids, mut prompt, mut n, mut chunk) = (Vec::<u32>::new(), None, 32usize, 64usize);
     let (mut out, mut quiet, mut verbose) = (None::<PathBuf>, false, false);
+    // `--slots N` (N > 1): the batcher bench — N sequence slots, the same prompt in each,
+    // decoded round-robin; per-step wall ms + every slot's ids (they must all be equal)
+    let mut slots = 1usize;
     let push = |ids: &mut Vec<u32>, s: &str| -> Result<()> {
         for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
             if !w.is_empty() {
@@ -1612,6 +1615,7 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
             "--chunk" => chunk = val()?.parse()?,
             "--out" => out = Some(PathBuf::from(val()?)),
             "--quiet" => quiet = true,
+            "--slots" => slots = val()?.parse::<usize>()?.max(1),
             "-v" | "--verbose" => verbose = true,
             "--temp" => {
                 let t: f32 = val()?.parse()?;
@@ -1639,7 +1643,13 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     let mut e = Glm5Engine::open(&path)?;
     e.verbose = verbose;
     #[cfg(feature = "cuda")]
-    e.use_gpu()?;
+    if slots > 1 {
+        e.use_gpu_slots(slots)?;
+    } else {
+        e.use_gpu()?;
+    }
+    #[cfg(not(feature = "cuda"))]
+    ensure!(slots == 1, "--slots needs a cuda build");
     #[cfg(feature = "cuda")]
     if traced {
         if let Some(g) = &e.gpu {
@@ -1659,6 +1669,9 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         hp.n_vocab,
         t0.elapsed().as_secs_f64()
     );
+    if slots > 1 {
+        return slots_bench(&mut e, &ids, n, chunk, slots, out.as_deref());
+    }
     let t1 = Instant::now();
     let mut cur = e.prefill(&ids, chunk)?;
     let prefill_s = t1.elapsed().as_secs_f64();
@@ -1727,6 +1740,69 @@ fn sol_gbs(g: &tang_moe::gpu::Gpu) -> (f64, String) {
     let clk = g.attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE).unwrap_or(0) as f64; // kHz
     let bus = g.attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH).unwrap_or(0) as f64; // bits
     (clk * 1e3 * 2.0 * bus / 8.0 / 1e9, format!("{name}, driver clock × bus"))
+}
+
+/// `--slots N`: prefill `ids` into each of `slots` sequence slots, then decode `n - 1`
+/// steps round-robin (one step = one token for EVERY slot, through that slot's state).
+/// Prints each slot's ids (they must be identical — the same prompt, greedy — or the
+/// slots' state bleeds), per-step wall ms (median / min / max over the steps) and the
+/// aggregate decode tok/s.
+fn slots_bench(
+    e: &mut Glm5Engine,
+    ids: &[u32],
+    n: usize,
+    chunk: usize,
+    slots: usize,
+    out: Option<&Path>,
+) -> Result<()> {
+    let t1 = Instant::now();
+    let mut cur: Vec<u32> = (0..slots)
+        .map(|s| e.prefill_slot(s, ids, chunk))
+        .collect::<Result<_>>()?;
+    let prefill_s = t1.elapsed().as_secs_f64();
+    let mut gen: Vec<Vec<u32>> = cur.iter().map(|&c| vec![c]).collect();
+    let mut step_ms = Vec::new();
+    let t2 = Instant::now();
+    for _ in 1..n {
+        let ts = Instant::now();
+        for s in 0..slots {
+            cur[s] = e.step_slot(s, cur[s])?;
+            gen[s].push(cur[s]);
+        }
+        step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
+    }
+    let decode_s = t2.elapsed().as_secs_f64();
+    println!(
+        "prompt: {} tokens x {slots} slots, prefill {:.2} s",
+        ids.len(),
+        prefill_s
+    );
+    let line = |g: &[u32]| g.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+    for (s, g) in gen.iter().enumerate() {
+        println!("ids slot {s}: {}", line(g));
+    }
+    let same = gen.iter().all(|g| g == &gen[0]);
+    println!("slots agree: {}", if same { "yes" } else { "NO — slot state bleeds" });
+    if !step_ms.is_empty() {
+        let mut v = step_ms.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let toks = (slots * step_ms.len()) as f64;
+        println!(
+            "slots {slots}: per-step wall {:.1} ms median (min {:.1}, max {:.1}) over {} steps | {:.1} ms/token/slot | aggregate {:.2} tok/s, per stream {:.2} tok/s",
+            v[v.len() / 2],
+            v[0],
+            v[v.len() - 1],
+            v.len(),
+            v[v.len() / 2] / slots as f64,
+            toks / decode_s,
+            step_ms.len() as f64 / decode_s
+        );
+    }
+    if let Some(o) = out {
+        std::fs::write(o, format!("{}\n", line(&gen[0])))?;
+    }
+    ensure!(same, "slot ids differ");
+    Ok(())
 }
 
 #[cfg(test)]
