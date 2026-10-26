@@ -1,6 +1,11 @@
-//! GPU launcher for the naive GLM-5 MoE kernels ([`super::SRC`]): weights uploaded in their
-//! storage format (GGUF bytes as-is, or f32), f32 activations. Correctness first; see "Later"
-//! in the module docs for the fast path.
+//! GPU launcher for the GLM-5 MoE kernels ([`super::SRC`]): weights uploaded in their storage
+//! format (GGUF bytes as-is, or f32), f32 activations at the interface.
+//!
+//! Two paths, picked per [`Kernels`] (`TANG_GLM5_MOE=fast` | anything else = naive):
+//! - naive: the reference kernels (one thread per output); the parity baseline.
+//! - fast (`g5f_*` in moe_cuda.cuh): warp-per-row dequant-reuse GEMVs with int8 activations
+//!   (dp4a), one grouped gate|up and one grouped down(+combine) launch for all of a token's
+//!   experts + the shared expert, warp router/select, scratch reused across calls.
 //!
 //! Pod parity test (1×H200 or any CUDA card):
 //! `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm --features cuda --lib flash::glm5::moe`
@@ -8,6 +13,8 @@
 use super::{MoeParams, W};
 use crate::gguf::{GgmlType, TensorInfo};
 use anyhow::{bail, ensure, Context, Result};
+use cudarc::driver::sys as cu;
+use std::cell::RefCell;
 use tang_moe::gpu::{self, DevBuf, Gpu, Module, Stream};
 
 type Func = cudarc::driver::sys::CUfunction;
@@ -22,6 +29,56 @@ pub struct G5W {
     pub ty: u32,
 }
 
+/// No weight (`base == 0`): the kernels' "no shared expert".
+const NO_W: G5W = G5W {
+    base: 0,
+    estride: 0,
+    row_bytes: 0,
+    ty: 0,
+};
+
+/// Scratch slots of [`Pool`].
+const P_X: usize = 0;
+const P_Y: usize = 1;
+const P_XQ: usize = 2;
+const P_XD: usize = 3;
+const P_SC: usize = 4;
+const P_IDS: usize = 5;
+const P_WTS: usize = 6;
+const P_H: usize = 7;
+const P_HQ: usize = 8;
+const P_HD: usize = 9;
+const P_XQ2: usize = 10;
+const P_HQ2: usize = 11;
+const P_N: usize = 12;
+
+/// Device scratch reused across calls (grown on demand), plus the stream `ffn_host` runs on.
+#[derive(Default)]
+struct Pool {
+    bufs: Vec<Option<DevBuf>>,
+    stream: Option<Stream>,
+    /// dynamic-smem opt-in already set on g5f_gu / g5f_down (bytes)
+    smem_set: [u32; 2],
+}
+
+impl Pool {
+    fn buf(&mut self, slot: usize, bytes: usize) -> Result<&DevBuf> {
+        if self.bufs.len() < P_N {
+            self.bufs.resize_with(P_N, || None);
+        }
+        let b = &mut self.bufs[slot];
+        if b.as_ref().is_none_or(|b| b.len < bytes) {
+            *b = None; // free before allocating the larger one
+            *b = Some(DevBuf::alloc(bytes.max(256))?);
+        }
+        Ok(b.as_ref().unwrap())
+    }
+
+    fn get(&mut self, slot: usize, bytes: usize) -> Result<u64> {
+        Ok(self.buf(slot, bytes)?.ptr)
+    }
+}
+
 pub struct Kernels {
     _m: Module,
     logits: Func,
@@ -29,19 +86,77 @@ pub struct Kernels {
     gu: Func,
     down: Func,
     combine: Func,
+    f_q8: Func,
+    f_router: Func,
+    f_select: Func,
+    f_gu: Func,
+    f_down: Func,
+    /// The fast path (`TANG_GLM5_MOE=fast`). Tests flip it directly.
+    pub fast: bool,
+    /// Two-level int8 activations (codes + residual codes; `TANG_GLM5_MOE_ACT=q8` turns it
+    /// off): ~1e-5 activation error instead of ~1e-2, 2–4 more dp4a per 8 weights.
+    pub act2: bool,
+    /// Stage weight rows in shared memory (`TANG_GLM5_MOE_STAGE=0`: read them from global).
+    pub stage: bool,
+    /// NaN-fill h / y before each fast call (`TANG_GLM5_MOE_DEBUG=1`, unless `..._POISON=0`).
+    pub poison: bool,
+    smem_optin: u32,
+    pool: RefCell<Pool>,
+}
+
+impl Drop for Kernels {
+    fn drop(&mut self) {
+        // device buffers + the stream go before the module (both before the context, which
+        // the owner drops after us)
+        let p = self.pool.get_mut();
+        p.bufs.clear();
+        p.stream = None;
+    }
 }
 
 impl Kernels {
     pub fn new(g: &Gpu) -> Result<Self> {
         let m = g.module(super::SRC)?;
+        let env_on = |k: &str, d: bool| match std::env::var(k) {
+            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+            Err(_) => d,
+        };
+        let debug = std::env::var("TANG_GLM5_MOE_DEBUG").is_ok_and(|v| v == "1");
+        let smem_optin = g
+            .attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+            .unwrap_or(48 * 1024) as u32;
         Ok(Kernels {
             logits: m.func("g5_router_logits")?,
             select: m.func("g5_router_select")?,
             gu: m.func("g5_expert_gu")?,
             down: m.func("g5_expert_down")?,
             combine: m.func("g5_combine")?,
+            f_q8: m.func("g5f_q8")?,
+            f_router: m.func("g5f_router")?,
+            f_select: m.func("g5f_select")?,
+            f_gu: m.func("g5f_gu")?,
+            f_down: m.func("g5f_down")?,
+            fast: std::env::var("TANG_GLM5_MOE").is_ok_and(|v| v == "fast"),
+            stage: env_on("TANG_GLM5_MOE_STAGE", true),
+            act2: !std::env::var("TANG_GLM5_MOE_ACT").is_ok_and(|v| v == "q8"),
+            poison: debug && env_on("TANG_GLM5_MOE_DEBUG_POISON", true),
+            smem_optin,
+            pool: RefCell::new(Pool::default()),
             _m: m,
         })
+    }
+
+    /// The fast path's routing from the last MoE call (`[t][k]` ids, weights): the debug
+    /// shadow's tap. `None` if the last call was not a fast MoE call of this shape.
+    pub fn last_routing(&self, t: usize, k: usize) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        let p = self.pool.borrow();
+        let (Some(Some(i)), Some(Some(w))) = (p.bufs.get(P_IDS), p.bufs.get(P_WTS)) else {
+            return Ok(None);
+        };
+        if i.len < t * k * 4 || w.len < t * k * 4 {
+            return Ok(None);
+        }
+        Ok(Some((i.read::<u32>(0, t * k)?, w.read::<f32>(0, t * k)?)))
     }
 }
 
@@ -215,8 +330,16 @@ fn mlp(
 }
 
 /// `y = ffn(x)` for `t_len` tokens (dense or MoE); `x`, `y` are device `[t_len][hidden]` f32.
-/// Synchronous (returns after the stream drains).
+/// Synchronous (returns after the stream drains). Fast or naive per `k.fast`.
 pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
+    if k.fast {
+        let mut pool = k.pool.borrow_mut();
+        return ffn_fast(k, &mut pool, s, m, x, y, t_len);
+    }
+    ffn_naive(k, s, m, x, y, t_len)
+}
+
+fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
     let p = &m.p;
     let hid = p.hidden;
     if let Some(d) = &m.dense {
@@ -313,13 +436,224 @@ pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) ->
     Ok(())
 }
 
-/// Convenience for tests and W1's first wiring: host `x` in, host `y` out.
+/// Staging rows of `ws` (the widest row decides): uint4s per warp row, padded for the
+/// aligned-down start and `g5f_rd64`'s 4-byte over-read.
+fn row16(ws: &[G5W]) -> usize {
+    ws.iter()
+        .filter(|w| w.base != 0)
+        .map(|w| (w.row_bytes as usize + 30) / 16 + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Dynamic smem for a 4-warp block staging two rows a warp, or `(0, 0)` (no staging) when it
+/// exceeds the device's opt-in; sets the function's opt-in once when it passes 48 KB.
+fn smem_for(k: &Kernels, pool: &mut Pool, which: usize, f: Func, r16: usize) -> Result<(i32, u32)> {
+    if !k.stage || r16 == 0 {
+        return Ok((0, 0));
+    }
+    let bytes = (8 * r16 * 16) as u32;
+    if bytes + 512 > k.smem_optin {
+        return Ok((0, 0));
+    }
+    if bytes > 48 * 1024 && pool.smem_set[which] < bytes {
+        gpu::check(
+            unsafe {
+                cu::cuFuncSetAttribute(
+                    f,
+                    cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
+            },
+            "cuFuncSetAttribute(g5f smem)",
+        )?;
+        pool.smem_set[which] = bytes;
+    }
+    Ok((r16 as i32, bytes))
+}
+
+fn nan_fill(ptr: u64, n_f32: usize, s: &Stream) -> Result<()> {
+    Ok(gpu::check(
+        unsafe { cu::cuMemsetD32Async(ptr, 0x7fc0_0000, n_f32, s.0) },
+        "cuMemsetD32Async(NaN)",
+    )?)
+}
+
+/// The fast path: q8(x) → [router → select] → grouped gate|up → q8(h) → grouped down + combine.
+#[allow(clippy::too_many_arguments)]
+fn ffn_fast(
+    k: &Kernels,
+    pool: &mut Pool,
+    s: &Stream,
+    m: &DevMoe,
+    x: u64,
+    y: u64,
+    t_len: usize,
+) -> Result<()> {
+    let p = &m.p;
+    let hid = p.hidden;
+    let (gate, up, down, ff, lim, nr, routed) = match (&m.dense, &m.exps) {
+        (Some(d), _) => (d.0.w, d.1.w, d.2.w, p.ff_dense, p.limit_shexp, 1usize, false),
+        (None, Some(e)) => (e.0.w, e.1.w, e.2.w, p.ff_exp, p.limit_exp, p.top_k, true),
+        (None, None) => bail!("no dense FFN and no routed experts"),
+    };
+    let sh = if routed { m.sh.as_ref() } else { None };
+    let (sg, su, sd, ffs) = sh.map_or((NO_W, NO_W, NO_W, 0), |s| (s.0.w, s.1.w, s.2.w, p.ff_shexp));
+    ensure!(
+        hid % 32 == 0 && ff % 32 == 0 && ffs % 32 == 0 && nr <= 32,
+        "fast MoE: hid {hid}, ff {ff}, ff_sh {ffs} must be multiples of 32, top_k {nr} <= 32"
+    );
+    let slots = nr + usize::from(sh.is_some());
+    let hs = ff.max(ffs);
+    let t = t_len;
+    let ti = t as i32;
+    let (hidi, ffi, ffsi, hsi) = (hid as i32, ff as i32, ffs as i32, hs as i32);
+    let blk = (128u32, 1u32, 1u32);
+
+    // x -> int8 codes + per-32 scales
+    let xq = pool.get(P_XQ, t * hid)?;
+    let xd = pool.get(P_XD, t * hid / 32 * 4)?;
+    let xq2 = if k.act2 { pool.get(P_XQ2, t * hid)? } else { 0u64 };
+    unsafe {
+        gpu::launch(
+            k.f_q8,
+            (hid.div_ceil(128) as u32, t as u32, 1),
+            blk,
+            0,
+            s,
+            tang_moe::args![x, xq, xq2, xd, hidi],
+        )?;
+    }
+
+    // routing
+    let (idp, wtp, kk, ne) = if routed {
+        let router = m.router.as_ref().context("no router")?;
+        let ne = p.n_expert;
+        let sc = pool.get(P_SC, t * ne * 4)?;
+        let idp = pool.get(P_IDS, t * nr * 4)?;
+        let wtp = pool.get(P_WTS, t * nr * 4)?;
+        let (rw, nei) = (router.w, ne as i32);
+        let bias = m.bias.as_ref().map_or(0u64, |b| b.ptr);
+        let (kki, norm, scale) = (nr as i32, p.norm_topk_prob as i32, p.scale);
+        unsafe {
+            if rw.ty == 0 && hid % 8 == 0 {
+                gpu::launch(
+                    k.f_router,
+                    (ne.div_ceil(4) as u32, t as u32, 1),
+                    blk,
+                    0,
+                    s,
+                    tang_moe::args![rw, x, sc, nei, hidi],
+                )?;
+            } else {
+                gpu::launch(
+                    k.logits,
+                    grid(t * ne),
+                    BLOCK,
+                    0,
+                    s,
+                    tang_moe::args![rw, x, sc, ti, nei, hidi],
+                )?;
+            }
+            if p.n_group <= 1 && ne <= 1024 {
+                gpu::launch(
+                    k.f_select,
+                    (t as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![sc, bias, idp, wtp, nei, kki, norm, scale],
+                )?;
+            } else {
+                let (ng, tg) = (p.n_group as i32, p.topk_group as i32);
+                gpu::launch(
+                    k.select,
+                    grid(t),
+                    BLOCK,
+                    0,
+                    s,
+                    tang_moe::args![sc, bias, idp, wtp, ti, nei, kki, ng, tg, norm, scale],
+                )?;
+            }
+        }
+        (idp, wtp, nr as i32, ne as i32)
+    } else {
+        (0u64, 0u64, 1i32, 1i32)
+    };
+
+    // grouped gate|up -> h, q8(h)
+    let nh = t * slots * hs;
+    let h = pool.get(P_H, nh * 4)?;
+    let hq = pool.get(P_HQ, nh)?;
+    let hd = pool.get(P_HD, nh / 32 * 4)?;
+    let hq2 = if k.act2 { pool.get(P_HQ2, nh)? } else { 0u64 };
+    if k.poison {
+        nan_fill(h, nh, s)?;
+        nan_fill(y, t * hid, s)?;
+    }
+    let (r16g, smg) = smem_for(k, pool, 0, k.f_gu, row16(&[gate, up, sg, su]))?;
+    let (r16d, smd) = smem_for(k, pool, 1, k.f_down, row16(&[down, sd]))?;
+    let lims = p.limit_shexp;
+    unsafe {
+        gpu::launch(
+            k.f_gu,
+            (hs.div_ceil(4) as u32, t as u32, 1),
+            blk,
+            smg,
+            s,
+            tang_moe::args![
+                gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims, r16g
+            ],
+        )?;
+        gpu::launch(
+            k.f_q8,
+            (hs.div_ceil(128) as u32, (t * slots) as u32, 1),
+            blk,
+            0,
+            s,
+            tang_moe::args![h, hq, hq2, hd, hsi],
+        )?;
+        gpu::launch(
+            k.f_down,
+            (hid.div_ceil(8) as u32, t as u32, 1),
+            blk,
+            smd,
+            s,
+            tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d],
+        )?;
+    }
+    s.sync()?;
+    Ok(())
+}
+
+/// Convenience for tests and W1's first wiring: host `x` in, host `y` out. The fast path
+/// reuses its device x / y and stream across calls; the naive path allocates per call (as
+/// it always has — part of the baseline it measures).
 pub fn ffn_host(k: &Kernels, m: &DevMoe, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
     ensure!(x.len() == t_len * m.p.hidden, "ffn_host: x size");
+    if k.fast {
+        let mut pool = k.pool.borrow_mut();
+        let s = match pool.stream.take() {
+            Some(s) => s,
+            None => Stream::blocking()?,
+        };
+        let r = (|| {
+            let xp = {
+                let b = pool.buf(P_X, x.len() * 4)?;
+                b.write(0, x)?;
+                b.ptr
+            };
+            let yp = pool.get(P_Y, x.len() * 4)?;
+            ffn_fast(k, &mut pool, &s, m, xp, yp, t_len)?;
+            Ok(pool.buf(P_Y, x.len() * 4)?.read::<f32>(0, x.len())?)
+        })();
+        pool.stream = Some(s);
+        return r;
+    }
     let s = Stream::blocking()?;
     let xd = DevBuf::from_slice(x)?;
     let yd = DevBuf::zeroed(x.len() * 4)?;
-    ffn(k, &s, m, xd.ptr, yd.ptr, t_len)?;
+    ffn_naive(k, &s, m, xd.ptr, yd.ptr, t_len)?;
     Ok(yd.read::<f32>(0, x.len())?)
 }
 

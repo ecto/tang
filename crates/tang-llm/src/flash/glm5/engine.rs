@@ -71,9 +71,13 @@ pub struct GpuFfn {
     /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
     /// scratch pool on the device; `TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
     mhc_g: Vec<Option<super::mhc::MhcGpu>>,
-    layers: Vec<super::moe::gpu::DevMoe>,
+    /// Per layer: its FFN resident on the GPU (`None`: not resident, the CPU runs it —
+    /// `TANG_GLM5_GPU_FFN=0` for all, or `TANG_GLM5_GPU_FFN_LAYERS` to pick a subset).
+    layers: Vec<Option<super::moe::gpu::DevMoe>>,
     dev_of: Vec<usize>,
     pub split: usize,
+    /// `TANG_GLM5_MOE_PROF=1`: per layer, (calls, total µs) for T = 1 / T > 1 FFN calls.
+    prof: Option<Vec<[(u64, f64); 2]>>,
 }
 
 /// Everything device-owned goes before the contexts it lives in. Fields drop in
@@ -84,6 +88,7 @@ pub struct GpuFfn {
 #[cfg(feature = "cuda")]
 impl Drop for GpuFfn {
     fn drop(&mut self) {
+        self.print_prof();
         if let Some((g, _)) = self.devs.first() {
             let _ = g.bind();
         }
@@ -269,25 +274,50 @@ impl GpuFfn {
 
         let t0 = Instant::now();
         let ffn_on = !std::env::var("TANG_GLM5_GPU_FFN").is_ok_and(|v| v == "0");
-        let mut layers = Vec::with_capacity(if ffn_on { n_layer } else { 0 });
+        // TANG_GLM5_GPU_FFN_LAYERS=0-6,11: only these layers' FFNs resident (the rest on the
+        // CPU) — lets a 24 GB card run the real model with some MoE layers on the GPU
+        let pick = std::env::var("TANG_GLM5_GPU_FFN_LAYERS").ok().map(|s| {
+            let mut v = Vec::new();
+            for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                match part.split_once('-') {
+                    Some((a, b)) => {
+                        if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                            v.extend(a..=b);
+                        }
+                    }
+                    None => v.extend(part.parse::<usize>().ok()),
+                }
+            }
+            v
+        });
+        let mut layers = Vec::with_capacity(n_layer);
         let mut dev_of = vec![0usize; n_layer];
-        for l in 0..(if ffn_on { n_layer } else { 0 }) {
+        for l in 0..n_layer {
             let d = usize::from(l >= split);
+            dev_of[l] = d;
+            if !ffn_on || pick.as_ref().is_some_and(|v| !v.contains(&l)) {
+                layers.push(None);
+                continue;
+            }
             devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
             let p = super::moe::MoeParams::from_gguf(g, l)?;
-            layers.push(
+            layers.push(Some(
                 super::moe::gpu::DevMoe::new(&p)
                     .with_context(|| format!("uploading layer {l}'s FFN to GPU {d}"))?,
-            );
-            dev_of.push(d);
+            ));
             if l % 8 == 7 || l + 1 == n_layer {
                 eprintln!(
                     "glm5: {} of {n_layer} FFNs on the GPU ({:.0} s)",
-                    l + 1,
+                    layers.iter().filter(|x| x.is_some()).count(),
                     t0.elapsed().as_secs_f64()
                 );
             }
         }
+        eprintln!(
+            "glm5: {} of {n_layer} FFNs resident on the GPU, MoE kernels: {}",
+            layers.iter().filter(|x| x.is_some()).count(),
+            if devs.first().is_some_and(|d| d.1.fast) { "fast (TANG_GLM5_MOE=fast)" } else { "naive" }
+        );
         eprintln!(
             "glm5: FFNs on {} GPU(s), layers [0, {split}) on GPU 0{}",
             devs.len(),
@@ -308,14 +338,70 @@ impl GpuFfn {
             layers,
             dev_of,
             split,
+            prof: std::env::var("TANG_GLM5_MOE_PROF")
+                .is_ok_and(|v| v == "1")
+                .then(|| vec![[(0u64, 0f64); 2]; n_layer]),
         }))
     }
 
+    /// Whether layer `l`'s FFN is resident.
+    fn has_ffn(&self, l: usize) -> bool {
+        self.layers.get(l).is_some_and(|m| m.is_some())
+    }
+
     /// Layer `l`'s FFN on its GPU: host `x` `[t][hidden]` in, host `y` out.
-    fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+    fn ffn(&mut self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
         let (gpu, k) = &self.devs[self.dev_of[l]];
         gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-        super::moe::gpu::ffn_host(k, &self.layers[l], x, t)
+        let m = self.layers[l].as_ref().context("FFN not resident")?;
+        let t0 = Instant::now();
+        let y = super::moe::gpu::ffn_host(k, m, x, t)?;
+        if let Some(p) = self.prof.as_mut() {
+            let e = &mut p[l][usize::from(t > 1)];
+            e.0 += 1;
+            e.1 += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        Ok(y)
+    }
+
+    /// The fast path's routing of the last call on layer `l`'s device (`MoE debug tap`).
+    fn last_routing(&self, l: usize, t: usize, k: usize) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        let (gpu, kern) = &self.devs[self.dev_of[l]];
+        if !kern.fast {
+            return Ok(None);
+        }
+        gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        kern.last_routing(t, k)
+    }
+
+    /// `TANG_GLM5_MOE_PROF=1` summary: mean µs per FFN call, per layer and kind.
+    fn print_prof(&self) {
+        let Some(p) = &self.prof else { return };
+        let mut tot = [(0u64, 0f64); 2];
+        for (l, e) in p.iter().enumerate() {
+            for (i, (n, us)) in e.iter().enumerate() {
+                if *n == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "moeprof l{l} {} calls {n} mean {:.0} us",
+                    if i == 0 { "T=1" } else { "T>1" },
+                    us / *n as f64
+                );
+                tot[i].0 += n;
+                tot[i].1 += us;
+            }
+        }
+        for (i, (n, us)) in tot.iter().enumerate() {
+            if *n > 0 {
+                eprintln!(
+                    "moeprof ALL {} calls {n} total {:.1} ms mean {:.0} us/call",
+                    if i == 0 { "T=1" } else { "T>1" },
+                    us / 1e3,
+                    us / *n as f64
+                );
+            }
+        }
     }
 }
 
@@ -341,6 +427,9 @@ pub struct Glm5Engine {
     /// intermediate-by-intermediate after each window ([`super::kda_debug`]).
     #[cfg(feature = "cuda")]
     kda_dbg: Option<super::kda_debug::Shadow>,
+    /// `TANG_GLM5_MOE_DEBUG=1`: the CPU shadow of every GPU FFN call ([`super::moe_debug`]).
+    #[cfg(feature = "cuda")]
+    moe_dbg: Option<super::moe_debug::Shadow>,
 }
 
 impl Glm5Engine {
@@ -362,6 +451,8 @@ impl Glm5Engine {
             gpu: None,
             #[cfg(feature = "cuda")]
             kda_dbg: super::kda_debug::Shadow::from_env(nl),
+            #[cfg(feature = "cuda")]
+            moe_dbg: super::moe_debug::Shadow::from_env(nl),
         })
     }
 
@@ -375,13 +466,20 @@ impl Glm5Engine {
     }
 
     /// Layer `l`'s FFN: on its GPU when loaded, else W1's dense FFN / W5's CPU MoE.
-    fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+    fn ffn(&mut self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
-        if let Some(g) = &self.gpu {
-            if l < g.layers.len() {
-                return g.ffn(l, x, t);
+        if let Some(g) = self.gpu.as_mut() {
+            if g.has_ffn(l) {
+                let y = g.ffn(l, x, t)?;
+                if let Some(d) = self.moe_dbg.as_mut().filter(|d| d.wants(l)) {
+                    let p = super::moe::MoeParams::from_gguf(&self.m.g, l)?;
+                    let route = if p.is_dense() { None } else { g.last_routing(l, t, p.top_k)? };
+                    let m = &self.m;
+                    d.check(l, &p, x, t, &y, route, &|| m.dense_ffn(l, x, t))?;
+                }
+                return Ok(y);
             }
-            // TANG_GLM5_GPU_FFN=0: no FFNs resident; fall through to the CPU MoE path.
+            // not resident (TANG_GLM5_GPU_FFN=0 / _LAYERS): fall through to the CPU path.
         }
         if self.m.hp.is_dense(l) {
             self.m.dense_ffn(l, x, t)

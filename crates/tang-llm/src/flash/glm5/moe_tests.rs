@@ -466,23 +466,54 @@ fn tiny_quantised_gguf_layers_close_to_hf() {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use crate::flash::glm5::moe::gpu::{ffn_host, DevMoe, Kernels};
-    use tang_moe::gpu::Gpu;
+    use crate::flash::glm5::kda_debug::stat;
+    use crate::flash::glm5::moe::gpu::{ffn as gpu_ffn, ffn_host, DevMoe, Kernels};
+    use std::time::Instant;
+    use tang_moe::gpu::{DevBuf, Gpu, Stream};
 
-    fn check(name: &str, p: &MoeParams, x: &[f32], tol: f32) {
+    /// Every GPU path vs the CPU reference: naive and fast with two-level int8 activations
+    /// (q8x2, the default) within `tol`, fast with one-level int8 (q8) within `tol_fast` (all
+    /// relative to max(1, max |y|)). F32 / F16 weights take f32 activations on the fast path
+    /// too; quantized weights take int8 (q8 ≈1e-2 relative, q8x2 ≈1e-5).
+    fn check2(name: &str, p: &MoeParams, x: &[f32], tol: f32, tol_fast: f32) {
         let Some(g) = Gpu::for_test() else { return };
         g.bind().unwrap();
-        let k = Kernels::new(&g).unwrap();
+        let mut k = Kernels::new(&g).unwrap();
         let m = DevMoe::new(p).unwrap();
         let t_len = x.len() / p.hidden;
-        let got = ffn_host(&k, &m, x, t_len).unwrap();
         let want = ffn(p, x, t_len).unwrap();
-        let err = max_err(&got, &want);
-        eprintln!("gpu {name}: max abs err vs cpu {err:e}");
-        assert!(
-            err <= tol * max_abs(&want).max(1.0),
-            "gpu {name}: max abs err {err}"
-        );
+        for (mode, fast, act2, tl) in [
+            ("naive", false, true, tol),
+            ("fast q8x2", true, true, tol),
+            ("fast q8", true, false, tol_fast),
+        ] {
+            k.fast = fast;
+            k.act2 = act2;
+            k.poison = fast;
+            let got = ffn_host(&k, &m, x, t_len).unwrap();
+            let err = max_err(&got, &want);
+            let s = stat(&got, &want, 1e-3);
+            eprintln!(
+                "gpu {mode} {name}: max abs err vs cpu {err:e}, rel l2 {:.3e}, nonfinite {}",
+                s.rel_l2, s.nonfinite_gpu
+            );
+            assert!(s.nonfinite_gpu == 0, "gpu {mode} {name}: {} non-finite", s.nonfinite_gpu);
+            assert!(
+                err <= tl * max_abs(&want).max(1.0),
+                "gpu {mode} {name}: max abs err {err}"
+            );
+            if fast && !p.is_dense() {
+                // the fast router/select picks the CPU's experts
+                let (ci, cw) = route(p, x, t_len).unwrap();
+                let (gi, gw) = k.last_routing(t_len, p.top_k).unwrap().unwrap();
+                let werr = route_err(&gi, &gw, &ci, &cw, p.top_k);
+                assert!(werr <= 1e-5, "gpu fast {name}: routing weights err {werr}");
+            }
+        }
+    }
+
+    fn check(name: &str, p: &MoeParams, x: &[f32], tol: f32) {
+        check2(name, p, x, tol, tol)
     }
 
     #[test]
@@ -527,16 +558,145 @@ mod cuda {
     /// Q8_0 / Q4_K / Q5_K / Q6_K weights decoded on the GPU vs tang's CPU decoders (same GGUF).
     #[test]
     fn gpu_tiny_quantised_gguf_matches_cpu() {
-        for file in [
-            "glm5-tiny-f32.gguf",
-            "glm5-tiny-q8_0.gguf",
-            "glm5-tiny-q4_k_m.gguf",
+        for (file, tol_fast) in [
+            ("glm5-tiny-f32.gguf", 1e-4),
+            ("glm5-tiny-q8_0.gguf", 3e-2),
+            ("glm5-tiny-q4_k_m.gguf", 3e-2),
         ] {
             let Some(g) = tiny(file) else { continue };
             for l in [0, 2] {
                 let p = MoeParams::from_gguf(g, l).unwrap();
-                check(&format!("{file} layer {l}"), &p, f("tiny_x"), 1e-4);
+                check2(&format!("{file} layer {l}"), &p, f("tiny_x"), 2e-4, tol_fast);
             }
         }
+    }
+
+    /// Deterministic pseudo-normal activations (Irwin–Hall of 4 uniforms), a few outliers.
+    fn synth_x(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut u = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32
+        };
+        (0..n)
+            .map(|i| {
+                let v = (u() + u() + u() + u() - 2.0) * 1.7;
+                if i % 997 == 0 { v * 8.0 } else { v }
+            })
+            .collect()
+    }
+
+    /// Mean µs of `f` over `n` runs (after one warm-up).
+    fn time_us(n: usize, mut f: impl FnMut()) -> f64 {
+        f();
+        let t0 = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t0.elapsed().as_secs_f64() * 1e6 / n as f64
+    }
+
+    /// REAL GLM-5.3 layers, one layer's FFN resident at a time (a 24 GB card can't hold all
+    /// 45): naive and fast GPU vs the CPU reference on the same x (full [t][hidden] tensors,
+    /// routing sets), and per-layer µs of both (device-resident x / y, sync per call — what a
+    /// decode step pays per layer). `TANG_GLM5_REAL_GGUF=<shard 1>`;
+    /// `TANG_GLM5_MOE_BENCH_LAYERS` (default 0,4,11,12: dense Q8_0; Q4_K/Q5_K; Q5_K/Q6_K;
+    /// Q4_K/Q6_K); `TANG_GLM5_MOE_BENCH_T` (default 1,8).
+    #[test]
+    fn real_layers_fast_matches_cpu() {
+        let Some(path) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let gg = Gguf::open(Path::new(&path)).unwrap();
+        let mut k = Kernels::new(&g).unwrap();
+        let list = |key: &str, d: &str| -> Vec<usize> {
+            std::env::var(key)
+                .unwrap_or_else(|_| d.into())
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect()
+        };
+        let mut worst_fast = 0f64;
+        for l in list("TANG_GLM5_MOE_BENCH_LAYERS", "0,4,11,12") {
+            let p = MoeParams::from_gguf(&gg, l).unwrap();
+            let t_up = Instant::now();
+            let m = DevMoe::new(&p).unwrap();
+            let tys = |w: &Option<W>| match w {
+                Some(W::Gguf(_, t)) => t.ty.name().to_string(),
+                _ => "-".into(),
+            };
+            eprintln!(
+                "moebench l{l} {} gate {} up {} down {} sh {}/{}/{} (upload {:.1} s)",
+                if p.is_dense() { "dense" } else { "moe" },
+                tys(if p.is_dense() { &p.dense_gate } else { &p.gate_exps }),
+                tys(if p.is_dense() { &p.dense_up } else { &p.up_exps }),
+                tys(if p.is_dense() { &p.dense_down } else { &p.down_exps }),
+                tys(&p.sh_gate),
+                tys(&p.sh_up),
+                tys(&p.sh_down),
+                t_up.elapsed().as_secs_f64()
+            );
+            for t_len in list("TANG_GLM5_MOE_BENCH_T", "1,8") {
+                let hid = p.hidden;
+                let x = synth_x(t_len * hid, (l * 1000 + t_len) as u64);
+                let t_c = Instant::now();
+                let want = ffn(&p, &x, t_len).unwrap();
+                let cpu_ms = t_c.elapsed().as_secs_f64() * 1e3;
+                let xd = DevBuf::from_slice(&x).unwrap();
+                let yd = DevBuf::zeroed(x.len() * 4).unwrap();
+                let s = Stream::blocking().unwrap();
+                let mut outs = Vec::new();
+                for (mode, fast, act2) in
+                    [("naive", false, true), ("fast-q8x2", true, true), ("fast-q8", true, false)]
+                {
+                    k.fast = fast;
+                    k.act2 = act2;
+                    k.poison = fast;
+                    let got = ffn_host(&k, &m, &x, t_len).unwrap();
+                    let st = stat(&got, &want, 2e-2);
+                    k.poison = false;
+                    let reps = if fast { 50 } else { 3 };
+                    let us = time_us(reps, || gpu_ffn(&k, &s, &m, xd.ptr, yd.ptr, t_len).unwrap());
+                    let us_host = time_us(reps, || {
+                        ffn_host(&k, &m, &x, t_len).unwrap();
+                    });
+                    eprintln!(
+                        "moebench l{l} T{t_len} {mode:<9} rel {:.3e} cos {:.7} max {:.3e} nonfinite {} | {:.0} us/call (device x/y), {:.0} us/call (host x/y) | cpu {:.0} ms",
+                        st.rel_l2, st.cos, st.max_abs, st.nonfinite_gpu, us, us_host, cpu_ms
+                    );
+                    assert_eq!(st.nonfinite_gpu, 0, "l{l} {mode}: non-finite output");
+                    let bar = if !fast { 1e-4 } else if act2 { 1e-3 } else { 1e-1 };
+                    assert!(st.rel_l2 <= bar, "l{l} T{t_len} {mode}: rel l2 {} > {bar}", st.rel_l2);
+                    if fast && act2 {
+                        worst_fast = worst_fast.max(st.rel_l2);
+                        if !p.is_dense() {
+                            let (ci, _) = route(&p, &x, t_len).unwrap();
+                            let (gi, _) = k.last_routing(t_len, p.top_k).unwrap().unwrap();
+                            let sets = |v: &[u32]| {
+                                v.chunks(p.top_k)
+                                    .map(|c| {
+                                        let mut c = c.to_vec();
+                                        c.sort();
+                                        c
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+                            assert_eq!(sets(&gi), sets(&ci), "l{l} T{t_len}: fast routing differs");
+                        }
+                    }
+                    outs.push(got);
+                }
+                for (i, name) in [(1, "fast-q8x2"), (2, "fast-q8")] {
+                    let ab = stat(&outs[i], &outs[0], 2e-2);
+                    eprintln!("moebench l{l} T{t_len} {name}-vs-naive rel {:.3e}", ab.rel_l2);
+                }
+            }
+        }
+        eprintln!("moebench worst fast-q8x2 rel l2 {worst_fast:.3e}");
     }
 }
