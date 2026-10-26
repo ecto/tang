@@ -115,13 +115,6 @@ impl DevLayer {
         let g8ga = gemv8 && self.ga.w.ty == 8;
         let skip = (g8f as u32) | ((g8ga as u32) << 1);
         unsafe {
-            if g8f {
-                // x's codes are still in xq8 from the q/k/v pre-pass
-                self.gemv8_launch(&self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, 1)?;
-            }
-            if g8ga {
-                self.gemv8_launch(&self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, 1)?;
-            }
             let r0 = if gemv8 {
                 // the dequant-reuse GEMV for q/k/v (kda_dev's TANG_GLM5_GEMV8 path, T = 1)
                 launch(
@@ -146,6 +139,15 @@ impl DevLayer {
                         args![w.w, 0u32, codes, scales, qkv + off, (3 * di) as u32, 1u32,
                             di as u32, hidden as u32],
                     )?;
+                }
+                // f_a / g_a read the SAME x codes — strictly AFTER k5_q8 above: before it,
+                // xq8 still holds the previous step's o_proj codes (yb, d_inner wide), a
+                // stale read that diverged every output on the first real-weights rerun
+                if g8f {
+                    self.gemv8_launch(&self.fa, codes, hidden, self.g1b.ptr, hd, hd, 1)?;
+                }
+                if g8ga {
+                    self.gemv8_launch(&self.ga, codes, hidden, self.g2a.ptr, hd, hd, 1)?;
                 }
                 3 * di
             } else {
