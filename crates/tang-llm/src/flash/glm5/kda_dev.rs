@@ -801,6 +801,37 @@ mod gemv8_tests {
     use super::*;
     use std::path::Path;
 
+    /// section `sec` (0=q,1=k,2=v) of a stacked [t][3·di] tap (the old kda_debug helper,
+    /// which the tang-verify port replaced with the Spec's stacked sections)
+    fn section(v: &[f32], t: usize, di: usize, sec: usize) -> Vec<f32> {
+        if v.len() < t * 3 * di { return Vec::new(); }
+        let mut out = Vec::with_capacity(t * di);
+        for ti in 0..t {
+            let b = ti * 3 * di + sec * di;
+            out.extend_from_slice(&v[b..b + di]);
+        }
+        out
+    }
+
+    /// relative L2 (the old kda_debug::stat's headline number)
+    fn stat(gpu: &[f32], cpu: &[f32], _tol: f64) -> (f64, f64, usize) {
+        if gpu.is_empty() || cpu.is_empty() {
+            return (0.0, 0.0, 1); // missing tap: flagged as nonfinite below
+        }
+        let (mut d2, mut c2, mut nf) = (0f64, 0f64, 0usize);
+        for (&g, &c) in gpu.iter().zip(cpu) {
+            if !g.is_finite() { nf += 1; continue; }
+            d2 += ((g as f64) - (c as f64)).powi(2);
+            c2 += (c as f64).powi(2);
+        }
+        let n = gpu.len().min(cpu.len()) as f64;
+        let rms = (c2 / n).sqrt();
+        let bad = gpu.iter().zip(cpu).filter(|(&g, &c)| {
+            !g.is_finite() || ((g as f64) - (c as f64)).abs() > _tol * ((c as f64).abs() + rms)
+        }).count();
+        (d2.sqrt() / c2.max(1e-30).sqrt(), d2.sqrt(), bad)
+    }
+
     // the Q8_0 fixture: gemv8 only takes Q8_0 rows (the f32 fixture routes to k5_gemv)
     const TINY: &str = "/private/tmp/glm5-tiny/glm5-tiny-q8_0.gguf";
 
@@ -854,29 +885,29 @@ mod gemv8_tests {
         let (y1, t1) = run(&mut layer, true);
         let di = cfg.heads * cfg.head_dim;
         for (sec, name) in [(0, "q"), (1, "k"), (2, "v")] {
-            let a = super::super::kda_debug::section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, sec);
-            let b = super::super::kda_debug::section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, sec);
-            let s = super::super::kda_debug::stat(&b, &a, 1e-2);
-            eprintln!("qkv.{name}: rel {:.3e} max {:.3e} nonfinite {} zeros {}/{}", s.rel_l2, s.max_abs, s.nonfinite_gpu, s.zeros_gpu, s.zeros_cpu);
+            let a = section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, sec);
+            let b = section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, sec);
+            let s = stat(&b, &a, 1e-2);
+            eprintln!("qkv.{name}: rel {:.3e} max {:.3e} bad {}", s.0, s.1, s.2);
             // int8 activations vs f32: the fe_gemv8 band, not bitwise
-            assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 qkv.{name} diverges: {s:?}");
+            assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 qkv.{name} diverges: rel {:.3e}", s.0);
         }
         // f_a (gate) and g_a (g2) now on gemv8 too; o_proj covers the layer output
         for (name, a, b) in [("g", tap(&t0, super::super::kda_debug::tap::G), tap(&t1, super::super::kda_debug::tap::G)), ("g2", tap(&t0, super::super::kda_debug::tap::G2), tap(&t1, super::super::kda_debug::tap::G2))] {
-            let s = super::super::kda_debug::stat(&b, &a, 1e-2);
-            eprintln!("{name}: rel {:.3e} max {:.3e} nonfinite {}", s.rel_l2, s.max_abs, s.nonfinite_gpu);
-            assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 {name} diverges: {s:?}");
+            let s = stat(&b, &a, 1e-2);
+            eprintln!("{name}: rel {:.3e} max {:.3e} bad {}", s.0, s.1, s.2);
+            assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 {name} diverges: rel {:.3e}", s.0);
         }
-        let s = super::super::kda_debug::stat(&y1, &y0, 1e-2);
-        eprintln!("layer out: rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
+        let s = stat(&y1, &y0, 1e-2);
+        eprintln!("layer out: rel {:.3e} max {:.3e}", s.0, s.1);
         // a hollow A/B (both runs on the naive kernel) gives EXACTLY 0 — int8 activations
         // always leave some noise, so 0 means gemv8 never ran
-        let sq = super::super::kda_debug::stat(
-            &super::super::kda_debug::section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, 0),
-            &super::super::kda_debug::section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, 0),
+        let sq = stat(
+            &section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, 0),
+            &section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, 0),
             1e-2,
         );
-        assert!(sq.rel_l2 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
-        assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 2e-2, "gemv8 layer output diverges: {s:?}");
+        assert!(sq.0 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
+        assert!(s.1 < 2e-2, "gemv8 layer output diverges: rel {:.3e}", s.0);
     }
 }
