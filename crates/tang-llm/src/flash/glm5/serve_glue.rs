@@ -36,7 +36,7 @@ pub struct Glm5Serve {
     e: Glm5Engine,
     /// Sequence slots (`TANG_GLM5_SLOTS`; 1 = single sequence).
     slots: usize,
-    /// The last window's logits per slot (`[t][n_vocab]`), for [`ServeEngine::logits_at`]
+    /// The last window's logits per slot (`[t][n_vocab]`), for [`Glm5Serve::logits_at`]
     /// and slot 0's [`ServeEngine::logits`].
     last_logits: Vec<Vec<f32>>,
     last_window: WinStats,
@@ -232,50 +232,11 @@ impl ServeEngine for Glm5Serve {
         self.verify_slot(0, cur, drafts)
     }
 
-    fn verify_slot(&mut self, slot: usize, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
-        // Drafting is off for this engine (no MTP, no suffix drafts), so `drafts` is empty
-        // and a verify is one decode step. A non-empty draft list would need a state
-        // rewind: run the chain, keep the greedy prefix, replay the kept tokens
-        // (correct, slow, and currently unreachable).
-        self.e.slot_tokens_mut(slot).push(cur);
-        let mut lg = self.run_window(slot, &[cur])?;
-        let nv = self.e.m.hp.n_vocab;
-        let mut kept = vec![argmax(&lg[(lg.len() - nv)..])];
-        if drafts.is_empty() {
-            return Ok(kept);
-        }
-        for (i, &d) in drafts.iter().enumerate() {
-            self.e.slot_tokens_mut(slot).push(d);
-            lg = self.run_window(slot, &[d])?;
-            let next = argmax(&lg[(lg.len() - nv)..]);
-            if next != d || i + 1 == drafts.len() {
-                break;
-            }
-            kept.push(next);
-        }
-        // Rewind: the engine state now covers the whole attempted chain; rebuild it for the
-        // accepted prefix only.
-        let toks = self.e.slot_tokens(slot);
-        let keep_to = toks.len() - (drafts.len() + 1 - kept.len());
-        let prefix: Vec<u32> = toks[..keep_to].to_vec();
-        self.e.reset_slot(slot);
-        if !prefix.is_empty() {
-            self.e.prefill_slot(slot, &prefix, 512)?;
-        }
-        Ok(kept)
-    }
 
     fn logits(&self, t: usize) -> Vec<f32> {
         self.logits_at(0, t)
     }
 
-    #[allow(unused)]
-    fn logits_at(&self, slot: usize, t: usize) -> Vec<f32> {
-        let nv = self.e.m.hp.n_vocab;
-        let lg = &self.last_logits[slot.min(self.slots - 1)];
-        let start = lg.len().saturating_sub(t * nv);
-        lg[start..].to_vec()
-    }
 
     fn set_sampling(&mut self, _temperature: f32, _seed: u32) {
         // Greedy only (see the module docs).
@@ -348,6 +309,47 @@ impl ServeEngine for Glm5Serve {
 }
 
 impl Glm5Serve {
+    /// One verify window for `slot` (a single token: no drafts for this engine).
+    fn verify_slot(&mut self, slot: usize, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        // Drafting is off for this engine (no MTP, no suffix drafts), so `drafts` is empty
+        // and a verify is one decode step. A non-empty draft list would need a state
+        // rewind: run the chain, keep the greedy prefix, replay the kept tokens
+        // (correct, slow, and currently unreachable).
+        self.e.slot_tokens_mut(slot).push(cur);
+        let mut lg = self.run_window(slot, &[cur])?;
+        let nv = self.e.m.hp.n_vocab;
+        let mut kept = vec![argmax(&lg[(lg.len() - nv)..])];
+        if drafts.is_empty() {
+            return Ok(kept);
+        }
+        for (i, &d) in drafts.iter().enumerate() {
+            self.e.slot_tokens_mut(slot).push(d);
+            lg = self.run_window(slot, &[d])?;
+            let next = argmax(&lg[(lg.len() - nv)..]);
+            if next != d || i + 1 == drafts.len() {
+                break;
+            }
+            kept.push(next);
+        }
+        // Rewind: the engine state now covers the whole attempted chain; rebuild it for the
+        // accepted prefix only.
+        let toks = self.e.slot_tokens(slot);
+        let keep_to = toks.len() - (drafts.len() + 1 - kept.len());
+        let prefix: Vec<u32> = toks[..keep_to].to_vec();
+        self.e.reset_slot(slot);
+        if !prefix.is_empty() {
+            self.e.prefill_slot(slot, &prefix, 512)?;
+        }
+        Ok(kept)
+    }
+
+    fn logits_at(&self, slot: usize, t: usize) -> Vec<f32> {
+        let nv = self.e.m.hp.n_vocab;
+        let lg = &self.last_logits[slot.min(self.slots - 1)];
+        let start = lg.len().saturating_sub(t * nv);
+        lg[start..].to_vec()
+    }
+
     /// The KDA layer count (the state's `gdn_layers`).
     fn kda_layers(&self) -> usize {
         self.e.m.hp.is_kda.iter().filter(|&&k| k).count()
