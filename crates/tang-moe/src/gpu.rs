@@ -129,7 +129,265 @@ impl Module {
         let c = CString::new(name).unwrap();
         let mut f: sys::CUfunction = std::ptr::null_mut();
         ck!(sys::cuModuleGetFunction(&mut f, self.0, c.as_ptr()))?;
+        trace::named(f, name);
         Ok(f)
+    }
+}
+
+/// Opt-in accounting of every launch, copy and allocation that goes through this module,
+/// for profilers (GLM-5's `TANG_GLM5_TRACE`). Off (the default): one relaxed atomic load
+/// per call. On ([`trace::enable`]):
+///
+/// - counters: launches, host→device / device→host bytes and calls, the host time spent in
+///   synchronous copies (which includes waiting for the work they order after), and
+///   `cuMemAlloc`/`cuMemFree` calls and time;
+/// - every [`launch`] outside graph capture is bracketed by two timing events and queued
+///   with the caller's current [`trace::tag`], the kernel (named at [`Module::func`]) and an
+///   optional byte count the caller declared for it ([`trace::bytes`]); [`trace::drain`]
+///   resolves the queue into GPU milliseconds.
+///
+/// The process drives the GPU from one thread at a time, so a global tag is enough.
+pub mod trace {
+    use super::sys;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+    use std::sync::Mutex;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static TAG: AtomicU32 = AtomicU32::new(0);
+    static HINT: AtomicU64 = AtomicU64::new(0);
+
+    /// Running totals since the process started tracing (never reset; take deltas).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Snap {
+        pub launches: u64,
+        pub h2d_bytes: u64,
+        pub h2d_calls: u64,
+        pub d2h_bytes: u64,
+        pub d2h_calls: u64,
+        /// Host nanoseconds inside synchronous copies (transfer + the wait they imply).
+        pub copy_ns: u64,
+        pub allocs: u64,
+        pub alloc_bytes: u64,
+        /// Host nanoseconds inside cuMemAlloc + cuMemFree.
+        pub alloc_ns: u64,
+    }
+
+    impl Snap {
+        /// `self - earlier`, field by field.
+        pub fn since(&self, e: &Snap) -> Snap {
+            Snap {
+                launches: self.launches - e.launches,
+                h2d_bytes: self.h2d_bytes - e.h2d_bytes,
+                h2d_calls: self.h2d_calls - e.h2d_calls,
+                d2h_bytes: self.d2h_bytes - e.d2h_bytes,
+                d2h_calls: self.d2h_calls - e.d2h_calls,
+                copy_ns: self.copy_ns - e.copy_ns,
+                allocs: self.allocs - e.allocs,
+                alloc_bytes: self.alloc_bytes - e.alloc_bytes,
+                alloc_ns: self.alloc_ns - e.alloc_ns,
+            }
+        }
+        pub fn add(&mut self, o: &Snap) {
+            self.launches += o.launches;
+            self.h2d_bytes += o.h2d_bytes;
+            self.h2d_calls += o.h2d_calls;
+            self.d2h_bytes += o.d2h_bytes;
+            self.d2h_calls += o.d2h_calls;
+            self.copy_ns += o.copy_ns;
+            self.allocs += o.allocs;
+            self.alloc_bytes += o.alloc_bytes;
+            self.alloc_ns += o.alloc_ns;
+        }
+    }
+
+    static C: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    const LAUNCHES: usize = 0;
+    const H2D_B: usize = 1;
+    const H2D_N: usize = 2;
+    const D2H_B: usize = 3;
+    const D2H_N: usize = 4;
+    const COPY_NS: usize = 5;
+    const ALLOCS: usize = 6;
+    const ALLOC_B: usize = 7;
+    const ALLOC_NS: usize = 8;
+
+    /// One traced launch.
+    struct Pending {
+        tag: u32,
+        func: usize,
+        bytes: u64,
+        /// (context, start, end) — `None` inside graph capture (no timing).
+        ev: Option<(usize, usize, usize)>,
+    }
+
+    static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+    /// Reusable timing events, with the context each belongs to.
+    static POOL: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    static NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+
+    /// A resolved launch: its tag, kernel, declared bytes and GPU time (`None`: captured).
+    #[derive(Clone, Debug)]
+    pub struct Launch {
+        pub tag: u32,
+        pub func: usize,
+        pub bytes: u64,
+        pub gpu_ms: Option<f32>,
+    }
+
+    /// Turn tracing on or off (process-wide).
+    pub fn enable(on: bool) {
+        ON.store(on, Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn on() -> bool {
+        ON.load(Relaxed)
+    }
+
+    /// Set the tag later launches are attributed to; returns the previous one.
+    pub fn tag(t: u32) -> u32 {
+        TAG.swap(t, Relaxed)
+    }
+
+    /// Declare the bytes the NEXT launch reads + writes (for GB/s; consumed by it).
+    #[inline(always)]
+    pub fn bytes(n: u64) {
+        if on() {
+            HINT.store(n, Relaxed);
+        }
+    }
+
+    pub fn snap() -> Snap {
+        let g = |i: usize| C[i].load(Relaxed);
+        Snap {
+            launches: g(LAUNCHES),
+            h2d_bytes: g(H2D_B),
+            h2d_calls: g(H2D_N),
+            d2h_bytes: g(D2H_B),
+            d2h_calls: g(D2H_N),
+            copy_ns: g(COPY_NS),
+            allocs: g(ALLOCS),
+            alloc_bytes: g(ALLOC_B),
+            alloc_ns: g(ALLOC_NS),
+        }
+    }
+
+    /// The kernel's name as given to [`super::Module::func`] (or its address).
+    pub fn name(func: usize) -> String {
+        NAMES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&func).cloned())
+            .unwrap_or_else(|| format!("fn@{func:#x}"))
+    }
+
+    pub(super) fn named(f: sys::CUfunction, name: &str) {
+        if !on() {
+            return;
+        }
+        let mut g = NAMES.lock().unwrap();
+        g.get_or_insert_with(HashMap::new)
+            .entry(f as usize)
+            .or_insert_with(|| name.to_string());
+    }
+
+    pub(super) fn copy(h2d: bool, bytes: usize, t0: Option<std::time::Instant>) {
+        let (b, n) = if h2d { (H2D_B, H2D_N) } else { (D2H_B, D2H_N) };
+        C[b].fetch_add(bytes as u64, Relaxed);
+        C[n].fetch_add(1, Relaxed);
+        if let Some(t0) = t0 {
+            C[COPY_NS].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+
+    pub(super) fn alloc(bytes: usize, t0: std::time::Instant) {
+        C[ALLOCS].fetch_add(1, Relaxed);
+        C[ALLOC_B].fetch_add(bytes as u64, Relaxed);
+        C[ALLOC_NS].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    pub(super) fn free(t0: std::time::Instant) {
+        C[ALLOC_NS].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    fn event(ctx: usize) -> Option<usize> {
+        {
+            let mut p = POOL.lock().unwrap();
+            if let Some(i) = p.iter().position(|&(c, _)| c == ctx) {
+                return Some(p.swap_remove(i).1);
+            }
+        }
+        let mut e: sys::CUevent = std::ptr::null_mut();
+        let r = unsafe { sys::cuEventCreate(&mut e, sys::CUevent_flags::CU_EVENT_DEFAULT as u32) };
+        (r == sys::CUresult::CUDA_SUCCESS).then_some(e as usize)
+    }
+
+    /// Before a launch on `s`: the start event (outside capture), the kernel's declared bytes.
+    pub(super) fn before(s: sys::CUstream) -> (Option<(usize, usize)>, u64) {
+        C[LAUNCHES].fetch_add(1, Relaxed);
+        let bytes = HINT.swap(0, Relaxed);
+        let mut st = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let capturing = unsafe { sys::cuStreamIsCapturing(s, &mut st) } != sys::CUresult::CUDA_SUCCESS
+            || st != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        if capturing {
+            return (None, bytes);
+        }
+        let mut ctx: sys::CUcontext = std::ptr::null_mut();
+        unsafe { sys::cuCtxGetCurrent(&mut ctx) };
+        let ctx = ctx as usize;
+        let Some(e0) = event(ctx) else { return (None, bytes) };
+        unsafe { sys::cuEventRecord(e0 as sys::CUevent, s) };
+        (Some((ctx, e0)), bytes)
+    }
+
+    pub(super) fn after(f: sys::CUfunction, s: sys::CUstream, start: Option<(usize, usize)>, bytes: u64) {
+        let ev = start.and_then(|(ctx, e0)| {
+            let e1 = event(ctx)?;
+            unsafe { sys::cuEventRecord(e1 as sys::CUevent, s) };
+            Some((ctx, e0, e1))
+        });
+        PENDING.lock().unwrap().push(Pending {
+            tag: TAG.load(Relaxed),
+            func: f as usize,
+            bytes,
+            ev,
+        });
+    }
+
+    /// Resolve every queued launch (waits for each one's end event) and return them in
+    /// launch order; their events go back to the pool.
+    pub fn drain() -> Vec<Launch> {
+        let pend = std::mem::take(&mut *PENDING.lock().unwrap());
+        let mut cur: sys::CUcontext = std::ptr::null_mut();
+        unsafe { sys::cuCtxGetCurrent(&mut cur) };
+        let mut out = Vec::with_capacity(pend.len());
+        let mut back = Vec::with_capacity(pend.len() * 2);
+        for p in pend {
+            let gpu_ms = p.ev.and_then(|(ctx, e0, e1)| {
+                let push = ctx != cur as usize;
+                unsafe {
+                    if push {
+                        sys::cuCtxPushCurrent_v2(ctx as sys::CUcontext);
+                    }
+                    let mut ms = 0f32;
+                    let ok = sys::cuEventSynchronize(e1 as sys::CUevent) == sys::CUresult::CUDA_SUCCESS
+                        && sys::cuEventElapsedTime(&mut ms, e0 as sys::CUevent, e1 as sys::CUevent)
+                            == sys::CUresult::CUDA_SUCCESS;
+                    if push {
+                        let mut popped: sys::CUcontext = std::ptr::null_mut();
+                        sys::cuCtxPopCurrent_v2(&mut popped);
+                    }
+                    back.push((ctx, e0));
+                    back.push((ctx, e1));
+                    ok.then_some(ms)
+                }
+            });
+            out.push(Launch { tag: p.tag, func: p.func, bytes: p.bytes, gpu_ms });
+        }
+        POOL.lock().unwrap().extend(back);
+        out
     }
 }
 
@@ -253,8 +511,12 @@ impl DevBuf {
     /// the assert fires later, in an unrelated read. When in doubt: `alloc_bytes(n * size)` +
     /// `read::<T>(0, n)` never mix.
     pub fn alloc(len: usize) -> Result<Self> {
+        let t0 = trace::on().then(std::time::Instant::now);
         let mut p: sys::CUdeviceptr = 0;
         ck!(sys::cuMemAlloc_v2(&mut p, len.max(1)))?;
+        if let Some(t0) = t0 {
+            trace::alloc(len, t0);
+        }
         Ok(DevBuf { ptr: p, len })
     }
 
@@ -283,11 +545,16 @@ impl DevBuf {
         if n == 0 {
             return Ok(());
         }
-        ck!(sys::cuMemcpyHtoD_v2(
+        let t0 = trace::on().then(std::time::Instant::now);
+        let r = ck!(sys::cuMemcpyHtoD_v2(
             self.ptr + off as u64,
             data.as_ptr() as *const c_void,
             n
-        ))
+        ));
+        if t0.is_some() {
+            trace::copy(true, n, t0);
+        }
+        r
     }
 
     /// Async copy from pageable `data` (the driver stages it before returning).
@@ -296,6 +563,9 @@ impl DevBuf {
         assert!(off + n <= self.len);
         if n == 0 {
             return Ok(());
+        }
+        if trace::on() {
+            trace::copy(true, n, None);
         }
         ck!(sys::cuMemcpyHtoDAsync_v2(
             self.ptr + off as u64,
@@ -310,11 +580,15 @@ impl DevBuf {
         let bytes = n * std::mem::size_of::<T>();
         assert!(off + bytes <= self.len);
         if bytes > 0 {
+            let t0 = trace::on().then(std::time::Instant::now);
             ck!(sys::cuMemcpyDtoH_v2(
                 v.as_mut_ptr() as *mut c_void,
                 self.ptr + off as u64,
                 bytes
             ))?;
+            if t0.is_some() {
+                trace::copy(false, bytes, t0);
+            }
         }
         Ok(v)
     }
@@ -322,8 +596,12 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
+        let t0 = trace::on().then(std::time::Instant::now);
         unsafe {
             sys::cuMemFree_v2(self.ptr);
+        }
+        if let Some(t0) = t0 {
+            trace::free(t0);
         }
     }
 }
@@ -334,6 +612,23 @@ impl Drop for DevBuf {
 /// `args` must match the kernel's parameter list in count and types, and every device
 /// address passed must be valid for what the kernel does with it.
 pub unsafe fn launch(
+    f: sys::CUfunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    smem: u32,
+    s: &Stream,
+    args: &mut [*mut c_void],
+) -> Result<()> {
+    if trace::on() {
+        let (ev, bytes) = trace::before(s.0);
+        let r = launch_raw(f, grid, block, smem, s, args);
+        trace::after(f, s.0, ev, bytes);
+        return r;
+    }
+    launch_raw(f, grid, block, smem, s, args)
+}
+
+unsafe fn launch_raw(
     f: sys::CUfunction,
     grid: (u32, u32, u32),
     block: (u32, u32, u32),

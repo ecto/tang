@@ -283,6 +283,8 @@ impl DevLayer {
     ) -> Result<()> {
         let scales = xq8 + (self.max_t * cols) as u64;
         let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
+        // TANG_GLM5_TRACE: the weight bytes (the stream a decode GEMV is bound by)
+        tang_moe::gpu::trace::bytes(w.w.estride);
         unsafe {
             launch(
                 self.gv.gemv8,
@@ -309,6 +311,9 @@ impl DevLayer {
             // differs, the divergence is upstream of KDA (not a staging bug)
             eprintln!("kda gpu x[0..8]: {:?}", &x[..8.min(x.len())]);
         }
+        use super::trace::span;
+        use tang_moe::gpu::trace::bytes as tr_bytes;
+        let tr = span("proj");
         self.xb.write(0, x)?;
         let mut tp = self.probe.take();
         if let Some(p) = &tp {
@@ -358,6 +363,7 @@ impl DevLayer {
                 }
             } else {
                 for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    tr_bytes(w.w.estride);
                     launch(
                         self.gv.gemv,
                         grid(t * di),
@@ -371,11 +377,14 @@ impl DevLayer {
                     )?;
                 }
             }
+            drop(tr);
+            let tr = span("gates");
             // forget gate: f_a → g1, f_b: g1 → g (out of place), finish in place on g
             if gemv8 && g8(&self.fa) {
                 // x's int8 codes are still in xq8 from the q/k/v pre-pass
                 self.gemv8_launch(&self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, t)?;
             } else {
+                tr_bytes(self.fa.w.estride);
                 launch(
                     self.gv.gemv,
                     grid(t * hd),
@@ -386,6 +395,7 @@ impl DevLayer {
                         hd as u32, hidden as u32],
                 )?;
             }
+            tr_bytes(self.fb.w.estride);
             launch(
                 self.gv.gemv,
                 grid(t * di),
@@ -405,6 +415,7 @@ impl DevLayer {
                     lb, t as u32],
             )?;
             // beta gate
+            tr_bytes(self.bproj.w.estride);
             launch(
                 self.gv.beta,
                 grid(t * nh),
@@ -414,7 +425,9 @@ impl DevLayer {
                 args![self.bproj.w, self.xb.ptr, self.bb.ptr, t as u32, hidden as u32,
                     nh as u32],
             )?;
+            drop(tr);
         }
+        let tr = span("core");
         if self.pf2 {
             if prof {
                 self.s.sync()?;
@@ -426,6 +439,7 @@ impl DevLayer {
                 self.s.sync()?;
                 eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
             }
+            drop(tr);
             return self.finish(t, None, tp);
         }
         self.s.sync()?;
@@ -539,6 +553,7 @@ impl DevLayer {
         if prof {
             eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
         }
+        drop(tr);
         self.finish(t, Some(o), tp)
     }
 
@@ -605,6 +620,9 @@ impl DevLayer {
             };
             eprintln!("kda gpu o[0..8]: {:?}", &o[..8.min(o.len())]);
         }
+        use super::trace::span;
+        use tang_moe::gpu::trace::bytes as tr_bytes;
+        let tr = span("out_gate");
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
             if gemv8 && g8(&self.ga) {
@@ -612,6 +630,7 @@ impl DevLayer {
                 // the o_proj pass below is the first to overwrite them)
                 self.gemv8_launch(&self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, t)?;
             } else {
+                tr_bytes(self.ga.w.estride);
                 launch(
                     self.gv.gemv,
                     grid(t * hd),
@@ -622,6 +641,7 @@ impl DevLayer {
                         hd as u32, hidden as u32],
                 )?;
             }
+            tr_bytes(self.gb.w.estride);
             launch(
                 self.gv.gemv,
                 grid(t * di),
@@ -640,6 +660,8 @@ impl DevLayer {
                 args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32,
                     hd as u32, self.cfg.eps, t as u32],
             )?;
+            drop(tr);
+            let _tr = span("o_proj");
             if g8(&self.wo) {
                 // o_proj reads yb (d_inner wide): quantise it, then the dequant-reuse GEMV
                 launch(
@@ -652,6 +674,7 @@ impl DevLayer {
                 )?;
                 self.gemv8_launch(&self.wo, self.xq8.ptr, di, self.outb.ptr, hidden, hidden, t)?;
             } else {
+                tr_bytes(self.wo.w.estride);
                 launch(
                     self.gv.gemv,
                     grid(t * hidden),
@@ -663,11 +686,15 @@ impl DevLayer {
                 )?;
             }
         }
+        // the layer's one wait: the stream drains here (async kernels' wall time lands in
+        // this span; their GPU time is on the spans that launched them)
+        let tr = span("sync+read");
         self.s.sync()?;
         if prof {
             eprintln!("glm5: prof kda out: {:.2} ms", t_out.elapsed().as_secs_f32() * 1e3);
         }
         let out = self.outb.read::<f32>(0, t * hidden)?;
+        drop(tr);
         if let Some(mut p) = tp {
             use super::kda_debug::tap;
             // the host-staged path hands back the core output it read; PF2 leaves it in
