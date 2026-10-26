@@ -168,6 +168,7 @@ impl DevLayer {
         conv: &ConvState,
         state: &KdaState,
         max_t: usize,
+        slots: usize,
     ) -> Result<Self> {
         let (nh, hd) = (cfg.heads, cfg.head_dim);
         let d_inner = nh * hd;
@@ -205,8 +206,7 @@ impl DevLayer {
         let mut core = DevKda::new(g, &kers, cfg, &conv_w, conv, state, slots)?;
         if pf2 {
             core.enable_pf2(max_t)?;
-        }
-        Ok(Self {
+        }        Ok(Self {
             core,
             wq: dev_w(gguf, &t("attn_q.weight"))?,
             wk: dev_w(gguf, &t("attn_k.weight"))?,
@@ -257,20 +257,29 @@ impl DevLayer {
     }
 
     /// Pull the device's conv + recurrent state into the host copies (before a CPU
-    /// fallback window on this layer; cheap, 288 KiB + 4 MiB).
+    /// fallback window on this layer; cheap, 288 KiB + 4 MiB). Slot 0 (the single-sequence
+    /// callers: tests, the bench).
     pub fn read_back(&self, conv: &mut ConvState, state: &mut KdaState) -> Result<()> {
+        self.read_back_at(0, conv, state)
+    }
+
+    /// [`Self::read_back`] of sequence `slot`'s state.
+    pub fn read_back_at(&self, slot: usize, conv: &mut ConvState, state: &mut KdaState) -> Result<()> {
         self.s.sync()?;
-        self.core.read_conv(conv)?;
-        self.core.read_state(state)?;
+        self.core.read_conv_at(slot, conv)?;
+        self.core.read_state_at(slot, state)?;
         Ok(())
     }
 
     /// Push the host copies back onto the device (after a CPU fallback window; the device
-    /// takes over from the host's values).
+    /// takes over from the host's values). Slot 0.
     pub fn seed(&self, conv: &ConvState, state: &KdaState) -> Result<()> {
-        self.core.h0.write(0, &conv.0)?;
-        self.core.st.write(0, &state.0)?;
-        Ok(())
+        self.seed_at(0, conv, state)
+    }
+
+    /// [`Self::seed`] of sequence `slot`'s state.
+    pub fn seed_at(&self, slot: usize, conv: &ConvState, state: &KdaState) -> Result<()> {
+        self.core.seed_at(slot, conv, state)
     }
 
     /// Run one window (`x` `[t][hidden]`, `t ≤ max_t`) through the layer. The host's
@@ -310,12 +319,20 @@ impl DevLayer {
     }
 
     pub fn window(&mut self, x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
+        self.window_at(0, x, t, conv)
+    }
+
+    /// [`Self::window`] for sequence `slot` (its device conv + recurrent state, one slice
+    /// of the layer's `[slots][...]` state buffers). The projection scratch is shared: one
+    /// window at a time runs per layer (the server decodes round-robin), so no slot
+    /// partitioning is needed there.
+    pub fn window_at(&mut self, slot: usize, x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
         ensure!(x.len() == t * self.hidden, "k5 layer input");
         ensure!(t <= self.max_t, "k5 window {t} > {max}", max = self.max_t);
         if t == 1 && self.fast.is_some() {
             let mode = decode::Mode::from_env();
             if mode != decode::Mode::Naive {
-                return self.decode_fast(x, conv, mode);
+                return self.decode_fast_at(slot, x, conv, mode);
             }
         }
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
@@ -451,7 +468,7 @@ impl DevLayer {
                 eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
             }
             let t_core = std::time::Instant::now();
-            self.core_pf2(t, conv, &mut tp)?;
+            self.core_pf2(slot, t, conv, &mut tp)?;
             if prof {
                 self.s.sync()?;
                 eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
@@ -539,7 +556,7 @@ impl DevLayer {
                             * self.cfg.head_dim
                     ],
                 ));
-                self.read_back(&mut hconv, &mut hstate)?;
+                self.read_back_at(slot, &mut hconv, &mut hstate)?;
                 let yc = super::kda::conv1d_prefill(
                     &qkv_h[off * 3 * di..t * 3 * di],
                     &self.conv_w,
@@ -562,7 +579,7 @@ impl DevLayer {
                 if let Some(p) = tp.as_mut() {
                     p.taps.put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
                 }
-                self.seed(&hconv, &hstate)?;
+                self.seed_at(slot, &hconv, &hstate)?;
                 *conv = hconv;
             }
         }
@@ -580,7 +597,7 @@ impl DevLayer {
     /// the conv output (in place in `qkvb`) are read back as taps, and the host conv copy
     /// is mirrored from the device (this path doesn't maintain it: the device is
     /// authoritative and `read_back` syncs it before any CPU use).
-    fn core_pf2(&mut self, t: usize, conv: &mut ConvState, tp: &mut Option<tang_verify::Probe>) -> Result<()> {
+    fn core_pf2(&mut self, slot: usize, t: usize, conv: &mut ConvState, tp: &mut Option<tang_verify::Probe>) -> Result<()> {
         let (nh, di) = (self.nh, self.d_inner);
         if let Some(p) = tp.as_mut() {
             use super::kda_debug::tap;
@@ -590,11 +607,12 @@ impl DevLayer {
             p.read(tap::BETA, &self.bb, t * nh)?;
         }
         if t == 1 {
-            self.core.decode_dev(&self.kers, &self.s, self.qkvb.ptr, self.gb_out.ptr, self.bb.ptr, self.ob.ptr)?;
+            self.core.decode_dev(&self.kers, &self.s, slot, self.qkvb.ptr, self.gb_out.ptr, self.bb.ptr, self.ob.ptr)?;
         } else {
             self.core.prefill_dev(
                 &self.kers,
                 &self.s,
+                slot,
                 self.qkvb.ptr,
                 3 * di,
                 self.gb_out.ptr,
@@ -612,7 +630,7 @@ impl DevLayer {
             if t > 1 {
                 p.read_at(tap::CONV, 0, &self.qkvb, t * 3 * di)?;
             }
-            self.core.read_conv(conv)?;
+            self.core.read_conv_at(slot, conv)?;
         }
         Ok(())
     }

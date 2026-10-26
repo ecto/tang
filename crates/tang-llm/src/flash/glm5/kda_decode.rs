@@ -91,23 +91,31 @@ fn grid(n: usize) -> (u32, u32, u32) {
 }
 
 impl DevLayer {
-    /// Enqueue the fused decode step on `s` (device pointers only: valid inside a capture).
-    /// `ev` (eager only, the bench's per-stage breakdown): 5 events recorded before the
-    /// projections and after each of proj / gate2 / step / o_proj.
+    /// Enqueue the fused decode step on `s`, slot 0.
     fn enqueue_decode(&self, s: &Stream, gemv8: bool, ev: Option<&[Event]>) -> Result<()> {
-        let mark = |i: usize| -> Result<()> {
-            if let Some(e) = ev {
-                e[i].record(s).map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-            Ok(())
-        };
-        mark(0)?;
+        self.enqueue_decode_at(s, 0, gemv8)?;
+        if let Some(ev) = ev {
+            // the bench's per-stage breakdown: the events are recorded around the same
+            // launches this enqueued (proj | gate2 | step | o_proj read back after sync)
+            ev[4].record(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::enqueue_decode`] for sequence `slot`: only the step kernel's state pointers
+    /// (h0 / st) move — everything else is per-window scratch.
+    fn enqueue_decode_at(&self, s: &Stream, slot: usize, gemv8: bool) -> Result<()> {
         let fast = self.fast.as_ref().context("kda fused decode: kernels not built")?;
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
         let f = std::mem::size_of::<f32>() as u64;
         let qkv = self.qkvb.ptr;
         let rows = 3 * di + 2 * hd + nh;
+        // this slot's conv history / recurrent state (the `[slot][...]` state layout)
+        let ch_dim = 3 * di;
+        let m = self.cfg.d_conv - 1;
+        let h0 = self.core.h0.ptr + (slot * ch_dim * m) as u64 * f;
+        let st = self.core.st.ptr + (slot * nh * hd * hd) as u64 * f;
         unsafe {
             let r0 = if gemv8 {
                 // the dequant-reuse GEMV for q/k/v (kda_dev's TANG_GLM5_GEMV8 path, T = 1)
@@ -148,7 +156,6 @@ impl DevLayer {
                     self.xb.ptr, qkv, self.g1b.ptr, self.bb.ptr, self.g2a.ptr, di as u32,
                     hd as u32, nh as u32, hidden as u32, r0 as u32],
             )?;
-            mark(1)?;
             launch(
                 fast.gate2,
                 grid(2 * di),
@@ -158,18 +165,16 @@ impl DevLayer {
                 args![self.fb.w, self.gb.w, self.g1b.ptr, self.g2a.ptr, self.dt.ptr,
                     self.rate.ptr, self.gb_out.ptr, self.g2b.ptr, nh as u32, hd as u32, lb],
             )?;
-            mark(2)?;
             launch(
                 fast.step,
                 (nh as u32, 1, 1),
                 (hd as u32, 1, 1),
                 0,
                 s,
-                args![qkv, self.core.h0.ptr, self.core.wconv.ptr, self.gb_out.ptr,
-                    self.bb.ptr, self.core.st.ptr, self.ob.ptr, self.on.ptr, self.g2b.ptr,
+                args![qkv, h0, self.core.wconv.ptr, self.gb_out.ptr,
+                    self.bb.ptr, st, self.ob.ptr, self.on.ptr, self.g2b.ptr,
                     self.yb.ptr, self.cfg.eps],
             )?;
-            mark(3)?;
             launch(
                 self.gv.gemv,
                 grid(hidden),
@@ -179,7 +184,6 @@ impl DevLayer {
                 args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, 1u32,
                     hidden as u32, di as u32],
             )?;
-            mark(4)?;
         }
         Ok(())
     }
@@ -187,6 +191,14 @@ impl DevLayer {
     /// One decode token through the fused step (`mode` Fused or Graph). Same contract as
     /// [`DevLayer::window`] at `t = 1`, including the debug taps.
     pub(super) fn decode_fast(&mut self, x: &[f32], conv: &mut ConvState, mode: Mode) -> Result<Vec<f32>> {
+        self.decode_fast_at(0, x, conv, mode)
+    }
+
+    /// [`Self::decode_fast`] for sequence `slot`. The fused launches take the state
+    /// pointers directly (`enqueue_decode`'s `self.core.h0.ptr` etc. are slot-0 bases), so
+    /// a slot adds its offsets to the step kernel's arguments — and only the EAGER path can
+    /// do that: a captured graph freezes the pointers, so Graph mode runs slot 0 only.
+    pub(super) fn decode_fast_at(&mut self, slot: usize, x: &[f32], conv: &mut ConvState, mode: Mode) -> Result<Vec<f32>> {
         ensure!(x.len() == self.hidden, "k5 decode input");
         ensure!(mode != Mode::Naive, "decode_fast: naive mode");
         let (nh, di, hidden) = (self.nh, self.d_inner, self.hidden);
@@ -211,27 +223,32 @@ impl DevLayer {
             self.yb.write(0, &nan(di))?;
             self.outb.write(0, &nan(hidden))?;
         }
-        match mode {
-            Mode::Graph if self.fast.as_ref().and_then(|f| f.graph.as_ref()).is_some_and(|g| g.1 == gemv8) => {
-                let f = self.fast.as_ref().unwrap();
-                f.graph.as_ref().unwrap().0.launch(&self.s).map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
-            }
-            Mode::Graph => {
-                // first token (or GEMV8 toggled): run eagerly, then capture for the next
-                // tokens (capture records, it does not execute)
-                self.enqueue_decode(&self.s, gemv8, None)?;
-                self.s.sync()?;
-                if let Some(f) = self.fast.as_mut() {
-                    f.graph = None;
+        if slot == 0 {
+            match mode {
+                Mode::Graph if self.fast.as_ref().and_then(|f| f.graph.as_ref()).is_some_and(|g| g.1 == gemv8) => {
+                    let f = self.fast.as_ref().unwrap();
+                    f.graph.as_ref().unwrap().0.launch(&self.s).map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
                 }
-                let me = &*self;
-                let gr = Graph::capture(&me.s, |s| {
-                    me.enqueue_decode(s, gemv8, None).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
-                })
-                .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
-                self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
+                Mode::Graph => {
+                    // first token (or GEMV8 toggled): run eagerly, then capture for the next
+                    // tokens (capture records, it does not execute)
+                    self.enqueue_decode(&self.s, gemv8, None)?;
+                    self.s.sync()?;
+                    if let Some(f) = self.fast.as_mut() {
+                        f.graph = None;
+                    }
+                    let me = &*self;
+                    let gr = Graph::capture(&me.s, |s| {
+                        me.enqueue_decode(s, gemv8, None).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
+                    })
+                    .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
+                    self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
+                }
+                _ => self.enqueue_decode(&self.s, gemv8, None)?,
             }
-            _ => self.enqueue_decode(&self.s, gemv8, None)?,
+        } else {
+            ensure!(mode == Mode::Fused, "kda fused decode: slot {slot} needs eager mode (the captured graph has slot 0's pointers frozen)");
+            self.enqueue_decode_at(&self.s, slot, gemv8)?;
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, hidden)?;

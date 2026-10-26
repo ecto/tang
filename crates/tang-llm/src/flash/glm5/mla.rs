@@ -1266,6 +1266,10 @@ pub mod cuda {
         /// rows, the pooled keys and their watermarks. Eviction frees the buffers; a
         /// re-entry re-uploads the caller's mirror once (4 MB/layer) and re-bases.
         seqs: std::cell::RefCell<SeqLru>,
+        /// The LRU cap (`set_slots`; 4 until a batched server raises it to its slot count —
+        /// every running sequence's caches must stay resident or a switch re-uploads the
+        /// mirror and re-bases, losing the watermark).
+        slots: std::cell::Cell<usize>,
         /// persistent scratch: q [cap_t][nh*dk] f32, out [cap_t][nh*dv] f32,
         /// sel [cap_t][width] i32, folded q' [cap_t][nh*dl] f32, hw [cap_t][nh].
         q_d: std::cell::RefCell<DevBuf>,
@@ -1296,16 +1300,22 @@ pub mod cuda {
         tick: u64,
     }
 
-    /// A tiny LRU over sequence ids (LRU cap 4; a batched server rarely has more hot
-    /// sequences per layer than the running decode set).
+    /// A tiny LRU over sequence ids (cap `slots`: the batched server's running decode set;
+    /// default 4 for the pre-batching callers).
     struct SeqLru {
         entries: Vec<SeqState>,
+        /// The eviction cap (`MlaCuda::slots`).
+        cap: usize,
         active: u64,
         tick: u64,
     }
 
     impl SeqLru {
         fn new() -> Self {
+            Self::with_cap(4)
+        }
+
+        fn with_cap(cap: usize) -> Self {
             SeqLru {
                 // id 0 pre-created: single-sequence callers (tests, current engine) see
                 // exactly the pre-LRU behavior with zero churn
@@ -1321,6 +1331,7 @@ pub mod cuda {
                     pool_upto: 0,
                     tick: 0,
                 }],
+                cap: cap.max(1),
                 active: 0,
                 tick: 1,
             }
@@ -1340,7 +1351,7 @@ pub mod cuda {
                 return self.active_idx();
             }
             self.active = id;
-            if self.entries.len() >= 4 {
+            if self.entries.len() >= self.cap {
                 // evict least-recently-touched entry that is NOT the new id
                 let victim = self
                     .entries
@@ -1416,6 +1427,7 @@ pub mod cuda {
                 ikb_d: std::cell::RefCell::new(None),
                 ape_d: std::cell::RefCell::new(None),
                 seqs: std::cell::RefCell::new(SeqLru::new()),
+                slots: std::cell::Cell::new(4),
                 q_d: std::cell::RefCell::new(DevBuf::zeroed_elems::<f32>(
                     cap_t * w.n_head * w.qk_nope,
                 )?),
@@ -1444,6 +1456,39 @@ pub mod cuda {
         /// (LRU cap 4 per layer) instead of paying a ~4 MB mirror re-upload per switch.
         pub fn set_seq(&self, id: u64) {
             self.seqs.borrow_mut().switch(id);
+        }
+
+        /// Drop sequence `id`'s resident caches (a `reset` of that slot): the watermarks
+        /// go to 0 so the next append re-uploads from the caller's (fresh) mirror.
+        pub fn reset_seq(&self, id: u64) {
+            let mut lru = self.seqs.borrow_mut();
+            let Some(i) = lru.entries.iter().position(|e| e.id == id) else {
+                return;
+            };
+            let e = &mut lru.entries[i];
+            e.lat_d = None;
+            e.lat_rows = 0;
+            e.idk_d = None;
+            e.idg_d = None;
+            e.val_d = None;
+            e.idx_rows = 0;
+            e.pool_d = None;
+            e.pool_upto = 0;
+        }
+
+        /// Raise the sequence LRU's cap to a batched server's slot count (`set_seq` ids
+        /// above it would otherwise evict each other every round). Call once at engine
+        /// load, before any window.
+        pub fn set_slots(&self, slots: usize) {
+            let slots = slots.max(1);
+            self.slots.set(slots);
+            let mut lru = self.seqs.borrow_mut();
+            lru.cap = slots;
+            // pre-create every id the server will use, so no round pays a switch
+            for id in 0..slots as u64 {
+                lru.switch(id);
+            }
+            lru.active = 0;
         }
 
         /// Grow the ACTIVE sequence's latent cache to `rows` (bf16 rows). Realloc

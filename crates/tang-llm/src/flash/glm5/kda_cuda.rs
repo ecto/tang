@@ -646,13 +646,16 @@ pub mod cuda {
         nh: usize,
         hd: usize,
         chunk: usize,
+        /// `d_conv − 1` (the conv history's per-channel depth; slot pointer math).
+        d_conv_m1: usize,
     }
 
     impl DevKda {
         /// Allocate everything once. `conv` / `state` are the CPU-side values to seed with
         /// (from the tiny-model / GGUF load or a CPU fallback window); they stay the source
         /// of truth on the host ONLY for read-back via [`Self::read_conv`] /
-        /// [`Self::read_state`].
+        /// [`Self::read_state`]. The state layout is `[slots][...]`; slot 0 is seeded with
+        /// the caller's values (the single-sequence contract), the rest zeroed.
         pub fn new(
             g: &Gpu,
             k: &Kernels,
@@ -674,10 +677,17 @@ pub mod cuda {
             // completes (gpu.rs Stream::blocking; it bit the GLM-5.3 staging run too)
             let s = Stream::blocking()?;
             g.bind()?;
+            // the state buffers hold `slots` sequences; slot 0 is seeded, the rest zeroed
+            let mut h0 = conv.0.clone();
+            let mut st = state.0.clone();
+            if slots > 1 {
+                h0.resize(slots * h0.len(), 0.0);
+                st.resize(slots * st.len(), 0.0);
+            }
             Ok(DevKda {
                 wconv: DevBuf::from_slice(wconv)?,
-                h0: DevBuf::from_slice(&conv.0)?,
-                st: DevBuf::from_slice(&state.0)?,
+                h0: DevBuf::from_slice(&h0)?,
+                st: DevBuf::from_slice(&st)?,
                 xb: DevBuf::zeroed(slots * chunk * ch_dim * 4)?,
                 gb: DevBuf::zeroed(slots * chunk * nh * hd * 4)?,
                 bb: DevBuf::zeroed(slots * chunk * nh * 4)?,
@@ -691,6 +701,7 @@ pub mod cuda {
                 nh,
                 hd,
                 chunk,
+                d_conv_m1: cfg.d_conv.saturating_sub(1),
             })
         }
 
@@ -837,14 +848,17 @@ pub mod cuda {
             self.pf_groups * self.nh * super::pf_slot(self.hd)
         }
 
-        /// Device-resident prefill of `t ≥ 1` tokens (any length, one slot): conv in place
-        /// on `qkv` (`[t][stride]`, pre-conv q|k|v → post-conv, history committed to h0),
-        /// then the parallel chunked core writing `o` `[t][H·D]` and the device state. All
-        /// launches go on `s` (the caller's stream — no host sync, no host staging).
+        /// Device-resident prefill of `t ≥ 1` tokens for sequence `slot` (any length): conv
+        /// in place on `qkv` (`[t][stride]`, pre-conv q|k|v → post-conv, history committed
+        /// to this slot's h0), then the parallel chunked core writing `o` `[t][H·D]` and the
+        /// slot's device state. All launches go on `s` (the caller's stream — no host sync,
+        /// no host staging).
+        #[allow(clippy::too_many_arguments)]
         pub fn prefill_dev(
             &self,
             k: &Kernels,
             s: &Stream,
+            slot: usize,
             qkv: u64,
             stride: usize,
             g: u64,
@@ -859,6 +873,9 @@ pub mod cuda {
             let (nh, hd, ch_dim) = (self.nh, self.hd, self.ch_dim);
             let vs = hd.min(super::PF_VS);
             let nc = t.div_ceil(super::PF_C);
+            // the kernels index the state by `blockIdx.y` (kda_step/prefill) or take the
+            // state pointer directly (conv_ip / pf_state): this slot's base offsets
+            let (h0, st) = self.slot_state_ptrs(slot);
             unsafe {
                 launch(
                     k.conv_ip,
@@ -866,7 +883,7 @@ pub mod cuda {
                     (256, 1, 1),
                     0,
                     s,
-                    args![qkv, stride as u32, self.h0.ptr, self.wconv.ptr, t as u32],
+                    args![qkv, stride as u32, h0, self.wconv.ptr, t as u32],
                 )?;
                 let mut c0 = 0usize;
                 while c0 < nc {
@@ -888,7 +905,7 @@ pub mod cuda {
                         (super::PF_NT as u32, 1, 1),
                         0,
                         s,
-                        args![self.ws.ptr, self.st.ptr, o, c0 as u32, ng as u32, t as u32, vs as u32],
+                        args![self.ws.ptr, st, o, c0 as u32, ng as u32, t as u32, vs as u32],
                     )?;
                     c0 += ng;
                 }
@@ -896,12 +913,23 @@ pub mod cuda {
             Ok(())
         }
 
-        /// Device-resident decode step (one token, one slot): `qkv` the raw `[conv_dim]`
-        /// row, `g` `[H·D]` pre-exp, `beta` `[H]`; writes `o` `[H·D]`, the state, and
-        /// shifts the device conv history. Launches on `s`; the host conv copy is NOT
-        /// touched (the device is authoritative; `read_conv` syncs it when needed).
-        pub fn decode_dev(&self, k: &Kernels, s: &Stream, qkv: u64, g: u64, beta: u64, o: u64) -> Result<()> {
+        /// Device-resident decode step (one token, sequence `slot`): `qkv` the raw
+        /// `[conv_dim]` row, `g` `[H·D]` pre-exp, `beta` `[H]`; writes `o` `[H·D]`, the
+        /// slot's state, and shifts its device conv history. Launches on `s`; the host conv
+        /// copy is NOT touched (the device is authoritative; `read_conv` syncs it when
+        /// needed).
+        pub fn decode_dev(
+            &self,
+            k: &Kernels,
+            s: &Stream,
+            slot: usize,
+            qkv: u64,
+            g: u64,
+            beta: u64,
+            o: u64,
+        ) -> Result<()> {
             let (nh, hd, ch_dim) = (self.nh, self.hd, self.ch_dim);
+            let (h0, st) = self.slot_state_ptrs(slot);
             unsafe {
                 launch(
                     k.step,
@@ -909,7 +937,7 @@ pub mod cuda {
                     (hd as u32, 1, 1),
                     (3 * hd * 4) as u32,
                     s,
-                    args![qkv, self.h0.ptr, self.wconv.ptr, g, beta, self.st.ptr, o],
+                    args![qkv, h0, self.wconv.ptr, g, beta, st, o],
                 )?;
                 launch(
                     k.conv_commit,
@@ -917,10 +945,20 @@ pub mod cuda {
                     (256, 1, 1),
                     0,
                     s,
-                    args![self.h0.ptr, qkv, ch_dim as u32, 1u32],
+                    args![h0, qkv, ch_dim as u32, 1u32],
                 )?;
             }
             Ok(())
+        }
+
+        /// This slot's conv-history / recurrent-state base pointers (the state layout is
+        /// `[slot][...]`, so the pointers just offset into the one allocation).
+        fn slot_state_ptrs(&self, slot: usize) -> (u64, u64) {
+            let f = std::mem::size_of::<f32>() as u64;
+            (
+                self.h0.ptr + slot as u64 * self.ch_dim as u64 * self.d_conv_m1 as u64 * f,
+                self.st.ptr + slot as u64 * self.nh as u64 * self.hd as u64 * self.hd as u64 * f,
+            )
         }
 
         /// Read the conv history back (for a CPU fallback window or a checkpoint).
@@ -932,6 +970,31 @@ pub mod cuda {
         /// Read the recurrent state back (for a CPU fallback window or a checkpoint).
         pub fn read_state(&self, state: &mut KdaState) -> Result<()> {
             state.0 = self.st.read(0, state.0.len())?;
+            Ok(())
+        }
+
+        /// Read one slot's conv history back.
+        pub fn read_conv_at(&self, slot: usize, conv: &mut ConvState) -> Result<()> {
+            let n = self.ch_dim * self.d_conv_m1;
+            conv.0 = self.h0.read(slot * n * 4, n)?;
+            Ok(())
+        }
+
+        /// Read one slot's recurrent state back.
+        pub fn read_state_at(&self, slot: usize, state: &mut KdaState) -> Result<()> {
+            let n = self.nh * self.hd * self.hd;
+            state.0 = self.st.read(slot * n * 4, n)?;
+            Ok(())
+        }
+
+        /// Push the host copies back onto the device, one slot (after a CPU fallback window
+        /// on that slot; the device takes over from the host's values).
+        pub fn seed_at(&self, slot: usize, conv: &ConvState, state: &KdaState) -> Result<()> {
+            let n = self.nh * self.hd * self.hd;
+            let m = self.d_conv_m1;
+            let cn = self.ch_dim * m;
+            self.h0.write(slot * cn * 4, &conv.0[..cn])?;
+            self.st.write(slot * n * 4, &state.0[..n])?;
             Ok(())
         }
     }

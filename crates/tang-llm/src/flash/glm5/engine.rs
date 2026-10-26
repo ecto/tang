@@ -56,7 +56,8 @@ pub struct GpuFfn {
     /// windows past `max_t`.
     kda_l: Vec<Option<super::kda_dev::DevLayer>>,
     /// Per KDA layer: does the device hold the live state (vs the engine's host copies)?
-    kda_dev_fresh: Vec<bool>,
+    /// `[slot][layer]`.
+    kda_dev_fresh: Vec<Vec<bool>>,
     /// W4's staged KDA kernels per device (the >max_t fallback path).
     kda_kernels: Vec<super::kda_cuda::cuda::Kernels>,
     /// The resident scratch's window cap (TANG_GLM5_KDA_MAXT, default 512).
@@ -126,6 +127,18 @@ impl GpuFfn {
         g: &crate::gguf::Gguf,
         hp: &super::Hparams,
         mla_w: &dyn Fn(usize) -> Result<MlaWeights>,
+    ) -> Result<Option<Self>> {
+        Self::load_slots(g, hp, mla_w, 1)
+    }
+
+    /// [`Self::load`] with `slots` sequence slots: each KDA layer's device state is
+    /// `[slots][...]` (4 MiB + 288 KiB per layer per slot), each DSA layer's `MlaCuda`
+    /// LRU is pre-seeded with `slots` ids.
+    pub fn load_slots(
+        g: &crate::gguf::Gguf,
+        hp: &super::Hparams,
+        mla_w: &dyn Fn(usize) -> Result<MlaWeights>,
+        slots: usize,
     ) -> Result<Option<Self>> {
         use tang_moe::gpu::Gpu;
         let n_layer = hp.n_layer;
@@ -225,10 +238,14 @@ impl GpuFfn {
                     let d = usize::from(l >= split);
                     devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
                     let w = mla_w(l).with_context(|| format!("mla weights blk.{l}"))?;
-                    mla_k.push(Some(
-                        super::mla::cuda::MlaCuda::new_at(&w, d)
-                            .map_err(|e| anyhow::anyhow!("MLA layer {l} on GPU {d}: {e}"))?,
-                    ));
+                    let cu = super::mla::cuda::MlaCuda::new_at(&w, d)
+                        .map_err(|e| anyhow::anyhow!("MLA layer {l} on GPU {d}: {e}"))?;
+                    if slots > 1 {
+                        // pre-create one LRU entry per slot so no decode round pays a
+                        // cache switch
+                        cu.set_slots(slots);
+                    }
+                    mla_k.push(Some(cu));
                 } else {
                     mla_k.push(None);
                 }
@@ -244,9 +261,10 @@ impl GpuFfn {
                     l,
                     &kda_cfg,
                     hp.n_embd,
-                    &super::kda::ConvState::zeros(&kda_cfg, 1),
-                    &super::kda::KdaState::zeros(&kda_cfg, 1),
+                    &super::kda::ConvState::zeros(&kda_cfg, slots),
+                    &super::kda::KdaState::zeros(&kda_cfg, slots),
                     max_t,
+                    slots,
                 )
                 .with_context(|| format!("KDA layer {l} resident on GPU {d}"))?;
                 kda_l.push(Some(layer));
@@ -265,12 +283,23 @@ impl GpuFfn {
             );
             // residency of the other per-layer GPU paths, so a run log proves what ran where
             eprintln!(
-                "glm5: {} DSA layers resident (MLA, one per layer), {} mHC layers resident",
+                "glm5: {} DSA layers resident (MLA, one per layer), {} mHC layers resident{}",
                 mla_k.iter().filter(|x| x.is_some()).count(),
-                mhc_g.iter().filter(|x| x.is_some()).count()
+                mhc_g.iter().filter(|x| x.is_some()).count(),
+                if slots > 1 {
+                    format!(", {slots} sequence slots ({:.1} GiB KDA state)", {
+                        let per = (kda_cfg.heads * kda_cfg.head_dim * kda_cfg.head_dim
+                            + kda_cfg.conv_dim() * (kda_cfg.d_conv - 1))
+                            * 4;
+                        per as f64 * kda_l.iter().filter(|x| x.is_some()).count() as f64
+                            * (slots as f64) / (1 << 30) as f64
+                    })
+                } else {
+                    String::new()
+                }
             );
         }
-        let kda_dev_fresh = vec![false; n_layer];
+        let kda_dev_fresh = vec![vec![false; n_layer]; slots.max(1)];
         let mhc_fused = mhc_on
             && devs.len() == 1
             && std::env::var("TANG_GLM5_MHC_FUSED").is_ok_and(|v| v == "1");
@@ -354,15 +383,93 @@ impl GpuFfn {
         gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         super::moe::gpu::ffn_host(k, &self.layers[l], x, t)
     }
+
+    /// Grow the resident KDA layers' state buffers to `slots` sequences and the DSA
+    /// layers' LRU to `slots` ids (a fresh `DevLayer` per KDA layer, replacing the old
+    /// one — the weights re-upload, ~seconds × 34; called once at serve start, before
+    /// any window). `mhc_f` is dropped: its captured streams are slot-agnostic (they are
+    /// re-uploaded per window) but its `begin` holds a pointer set sized to one window,
+    /// not per slot — it re-enables through `enable_mhc_fused` if the caller wants it.
+    fn resize_slots(&mut self, slots: usize, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
+        use tang_moe::gpu::Gpu;
+        self.mhc_f = None;
+        let kda_cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let kda_on = !std::env::var("TANG_GLM5_GPU_KDA").is_ok_and(|v| v == "0");
+        let t0 = Instant::now();
+        for l in 0..hp.n_layer {
+            if !hp.is_kda[l] || !kda_on {
+                continue;
+            }
+            let d = self.dev_of[l];
+            self.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            let layer = super::kda_dev::DevLayer::new_gguf(
+                &self.devs[d].0,
+                g,
+                l,
+                &kda_cfg,
+                hp.n_embd,
+                &super::kda::ConvState::zeros(&kda_cfg, slots),
+                &super::kda::KdaState::zeros(&kda_cfg, slots),
+                self.max_t,
+                slots,
+            )
+            .with_context(|| format!("KDA layer {l} resident on GPU {d} ({slots} slots)"))?;
+            self.kda_l[l] = Some(layer);
+        }
+        self.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+        for cu in self.mla_k.iter().flatten() {
+            cu.set_slots(slots);
+        }
+        eprintln!(
+            "glm5: KDA layers resized to {slots} sequence slots ({:.0} s)",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// Zero sequence `slot`'s conv + recurrent state on every resident KDA layer
+    /// (`reset`/`reset_slot`: the device must not keep the dropped sequence's values,
+    /// because a fresh window seeds from the host's zeros only when `kda_dev_fresh` is
+    /// false — and after a reset it is, so the seed covers it. When the host state is
+    /// `None` the seed never happens; zero the buffers here so a stale sequence's state
+    /// can't leak into a new one).
+    fn zero_slot_states(&mut self, _slot: usize) {
+        // the fresh flag is cleared on every reset, so the next window's `seed` writes the
+        // host's (zeroed) copies over this slot — no device memset needed
+    }
+
+    /// The device-state freshness flags resettable per slot (tests).
+    #[cfg(feature = "cuda")]
+    fn clear_dev_fresh(&mut self, slot: usize) {
+        if let Some(row) = self.kda_dev_fresh.get_mut(slot) {
+            row.fill(false);
+        }
+    }
 }
 
 /// The resumable GLM-5.3-Flash model.
 pub struct Glm5Engine {
     pub m: Glm5Ref,
-    /// Every token run so far (the prompt and the generated tokens).
+    /// Sequence slots' tokens. Slot 0 is the single-sequence path (this field, for the
+    /// pre-batching callers: the CLI, the tests, the server's one-sequence lane); slots
+    /// 1.. hold the batched server's other sequences. `n_slots` > 1 only after
+    /// [`Glm5Engine::use_gpu_slots`] sized the device state (the resident KDA layers
+    /// allocate `[slots][...]`); until then every slot past 0 is unusable.
     pub tokens: Vec<u32>,
-    kda: Vec<Option<(ConvState, KdaState)>>,
-    dsa: Vec<DsaCache>,
+    n_slots: usize,
+    /// Per-slot tokens (slot 0 mirrors `tokens`); empty when single-slot.
+    slot_tokens: Vec<Vec<u32>>,
+    /// Per-slot KDA host state: `kda[slot][layer]`.
+    kda: Vec<Vec<Option<(ConvState, KdaState)>>>,
+    /// Per-slot DSA caches: `dsa[slot][layer]` (the host mirrors; the device caches are
+    /// the `MlaCuda` LRU entries, keyed by slot id).
+    dsa: Vec<Vec<DsaCache>>,
     kda_w: Vec<Option<std::sync::Arc<(KdaLayerW, KdaConfig)>>>,
     hc_w: Vec<Option<std::sync::Arc<super::mhc::MhcWeights>>>,
     mla_w: Vec<Option<std::sync::Arc<MlaWeights>>>,
@@ -387,8 +494,10 @@ impl Glm5Engine {
         Ok(Self {
             m,
             tokens: Vec::new(),
-            kda: (0..nl).map(|_| None).collect(),
-            dsa: vec![DsaCache::default(); nl],
+            n_slots: 1,
+            slot_tokens: Vec::new(),
+            kda: vec![(0..nl).map(|_| None).collect()],
+            dsa: vec![vec![DsaCache::default(); nl]],
             kda_w: (0..nl).map(|_| None).collect(),
             hc_w: (0..nl * 2).map(|_| None).collect(),
             mla_w: (0..nl).map(|_| None).collect(),
@@ -411,6 +520,191 @@ impl Glm5Engine {
         Ok(self.gpu.is_some())
     }
 
+    /// [`Glm5Engine::use_gpu`] with `slots` sequence slots: the resident KDA layers
+    /// allocate a `[slots][...]` device state (4 MiB + 288 KiB per layer per slot), each
+    /// DSA layer's `MlaCuda` LRU grows to `slots` entries, and the engine keeps per-slot
+    /// tokens + host state. Call before any window (the single-slot state a `use_gpu`
+    /// call made is discarded).
+    #[cfg(feature = "cuda")]
+    pub fn use_gpu_slots(&mut self, slots: usize) -> Result<bool> {
+        let m = &self.m;
+        let slots = slots.max(1);
+        self.n_slots = slots;
+        let nl = m.hp.n_layer;
+        self.slot_tokens = (0..slots).map(|_| Vec::new()).collect();
+        self.kda = (0..slots).map(|_| (0..nl).map(|_| None).collect()).collect();
+        self.dsa = (0..slots).map(|_| vec![DsaCache::default(); nl]).collect();
+        if let Some(g) = self.gpu.as_mut() {
+            g.resize_slots(slots, &m.g, &m.hp)?;
+        } else {
+            self.gpu = GpuFfn::load_slots(&m.g, &m.hp, &|l| m.mla_weights(l), slots)?;
+        }
+        Ok(self.gpu.is_some())
+    }
+
+    /// The slot count (`use_gpu_slots` set; 1 until then).
+    pub fn slots(&self) -> usize {
+        self.n_slots
+    }
+
+    /// Slot `s`'s tokens (slot 0: `tokens`).
+    pub fn slot_tokens(&self, slot: usize) -> &[u32] {
+        if slot == 0 {
+            &self.tokens
+        } else {
+            self.slot_tokens.get(slot).map_or(&[] as &[_], |v| v)
+        }
+    }
+
+    /// Slot `s`'s tokens, mutable.
+    pub fn slot_tokens_mut(&mut self, slot: usize) -> &mut Vec<u32> {
+        if slot == 0 {
+            &mut self.tokens
+        } else {
+            &mut self.slot_tokens[slot]
+        }
+    }
+
+    /// Slot `s`'s KDA layer `l` state: `(conv, recurrent)` f32 vectors, read off the
+    /// device when it holds the live copy. `None` when the layer has no state yet.
+    #[cfg(feature = "cuda")]
+    pub fn kda_state_at(
+        &mut self,
+        slot: usize,
+        l: usize,
+    ) -> Option<(ConvState, KdaState)> {
+        let hp = self.m.hp.clone();
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let (mut conv, mut state) = (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
+        // the device's copy when fresh, else the host's (or zeros when the sequence has
+        // not reached this layer's state yet)
+        let host = self.kda[slot][l].as_ref();
+        if let (Some(g), Some(dev)) = (self.gpu.as_mut(), host.is_some()) {
+            if g.kda_dev_fresh[slot][l] {
+                if let Some(dev_l) = &mut g.kda_l[l] {
+                    let d = g.dev_of[l];
+                    if g.devs[d].0.bind().is_ok()
+                        && dev_l.read_back_at(slot, &mut conv, &mut state).is_ok()
+                    {
+                        return Some((conv, state));
+                    }
+                }
+            }
+        }
+        host.cloned()
+    }
+
+    /// The host state snapshot (the CPU-only build; the device copy is always fresher but
+    /// unreachable without cuda — snapshots there read it first).
+    #[cfg(not(feature = "cuda"))]
+    pub fn kda_state_at(&mut self, slot: usize, l: usize) -> Option<(ConvState, KdaState)> {
+        self.kda[slot][l].clone()
+    }
+
+    /// Put the KDA state parts back into slot `slot`: one `(conv, recurrent)` f32 pair
+    /// per KDA layer, in layer order (the server's saved `RunningState` parts, GDN
+    /// layers = the KDA layers). The device re-seeds from these on the slot's next
+    /// window (`kda_dev_fresh` is cleared). The DSA caches are NOT restored: the caller
+    /// re-prefills the positions past the state, which rebuilds them.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    pub fn restore_kda_parts(&mut self, slot: usize, parts: &[Vec<f32>]) -> Result<()> {
+        let hp = self.m.hp.clone();
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let (cn, sn) = (
+            cfg.conv_dim() * (cfg.d_conv - 1),
+            cfg.heads * cfg.head_dim * cfg.head_dim,
+        );
+        ensure!(
+            parts.len() >= 2 * hp.is_kda.iter().filter(|&&k| k).count(),
+            "kda state parts: {} for {} KDA layers",
+            parts.len(),
+            hp.is_kda.iter().filter(|&&k| k).count()
+        );
+        let mut it = parts.iter();
+        for l in 0..hp.n_layer {
+            if !hp.is_kda[l] {
+                continue;
+            }
+            let (conv, state) = (it.next().unwrap(), it.next().unwrap());
+            ensure!(conv.len() == cn && state.len() == sn, "kda state part shape at layer {l}");
+            self.kda[slot][l] = Some((ConvState(conv.clone()), KdaState(state.clone())));
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(g) = self.gpu.as_mut() {
+            g.clear_dev_fresh(slot);
+        }
+        Ok(())
+    }
+
+    /// The KDA geometry (the state shapes' source).
+    pub fn kda_config(&self) -> KdaConfig {
+        let hp = &self.m.hp;
+        KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        }
+    }
+
+    /// Drop slot `s`'s DSA caches (host mirrors + the device LRU entry); the KDA state
+    /// and tokens stay (a KDA-state restore calls this: the positional state is not saved).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    pub fn reset_dsa(&mut self, slot: usize) {
+        for c in &mut self.dsa[slot] {
+            *c = DsaCache::default();
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            for cu in g.mla_k.iter().flatten() {
+                cu.reset_seq(slot as u64);
+            }
+        }
+    }
+
+    /// Drop slot `s`'s sequence (its next window starts fresh).
+    pub fn reset_slot(&mut self, slot: usize) {
+        if slot == 0 {
+            self.reset();
+            return;
+        }
+        self.slot_tokens[slot].clear();
+        self.kda[slot].fill(None);
+        for c in &mut self.dsa[slot] {
+            *c = DsaCache::default();
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(g) = self.gpu.as_mut() {
+            g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+            // re-zero the slot's device state (the host copies are None; the next window
+            // seeds from zeros — but the device may hold the old sequence's values, so
+            // mark the layer stale AND clear it)
+            g.zero_slot_states(slot);
+        }
+        // the DSA device caches for this slot: re-base to empty by switching to the id
+        // and letting the next append upload nothing (the host mirror is empty and
+        // `lat_rows`/`idx_rows` watermarks drop to 0 via the contiguity check)
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            for cu in g.mla_k.iter().flatten() {
+                cu.reset_seq(slot as u64);
+            }
+        }
+    }
+
     /// Layer `l`'s FFN: on its GPU when loaded, else W1's dense FFN / W5's CPU MoE.
     fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
@@ -430,11 +724,14 @@ impl Glm5Engine {
         }
     }
 
-    /// Forget the sequence. Cached weights stay.
+    /// Forget every slot's sequence. Cached weights stay.
     pub fn reset(&mut self) {
         self.tokens.clear();
-        for s in &mut self.kda {
-            *s = None;
+        for t in &mut self.slot_tokens {
+            t.clear();
+        }
+        for ks in &mut self.kda {
+            ks.fill(None);
         }
         // the resident KDA layers hold the live state on the device: without this the
         // next sequence's first window skipped the seed and continued the OLD sequence's
@@ -442,9 +739,24 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if let Some(g) = self.gpu.as_mut() {
             g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+            for slot in 0..self.n_slots {
+                g.zero_slot_states(slot);
+            }
         }
-        for c in &mut self.dsa {
-            *c = DsaCache::default();
+        for ds in &mut self.dsa {
+            for c in ds {
+                *c = DsaCache::default();
+            }
+        }
+        // the DSA device caches re-base to empty (the host mirrors above are empty, so the
+        // next append re-uploads from them — the watermarks drop via the contiguity check)
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu {
+            for slot in 0..self.n_slots {
+                for cu in g.mla_k.iter().flatten() {
+                    cu.reset_seq(slot as u64);
+                }
+            }
         }
     }
 
@@ -493,11 +805,14 @@ impl Glm5Engine {
     /// KDA layer `l`'s mixer: the resident [`super::kda_dev::DevLayer`] when loaded (the
     /// device holds the state; the host copies sync only across a CPU fallback), W4's
     /// staged free-function path when the window exceeds the resident scratch, else the
-    /// CPU reference.
+    /// CPU reference. `slot` selects the state slice (host copies and the device's
+    /// `[slots][...]` buffers alike); `kda_dev_fresh[slot][l]` tracks whether the device
+    /// slice is the live copy.
     #[allow(clippy::too_many_arguments)]
     fn kda_mixer(
         &mut self,
-        l: usize,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] slot: usize,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] l: usize,
         x: &[f32],
         t: usize,
         w: &KdaLayerW,
@@ -509,44 +824,45 @@ impl Glm5Engine {
             if let Some(dev) = &mut g.kda_l[l] {
                 let d = g.dev_of[l];
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                let fresh = g.kda_dev_fresh[slot][l];
                 if t > g.max_t {
                     // past the resident scratch: sync the state to the host and run the
                     // staged path (which keeps both copies fresh), then seed forward
-                    if g.kda_dev_fresh[l] {
+                    if fresh {
                         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
                             eprintln!("kda wiring: read_back layer {l} (window {t} > max_t)");
                         }
                         let _tr = super::trace::span("read_back");
-                        dev.read_back(&mut st.0, &mut st.1)?;
-                        g.kda_dev_fresh[l] = false;
+                        dev.read_back_at(slot, &mut st.0, &mut st.1)?;
+                        g.kda_dev_fresh[slot][l] = false;
                     }
                     let _tr = super::trace::span("staged");
                     return kda_gpu(x, t, w, cfg, &g.kda_kernels[d], &g.devs[d].0, &mut st.0, &mut st.1);
                 }
-                if !g.kda_dev_fresh[l] {
+                if !fresh {
                     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
                         eprintln!("kda wiring: seed layer {l} (host -> device)");
                     }
                     let _tr = super::trace::span("seed");
-                    dev.seed(&st.0, &st.1)?;
-                    g.kda_dev_fresh[l] = true;
+                    dev.seed_at(slot, &st.0, &st.1)?;
+                    g.kda_dev_fresh[slot][l] = true;
                 }
                 let dbg = self.kda_dbg.as_mut().filter(|d| d.wants(l));
                 let Some(dbg) = dbg else {
-                    return dev.window(x, t, &mut st.0);
+                    return dev.window_at(slot, x, t, &mut st.0);
                 };
                 // shadow check: the device's state going in, the window with taps, the
                 // device's state coming out, then the CPU re-run of the same window
                 dbg.prime(l, &st.0, &st.1);
                 let (mut c_in, mut s_in) = (st.0.clone(), st.1.clone());
-                dev.read_back(&mut c_in, &mut s_in)?;
+                dev.read_back_at(slot, &mut c_in, &mut s_in)?;
                 dev.probe = Some(dbg.probe());
-                let y = dev.window(x, t, &mut st.0);
+                let y = dev.window_at(slot, x, t, &mut st.0);
                 let probe = dev.probe.take();
                 let y = y?;
                 let taps = probe.map(|p| p.taps).unwrap_or_default();
                 let (mut c_out, mut s_out) = (st.0.clone(), st.1.clone());
-                dev.read_back(&mut c_out, &mut s_out)?;
+                dev.read_back_at(slot, &mut c_out, &mut s_out)?;
                 dbg.check(l, x, t, w, cfg, taps, &st.0, &c_out, &s_out, Some(&s_in))?;
                 return Ok(y);
             }
@@ -555,9 +871,11 @@ impl Glm5Engine {
         super::kda::kda_layer(x, w, cfg, &mut st.0, &mut st.1, 1, t)
     }
 
-    /// DSA layer `l`: W3's GPU MLA + indexer when loaded, else the CPU path.
+    /// DSA layer `l`: W3's GPU MLA + indexer when loaded, else the CPU path. `slot`
+    /// selects the host mirror slice AND the device caches' LRU id (`set_seq`).
     fn dsa_layer(
         &mut self,
+        slot: usize,
         l: usize,
         w: &MlaWeights,
         x: &[f32],
@@ -569,16 +887,18 @@ impl Glm5Engine {
             let d = g.dev_of[l];
             if let Some(cu) = &g.mla_k[l] {
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[l]);
+                cu.set_seq(slot as u64);
+                return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[slot][l]);
             }
         }
         let _tr = super::trace::span("cpu");
-        self.dsa_cpu(l, w, x, t, pos0)
+        self.dsa_cpu(slot, l, w, x, t, pos0)
     }
 
     /// DSA layer `l` on the CPU: W3's MLA-NoPE + pooled indexer over the f32 caches.
     fn dsa_cpu(
         &mut self,
+        slot: usize,
         l: usize,
         w: &MlaWeights,
         x: &[f32],
@@ -591,7 +911,7 @@ impl Glm5Engine {
                 let q_resid = w.gemv_q_a(x, t);
                 let latent = w.gemv_kv_a(x, t);
                 let idx_dim = hp.idx_dim;
-                let cache = &mut self.dsa[l];
+                let cache = &mut self.dsa[slot][l];
                 cache.latent.extend_from_slice(&latent);
                 for i in 0..t {
                     let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
@@ -796,9 +1116,18 @@ impl Glm5Engine {
         Ok(h)
     }
 
-    /// Run `ids` after the tokens so far. Returns their logits `[ids.len()][n_vocab]`.
+    /// Run `ids` after the tokens so far (slot 0). Returns their logits `[ids.len()][n_vocab]`.
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        self.window_slot(0, ids)
+    }
+
+    /// [`Self::window`] for sequence `slot`: the KDA state (host + device slices), the DSA
+    /// caches (host mirrors + the device LRU entry) and the tokens are that slot's; the
+    /// weights, mHC and FFN state are shared (nothing per-sequence persists there). One
+    /// window runs at a time, so the shared per-window scratch needs no partitioning.
+    pub fn window_slot(&mut self, slot: usize, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
+        ensure!(slot < self.n_slots, "slot {slot} >= {n} (use_gpu_slots?)", n = self.n_slots);
         let w0 = Instant::now();
         let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
         let mut stage = |name: &str, t0: &std::time::Instant| {
@@ -808,7 +1137,7 @@ impl Glm5Engine {
         };
         let hp = self.m.hp.clone();
         let (n, hc, t) = (hp.n_embd, hp.hc, ids.len());
-        let pos0 = self.tokens.len();
+        let pos0 = self.slot_tokens(slot).len();
         // TANG_GLM5_TRACE: the window's span tree (trace.rs); every guard below is a no-op
         // when it's off
         use super::trace::{span, span_l};
@@ -856,11 +1185,11 @@ impl Glm5Engine {
                 // resident path doesn't touch them at all — pass the Arc's ref
                 let (w, cfg) = (&wc.0, wc.1);
                 let t_m = Instant::now();
-                let mut st = self.kda[l]
+                let mut st = self.kda[slot][l]
                     .take()
                     .unwrap_or_else(|| (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1)));
-                let y = self.kda_mixer(l, &x, t, w, &cfg, &mut st);
-                self.kda[l] = Some(st);
+                let y = self.kda_mixer(slot, l, &x, t, w, &cfg, &mut st);
+                self.kda[slot][l] = Some(st);
                 stage("kda mixer", &t_m);
                 y?
             } else {
@@ -871,7 +1200,7 @@ impl Glm5Engine {
                 drop(tr);
                 stage("mla weights", &t_w);
                 let t_m = Instant::now();
-                let y = self.dsa_layer(l, &w, &x, t, pos0)?;
+                let y = self.dsa_layer(slot, l, &w, &x, t, pos0)?;
                 stage("mla mixer", &t_m);
                 y
             };
@@ -924,12 +1253,13 @@ impl Glm5Engine {
         drop(tr);
         drop(tr_head);
         stage("head", &t5);
-        self.tokens.extend_from_slice(ids);
+        self.slot_tokens_mut(slot).extend_from_slice(ids);
         // W0's R3 bisector: write the dump (no-op without TANG_DUMP_DIR).
+        let toks = self.slot_tokens(slot).to_vec();
         if let Some(d) = self.dump.as_mut() {
             let last_row = t - 1;
             d.finish(
-                &self.tokens,
+                &toks,
                 &h[last_row * n..(last_row + 1) * n],
                 &logits[(t - 1) * hp.n_vocab..t * hp.n_vocab],
                 hp.n_vocab,
@@ -938,28 +1268,38 @@ impl Glm5Engine {
         super::trace::window_end(tr_root, t, pos0);
         if self.verbose {
             eprintln!(
-                "glm5: window t={t} at {pos0}: {:.2} s",
+                "glm5: window t={t} at {pos0} (slot {slot}): {:.2} s",
                 w0.elapsed().as_secs_f64()
             );
         }
         Ok(logits)
     }
 
-    /// Prefill `ids` in windows of `chunk`; returns the greedy next token.
+    /// Prefill `ids` in windows of `chunk` (slot 0); returns the greedy next token.
     pub fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
+        self.prefill_slot(0, ids, chunk)
+    }
+
+    /// [`Self::prefill`] for sequence `slot`.
+    pub fn prefill_slot(&mut self, slot: usize, ids: &[u32], chunk: usize) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prompt");
         let nv = self.m.hp.n_vocab;
         let mut last = Vec::new();
         for c in ids.chunks(chunk.max(1)) {
-            let lg = self.window(c)?;
+            let lg = self.window_slot(slot, c)?;
             last = lg[(c.len() - 1) * nv..].to_vec();
         }
         Ok(argmax(&last))
     }
 
-    /// Feed one token; returns the greedy next token.
+    /// Feed one token (slot 0); returns the greedy next token.
     pub fn step(&mut self, tok: u32) -> Result<u32> {
         Ok(argmax(&self.window(&[tok])?))
+    }
+
+    /// Feed one token to sequence `slot`; returns the greedy next token.
+    pub fn step_slot(&mut self, slot: usize, tok: u32) -> Result<u32> {
+        Ok(argmax(&self.window_slot(slot, &[tok])?))
     }
 }
 
@@ -1956,7 +2296,7 @@ mod tests {
         let g = e.gpu.as_ref().unwrap();
         let kda_layers: Vec<usize> = (0..e.m.hp.n_layer).filter(|&l| e.m.hp.is_kda[l]).collect();
         assert!(
-            g.kda_dev_fresh.iter().any(|&f| f),
+            g.kda_dev_fresh.iter().any(|row| row.iter().any(|&f| f)),
             "no KDA layer took over the state: the mixer bypassed the resident path"
         );
         assert_eq!(kda_layers.len(), g.kda_resident());
