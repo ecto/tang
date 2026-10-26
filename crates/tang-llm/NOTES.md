@@ -4,6 +4,50 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 (speed step 4) — fused, device-resident mHC: 170.8 → 10.5 ms per decode step (3090)
+
+`TANG_GLM5_MHC_FUSED=1` (default off), `mhc_fused.rs`. The 4 residual streams stay on
+the device for a whole window. Per half block: one kernel applies the previous half's
+post in place and accumulates this half's 24 mix dots + flat sum of squares over 128-feature
+chunks (`mhcf_part`, grid `(n/128, t)`), one kernel per token reduces them, runs
+pre/post/comb/Sinkhorn, collapses and applies the block's weighted RMSNorm
+(`mhcf_finish`). Host traffic per half: `y` up, `x` down (`t·n` f32 each); the window
+uploads `r` once and reads back only the head mean. Was: 4 transfers each way incl. two
+`t·4n`, a host repack and the host norm, and a one-warp-per-token mixes GEMV.
+
+Why it was slow: the old `mhc_pre` kernel is one 32-thread block per token streaming
+24 × 16384 weights — `mhc_cuda_real_shape` bench: 842 µs per pre at t=1 (891 µs at
+t=8), post 102 µs. The fused unit bench: post+pre+norm 59 µs at t=1 vs `MhcGpu::pre`
+843 µs alone.
+
+mew 3090, real model, `TANG_GLM5_GPU_FFN=0 TANG_GLM5_KDA_MAXT=64`, same binary (md5
+0bfa2f62…), `TANG_GLM5_PROF=1`, per-stage sums (decode = mean of the 7 steps):
+
+| stage | off: prefill 20 tok | off: decode/step | fused: prefill | fused: decode/step |
+|---|---|---|---|---|
+| mhc_pre+norm(attn) | 154.3 ms | 73.2 ms | 41.7 ms | 4.6 ms |
+| mhc_pre+norm(ffn) | 224.9 ms | 73.6 ms | 30.5 ms | 5.8 ms |
+| mhc_post(attn) | 41.9 ms | 10.3 ms | 0.0 ms | 0.0 ms |
+| mhc_post(ffn) | 55.3 ms | 13.7 ms | 4.5 ms | 0.1 ms |
+| **mHC total** | 476.4 ms | 170.8 ms | 76.7 ms | 10.5 ms |
+
+ids both runs = the oracle (785 1196 6801 264 6386 38038 911 279). End-to-end decode on
+mew is unchanged (0.05 tok/s both: 7 tok in 129.36 vs 128.75 s) because the CPU FFN is
+17.0 s of the 18.4 s step there; on the all-GPU B300 (1.9 s/step) the same ~160 ms
+saving is ~8% — unmeasured.
+
+Verification: fused + `TANG_GLM5_MHC_DEBUG=1` (new: every pre/post shadowed on the CPU
+from the device's own `r`) + `TANG_GLM5_KDA_DEBUG=1`: `mhcdbg SUMMARY: 2888 checks, 0
+failed; worst rel 2.984e-5`, `kdadbg SUMMARY: 272 windows checked, 0 failed`, ids = oracle.
+Tiny: `engine_gpu_fused_mhc_matches_cpu` 0 flips, logits max abs 7.9e-5, 4 fused
+windows; `fused_chain_matches_cpu` (2 layers × both blocks, distinct hc + norm weights
+per block, asserts the wrong block is visibly wrong). Pre-existing, not from this:
+`engine_gpu_mla_matches_cpu` (167/170, 16.47) and `mla::cuda_resident_flow_matches_upload`
+fail identically in the gemv8 worker's logs.
+
+Limits: single device only (`TANG_GPUS=2` keeps the per-call path); windows past
+`max_t` and `TANG_DUMP_DIR` runs fall back per window.
+
 ## 2026-10-26 (housekeeping) — GPU tests can no longer silently skip; regressions for both fixture-blind bug classes
 
 `skip_or_fail()` in engine.rs tests: with `TANG_REQUIRE_CUDA=1` a skip panics; without
