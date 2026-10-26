@@ -15,7 +15,8 @@
 //! `out` after. That sequence has fixed pointers and shapes, so with
 //! `TANG_GLM5_KDA_GRAPH=1` it is captured once (after one eager run) and replayed as a
 //! single `cuGraphLaunch` per layer per token. With `TANG_GLM5_GEMV8=1` the q/k/v rows
-//! go through `k5_q8` + `k5_gemv8` instead (the graph is keyed on that flag).
+//! go through `k5_q8` + `k5_gemv8` instead (kda_dev's Q8_0-only rule; the graph is keyed
+//! on the choice).
 //!
 //! Env (default OFF until verified on the real model):
 //! - `TANG_GLM5_KDA_FUSED=1` — the fused launches, eager
@@ -176,7 +177,9 @@ impl DevLayer {
         ensure!(x.len() == self.hidden, "k5 decode input");
         ensure!(mode != Mode::Naive, "decode_fast: naive mode");
         let (nh, di, hidden) = (self.nh, self.d_inner, self.hidden);
-        let gemv8 = std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1");
+        // kda_dev's rule: the layer's gemv8 toggle, and only when q/k/v are all Q8_0 (the
+        // kernel reads 34-byte Q8_0 blocks; the f32 tiny fixture must take k5_gemv)
+        let gemv8 = self.gemv8 && [&self.wq, &self.wk, &self.wv].iter().all(|w| w.w.ty == 8);
         // the core's prefill path uses its own stream: make sure it has drained (it syncs
         // at the end of every call, so this is free; it keeps the ordering explicit)
         self.core.s.sync()?;
@@ -255,6 +258,14 @@ mod tests {
 
     const TINY: &str = "/private/tmp/glm5-tiny/glm5-tiny-f32.gguf";
 
+    fn poison(d: &DevLayer) {
+        let (di, hd, nh) = (d.d_inner, d.hd, d.nh);
+        let nan = |n: usize| vec![f32::NAN; n];
+        for (b, n) in [(&d.qkvb, 3 * di), (&d.g1b, hd), (&d.gb_out, di), (&d.bb, nh), (&d.g2a, hd), (&d.g2b, di), (&d.ob, di), (&d.yb, di), (&d.outb, d.hidden)] {
+            b.write(0, &nan(n)).unwrap();
+        }
+    }
+
     /// The fused decode (eager and graph-replayed) equals the naive decode on the tiny
     /// model's first KDA layer: 6 tokens of carried state, output and device state
     /// compared every step. Bit-equality is expected (same expressions) up to the naive
@@ -301,6 +312,11 @@ mod tests {
         for step in 0..6 {
             let x: Vec<f32> = (0..n).map(|_| rnd()).collect();
             let ya = a.window(&x, 1, &mut ca).unwrap();
+            // NaN-poison every buffer the fused step writes before each call: a graph node
+            // that didn't replay (or a stale pointer) then reads NaN, not last step's values
+            for d in [&b, &c] {
+                poison(d);
+            }
             let yb = b.decode_fast(&x, &mut cb, Mode::Fused).unwrap();
             let yc = c.decode_fast(&x, &mut cc, Mode::Graph).unwrap();
             let (mut sa, mut sb, mut sc) = (KdaState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
@@ -321,5 +337,84 @@ mod tests {
             }
         }
         assert!(c.fast.as_ref().unwrap().graph.is_some(), "graph never captured");
+    }
+
+    /// REAL WEIGHTS, one KDA layer (TANG_GLM5_REAL_GGUF = shard 1; TANG_GLM5_BENCH_LAYER,
+    /// default the first KDA layer): naive vs fused vs graph decode on the same random
+    /// token stream — per-step bit-equality of the outputs and the final device state,
+    /// then wall-clock µs per decode step of each (host-timed, x in → y out, i.e. what
+    /// the engine's `kda mixer` stage pays per layer). Skips without the env var.
+    #[test]
+    fn kda_decode_real_bench() {
+        let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let g = Gpu::for_test().expect("GPU");
+        g.bind().unwrap();
+        let gguf = crate::gguf::Gguf::open(Path::new(&real)).unwrap();
+        let hp = super::super::super::Hparams::from_gguf(&gguf).unwrap();
+        let l = std::env::var("TANG_GLM5_BENCH_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| (0..hp.n_layer).find(|&l| hp.is_kda[l]).unwrap());
+        assert!(hp.is_kda[l], "layer {l} is not KDA");
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let n = hp.n_embd;
+        let mk = |fast: bool| {
+            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64).unwrap();
+            d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
+            d
+        };
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let steps = 64usize;
+        let xs: Vec<Vec<f32>> = (0..steps).map(|_| (0..n).map(|_| rnd()).collect()).collect();
+        let mut outs: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut states = Vec::new();
+        for mode in [Mode::Naive, Mode::Fused, Mode::Graph] {
+            let mut d = mk(mode != Mode::Naive);
+            let mut conv = ConvState::zeros(&cfg, 1);
+            let mut ys = Vec::with_capacity(steps);
+            // 8 warm-up steps (the graph captures on its first), then the timed rest
+            let mut t0 = std::time::Instant::now();
+            for (i, x) in xs.iter().enumerate() {
+                if i == 8 {
+                    t0 = std::time::Instant::now();
+                }
+                ys.push(match mode {
+                    Mode::Naive => d.window(x, 1, &mut conv).unwrap(),
+                    m => d.decode_fast(x, &mut conv, m).unwrap(),
+                });
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / (steps - 8) as f64;
+            eprintln!("kda decode layer {l} {mode:?}: {us:.0} us/step (real weights, {} steps timed)", steps - 8);
+            let mut st = KdaState::zeros(&cfg, 1);
+            let mut hc = conv.clone();
+            d.read_back(&mut hc, &mut st).unwrap();
+            outs.push(ys);
+            states.push((hc, st));
+        }
+        for (mi, name) in [(1, "fused"), (2, "graph")] {
+            let diff = outs[mi]
+                .iter()
+                .zip(&outs[0])
+                .flat_map(|(a, b)| a.iter().zip(b))
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let sdiff = states[mi].1 .0.iter().zip(&states[0].1 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let cdiff = states[mi].0 .0.iter().zip(&states[0].0 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            eprintln!("{name} vs naive: {diff} output values differ (bits), state {sdiff}, conv {cdiff}");
+            assert_eq!((diff, sdiff, cdiff), (0, 0, 0), "{name} decode is not bit-equal to naive on real weights");
+        }
     }
 }
