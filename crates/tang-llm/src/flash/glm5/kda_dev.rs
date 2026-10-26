@@ -344,7 +344,7 @@ impl DevLayer {
                 eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
             }
             let t_core = std::time::Instant::now();
-            self.core_pf2(t, conv, tp.as_mut())?;
+            self.core_pf2(t, conv, &mut tp)?;
             if prof {
                 self.s.sync()?;
                 eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
@@ -471,18 +471,14 @@ impl DevLayer {
     /// the conv output (in place in `qkvb`) are read back as taps, and the host conv copy
     /// is mirrored from the device (this path doesn't maintain it: the device is
     /// authoritative and `read_back` syncs it before any CPU use).
-    fn core_pf2(
-        &mut self,
-        t: usize,
-        conv: &mut ConvState,
-        mut tp: Option<&mut super::kda_debug::KdaTaps>,
-    ) -> Result<()> {
+    fn core_pf2(&mut self, t: usize, conv: &mut ConvState, tp: &mut Option<tang_verify::Probe>) -> Result<()> {
         let (nh, di) = (self.nh, self.d_inner);
-        if let Some(tp) = tp.as_mut() {
+        if let Some(p) = tp.as_mut() {
+            use super::kda_debug::tap;
             self.s.sync()?;
-            tp.qkv_pre = self.qkvb.read::<f32>(0, t * 3 * di)?;
-            tp.g = self.gb_out.read::<f32>(0, t * di)?;
-            tp.beta = self.bb.read::<f32>(0, t * nh)?;
+            p.read(tap::QKV, &self.qkvb, t * 3 * di)?;
+            p.read(tap::G, &self.gb_out, t * di)?;
+            p.read(tap::BETA, &self.bb, t * nh)?;
         }
         if t == 1 {
             self.core.decode_dev(&self.kers, &self.s, self.qkvb.ptr, self.gb_out.ptr, self.bb.ptr, self.ob.ptr)?;
@@ -500,10 +496,12 @@ impl DevLayer {
                 t,
             )?;
         }
-        if let Some(tp) = tp.as_mut() {
+        if let Some(p) = tp.as_mut() {
+            use super::kda_debug::tap;
             self.s.sync()?;
+            // the conv ran in place on qkvb — the post-conv qkv IS the conv output tap
             if t > 1 {
-                tp.conv_out = self.qkvb.read::<f32>(0, t * 3 * di)?;
+                p.read_at(tap::CONV, 0, &self.qkvb, t * 3 * di)?;
             }
             self.core.read_conv(conv)?;
         }
@@ -512,12 +510,7 @@ impl DevLayer {
 
     /// The gated output norm + o_proj from the core output in `ob` (`o`: the host copy
     /// when the host-staged path produced it), then the taps.
-    fn finish(
-        &mut self,
-        t: usize,
-        o: Option<Vec<f32>>,
-        tp: Option<super::kda_debug::KdaTaps>,
-    ) -> Result<Vec<f32>> {
+    fn finish(&mut self, t: usize, o: Option<Vec<f32>>, tp: Option<tang_verify::Probe>) -> Result<Vec<f32>> {
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
         let t_out = std::time::Instant::now();
