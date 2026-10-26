@@ -1746,6 +1746,7 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     // decoded round-robin; per-step wall ms + every slot's ids (they must all be equal)
     let mut slots = 1usize;
     let mut rr = false;
+    let mut diverse = false;
     let push = |ids: &mut Vec<u32>, s: &str| -> Result<()> {
         for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
             if !w.is_empty() {
@@ -1769,6 +1770,10 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
             // with --slots: one window per slot per step (round-robin) instead of one
             // batched window over all slots
             "--rr" => rr = true,
+            // with --slots: slot s > 0 gets the prompt with one token changed, so the
+            // slots' states and expert routing differ (identical prompts route every row
+            // to the same experts — the CPU MoE's best case); slot 0 keeps the prompt
+            "--diverse" => diverse = true,
             "-v" | "--verbose" => verbose = true,
             "--temp" => {
                 let t: f32 = val()?.parse()?;
@@ -1823,7 +1828,7 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     if slots > 1 {
-        return slots_bench(&mut e, &ids, n, chunk, slots, rr, out.as_deref());
+        return slots_bench(&mut e, &ids, n, chunk, slots, rr, diverse, out.as_deref());
     }
     let t1 = Instant::now();
     let mut cur = e.prefill(&ids, chunk)?;
@@ -1907,6 +1912,7 @@ fn slots_bench(
     chunk: usize,
     slots: usize,
     rr: bool,
+    diverse: bool,
     out: Option<&Path>,
 ) -> Result<()> {
     // prefill in lockstep (both modes; prefill is not what this measures): position j of
@@ -1914,9 +1920,21 @@ fn slots_bench(
     let t1 = Instant::now();
     let nv = e.m.hp.n_vocab;
     let _ = chunk;
+    let nvu = nv as u32;
+    // slot s's prompt: `ids`, or (diverse, s > 0) with the token 4 from the end — inside
+    // the user message — replaced by a different id (same length, so lockstep works)
+    let prompt = |s: usize| -> Vec<u32> {
+        let mut p = ids.to_vec();
+        if diverse && s > 0 && p.len() > 4 {
+            let j = p.len() - 4;
+            p[j] = (p[j] + 7919 * s as u32) % nvu;
+        }
+        p
+    };
+    let prompts: Vec<Vec<u32>> = (0..slots).map(prompt).collect();
     let mut lg = Vec::new();
-    for &tok in ids {
-        let rows: Vec<(usize, u32)> = (0..slots).map(|s| (s, tok)).collect();
+    for j in 0..ids.len() {
+        let rows: Vec<(usize, u32)> = (0..slots).map(|s| (s, prompts[s][j])).collect();
         lg = e.window_batch(&rows)?;
     }
     let mut cur: Vec<u32> = (0..slots).map(|s| argmax(&lg[s * nv..(s + 1) * nv])).collect();
@@ -1952,15 +1970,27 @@ fn slots_bench(
     for (s, g) in gen.iter().enumerate() {
         println!("ids slot {s}: {}", line(g));
     }
-    let same = gen.iter().all(|g| g == &gen[0]);
-    println!("slots agree: {}", if same { "yes" } else { "NO — slot state bleeds" });
+    // identical prompts: every slot must give the same ids; diverse: only slot 0 has the
+    // reference prompt (compare its ids to the oracle), the others just differ
+    let same = diverse || gen.iter().all(|g| g == &gen[0]);
+    if diverse {
+        let distinct = gen.iter().skip(1).filter(|g| *g != &gen[0]).count();
+        println!("diverse prompts: {distinct} of {} other slots decode differently from slot 0", slots - 1);
+    } else {
+        println!("slots agree: {}", if same { "yes" } else { "NO — slot state bleeds" });
+    }
     if !step_ms.is_empty() {
         let mut v = step_ms.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let toks = (slots * step_ms.len()) as f64;
         println!(
             "slots {slots} ({}): per-step wall {:.1} ms median (min {:.1}, max {:.1}) over {} steps | {:.1} ms/token/slot | aggregate {:.2} tok/s, per stream {:.2} tok/s",
-            if rr { "round-robin" } else { "batched" },
+            match (rr, diverse) {
+                (false, false) => "batched, same prompt",
+                (false, true) => "batched, diverse",
+                (true, false) => "round-robin, same prompt",
+                (true, true) => "round-robin, diverse",
+            },
             v[v.len() / 2],
             v[0],
             v[v.len() - 1],
