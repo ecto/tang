@@ -39,7 +39,7 @@ pub use attribute::{attribute, Cause, Row, Verdict};
 pub use layout::{Dim, Layout};
 pub use spec::{tap, Region, Spec, Tap, Taps};
 pub use stat::{stat, Stat};
-pub use testing::{require_cuda, skip_or_fail, Cases};
+pub use testing::{require_cuda, skip_or_fail, CaseResult, Cases};
 pub use verifier::{fmt_stat, write_f32, Report, Verifier};
 
 use std::path::PathBuf;
