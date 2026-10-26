@@ -1307,9 +1307,11 @@ mod tests {
     fn engine_gpu_matches_cpu() {
         let (Some(_ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
+            return;
         };
         if tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("no CUDA device");
+            return;
         }
         let mut cpu = Glm5Engine::open(Path::new(TINY)).unwrap();
         let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
@@ -1330,7 +1332,7 @@ mod tests {
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
-        let _ = &ids;
+        let _ = &_ids;
         let mut flips = Vec::new();
         for (wi, w) in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]]
             .into_iter()
@@ -1375,19 +1377,20 @@ mod tests {
     fn mhc_gpu_pre_block1_matches_cpu_block1() {
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
+            return;
         }
         let r = Glm5Ref::open(Path::new(TINY)).unwrap();
-        let mhp = super::mhc::MhcHparams {
+        let mhp = super::super::mhc::MhcHparams {
             streams: r.hp.hc,
             sinkhorn_iters: r.hp.hc_sinkhorn_iters as u32,
             hc_eps: r.hp.hc_eps,
             rms_eps: r.hp.eps,
         };
-        let wa = super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
-        let wf = super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
-        let mut g = tang_moe::gpu::Gpu::for_test().unwrap();
+        let wa = super::super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
+        let wf = super::super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
+        let g = tang_moe::gpu::Gpu::for_test().unwrap();
         g.bind().unwrap();
-        let mh = super::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
+        let mh = super::super::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
         // four streams of nonzero state
         let t = 3usize;
         let n = r.hp.n_embd;
@@ -1439,34 +1442,17 @@ mod tests {
     /// fixture. This test asserts the structural invariant on the real model's geometry
     /// at load (no weights needed): `mla_k[l]` is `Some` exactly for DSA layers, and the
     /// per-layer instances are distinct objects.
-    #[cfg(feature = "cuda")]
     #[test]
     fn mla_resident_is_per_layer() {
-        // no fixture dependency: the invariant is checked inside engine_gpu_mla_matches_cpu
-        // on the tiny model (one DSA layer, so it only guards construction) AND here via
-        // the engine's own accounting on any loaded model. The load-log line
-        // "N DSA layers resident (MLA, one per layer)" is the real-model proof; this test
-        // pins the invariant so a future per-device revert fails construction-time asserts.
-        let dsa_layers = |hp: &super::Hparams| -> Vec<usize> {
-            (0..hp.n_layer).filter(|&l| !hp.is_kda[l]).collect()
-        };
-        // the real GLM-5.3 geometry: 11 DSA layers, first at layer 3
-        let hp = super::Hparams {
-            n_layer: 45,
-            is_kda: {
-                let mut v = vec![true; 45];
-                for l in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] {
-                    v[l] = false;
-                }
-                v
-            },
-            ..Default::default()
-        };
-        let dsa = dsa_layers(&hp);
+        // the real GLM-5.3 geometry (HF config kda_layers): 11 DSA layers, the first at 3 —
+        // the sample layer the per-device bug froze for all of them. The load-time
+        // invariant (mla_k[l] is Some exactly on DSA layers) is asserted on a real engine
+        // in engine_gpu_mla_matches_cpu; this pins the geometry the bug class depends on.
+        let is_kda: Vec<bool> = (0..45).map(|l| l % 4 != 3).collect();
+        let dsa: Vec<usize> = (0..45).filter(|&l| !is_kda[l]).collect();
         assert_eq!(dsa.len(), 11, "GLM-5.3 DSA layer count");
         assert_eq!(dsa[0], 3, "first DSA layer (the sample-layer bug's source)");
-        // and the count the load log prints must match the DSA layer count
-        assert_eq!(dsa.len(), 11);
+        assert!(dsa.len() > 1, "a single-DSA-layer geometry cannot see this bug class");
     }
 
     /// R3 (all of it): FFN + KDA + MLA/indexer on the GPU vs the CPU engine. W3's GPU
@@ -1477,6 +1463,7 @@ mod tests {
     fn engine_gpu_mla_matches_cpu() {
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
+            return;
         }
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
         let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
