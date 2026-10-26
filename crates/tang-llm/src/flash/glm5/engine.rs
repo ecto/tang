@@ -328,6 +328,7 @@ impl GpuFfn {
             kda_l,
             kda_dev_fresh,
             kda_kernels: kda_kernels,
+            head_dev,
             max_t,
             mla_k,
             mhc_g,
@@ -339,6 +340,41 @@ impl GpuFfn {
         if mhc_fused {
             f.enable_mhc_fused(g, hp)?;
         }
+        // the LM head on the GPU (TANG_GLM5_GPU_HEAD=1): t==1 decode only. The host
+        // tiled Mat::apply was 39.6 ms/token (trace); one k5_q8 + k5_gemv8 is ~150 us.
+        let head_dev = if std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
+            devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
+            let info = match g.get("output.weight") {
+                Some(t) => t,
+                None => g.info("token_embd.weight")?,
+            };
+            let rows = info.dims[1] as usize; // n_vocab
+            let cols = info.dims[0] as usize; // hidden
+            anyhow::ensure!(
+                info.ty == crate::gguf::GgmlType::Q8_0,
+                "lm head: want Q8_0 (k5_gemv8), got {:?}",
+                info.ty
+            );
+            let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, rows, cols)
+                .map_err(|e| anyhow::anyhow!("lm head upload: {e}"))?;
+            let k5 = super::moe::gpu::Kernels5::new(&devs[0].0)
+                .map_err(|e| anyhow::anyhow!("k5 (head): {e}"))?;
+            // scratch: k5_q8 codes [MAXT][cols] + scales after them (the gemv8 kernel
+            // reads scales at xq8 + MAXT*cols); here MAXT = 1
+            let xq8 = tang_moe::gpu::DevBuf::zeroed_elems::<u8>(cols + cols.div_ceil(32) * 4)
+                .map_err(|e| anyhow::anyhow!("head xq8: {e}"))?;
+            let out = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(rows)
+                .map_err(|e| anyhow::anyhow!("head out: {e}"))?;
+            let hs = tang_moe::gpu::Stream::blocking()
+                .map_err(|e| anyhow::anyhow!("head stream: {e}"))?;
+            eprintln!(
+                "glm5: LM head resident on the GPU ({} MB)",
+                dw.w.row_bytes * rows / 1_000_000
+            );
+            Some(HeadDev { dw, xq8, out, k5, s: hs })
+        } else {
+            None
+        };
         Ok(Some(f))
     }
 
