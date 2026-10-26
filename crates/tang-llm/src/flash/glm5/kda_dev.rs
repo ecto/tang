@@ -215,8 +215,10 @@ impl DevLayer {
             outb: DevBuf::zeroed_elems::<f32>(max_t * hidden).map_err(gerr)?,
             // TANG_GLM5_GEMV8: int8 codes [t][hidden] + f32 per-32 scales [t][hidden/32]
             // (k5_q8's layout; the codes+scales in one buffer, scales after T*hidden codes)
-            xq8: DevBuf::zeroed_elems::<u8>(max_t * hidden + max_t * hidden.div_ceil(32) * 4)
-                .map_err(gerr)?,
+            xq8: {
+                let w = hidden.max(d_inner); // o_proj quantises yb (d_inner wide)
+                DevBuf::zeroed_elems::<u8>(max_t * w + max_t * w.div_ceil(32) * 4).map_err(gerr)?
+            },
             s: Stream::blocking().map_err(gerr)?,
             kers,
             gv,
@@ -254,6 +256,36 @@ impl DevLayer {
     /// `conv` is updated in place (W4's launchers keep the host conv copy fresh); the
     /// recurrent state lives only on the device except across the CPU tail, which reads
     /// it back and seeds it forward.
+
+    /// `y[t*ystride + r] = W row r · x[t]` on k5_gemv8, for a Q8_0 `w` with `cols`-wide
+    /// rows; `xq8` holds x's k5_q8 codes (scales at `max_t * cols` bytes after them).
+    /// One row per warp (K5_WARPS warps a block); dynamic smem = one staged row per warp
+    /// plus one granule (an unaligned row spans row16 + 1 granules).
+    unsafe fn gemv8_launch(
+        &self,
+        w: &super::moe::gpu::DevW,
+        xq8: u64,
+        cols: usize,
+        y: u64,
+        ystride: usize,
+        rows: usize,
+        t: usize,
+    ) -> Result<()> {
+        let scales = xq8 + (self.max_t * cols) as u64;
+        let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
+        unsafe {
+            launch(
+                self.gv.gemv8,
+                (rows.div_ceil(K5_WARPS) as u32, t as u32, 1),
+                (128, 1, 1),
+                smem,
+                &self.s,
+                args![w.w, 0u32, xq8, scales, y, ystride as u32, t as u32, rows as u32, cols as u32],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn window(&mut self, x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
         ensure!(x.len() == t * self.hidden, "k5 layer input");
         ensure!(t <= self.max_t, "k5 window {t} > {max}", max = self.max_t);
@@ -301,7 +333,11 @@ impl DevLayer {
         // gemv8 is Q8_0-only (its dp4a reads 34-byte Q8_0 blocks): any other weight type —
         // e.g. the f32 tiny fixture — must take k5_gemv, or the kernel reads f32 rows as
         // Q8_0 blocks (NaN logits on the first tiny run)
-        let gemv8 = self.gemv8 && [&self.wq, &self.wk, &self.wv].iter().all(|w| w.w.ty == 8);
+        // PER MATRIX: gemv8 only takes Q8_0 rows. An all-or-nothing guard turned gemv8 off
+        // for the whole layer when one matrix wasn't Q8_0 (the tiny fixture's f_a/g_a are
+        // F32), which made the in-process A/B test compare naive against naive.
+        let g8 = |w: &super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
+        let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv); // the x pre-pass + q/k/v
         unsafe {
             if gemv8 {
                 launch(
@@ -312,22 +348,8 @@ impl DevLayer {
                     &self.s,
                     args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],  // MAXT: the codes array's row cap (scales follow it), NOT t
                 )?;
-                let codes = self.xq8.ptr;
-                let scales = codes + (self.max_t * hidden) as u64;
                 for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
-                    // dynamic shared memory: one staged row per warp, 16-byte granules
-                    // (the kernel's `extern __shared__ uint4 dsm[]`); 0 here wrote past
-                    // the allocation — CUDA_ERROR_ILLEGAL_ADDRESS on the first real run
-                    let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
-                    launch(
-                        self.gv.gemv8,
-                        (di.div_ceil(K5_WARPS) as u32, t as u32, 1),
-                        (128, 1, 1),
-                        smem,
-                        &self.s,
-                        args![w.w, 0u32, codes, scales, qkv + off, (3 * di) as u32,
-                            t as u32, di as u32, hidden as u32],
-                    )?;
+                    self.gemv8_launch(w, self.xq8.ptr, hidden, qkv + off, 3 * di, di, t)?;
                 }
             } else {
                 for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
@@ -345,15 +367,20 @@ impl DevLayer {
                 }
             }
             // forget gate: f_a → g1, f_b: g1 → g (out of place), finish in place on g
-            launch(
-                self.gv.gemv,
-                grid(t * hd),
-                (128, 1, 1),
-                0,
-                &self.s,
-                args![self.fa.w, 0u32, self.xb.ptr, self.g1b.ptr, hd as u32, t as u32,
-                    hd as u32, hidden as u32],
-            )?;
+            if gemv8 && g8(&self.fa) {
+                // x's int8 codes are still in xq8 from the q/k/v pre-pass
+                self.gemv8_launch(&self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, t)?;
+            } else {
+                launch(
+                    self.gv.gemv,
+                    grid(t * hd),
+                    (128, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.fa.w, 0u32, self.xb.ptr, self.g1b.ptr, hd as u32, t as u32,
+                        hd as u32, hidden as u32],
+                )?;
+            }
             launch(
                 self.gv.gemv,
                 grid(t * di),
@@ -498,15 +525,21 @@ impl DevLayer {
         self.ob.write(0, &o)?;
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
-            launch(
-                self.gv.gemv,
-                grid(t * hd),
-                (128, 1, 1),
-                0,
-                &self.s,
-                args![self.ga.w, 0u32, self.xb.ptr, self.g2a.ptr, hd as u32, t as u32,
-                    hd as u32, hidden as u32],
-            )?;
+            if gemv8 && g8(&self.ga) {
+                // x's codes are still in xq8 (nothing has re-quantised since the pre-pass;
+                // the o_proj pass below is the first to overwrite them)
+                self.gemv8_launch(&self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, t)?;
+            } else {
+                launch(
+                    self.gv.gemv,
+                    grid(t * hd),
+                    (128, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.ga.w, 0u32, self.xb.ptr, self.g2a.ptr, hd as u32, t as u32,
+                        hd as u32, hidden as u32],
+                )?;
+            }
             launch(
                 self.gv.gemv,
                 grid(t * di),
@@ -525,15 +558,28 @@ impl DevLayer {
                 args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32,
                     hd as u32, self.cfg.eps, t as u32],
             )?;
-            launch(
-                self.gv.gemv,
-                grid(t * hidden),
-                (128, 1, 1),
-                0,
-                &self.s,
-                args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32,
-                    t as u32, hidden as u32, di as u32],
-            )?;
+            if g8(&self.wo) {
+                // o_proj reads yb (d_inner wide): quantise it, then the dequant-reuse GEMV
+                launch(
+                    self.gv.q8,
+                    ((di / 32) as u32, t as u32, 1),
+                    (32, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.yb.ptr, self.xq8.ptr, di as u32, self.max_t as u32],
+                )?;
+                self.gemv8_launch(&self.wo, self.xq8.ptr, di, self.outb.ptr, hidden, hidden, t)?;
+            } else {
+                launch(
+                    self.gv.gemv,
+                    grid(t * hidden),
+                    (128, 1, 1),
+                    0,
+                    &self.s,
+                    args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32,
+                        t as u32, hidden as u32, di as u32],
+                )?;
+            }
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, t * hidden)?;
@@ -623,8 +669,22 @@ mod tests {
             // int8 activations vs f32: the fe_gemv8 band, not bitwise
             assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 qkv.{name} diverges: {s:?}");
         }
+        // f_a (gate) and g_a (g2) now on gemv8 too; o_proj covers the layer output
+        for (name, a, b) in [("g", &t0.g, &t1.g), ("g2", &t0.g2, &t1.g2)] {
+            let s = super::super::kda_debug::stat(b, a, 1e-2);
+            eprintln!("{name}: rel {:.3e} max {:.3e} nonfinite {}", s.rel_l2, s.max_abs, s.nonfinite_gpu);
+            assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 {name} diverges: {s:?}");
+        }
         let s = super::super::kda_debug::stat(&y1, &y0, 1e-2);
         eprintln!("layer out: rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
+        // a hollow A/B (both runs on the naive kernel) gives EXACTLY 0 — int8 activations
+        // always leave some noise, so 0 means gemv8 never ran
+        let sq = super::super::kda_debug::stat(
+            &super::super::kda_debug::section(&t1.qkv_pre, t, di, 0),
+            &super::super::kda_debug::section(&t0.qkv_pre, t, di, 0),
+            1e-2,
+        );
+        assert!(sq.rel_l2 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
         assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 2e-2, "gemv8 layer output diverges: {s:?}");
     }
 }
