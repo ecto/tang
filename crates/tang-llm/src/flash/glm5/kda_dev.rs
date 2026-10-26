@@ -113,6 +113,11 @@ pub struct DevLayer {
     nh: usize,
     hd: usize,
     max_t: usize,
+    /// `TANG_GLM5_KDA_DEBUG`: when set by the engine for this window, [`Self::window`]
+    /// poisons its scratch with NaN first and leaves every intermediate in [`Self::taps`]
+    /// for the shadow check ([`super::kda_debug`]).
+    pub debug: bool,
+    pub taps: Option<super::kda_debug::KdaTaps>,
 }
 
 /// The G5W descriptor of one `KdaLayerW` matrix, from the GGUF's raw tensor (the weights
@@ -210,6 +215,8 @@ impl DevLayer {
             nh,
             hd,
             max_t,
+            debug: false,
+            taps: None,
         })
     }
 
@@ -242,7 +249,30 @@ impl DevLayer {
             Some(v) => v,
             None => f32::NAN, // the kernel's softplus-form sentinel
         };
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the layer input, matching kda::kda_layer's `kda cpu x` line: if x already
+            // differs, the divergence is upstream of KDA (not a staging bug)
+            eprintln!("kda gpu x[0..8]: {:?}", &x[..8.min(x.len())]);
+        }
         self.xb.write(0, x)?;
+        if self.debug && super::kda_debug::poison_on() {
+            // NaN-fill every output scratch this window writes: a region no kernel
+            // touches then reads NaN in the shadow check, not a plausible 0.0
+            let nan = |n: usize| vec![f32::NAN; n];
+            self.qkvb.write(0, &nan(t * 3 * di))?;
+            self.g1b.write(0, &nan(t * hd))?;
+            self.gb_out.write(0, &nan(t * di))?;
+            self.bb.write(0, &nan(t * nh))?;
+            self.g2a.write(0, &nan(t * hd))?;
+            self.g2b.write(0, &nan(t * di))?;
+            self.yb.write(0, &nan(t * di))?;
+            self.outb.write(0, &nan(t * hidden))?;
+            // the core's own scratch (conv output, core output) for the device paths
+            let c = t.min(64);
+            self.core.yb.write(0, &nan(c * 3 * di))?;
+            self.core.ob.write(0, &nan(c * di))?;
+        }
+        let mut tp = self.debug.then(super::kda_debug::KdaTaps::default);
         // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di)
         let qkv = self.qkvb.ptr;
         unsafe {
@@ -303,14 +333,31 @@ impl DevLayer {
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
         let beta_h = self.bb.read::<f32>(0, t * nh)?;
+        if let Some(tp) = tp.as_mut() {
+            tp.qkv_pre = qkv_h.clone();
+            tp.g = g_h.clone();
+            tp.beta = beta_h.clone();
+            // the device conv path's output is only observable per 64-chunk (core.yb);
+            // NaN marks rows no path filled (decode fuses the conv into the step kernel)
+            if t > 1 {
+                tp.conv_out = vec![f32::NAN; t * 3 * di];
+            }
+        }
         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
             // the staging probe (matches kda::kda_layer's CPU dump; layout/units equal):
             // qkv[0..16] (token 0), g[0..8], beta[0..4], the device state's first 8,
             // and the host conv copy's first 4
-            let st_h = self.core.st.read::<f32>(0, 8).unwrap_or_default();
+            let st_h = self.core.st.read::<f32>(0, 8).unwrap_or_else(|e| {
+                // surface read errors loudly: a silent empty vec here looks like a zero
+                // state and wasted a diagnosis cycle (every state line printed 0.0)
+                eprintln!("kda gpu state READ ERROR: {e}");
+                Vec::new()
+            });
             eprintln!(
-                "kda gpu qkv[0..16]: {:?}\n kda gpu g[0..8]: {:?}\n kda gpu beta[0..4]: {:?}\n kda gpu state[0..8]: {:?}\n kda gpu conv_host[0..4]: {:?}",
+                "kda gpu qkv[0..16]: {:?}\n kda gpu qkv_k[0..8]: {:?}\n kda gpu qkv_v[0..8]: {:?}\n kda gpu g[0..8]: {:?}\n kda gpu beta[0..4]: {:?}\n kda gpu state[0..8]: {:?}\n kda gpu conv_host[0..4]: {:?}",
                 &qkv_h[..16.min(qkv_h.len())],
+                &qkv_h[di..di + 8.min(qkv_h.len() - di)],
+                &qkv_h[2 * di..2 * di + 8.min(qkv_h.len() - 2 * di)],
                 &g_h[..8.min(g_h.len())],
                 &beta_h[..4.min(beta_h.len())],
                 &st_h,
@@ -341,6 +388,10 @@ impl DevLayer {
                     64,
                 )?;
                 o[off * di..(off + 64) * di].copy_from_slice(&o64);
+                if let Some(tp) = tp.as_mut() {
+                    let y64 = self.core.yb.read::<f32>(0, 64 * 3 * di)?;
+                    tp.conv_out[off * 3 * di..(off + 64) * 3 * di].copy_from_slice(&y64);
+                }
                 off += 64;
             }
             // a tail shorter than one chunk: the CPU core on the device's state —
@@ -376,11 +427,19 @@ impl DevLayer {
                     64,
                 )?;
                 o[off * di..t * di].copy_from_slice(&oc);
+                if let Some(tp) = tp.as_mut() {
+                    tp.conv_out[off * 3 * di..t * 3 * di].copy_from_slice(&yc);
+                }
                 self.seed(&hconv, &hstate)?;
                 *conv = hconv;
             }
         }
         // gated output norm (device) then o_proj
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the core output pre-norm (the CPU tail path's `o`): y-divergence with a
+            // matching o pins the bug to the gated norm or the o_proj GEMV
+            eprintln!("kda gpu o[0..8]: {:?}", &o[..8.min(o.len())]);
+        }
         self.ob.write(0, &o)?;
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
@@ -422,6 +481,19 @@ impl DevLayer {
             )?;
         }
         self.s.sync()?;
-        Ok(self.outb.read::<f32>(0, t * hidden)?)
+        let out = self.outb.read::<f32>(0, t * hidden)?;
+        if let Some(mut tp) = tp {
+            tp.o = o;
+            tp.g2 = self.g2b.read::<f32>(0, t * di)?;
+            tp.y_norm = self.yb.read::<f32>(0, t * di)?;
+            tp.out = out.clone();
+            self.taps = Some(tp);
+        }
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the layer OUTPUT (post gated-norm + o_proj): pins the divergence to the
+            // core (ob/yb) or the output path (norm/wo) when x already matches
+            eprintln!("kda gpu y[0..8]: {:?}", &out[..8.min(out.len())]);
+        }
+        Ok(out)
     }
 }

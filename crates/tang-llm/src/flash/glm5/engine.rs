@@ -295,6 +295,10 @@ pub struct Glm5Engine {
     /// The FFNs on the GPU, when a CUDA build finds one ([`Glm5Engine::use_gpu`]).
     #[cfg(feature = "cuda")]
     pub gpu: Option<GpuFfn>,
+    /// `TANG_GLM5_KDA_DEBUG=1`: the CPU shadow of every resident KDA layer, checked
+    /// intermediate-by-intermediate after each window ([`super::kda_debug`]).
+    #[cfg(feature = "cuda")]
+    kda_dbg: Option<super::kda_debug::Shadow>,
 }
 
 impl Glm5Engine {
@@ -314,6 +318,8 @@ impl Glm5Engine {
             dump: super::dump::DumpSink::open(),
             #[cfg(feature = "cuda")]
             gpu: None,
+            #[cfg(feature = "cuda")]
+            kda_dbg: super::kda_debug::Shadow::from_env(nl),
         })
     }
 
@@ -437,7 +443,23 @@ impl Glm5Engine {
                     dev.seed(&st.0, &st.1)?;
                     g.kda_dev_fresh[l] = true;
                 }
-                let y = dev.window(x, t, &mut st.0)?;
+                let dbg = self.kda_dbg.as_mut().filter(|d| d.wants(l));
+                let Some(dbg) = dbg else {
+                    return dev.window(x, t, &mut st.0);
+                };
+                // shadow check: the device's state going in, the window with taps, the
+                // device's state coming out, then the CPU re-run of the same window
+                dbg.prime(l, &st.0, &st.1);
+                let (mut c_in, mut s_in) = (st.0.clone(), st.1.clone());
+                dev.read_back(&mut c_in, &mut s_in)?;
+                dev.debug = true;
+                let y = dev.window(x, t, &mut st.0);
+                dev.debug = false;
+                let y = y?;
+                let taps = dev.taps.take().unwrap_or_default();
+                let (mut c_out, mut s_out) = (st.0.clone(), st.1.clone());
+                dev.read_back(&mut c_out, &mut s_out)?;
+                dbg.check(l, x, t, w, cfg, &taps, &st.0, &c_out, &s_out, Some(&s_in))?;
                 return Ok(y);
             }
         }
@@ -1104,6 +1126,7 @@ mod tests {
     /// a tiny sequence. Named the bug the tiny fixture couldn't: if this fails while
     /// engine_gpu_matches_cpu passes, the divergence is real-weights/real-shape specific.
     /// Gated on TANG_GLM5_REAL_GGUF (the shard-1 path) so normal test runs stay cheap.
+    #[cfg(feature = "cuda")]
     #[test]
     fn engine_real_weights_gpu_matches_cpu() {
         let Some(real) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {

@@ -649,6 +649,23 @@ pub fn kda_layer(
     b: usize,
     t: usize,
 ) -> Result<Vec<f32>> {
+    kda_layer_taps(x, w, cfg, conv, state, b, t, None)
+}
+
+/// [`kda_layer`], optionally capturing every intermediate into `taps` (the
+/// `TANG_GLM5_KDA_DEBUG` shadow check compares them against the GPU's, see
+/// [`super::kda_debug`]). The math is the same code path either way.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_layer_taps(
+    x: &[f32],
+    w: &KdaLayerW,
+    cfg: &KdaConfig,
+    conv: &mut ConvState,
+    state: &mut KdaState,
+    b: usize,
+    t: usize,
+    mut taps: Option<&mut super::kda_debug::KdaTaps>,
+) -> Result<Vec<f32>> {
     let (nh, hd) = (cfg.heads, cfg.head_dim);
     let hidden = w.hidden;
     ensure!(x.len() == b * t * hidden, "layer input");
@@ -668,11 +685,21 @@ pub fn kda_layer(
         qkv[i * ch + nh * hd..i * ch + 2 * nh * hd].copy_from_slice(&kp[i * nh * hd..(i + 1) * nh * hd]);
         qkv[i * ch + 2 * nh * hd..(i + 1) * ch].copy_from_slice(&vp[i * nh * hd..(i + 1) * nh * hd]);
     }
+    // pre-conv, like kda_dev's `kda gpu qkv` (read from qkvb before the core's conv)
+    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        eprintln!("kda cpu qkv[0..16]: {:?}", &qkv[..16.min(qkv.len())]);
+    }
+    if let Some(tp) = taps.as_deref_mut() {
+        tp.qkv_pre = qkv.clone();
+    }
     let qkv = if t == 1 {
         conv1d_decode(&qkv, &w.conv, conv, cfg, b)?
     } else {
         conv1d_prefill(&qkv, &w.conv, conv, cfg, b, t)?
     };
+    if let Some(tp) = taps.as_deref_mut() {
+        tp.conv_out = qkv.clone();
+    }
     // gates
     let g = forget_gate(
         x,
@@ -687,9 +714,12 @@ pub fn kda_layer(
     );
     let beta = beta_gate(x, &w.b_proj, cfg, b, t);
     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
-        eprintln!("kda cpu qkv[0..16]: {:?}", &qkv[..16.min(qkv.len())]);
         eprintln!("kda cpu g[0..8]: {:?}", &g[..8.min(g.len())]);
         eprintln!("kda cpu beta[0..4]: {:?}", &beta[..4.min(beta.len())]);
+    }
+    if let Some(tp) = taps.as_deref_mut() {
+        tp.g = g.clone();
+        tp.beta = beta.clone();
     }
     // core
     let o = if t == 1 {
@@ -697,6 +727,10 @@ pub fn kda_layer(
     } else {
         kda_chunk(&qkv, &g, &beta, state, cfg, b, t, 64)?
     };
+    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        // the core output and the final layer output, matching kda_dev's `kda gpu o`/`y`
+        eprintln!("kda cpu o[0..8]: {:?}", &o[..8.min(o.len())]);
+    }
     // gated output norm: y = RMSNorm(o) * o_norm * σ(g2), g2 = g_b(g_a(x))
     let ga = matmul(&w.g_a, hd, hidden, x, b * t);
     let g2 = matmul(&w.g_b, nh * hd, hd, &ga, b * t);
@@ -711,7 +745,17 @@ pub fn kda_layer(
             }
         }
     }
-    Ok(matmul(&w.o_proj, hidden, nh * hd, &y, b * t))
+    let out = matmul(&w.o_proj, hidden, nh * hd, &y, b * t);
+    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        eprintln!("kda cpu y[0..8]: {:?}", &out[..8.min(out.len())]);
+    }
+    if let Some(tp) = taps {
+        tp.o = o;
+        tp.g2 = g2;
+        tp.y_norm = y;
+        tp.out = out.clone();
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
