@@ -21,6 +21,7 @@
 //! (`hidden ≤ 1024`, i.e. the tiny fixture), or with `TANG_GLM5_CACHE=1`, they are cached.
 
 use super::forward::Glm5Ref;
+use tang_moe::{args, gpu::launch};
 use super::kda::{ConvState, KdaConfig, KdaLayerW, KdaState};
 use super::mla::MlaWeights;
 use anyhow::{bail, ensure, Context, Result};
@@ -48,12 +49,29 @@ struct DsaCache {
 /// (`TANG_SPLIT_AT`, default: the cut that balances routed-expert bytes). Activations cross
 /// through the host for now (naive; one copy each way per FFN).
 #[cfg(feature = "cuda")]
+/// warps per k5_gemv8 block (kda_k5.cuh's K5_WARPS: one staged row per warp).
+const K5_WARPS: usize = 4;
+
+/// The LM head resident (TANG_GLM5_GPU_HEAD=1): weights, k5_q8 scratch (codes + scales
+/// after them, MAXT rows), the logits row, the k5 kernels, and a blocking stream
+/// (DevBuf::write is a synchronous legacy-stream copy; a NON_BLOCKING stream would not
+/// order against it — gpu.rs's doc).
+struct HeadDev {
+    dw: super::moe::gpu::DevW,
+    xq8: super::moe::gpu::DevBuf,
+    out: super::moe::gpu::DevBuf,
+    k5: super::moe::gpu::Kernels5,
+    s: tang_moe::gpu::Stream,
+}
+
 pub struct GpuFfn {
     devs: Vec<(tang_moe::gpu::Gpu, super::moe::gpu::Kernels)>,
     /// The resident KDA layers ([`super::kda_dev::DevLayer`], W4's DevKda core + the
     /// projections as device GEMVs), one per KDA layer, `None` when
     /// `TANG_GLM5_GPU_KDA=0`. The free-kernel path (`kda_gpu`) stays as the fallback for
     /// windows past `max_t`.
+    /// The device LM head (None unless TANG_GLM5_GPU_HEAD=1).
+    head_dev: Option<HeadDev>,
     kda_l: Vec<Option<super::kda_dev::DevLayer>>,
     /// Per KDA layer: does the device hold the live state (vs the engine's host copies)?
     kda_dev_fresh: Vec<bool>,
@@ -916,11 +934,50 @@ impl Glm5Engine {
         self.m.norm_all_exact(&mut h, "output_norm.weight")?;
         drop(tr);
         let tr = span("lm_head");
-        if self.head.is_none() {
-            self.head = Some(self.m.head()?);
-        }
-        let head = self.head.as_ref().unwrap();
-        let logits = head.apply(&h, t, false);
+        let logits = match self.gpu.as_ref().and_then(|g| g.head_dev.as_ref()) {
+            // decode (t=1): the normed h row on the device, one k5_q8 + one k5_gemv8. The
+            // host tiled path measured 39.6 ms/token (TANG_GLM5_TRACE); the kernel is
+            // ~150 us. The logits row lands in the `out` buffer, then one D2H read.
+            Some(hd) if t == 1 => {
+                let (gpu, _) = &g.devs[0];
+                gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+                let n = self.m.hp.n_embd;
+                let nv = self.m.hp.n_vocab;
+                let row = &h[(t - 1) * n..t * n];
+                hd.xq8.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
+                unsafe {
+                    // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
+                    tang_moe::gpu::launch(
+                        hd.k5.q8,
+                        ((n / 32) as u32, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &hd.s,
+                        args![row.as_ptr() as *mut std::ffi::c_void, hd.xq8.ptr, n as u32, 1u32],
+                    )?;
+                    // k5_gemv8: grid (rows/K5_WARPS, T=1), ROWS = n_vocab, COLS = n;
+                    // scales live at xq8 + 1*n bytes (the MAXT offset)
+                    tang_moe::gpu::launch(
+                        hd.k5.gemv8,
+                        ((nv / K5_WARPS) as u32, 1, 1),
+                        (128, 1, 1),
+                        (4 * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                        &hd.s,
+                        args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
+                            1u32, 1u32, nv as u32, n as u32],
+                    )?;
+                }
+                hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
+                hd.out.read::<f32>(0, nv).map_err(|e| anyhow::anyhow!("head read: {e}"))?
+            }
+            _ => {
+                if self.head.is_none() {
+                    self.head = Some(self.m.head()?);
+                }
+                let head = self.head.as_ref().unwrap();
+                head.apply(&h, t, false)
+            }
+        };
         drop(tr);
         drop(tr_head);
         stage("head", &t5);
