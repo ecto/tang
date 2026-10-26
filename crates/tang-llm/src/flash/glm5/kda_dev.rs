@@ -61,7 +61,6 @@ use super::kda_cuda::cuda::{DevKda, Kernels};
 ///   ordinary `k5_gemv` launches into the `g2` scratch (`g_a`: `[t][hd]`, then `g_b`
 ///   in place on a separate buffer, so no read/write race).
 
-
 /// Everything of one KDA layer on one GPU, built once at engine load.
 pub struct DevLayer {
     /// The conv + delta-rule core (W4's `DevKda`): state lives on device between windows.
@@ -169,7 +168,11 @@ impl DevLayer {
             // the converter splits HF's fused qkv conv per q|k|v; the CPU loader stacks
             // them in q,k,v order — the core kernel indexes the same stack
             let mut c = Vec::with_capacity(3 * d_inner * cfg.d_conv);
-            for n in ["ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"] {
+            for n in [
+                "ssm_conv1d_q.weight",
+                "ssm_conv1d_k.weight",
+                "ssm_conv1d_v.weight",
+            ] {
                 c.extend_from_slice(&gguf.tensor_f32(&t(n))?);
             }
             c
@@ -260,8 +263,16 @@ impl DevLayer {
             // no kernel touches then reads NaN in the shadow check, not a plausible 0.0.
             // Includes the core's own scratch (conv output, core output).
             p.poison(&[
-                &self.qkvb, &self.g1b, &self.gb_out, &self.bb, &self.g2a, &self.g2b, &self.yb,
-                &self.outb, &self.core.yb, &self.core.ob,
+                &self.qkvb,
+                &self.g1b,
+                &self.gb_out,
+                &self.bb,
+                &self.g2a,
+                &self.g2b,
+                &self.yb,
+                &self.outb,
+                &self.core.yb,
+                &self.core.ob,
             ])?;
         }
         // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di FLOATS).
@@ -272,7 +283,11 @@ impl DevLayer {
         let qkv = self.qkvb.ptr;
         let f = std::mem::size_of::<f32>() as u64;
         unsafe {
-            for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+            for (w, off) in [
+                (&self.wq, 0u64),
+                (&self.wk, di as u64 * f),
+                (&self.wv, 2 * di as u64 * f),
+            ] {
                 launch(
                     self.gv.gemv,
                     grid(t * di),
@@ -280,8 +295,14 @@ impl DevLayer {
                     0,
                     &self.s,
                     args![
-                        w.w, 0u32, self.xb.ptr, qkv + off, (3 * di) as u32, t as u32,
-                        di as u32, hidden as u32
+                        w.w,
+                        0u32,
+                        self.xb.ptr,
+                        qkv + off,
+                        (3 * di) as u32,
+                        t as u32,
+                        di as u32,
+                        hidden as u32
                     ],
                 )?;
             }
@@ -292,8 +313,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.fa.w, 0u32, self.xb.ptr, self.g1b.ptr, hd as u32, t as u32,
-                    hd as u32, hidden as u32],
+                args![
+                    self.fa.w,
+                    0u32,
+                    self.xb.ptr,
+                    self.g1b.ptr,
+                    hd as u32,
+                    t as u32,
+                    hd as u32,
+                    hidden as u32
+                ],
             )?;
             launch(
                 self.gv.gemv,
@@ -301,8 +330,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.fb.w, 0u32, self.g1b.ptr, self.gb_out.ptr, di as u32, t as u32,
-                    di as u32, hd as u32],
+                args![
+                    self.fb.w,
+                    0u32,
+                    self.g1b.ptr,
+                    self.gb_out.ptr,
+                    di as u32,
+                    t as u32,
+                    di as u32,
+                    hd as u32
+                ],
             )?;
             launch(
                 self.gv.gate,
@@ -310,8 +347,15 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.gb_out.ptr, self.dt.ptr, self.rate.ptr, nh as u32, hd as u32,
-                    lb, t as u32],
+                args![
+                    self.gb_out.ptr,
+                    self.dt.ptr,
+                    self.rate.ptr,
+                    nh as u32,
+                    hd as u32,
+                    lb,
+                    t as u32
+                ],
             )?;
             // beta gate
             launch(
@@ -320,8 +364,14 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.bproj.w, self.xb.ptr, self.bb.ptr, t as u32, hidden as u32,
-                    nh as u32],
+                args![
+                    self.bproj.w,
+                    self.xb.ptr,
+                    self.bb.ptr,
+                    t as u32,
+                    hidden as u32,
+                    nh as u32
+                ],
             )?;
         }
         self.s.sync()?;
@@ -361,11 +411,21 @@ impl DevLayer {
         // W4's core decode/prefill index state.head(cfg, slot, h) on the host even when the
         // device owns the state — hand it a correctly-sized zero buffer so the indexing is
         // in-bounds (the values are ignored: the device-side state is authoritative).
-        let mut dummy_state = KdaState(vec![0f32; self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim]);
+        let mut dummy_state = KdaState(vec![
+            0f32;
+            self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim
+        ]);
         let mut o = vec![0f32; t * di];
         if t == 1 {
             o.copy_from_slice(&self.core.decode(
-                &self.kers, &self.cfg, &qkv_h, &g_h, &beta_h, conv, &mut dummy_state, 1,
+                &self.kers,
+                &self.cfg,
+                &qkv_h,
+                &g_h,
+                &beta_h,
+                conv,
+                &mut dummy_state,
+                1,
             )?);
         } else {
             let mut off = 0usize;
@@ -383,7 +443,12 @@ impl DevLayer {
                 )?;
                 o[off * di..(off + 64) * di].copy_from_slice(&o64);
                 if let Some(p) = tp.as_mut() {
-                    p.read_at(super::kda_debug::tap::CONV, off * 3 * di, &self.core.yb, 64 * 3 * di)?;
+                    p.read_at(
+                        super::kda_debug::tap::CONV,
+                        off * 3 * di,
+                        &self.core.yb,
+                        64 * 3 * di,
+                    )?;
                 }
                 off += 64;
             }
@@ -395,11 +460,9 @@ impl DevLayer {
                     conv.clone(),
                     KdaState(vec![
                         0f32;
-                        self.cfg.heads
-                            * self.cfg.head_dim
-                            * self.cfg.head_dim
-                    ],
-                ));
+                        self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim
+                    ]),
+                );
                 self.read_back(&mut hconv, &mut hstate)?;
                 let yc = super::kda::conv1d_prefill(
                     &qkv_h[off * 3 * di..t * 3 * di],
@@ -421,7 +484,8 @@ impl DevLayer {
                 )?;
                 o[off * di..t * di].copy_from_slice(&oc);
                 if let Some(p) = tp.as_mut() {
-                    p.taps.put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
+                    p.taps
+                        .put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
                 }
                 self.seed(&hconv, &hstate)?;
                 *conv = hconv;
@@ -442,8 +506,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.ga.w, 0u32, self.xb.ptr, self.g2a.ptr, hd as u32, t as u32,
-                    hd as u32, hidden as u32],
+                args![
+                    self.ga.w,
+                    0u32,
+                    self.xb.ptr,
+                    self.g2a.ptr,
+                    hd as u32,
+                    t as u32,
+                    hd as u32,
+                    hidden as u32
+                ],
             )?;
             launch(
                 self.gv.gemv,
@@ -451,8 +523,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.gb.w, 0u32, self.g2a.ptr, self.g2b.ptr, di as u32, t as u32,
-                    di as u32, hd as u32],
+                args![
+                    self.gb.w,
+                    0u32,
+                    self.g2a.ptr,
+                    self.g2b.ptr,
+                    di as u32,
+                    t as u32,
+                    di as u32,
+                    hd as u32
+                ],
             )?;
             launch(
                 self.gv.norm,
@@ -460,8 +540,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32,
-                    hd as u32, self.cfg.eps, t as u32],
+                args![
+                    self.ob.ptr,
+                    self.on.ptr,
+                    self.g2b.ptr,
+                    self.yb.ptr,
+                    nh as u32,
+                    hd as u32,
+                    self.cfg.eps,
+                    t as u32
+                ],
             )?;
             launch(
                 self.gv.gemv,
@@ -469,8 +557,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32,
-                    t as u32, hidden as u32, di as u32],
+                args![
+                    self.wo.w,
+                    0u32,
+                    self.yb.ptr,
+                    self.outb.ptr,
+                    hidden as u32,
+                    t as u32,
+                    hidden as u32,
+                    di as u32
+                ],
             )?;
         }
         self.s.sync()?;
@@ -499,10 +595,12 @@ mod tests {
     //! `TANG_REQUIRE_CUDA=1`. Pod/mew: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
     //! --features cuda --lib kda_dev`.
     use super::*;
-    use tang_verify::{Cases, CaseResult, Layout, Probe, Spec, Taps};
+    use tang_verify::{CaseResult, Cases, Layout, Probe, Spec, Taps};
 
     fn rnd(s: &mut u64) -> f32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     }
 
@@ -518,11 +616,16 @@ mod tests {
     ) -> CaseResult {
         let mut seed = (t * 1_000_003 + di * 31 + hidden) as u64;
         let x: Vec<f32> = (0..t * hidden).map(|_| rnd(&mut seed)).collect();
-        let ws: Vec<Vec<f32>> =
-            (0..3).map(|_| (0..di * hidden).map(|_| rnd(&mut seed)).collect()).collect();
+        let ws: Vec<Vec<f32>> = (0..3)
+            .map(|_| (0..di * hidden).map(|_| rnd(&mut seed)).collect())
+            .collect();
         let xb = DevBuf::from_slice(&x)?;
         let qkv = p.output(t * 3 * di)?;
-        let unit = if elem_offsets { 1 } else { std::mem::size_of::<f32>() as u64 };
+        let unit = if elem_offsets {
+            1
+        } else {
+            std::mem::size_of::<f32>() as u64
+        };
         for (k, w) in ws.iter().enumerate() {
             let dw = super::super::moe::gpu::upload(&super::super::moe::W::F32(w), 1, di, hidden)?;
             let dst = qkv.ptr + k as u64 * di as u64 * unit;
@@ -533,7 +636,16 @@ mod tests {
                     (128, 1, 1),
                     0,
                     s,
-                    args![dw.w, 0u32, xb.ptr, dst, (3 * di) as u32, t as u32, di as u32, hidden as u32],
+                    args![
+                        dw.w,
+                        0u32,
+                        xb.ptr,
+                        dst,
+                        (3 * di) as u32,
+                        t as u32,
+                        di as u32,
+                        hidden as u32
+                    ],
                 )?;
             }
             s.sync()?;
@@ -555,7 +667,11 @@ mod tests {
         let lay = Layout::new().dim("tok", 0).dim("r", di);
         let spec = Spec::new("k5_gemv").stacked(
             "qkv",
-            &[("q", di, "k5_gemv W_q"), ("k", di, "k5_gemv W_k"), ("v", di, "k5_gemv W_v")],
+            &[
+                ("q", di, "k5_gemv W_q"),
+                ("k", di, "k5_gemv W_k"),
+                ("v", di, "k5_gemv W_v"),
+            ],
             lay,
             &[],
         );
@@ -565,7 +681,9 @@ mod tests {
     const SHAPES: &[(usize, usize, usize)] = &[(1, 64, 32), (5, 256, 96), (20, 128, 200)];
 
     tang_verify::kernel_test!(k5_gemv_stacked_qkv_matches_cpu, {
-        let Some(g) = tang_verify::device::gpu_or_skip("k5_gemv") else { return };
+        let Some(g) = tang_verify::device::gpu_or_skip("k5_gemv") else {
+            return;
+        };
         let kv = super::super::moe::gpu::Kernels5::new(&g).unwrap();
         let s = Stream::blocking().unwrap();
         Cases::new("k5_gemv")
@@ -577,7 +695,9 @@ mod tests {
     // The harness on the real kernel with the staging bug put back: it must fail every
     // case and name k's writer (not q's) with the ×4 element-vs-byte diagnosis.
     tang_verify::kernel_test!(k5_gemv_element_offset_bug_is_named, {
-        let Some(g) = tang_verify::device::gpu_or_skip("k5_gemv") else { return };
+        let Some(g) = tang_verify::device::gpu_or_skip("k5_gemv") else {
+            return;
+        };
         let kv = super::super::moe::gpu::Kernels5::new(&g).unwrap();
         let s = Stream::blocking().unwrap();
         let fails = Cases::new("k5_gemv-buggy")
@@ -585,7 +705,10 @@ mod tests {
             .check(|&shape, _, p| stacked_qkv(&kv, &s, shape, true, p));
         assert_eq!(fails.len(), SHAPES.len(), "{fails:#?}");
         for f in &fails {
-            assert!(f.contains("`k` wrote into `q`") && f.contains("k5_gemv W_k"), "{f}");
+            assert!(
+                f.contains("`k` wrote into `q`") && f.contains("k5_gemv W_k"),
+                "{f}"
+            );
             assert!(f.contains("ELEMENT offset added to a BYTE address"), "{f}");
         }
     });

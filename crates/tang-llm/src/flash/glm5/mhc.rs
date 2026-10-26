@@ -509,7 +509,9 @@ impl MhcKernels {
     /// Compile [`SRC`] for this device's architecture. `Gpu::bind` first.
     pub fn new(gpu: &tang_moe::gpu::Gpu) -> Result<Self> {
         Ok(Self {
-            module: gpu.module(SRC).map_err(|e| anyhow::anyhow!("mhc kernels: {e}"))?,
+            module: gpu
+                .module(SRC)
+                .map_err(|e| anyhow::anyhow!("mhc kernels: {e}"))?,
         })
     }
 
@@ -768,7 +770,16 @@ impl MhcGpu {
         self.comb.write(0, &mix.comb).map_err(gerr)?;
         unsafe {
             self.k
-                .post(&self.s, self.y.ptr, self.r.ptr, self.post.ptr, self.comb.ptr, self.rout.ptr, t, self.n)
+                .post(
+                    &self.s,
+                    self.y.ptr,
+                    self.r.ptr,
+                    self.post.ptr,
+                    self.comb.ptr,
+                    self.rout.ptr,
+                    t,
+                    self.n,
+                )
                 .map_err(|e| anyhow::anyhow!("mhc post launch: {e}"))?;
         }
         self.s.sync().map_err(gerr)?;
@@ -806,7 +817,7 @@ mod tests {
 
     fn read(name: &str, want: &[usize]) -> Vec<f32> {
         let b = std::fs::read(fixture_dir().join(format!("{name}.bin")))
-            .with_context(|| format!("{name}"))
+            .with_context(|| name.to_string())
             .unwrap();
         assert_eq!(b.len() % 4, 0, "{name}: not f32");
         assert_eq!(
@@ -1065,6 +1076,7 @@ mod tests {
 
     /// Deterministic pseudo-random f32 in [-1, 1) from an integer state (xorshift-ish; no
     /// external rng dep). Different `seed`s give independent sequences.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn rnd(state: &mut u64) -> f32 {
         // xorshift64*
         *state ^= *state >> 12;
@@ -1186,7 +1198,10 @@ mod tests {
         }
         // The mixes GEMV is 16k-long f32 dots: CPU f64-sumsq vs GPU f32 differ a little more
         // than the tiny case; 1e-4 stays the gate.
-        assert!(max <= 1e-4, "cuda real-shape parity: max abs err {max} > 1e-4");
+        assert!(
+            max <= 1e-4,
+            "cuda real-shape parity: max abs err {max} > 1e-4"
+        );
         eprintln!("mhc cuda real-shape (n={n}, t={t}): max abs err {max:.3e}");
 
         // Micro-bench: events timing of pre and post at batch 1 and 8, 50 reps each, the
@@ -1302,19 +1317,8 @@ mod tests {
             let combb = DevBuf::zeroed(t * 16 * 4).unwrap();
             unsafe {
                 k.pre(
-                    &stream,
-                    rb.ptr,
-                    fnb.ptr,
-                    base.ptr,
-                    scale.ptr,
-                    xb.ptr,
-                    postb.ptr,
-                    combb.ptr,
-                    t,
-                    n,
-                    w.iters,
-                    w.eps,
-                    w.rms_eps,
+                    &stream, rb.ptr, fnb.ptr, base.ptr, scale.ptr, xb.ptr, postb.ptr, combb.ptr, t,
+                    n, w.iters, w.eps, w.rms_eps,
                 )
                 .unwrap();
             }
@@ -1322,7 +1326,10 @@ mod tests {
             let gx: Vec<f32> = xb.read(0, t * n).unwrap();
             for i in 0..n {
                 let err = (gx[i] - cpu.x[i]).abs();
-                assert!(err <= 1e-4, "rep {rep}: stream-ordering race, x[{i}] err {err}");
+                assert!(
+                    err <= 1e-4,
+                    "rep {rep}: stream-ordering race, x[{i}] err {err}"
+                );
                 last_x = last_x.max(err);
             }
         }
@@ -1393,8 +1400,8 @@ mod tests {
                 let cb = DevBuf::zeroed(t * 16 * 4)?;
                 unsafe {
                     resident.k.pre(
-                        &s, rb.ptr, fb.ptr, bb.ptr, sb.ptr, xb.ptr, pb.ptr, cb.ptr, t, n,
-                        w.iters, w.eps, w.rms_eps,
+                        &s, rb.ptr, fb.ptr, bb.ptr, sb.ptr, xb.ptr, pb.ptr, cb.ptr, t, n, w.iters,
+                        w.eps, w.rms_eps,
                     )?;
                 }
                 s.sync()?;
@@ -1438,7 +1445,10 @@ mod tests {
             for d in 0..4 {
                 for i in 0..n {
                     let (a, b) = (outv[d * n + i], outs[d][i]);
-                    assert!((a - b).abs() <= 1e-4, "resident post [{d}][{i}]: {a} vs {b}");
+                    assert!(
+                        (a - b).abs() <= 1e-4,
+                        "resident post [{d}][{i}]: {a} vs {b}"
+                    );
                 }
             }
 

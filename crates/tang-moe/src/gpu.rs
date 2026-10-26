@@ -108,8 +108,14 @@ impl Gpu {
         // JITs to the actual device at cuModuleLoadData, so retry arch-less on that error.
         let ptx = match cudarc::nvrtc::compile_ptx_with_opts(src, opts.clone()) {
             Ok(p) => p,
-            Err(e) if format!("{e:?}").contains("INVALID_OPTION") || format!("{e:?}").contains("invalid value") => {
-                let opts = cudarc::nvrtc::CompileOptions { arch: None, ..Default::default() };
+            Err(e)
+                if format!("{e:?}").contains("INVALID_OPTION")
+                    || format!("{e:?}").contains("invalid value") =>
+            {
+                let opts = cudarc::nvrtc::CompileOptions {
+                    arch: None,
+                    ..Default::default()
+                };
                 cudarc::nvrtc::compile_ptx_with_opts(src, opts)
                     .map_err(|e| Error(format!("nvrtc: {e:?}")))?
             }

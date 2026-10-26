@@ -1455,7 +1455,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-
     #[test]
     fn shard_names() {
         // single file that doesn't exist: returns itself without error

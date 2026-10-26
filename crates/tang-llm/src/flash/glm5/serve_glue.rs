@@ -108,7 +108,9 @@ impl ServeEngine for Glm5Serve {
         ensure!(pos0 + t <= self.e.tokens.len(), "window past the sequence");
         let ids: Vec<u32> = self.e.tokens[pos0..pos0 + t].to_vec();
         let lg = self.run_window(&ids)?;
-        Ok((0..t).map(|i| argmax(&lg[i * self.e.m.hp.n_vocab..(i + 1) * self.e.m.hp.n_vocab])).collect())
+        Ok((0..t)
+            .map(|i| argmax(&lg[i * self.e.m.hp.n_vocab..(i + 1) * self.e.m.hp.n_vocab]))
+            .collect())
     }
 
     fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
@@ -179,5 +181,3 @@ impl Glm5Serve {
         Ok(self.last_logits.clone())
     }
 }
-
-

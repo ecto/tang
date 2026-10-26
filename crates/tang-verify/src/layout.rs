@@ -30,13 +30,21 @@ impl Layout {
 
     /// Append a dim (inner to the ones before it).
     pub fn dim(mut self, name: &'static str, size: usize) -> Self {
-        self.dims.push(Dim { name, size, labels: None });
+        self.dims.push(Dim {
+            name,
+            size,
+            labels: None,
+        });
         self
     }
 
     /// Append a labelled dim of `labels.len()` entries, printed by label.
     pub fn labeled(mut self, name: &'static str, labels: &'static [&'static str]) -> Self {
-        self.dims.push(Dim { name, size: labels.len(), labels: Some(labels) });
+        self.dims.push(Dim {
+            name,
+            size: labels.len(),
+            labels: Some(labels),
+        });
         self
     }
 
@@ -82,7 +90,11 @@ mod tests {
     fn names() {
         let inner = Layout::new().dim("tok", 0).dim("h", 2).dim("d", 4);
         assert_eq!(inner.locate(13), "tok1 h1 d1");
-        assert_eq!(inner.locate(8 * 7 + 3), "tok7 h0 d3", "leading dim unbounded");
+        assert_eq!(
+            inner.locate(8 * 7 + 3),
+            "tok7 h0 d3",
+            "leading dim unbounded"
+        );
         let state = Layout::new().dim("h", 0).dim("key", 4).dim("val", 4);
         assert_eq!(state.locate(16 + 4 * 2 + 3), "h1 key2 val3");
         let conv = Layout::new()

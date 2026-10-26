@@ -324,7 +324,6 @@ extern "C" __global__ void __launch_bounds__(1024) kda_prefill(
 }
 "#;
 
-
 // ---------------------------------------------------------------------------
 // cuda-gated launcher + parity tests
 
@@ -332,9 +331,9 @@ extern "C" __global__ void __launch_bounds__(1024) kda_prefill(
 pub mod cuda {
     use super::super::kda::{ConvState, KdaConfig, KdaState};
     use anyhow::{ensure, Result};
+    use cudarc::driver::sys;
     use tang_moe::gpu::{DevBuf, Gpu, Stream};
     use tang_moe::{args, gpu::launch};
-    use cudarc::driver::sys;
 
     /// All KDA kernels, NVRTC-compiled once.
     pub struct Kernels {
@@ -466,8 +465,13 @@ pub mod cuda {
                     (3 * hd * 4) as u32,
                     &self.s,
                     args![
-                        self.xb.ptr, self.h0.ptr, self.wconv.ptr, self.gb.ptr, self.bb.ptr,
-                        self.st.ptr, self.ob.ptr
+                        self.xb.ptr,
+                        self.h0.ptr,
+                        self.wconv.ptr,
+                        self.gb.ptr,
+                        self.bb.ptr,
+                        self.st.ptr,
+                        self.ob.ptr
                     ],
                 )?;
             }
@@ -534,7 +538,14 @@ pub mod cuda {
                     (256, 1, 1),
                     0,
                     &self.s,
-                    args![self.xb.ptr, ch_dim as u32, self.h0.ptr, self.wconv.ptr, self.yb.ptr, t as u32],
+                    args![
+                        self.xb.ptr,
+                        ch_dim as u32,
+                        self.h0.ptr,
+                        self.wconv.ptr,
+                        self.yb.ptr,
+                        t as u32
+                    ],
                 )?;
                 launch(
                     k.conv_commit,
@@ -551,8 +562,17 @@ pub mod cuda {
                     ((chunk * chunk + hd) * 4) as u32,
                     &self.s,
                     args![
-                        self.yb.ptr, t as u32, ch_dim as u32, self.gb.ptr, (nh * hd) as u32,
-                        self.bb.ptr, nh as u32, self.st.ptr, self.ob.ptr, self.scr.ptr, chunk as u32
+                        self.yb.ptr,
+                        t as u32,
+                        ch_dim as u32,
+                        self.gb.ptr,
+                        (nh * hd) as u32,
+                        self.bb.ptr,
+                        nh as u32,
+                        self.st.ptr,
+                        self.ob.ptr,
+                        self.scr.ptr,
+                        chunk as u32
                     ],
                 )?;
             }
@@ -626,8 +646,17 @@ pub mod cuda {
                 ((chunk * chunk + hd) * 4) as u32,
                 &s,
                 args![
-                    y.ptr, t as u32, ch_dim as u32, gb.ptr, (nh * hd) as u32, bb.ptr,
-                    nh as u32, st.ptr, o.ptr, scr.ptr, chunk as u32
+                    y.ptr,
+                    t as u32,
+                    ch_dim as u32,
+                    gb.ptr,
+                    (nh * hd) as u32,
+                    bb.ptr,
+                    nh as u32,
+                    st.ptr,
+                    o.ptr,
+                    scr.ptr,
+                    chunk as u32
                 ],
             )?;
         }
@@ -732,15 +761,53 @@ mod tests {
             let b = 1usize;
             let mut conv = ConvState::zeros(&cfg, b);
             let mut state = KdaState::zeros(&cfg, b);
-            let og = prefill(&g, &kers, &cfg, &x[..t * cfg.conv_dim()], &wconv, &gpre[..t * nh * hd],
-                &beta[..t * nh], &mut conv, &mut state, b, t, 64).unwrap();
+            let og = prefill(
+                &g,
+                &kers,
+                &cfg,
+                &x[..t * cfg.conv_dim()],
+                &wconv,
+                &gpre[..t * nh * hd],
+                &beta[..t * nh],
+                &mut conv,
+                &mut state,
+                b,
+                t,
+                64,
+            )
+            .unwrap();
             let mut conv2 = ConvState::zeros(&cfg, b);
             let mut state2 = KdaState::zeros(&cfg, b);
-            let y = kda::conv1d_prefill(&x[..t * cfg.conv_dim()], &wconv, &mut conv2, &cfg, b, t).unwrap();
-            let oc = kda::kda_chunk(&y, &gpre[..t * nh * hd], &beta[..t * nh], &mut state2, &cfg, b, t, 64).unwrap();
-            let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
-            let es: f32 = state.0.iter().zip(&state2.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
-            let ec: f32 = conv.0.iter().zip(&conv2.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+            let y = kda::conv1d_prefill(&x[..t * cfg.conv_dim()], &wconv, &mut conv2, &cfg, b, t)
+                .unwrap();
+            let oc = kda::kda_chunk(
+                &y,
+                &gpre[..t * nh * hd],
+                &beta[..t * nh],
+                &mut state2,
+                &cfg,
+                b,
+                t,
+                64,
+            )
+            .unwrap();
+            let e: f32 = og
+                .iter()
+                .zip(&oc)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
+            let es: f32 = state
+                .0
+                .iter()
+                .zip(&state2.0)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
+            let ec: f32 = conv
+                .0
+                .iter()
+                .zip(&conv2.0)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
             println!("T={t}: out {e:.3e} state {es:.3e} conv {ec:.3e}");
             assert!(e < 1e-4, "T={t} out {e}");
             assert!(es < 1e-4, "T={t} state {es}");
@@ -763,19 +830,54 @@ mod tests {
         // CPU state after the first 64 tokens
         let mut conv2 = ConvState::zeros(&cfg, b);
         let mut state2 = KdaState::zeros(&cfg, b);
-        let y0 = kda::conv1d_prefill(&x[..64 * cfg.conv_dim()], &wconv, &mut conv2, &cfg, b, 64).unwrap();
-        let _ = kda::kda_chunk(&y0, &gpre[..64 * nh * hd], &beta[..64 * nh], &mut state2, &cfg, b, 64, 64).unwrap();
+        let y0 = kda::conv1d_prefill(&x[..64 * cfg.conv_dim()], &wconv, &mut conv2, &cfg, b, 64)
+            .unwrap();
+        let _ = kda::kda_chunk(
+            &y0,
+            &gpre[..64 * nh * hd],
+            &beta[..64 * nh],
+            &mut state2,
+            &cfg,
+            b,
+            64,
+            64,
+        )
+        .unwrap();
         let kers = load(&g, &cfg).unwrap();
         let t = 65usize;
         // GPU: full T=65 (2 chunks), state/conv seeded with the CPU's after-64 values
         let mut conv = conv2.clone();
         let mut state = KdaState(state2.0.clone());
-        let og = prefill(&g, &kers, &cfg, &x[..t * cfg.conv_dim()], &wconv,
-            &gpre[..t * nh * hd], &beta[..t * nh], &mut conv, &mut state, b, t, 64).unwrap();
+        let og = prefill(
+            &g,
+            &kers,
+            &cfg,
+            &x[..t * cfg.conv_dim()],
+            &wconv,
+            &gpre[..t * nh * hd],
+            &beta[..t * nh],
+            &mut conv,
+            &mut state,
+            b,
+            t,
+            64,
+        )
+        .unwrap();
         let mut conv3 = conv2.clone();
         let mut state3 = KdaState(state2.0.clone());
-        let y = kda::conv1d_prefill(&x[..t * cfg.conv_dim()], &wconv, &mut conv3, &cfg, b, t).unwrap();
-        let oc = kda::kda_chunk(&y, &gpre[..t * nh * hd], &beta[..t * nh], &mut state3, &cfg, b, t, 64).unwrap();
+        let y =
+            kda::conv1d_prefill(&x[..t * cfg.conv_dim()], &wconv, &mut conv3, &cfg, b, t).unwrap();
+        let oc = kda::kda_chunk(
+            &y,
+            &gpre[..t * nh * hd],
+            &beta[..t * nh],
+            &mut state3,
+            &cfg,
+            b,
+            t,
+            64,
+        )
+        .unwrap();
         for ti in 63..t {
             let mut et = 0f32;
             for j in 0..nh * hd {
@@ -783,13 +885,21 @@ mod tests {
             }
             println!("  t={ti} err={et:.3e}");
         }
-        let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
-        let es: f32 = state.0.iter().zip(&state3.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        let e: f32 = og
+            .iter()
+            .zip(&oc)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
+        let es: f32 = state
+            .0
+            .iter()
+            .zip(&state3.0)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
         println!("chunk-cross: out {e:.3e} state {es:.3e}");
         assert!(es < 1e-4, "state {es}");
         assert!(e < 1e-4, "out {e}");
     }
-
 
     /// The resident `DevKda` path: 3 chained decodes + a 64-token prefill, all with no
     /// per-call allocations, vs the CPU reference. States must match to 1e-4.
@@ -812,33 +922,91 @@ mod tests {
         for ti in 0..3 {
             let row = &x[ti * ch_dim..(ti + 1) * ch_dim];
             let og = dev
-                .decode(&kers, &cfg, row, &gpre[ti * nh * hd..(ti + 1) * nh * hd],
-                    &beta[ti * nh..(ti + 1) * nh], &mut convg, &mut stateg, b)
+                .decode(
+                    &kers,
+                    &cfg,
+                    row,
+                    &gpre[ti * nh * hd..(ti + 1) * nh * hd],
+                    &beta[ti * nh..(ti + 1) * nh],
+                    &mut convg,
+                    &mut stateg,
+                    b,
+                )
                 .unwrap();
             let yc = kda::conv1d_decode(row, &wconv, &mut convc, &cfg, b).unwrap();
-            let oc = kda::kda_decode(&yc, &gpre[ti * nh * hd..(ti + 1) * nh * hd],
-                &beta[ti * nh..(ti + 1) * nh], &mut statec, &cfg, b).unwrap();
-            let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+            let oc = kda::kda_decode(
+                &yc,
+                &gpre[ti * nh * hd..(ti + 1) * nh * hd],
+                &beta[ti * nh..(ti + 1) * nh],
+                &mut statec,
+                &cfg,
+                b,
+            )
+            .unwrap();
+            let e: f32 = og
+                .iter()
+                .zip(&oc)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
             assert!(e < 1e-4, "decode token {ti}: {e}");
         }
         // then a 64-token prefill on the same resident state
         let t = 64usize;
         let og = dev
-            .prefill(&kers, &cfg, &x[3 * ch_dim..(3 + t) * ch_dim],
-                &gpre[3 * nh * hd..(3 + t) * nh * hd], &beta[3 * nh..(3 + t) * nh],
-                &mut convg, &mut stateg, b, t)
+            .prefill(
+                &kers,
+                &cfg,
+                &x[3 * ch_dim..(3 + t) * ch_dim],
+                &gpre[3 * nh * hd..(3 + t) * nh * hd],
+                &beta[3 * nh..(3 + t) * nh],
+                &mut convg,
+                &mut stateg,
+                b,
+                t,
+            )
             .unwrap();
-        let yc = kda::conv1d_prefill(&x[3 * ch_dim..(3 + t) * ch_dim], &wconv, &mut convc, &cfg, b, t).unwrap();
-        let oc = kda::kda_chunk(&yc, &gpre[3 * nh * hd..(3 + t) * nh * hd],
-            &beta[3 * nh..(3 + t) * nh], &mut statec, &cfg, b, t, 64).unwrap();
-        let e: f32 = og.iter().zip(&oc).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        let yc = kda::conv1d_prefill(
+            &x[3 * ch_dim..(3 + t) * ch_dim],
+            &wconv,
+            &mut convc,
+            &cfg,
+            b,
+            t,
+        )
+        .unwrap();
+        let oc = kda::kda_chunk(
+            &yc,
+            &gpre[3 * nh * hd..(3 + t) * nh * hd],
+            &beta[3 * nh..(3 + t) * nh],
+            &mut statec,
+            &cfg,
+            b,
+            t,
+            64,
+        )
+        .unwrap();
+        let e: f32 = og
+            .iter()
+            .zip(&oc)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
         println!("resident prefill err {e:.3e}");
         assert!(e < 1e-4, "prefill {e}");
         // read-back must agree with the CPU's states
         dev.read_state(&mut stateg).unwrap();
         dev.read_conv(&mut convg).unwrap();
-        let es: f32 = stateg.0.iter().zip(&statec.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
-        let ec: f32 = convg.0.iter().zip(&convc.0).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        let es: f32 = stateg
+            .0
+            .iter()
+            .zip(&statec.0)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
+        let ec: f32 = convg
+            .0
+            .iter()
+            .zip(&convc.0)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
         println!("resident states: state {es:.3e} conv {ec:.3e}");
         assert!(es < 1e-4, "state {es}");
         assert!(ec < 1e-4, "conv {ec}");
@@ -849,7 +1017,12 @@ mod tests {
     fn glm5_kda_decode_gpu_vs_cpu() {
         let Some(g) = Gpu::for_test() else { return };
         let cfg = cfg();
-        let (b, nh, hd, ch) = (1usize, cfg.heads, cfg.head_dim, 3 * cfg.heads * cfg.head_dim);
+        let (b, nh, hd, ch) = (
+            1usize,
+            cfg.heads,
+            cfg.head_dim,
+            3 * cfg.heads * cfg.head_dim,
+        );
         let x = loadf("conv_x"); // the conv input rows (qkv), [t][conv_dim]
         let wconv = loadf("conv_w");
         let gpre = loadf("g");
@@ -863,14 +1036,26 @@ mod tests {
         for ti in 0..3 {
             let row = &x[ti * ch..(ti + 1) * ch];
             let og = decode(
-                &g, &kers, &cfg, row, &wconv, &gpre[ti * nh * hd..(ti + 1) * nh * hd],
-                &beta[ti * nh..(ti + 1) * nh], &mut convg, &mut stateg, b,
+                &g,
+                &kers,
+                &cfg,
+                row,
+                &wconv,
+                &gpre[ti * nh * hd..(ti + 1) * nh * hd],
+                &beta[ti * nh..(ti + 1) * nh],
+                &mut convg,
+                &mut stateg,
+                b,
             )
             .unwrap();
             let yc = kda::conv1d_decode(row, &wconv, &mut convc, &cfg, b).unwrap();
             let oc = kda::kda_decode(
-                &yc, &gpre[ti * nh * hd..(ti + 1) * nh * hd], &beta[ti * nh..(ti + 1) * nh],
-                &mut statec, &cfg, b,
+                &yc,
+                &gpre[ti * nh * hd..(ti + 1) * nh * hd],
+                &beta[ti * nh..(ti + 1) * nh],
+                &mut statec,
+                &cfg,
+                b,
             )
             .unwrap();
             let e: f32 = og

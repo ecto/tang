@@ -64,16 +64,28 @@ pub struct Verdict {
 
 impl Verdict {
     pub fn message(&self) -> String {
-        let what = if self.what.is_empty() { String::new() } else { format!(" → suspect: {}", self.what) };
+        let what = if self.what.is_empty() {
+            String::new()
+        } else {
+            format!(" → suspect: {}", self.what)
+        };
         match &self.cause {
-            Cause::Misplaced { victim, at, from, actual_base, expected_base, hint } => {
+            Cause::Misplaced {
+                victim,
+                at,
+                from,
+                actual_base,
+                expected_base,
+                hint,
+            } => {
                 let _ = (actual_base, expected_base);
-                let geo = if hint.is_empty() { String::new() } else { format!(" ({hint})") };
+                let geo = if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({hint})")
+                };
                 if at.is_empty() {
-                    return format!(
-                        "`{}` likely wrote into `{victim}`{geo}{what}",
-                        self.suspect
-                    );
+                    return format!("`{}` likely wrote into `{victim}`{geo}{what}", self.suspect);
                 }
                 format!(
                     "`{}` wrote into `{victim}`: {victim}@{at} holds {}@{from}{geo}{what}",
@@ -87,7 +99,10 @@ impl Verdict {
             Cause::Zeroed { count, n } => {
                 format!("`{}` has {count}/{n} extra exact zeros{what}", self.suspect)
             }
-            Cause::Wrong => format!("stage `{}` fails with its inputs passing{what}", self.suspect),
+            Cause::Wrong => format!(
+                "stage `{}` fails with its inputs passing{what}",
+                self.suspect
+            ),
             Cause::NoCleanInput => "failures with no clean-input stage (see the BAD rows)".into(),
         }
     }
@@ -105,16 +120,26 @@ struct Found {
 
 /// Where do `victim`'s wrong values come from? Scans the CPU reference of every tap
 /// (siblings in the same buffer first) for a run of RUN consecutive bad GPU values.
-fn provenance(victim: &Tap, gv: &[f32], cv: &[f32], spec: &Spec, cpu: &Taps, tol: f64) -> Option<Found> {
+fn provenance(
+    victim: &Tap,
+    gv: &[f32],
+    cv: &[f32],
+    spec: &Spec,
+    cpu: &Taps,
+    tol: f64,
+) -> Option<Found> {
     let rms_v = rms(cv);
     // up to 16 candidate runs: the first ones may be constant or NaN-broken
     let mut starts = Vec::new();
     let mut i = 0;
     while i + RUN <= gv.len().min(cv.len()) && starts.len() < 16 {
-        let ok = (0..RUN).all(|k| gv[i + k].is_finite() && elem_bad(gv[i + k], cv[i + k], tol, rms_v));
+        let ok =
+            (0..RUN).all(|k| gv[i + k].is_finite() && elem_bad(gv[i + k], cv[i + k], tol, rms_v));
         if ok {
             let run = &gv[i..i + RUN];
-            let (lo, hi) = run.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+            let (lo, hi) = run
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
             if hi - lo > 1e-6 * (hi.abs() + lo.abs()) && hi.abs() + lo.abs() > 0.0 {
                 starts.push(i);
                 i += RUN * 64; // spread the probes
@@ -127,8 +152,16 @@ fn provenance(victim: &Tap, gv: &[f32], cv: &[f32], spec: &Spec, cpu: &Taps, tol
         (Some(a), Some(b)) => a.buffer == b.buffer,
         _ => false,
     };
-    let mut order: Vec<&Tap> = spec.taps.iter().filter(|t| same_buf(t) && t.name != victim.name).collect();
-    order.extend(spec.taps.iter().filter(|t| !same_buf(t) && t.name != victim.name));
+    let mut order: Vec<&Tap> = spec
+        .taps
+        .iter()
+        .filter(|t| same_buf(t) && t.name != victim.name)
+        .collect();
+    order.extend(
+        spec.taps
+            .iter()
+            .filter(|t| !same_buf(t) && t.name != victim.name),
+    );
     order.push(victim);
     let resolved: Vec<_> = order.iter().map(|t| (t, t.resolve(cpu))).collect();
     for &i in &starts {
@@ -142,7 +175,11 @@ fn provenance(victim: &Tap, gv: &[f32], cv: &[f32], spec: &Spec, cpu: &Taps, tol
                     continue;
                 }
                 if (0..RUN).all(|k| !elem_bad(run[k], ct[j + k], tol, rms_t)) {
-                    return Some(Found { source: t.name, i, j });
+                    return Some(Found {
+                        source: t.name,
+                        i,
+                        j,
+                    });
                 }
             }
         }
@@ -156,14 +193,27 @@ fn rms(v: &[f32]) -> f64 {
         s += (x as f64) * (x as f64);
         n += 1;
     }
-    if n > 0 { (s / n as f64).sqrt() } else { 0.0 }
+    if n > 0 {
+        (s / n as f64).sqrt()
+    } else {
+        0.0
+    }
 }
 
 /// The writer's actual base vs its expected one, when victim and source share a buffer.
-fn geometry(victim: &Tap, source: &Tap, i: usize, j: usize) -> (Option<i64>, Option<usize>, String) {
+fn geometry(
+    victim: &Tap,
+    source: &Tap,
+    i: usize,
+    j: usize,
+) -> (Option<i64>, Option<usize>, String) {
     let (Some(rv), Some(rs)) = (&victim.region, &source.region) else {
         if victim.name == source.name {
-            return (None, None, format!("shifted by {} elements", i as i64 - j as i64));
+            return (
+                None,
+                None,
+                format!("shifted by {} elements", i as i64 - j as i64),
+            );
         }
         return (None, None, String::new());
     };
@@ -175,7 +225,8 @@ fn geometry(victim: &Tap, source: &Tap, i: usize, j: usize) -> (Option<i64>, Opt
     let actual = rs.base as i64 + pv as i64 - ps as i64;
     let e = rs.base as i64;
     let why = if actual > 0 && actual * 4 == e {
-        "expected = 4 × actual: an ELEMENT offset added to a BYTE address (size_of::<f32>())".to_string()
+        "expected = 4 × actual: an ELEMENT offset added to a BYTE address (size_of::<f32>())"
+            .to_string()
     } else if actual > 0 && actual * 2 == e {
         "expected = 2 × actual: an element offset used as bytes for a 2-byte type".to_string()
     } else if e > 0 && actual == e * 4 {
@@ -183,12 +234,22 @@ fn geometry(victim: &Tap, source: &Tap, i: usize, j: usize) -> (Option<i64>, Opt
     } else {
         format!("displaced by {} elements", actual - e)
     };
-    let hint = format!("writer's base offset in `{}` is {actual}, expected {e}: {why}", rs.buffer);
+    let hint = format!(
+        "writer's base offset in `{}` is {actual}, expected {e}: {why}",
+        rs.buffer
+    );
     (Some(actual), Some(rs.base), hint)
 }
 
 /// Attribute a failing window. `rows` are the compared taps (spec order).
-pub fn attribute(spec: &Spec, rows: &[Row], gpu: &Taps, cpu: &Taps, tol: f64, poisoned: bool) -> Verdict {
+pub fn attribute(
+    spec: &Spec,
+    rows: &[Row],
+    gpu: &Taps,
+    cpu: &Taps,
+    tol: f64,
+    poisoned: bool,
+) -> Verdict {
     let row = |n: &str| rows.iter().find(|r| r.name == n);
     let bad = |n: &str| row(n).is_some_and(|r| r.bad);
     let cands: Vec<(&Tap, &Row)> = spec
@@ -198,9 +259,18 @@ pub fn attribute(spec: &Spec, rows: &[Row], gpu: &Taps, cpu: &Taps, tol: f64, po
         .filter(|(t, r)| r.bad && t.inputs.iter().all(|i| !bad(i)))
         .collect();
     if cands.is_empty() {
-        return Verdict { suspect: "", what: "", cause: Cause::NoCleanInput, evidence: Vec::new() };
+        return Verdict {
+            suspect: "",
+            what: "",
+            cause: Cause::NoCleanInput,
+            evidence: Vec::new(),
+        };
     }
-    let unwritten_word = if poisoned { "unwritten (poison NaN)" } else { "non-finite" };
+    let unwritten_word = if poisoned {
+        "unwritten (poison NaN)"
+    } else {
+        "non-finite"
+    };
     let mut evidence = Vec::new();
     let mut misplaced: Option<Verdict> = None;
     for (t, r) in &cands {
@@ -243,7 +313,12 @@ pub fn attribute(spec: &Spec, rows: &[Row], gpu: &Taps, cpu: &Taps, tol: f64, po
         }
         evidence.push(line);
     }
-    let finish = |suspect, what, cause| Verdict { suspect, what, cause, evidence: evidence.clone() };
+    let finish = |suspect, what, cause| Verdict {
+        suspect,
+        what,
+        cause,
+        evidence: evidence.clone(),
+    };
     if let Some(mut v) = misplaced {
         v.evidence = evidence;
         return v;
@@ -257,7 +332,10 @@ pub fn attribute(spec: &Spec, rows: &[Row], gpu: &Taps, cpu: &Taps, tol: f64, po
         if r.stat.extra_nonfinite() > 0 {
             continue;
         }
-        if let Some((s, sr)) = cands.iter().find(|(s, sr)| sib(t, s) && sr.stat.extra_nonfinite() > 0) {
+        if let Some((s, sr)) = cands
+            .iter()
+            .find(|(s, sr)| sib(t, s) && sr.stat.extra_nonfinite() > 0)
+        {
             return finish(s.name, s.what, Cause::Misplaced {
                     victim: t.name,
                     at: String::new(),
@@ -275,10 +353,27 @@ pub fn attribute(spec: &Spec, rows: &[Row], gpu: &Taps, cpu: &Taps, tol: f64, po
         }
     }
     if let Some((t, r)) = cands.iter().find(|(_, r)| r.stat.extra_nonfinite() > 0) {
-        return finish(t.name, t.what, Cause::Unwritten { count: r.stat.extra_nonfinite(), n: r.stat.n });
+        return finish(
+            t.name,
+            t.what,
+            Cause::Unwritten {
+                count: r.stat.extra_nonfinite(),
+                n: r.stat.n,
+            },
+        );
     }
-    if let Some((t, r)) = cands.iter().find(|(_, r)| r.stat.extra_zeros() > r.stat.n / 100) {
-        return finish(t.name, t.what, Cause::Zeroed { count: r.stat.extra_zeros(), n: r.stat.n });
+    if let Some((t, r)) = cands
+        .iter()
+        .find(|(_, r)| r.stat.extra_zeros() > r.stat.n / 100)
+    {
+        return finish(
+            t.name,
+            t.what,
+            Cause::Zeroed {
+                count: r.stat.extra_zeros(),
+                n: r.stat.n,
+            },
+        );
     }
     let (t, _) = cands[0];
     finish(t.name, t.what, Cause::Wrong)

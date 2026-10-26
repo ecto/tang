@@ -42,11 +42,8 @@ impl Ctx {
         use cudarc::driver::sys;
         let mut a = 0i32;
         unsafe {
-            let _ = sys::cuDeviceCanAccessPeer(
-                &mut a,
-                self.gpu.ctx.cu_device(),
-                other.ctx.cu_device(),
-            );
+            let _ =
+                sys::cuDeviceCanAccessPeer(&mut a, self.gpu.ctx.cu_device(), other.ctx.cu_device());
             // Enable ours→theirs from our context, theirs→ours from theirs.
             let _ = sys::cuCtxEnablePeerAccess(other.ctx.cu_ctx(), 0);
             other.bind().map_err(|e| anyhow!("{e}"))?;

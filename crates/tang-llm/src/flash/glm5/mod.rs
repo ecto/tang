@@ -171,7 +171,6 @@ impl Hparams {
             }
         };
 
-
         Ok(Self {
             n_vocab: g.info("token_embd.weight")?.dims[1] as usize,
             n_embd: u("embedding_length")?,
@@ -302,7 +301,11 @@ pub fn inventory(g: &Gguf) -> Result<String> {
             r.count,
             r.dims
                 .iter()
-                .map(|(d, n)| if *n > 1 { format!("{d}×{n}") } else { d.clone() })
+                .map(|(d, n)| if *n > 1 {
+                    format!("{d}×{n}")
+                } else {
+                    d.clone()
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
             r.types
@@ -313,7 +316,11 @@ pub fn inventory(g: &Gguf) -> Result<String> {
             r.bytes
         )?;
     }
-    writeln!(s, "total: {total} ({:.3} GiB)", total as f64 / (1u64 << 30) as f64)?;
+    writeln!(
+        s,
+        "total: {total} ({:.3} GiB)",
+        total as f64 / (1u64 << 30) as f64
+    )?;
     Ok(s)
 }
 

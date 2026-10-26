@@ -445,7 +445,11 @@ pub const SRC: &str = include_str!("moe_cuda.cuh");
 
 /// The KDA projection kernels ([`kda_dev::K5_SRC`]), appended to [`SRC`] at compile so
 /// `g5_dot`/`g5_deq` are in scope for them.
-pub const K5_SRC: &str = concat!(include_str!("moe_cuda.cuh"), "\n", include_str!("kda_k5.cuh"));
+pub const K5_SRC: &str = concat!(
+    include_str!("moe_cuda.cuh"),
+    "\n",
+    include_str!("kda_k5.cuh")
+);
 
 #[cfg(feature = "cuda")]
 #[path = "moe_gpu.rs"]
