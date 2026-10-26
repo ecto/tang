@@ -397,6 +397,13 @@ impl Glm5Engine {
         for s in &mut self.kda {
             *s = None;
         }
+        // the resident KDA layers hold the live state on the device: without this the
+        // next sequence's first window skipped the seed and continued the OLD sequence's
+        // conv + recurrent state (the host copies above are the fresh zeros it must get)
+        #[cfg(feature = "cuda")]
+        if let Some(g) = self.gpu.as_mut() {
+            g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+        }
         for c in &mut self.dsa {
             *c = DsaCache::default();
         }
@@ -1534,6 +1541,30 @@ mod tests {
         e.reset();
         let b = e.window(&ids[..6]).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// reset() gives a fresh sequence on the GPU too: the resident KDA layers must be
+    /// re-seeded from the zeroed host state, not continue the last sequence's device state.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_reset_gpu() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("no CUDA device");
+            return;
+        }
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu().unwrap());
+        let a = e.window(&ids[..6]).unwrap();
+        e.window(&ids[6..9]).unwrap();
+        e.reset();
+        let b = e.window(&ids[..6]).unwrap();
+        let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        println!("engine_reset_gpu: max |a - b| {d:.3e}");
+        assert!(d < 1e-4, "after reset the GPU window differs from a fresh one: {d}");
     }
 
     /// THE LESSON OF THIS PORT (the engine never wired the built-and-tested GPU structs
