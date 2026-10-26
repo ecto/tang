@@ -258,6 +258,12 @@ impl GpuFfn {
                 kda_l.iter().filter(|x| x.is_some()).count(),
                 t_k.elapsed().as_secs_f64()
             );
+            // residency of the other per-layer GPU paths, so a run log proves what ran where
+            eprintln!(
+                "glm5: {} DSA layers resident (MLA, one per layer), {} mHC layers resident",
+                mla_k.iter().filter(|x| x.is_some()).count(),
+                mhc_g.iter().filter(|x| x.is_some()).count()
+            );
         }
         let kda_dev_fresh = vec![false; n_layer];
 
