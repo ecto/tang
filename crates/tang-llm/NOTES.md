@@ -4,6 +4,32 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 (speed step 1) — k5_gemv8: correct on the real model, 1.61× per KDA decode layer
+
+k5_gemv8 (the dequant-reuse Q8_0 GEMV for the KDA q/k/v projections, c4925878) on the
+H200 (pod uj2gjryncj9dfh), real model, KDA+DSA+mHC on the GPU, FFN on the CPU:
+
+- Gate: `TANG_GLM5_GEMV8=1` → ids 785 1196 6801 264 6386 38038 911 279 = the CPU oracle;
+  shadow check 68/68 windows clean at the int8 tolerance (TANG_GLM5_KDA_DEBUG_TOL=1e-2;
+  worst rel 5.4e-3 — int8-activation noise, the fe_gemv8 band).
+- Timing (`TANG_GLM5_PROF=1`, `prof kda mixer` per KDA layer):
+
+| | naive | gemv8 | |
+|---|---|---|---|
+| decode step (t=1) | 12.15 ms | 7.56 ms | 1.61× |
+| prefill window (t=20) | 298.9 ms | 274.6 ms | 1.09× (core on the CPU tail) |
+
+Reading: q/k/v went from ~4.6 ms/layer to ~0 (107 MB of Q8_0 is ~20 µs at H200 SOL). The
+remaining ~7.5 ms/layer of a decode window is everything else — host round trips (qkv/g/
+beta read back every window), the naive o_proj / gate GEMVs / gated norm, and launch
+overhead: the CUDA-graphs + device-resident workstream's target. End-to-end tok/s on this
+box (0.03 both) is CPU-FFN-bound and not a kernel number.
+
+Bring-up bugs, all caught before the real-model run by the harness or the in-process A/B
+test: no dynamic smem (ILLEGAL_ADDRESS), misaligned u64 on 34-byte Q8_0 blocks, missing
+__syncwarp after staging + overlapping per-warp regions, k5_q8 MAXT given t, and f32 rows
+read as Q8_0 (needs the Q8_0-only guard).
+
 ## 2026-10-26 (housekeeping) — GPU tests can no longer silently skip; regressions for both fixture-blind bug classes
 
 `skip_or_fail()` in engine.rs tests: with `TANG_REQUIRE_CUDA=1` a skip panics; without
