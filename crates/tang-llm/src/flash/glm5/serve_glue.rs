@@ -195,6 +195,16 @@ impl ServeEngine for Glm5Serve {
         Ok(())
     }
 
+    fn save_positional_at(&mut self, _slot: usize, from: usize, to: usize) -> Result<Positional> {
+        // the DSA caches (the positional state) are not saved: snapshots carry the KDA
+        // state (the running part) only, so this is the empty positional for any slot
+        Ok(Positional::from_parts(from, to, Vec::new()))
+    }
+
+    fn restore_positional_at(&mut self, _slot: usize, _p: &Positional, _from: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
         self.prefill_slot(0, ids, chunk)
     }
