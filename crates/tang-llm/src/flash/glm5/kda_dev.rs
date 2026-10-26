@@ -324,11 +324,38 @@ impl DevLayer {
 
     /// [`Self::window`] for sequence `slot` (its device conv + recurrent state, one slice
     /// of the layer's `[slots][...]` state buffers). The projection scratch is shared: one
-    /// window at a time runs per layer (the server decodes round-robin), so no slot
-    /// partitioning is needed there.
+    /// window at a time runs per layer, so no slot partitioning is needed there.
     pub fn window_at(&mut self, slot: usize, x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
+        self.window_impl(&[slot], x, t, conv)
+    }
+
+    /// Whether the device-resident core is on (`TANG_GLM5_KDA_PF2=1` at load): the
+    /// batched decode rows need it.
+    pub fn pf2_on(&self) -> bool {
+        self.pf2
+    }
+
+    /// The batched decode window: row `i` of `x` (`[t][hidden]`, `t = slots.len()`) is ONE
+    /// token of sequence `slots[i]`. The projections, gates, gated norm and o_proj run once
+    /// over all `t` rows (the weight reads amortise across the batch); only the core — the
+    /// conv + delta-rule step — runs per row, on that row's slot state. Needs the
+    /// device-resident core (`TANG_GLM5_KDA_PF2=1`); the slots must be distinct.
+    pub fn window_rows(&mut self, slots: &[usize], x: &[f32]) -> Result<Vec<f32>> {
+        ensure!(self.pf2, "batched KDA rows need the device-resident core (TANG_GLM5_KDA_PF2=1)");
+        ensure!(!slots.is_empty(), "empty batch");
+        let mut dummy = ConvState(Vec::new());
+        self.window_impl(slots, x, slots.len(), &mut dummy)
+    }
+
+    /// `slots.len() == 1`: a window of `t` consecutive tokens of `slots[0]`;
+    /// `slots.len() == t > 1`: one decode row per slot ([`Self::window_rows`]).
+    fn window_impl(&mut self, slots: &[usize], x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
+        ensure!(slots.len() == 1 || slots.len() == t, "k5 rows: {} slots for {t} rows", slots.len());
+        let rows = slots.len() > 1;
+        let slot = slots[0];
         ensure!(x.len() == t * self.hidden, "k5 layer input");
         ensure!(t <= self.max_t, "k5 window {t} > {max}", max = self.max_t);
+        ensure!(!rows || self.probe.is_none(), "k5 rows: no shadow check on batched rows");
         if t == 1 && self.fast.is_some() {
             let mode = decode::Mode::from_env();
             if mode != decode::Mode::Naive {
@@ -468,7 +495,11 @@ impl DevLayer {
                 eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
             }
             let t_core = std::time::Instant::now();
-            self.core_pf2(slot, t, conv, &mut tp)?;
+            if rows {
+                self.core_rows(slots)?;
+            } else {
+                self.core_pf2(slot, t, conv, &mut tp)?;
+            }
             if prof {
                 self.s.sync()?;
                 eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
@@ -481,6 +512,7 @@ impl DevLayer {
             eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
         }
         let t_core = std::time::Instant::now();
+        ensure!(!rows, "k5 rows: the host-staged core runs one sequence (TANG_GLM5_KDA_PF2=1)");
         // the core (W4's launchers stage their inputs from host): qkv, g, beta
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
@@ -589,6 +621,28 @@ impl DevLayer {
         }
         drop(tr);
         self.finish(t, Some(o), tp)
+    }
+
+    /// The per-row core of a batched decode window: row `i`'s qkv / g / beta (already
+    /// projected for all rows) step slot `slots[i]`'s conv + recurrent state, writing row
+    /// `i` of `ob`. Two launches per row on the layer stream (a slot-index kernel taking
+    /// the whole batch in one launch is the next step).
+    fn core_rows(&mut self, slots: &[usize]) -> Result<()> {
+        let (nh, di) = (self.nh, self.d_inner);
+        let f = std::mem::size_of::<f32>() as u64;
+        for (i, &slot) in slots.iter().enumerate() {
+            let i = i as u64;
+            self.core.decode_dev(
+                &self.kers,
+                &self.s,
+                slot,
+                self.qkvb.ptr + i * (3 * di) as u64 * f,
+                self.gb_out.ptr + i * di as u64 * f,
+                self.bb.ptr + i * nh as u64 * f,
+                self.ob.ptr + i * di as u64 * f,
+            )?;
+        }
+        Ok(())
     }
 
     /// The PF2 core on the device: qkv (pre-conv, in `qkvb`), g (`gb_out`) and beta (`bb`)

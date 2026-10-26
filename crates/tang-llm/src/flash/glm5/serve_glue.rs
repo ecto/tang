@@ -16,10 +16,10 @@
 //!   state's 34 × 4 MiB + 288 KiB is readable from the device (`read_back_at`) and
 //!   re-seedable, so a saved state restores without replaying the prefix (the old glue
 //!   re-prefilled everything).
-//! - **The batcher** (serve_batch.rs): one round-robin decode window over ready slots per
-//!   step via `decode_batch` — each row's token runs through its slot's state; the window
-//!   is still T=1 inside (the kernels' batch axis stays unused), so per-step wall time is
-//!   expected to grow sub-linearly with the slot count, not stay flat.
+//! - **The batcher** (serve_batch.rs): `decode_batch` runs ONE engine window over every
+//!   ready slot (`Glm5Engine::window_batch`): the per-token stages (embedding, mHC, KDA
+//!   projections / o_proj, FFN, head) run once for all rows, only the KDA core and the DSA
+//!   attention split per slot. `TANG_GLM5_BATCH_RR=1` runs one window per row instead.
 //! - **No drafts**: `use_mtp()` is false and the server runs this engine with
 //!   `suffix: false`, so `verify` always sees a single token and never needs to rewind.
 
@@ -223,8 +223,15 @@ impl ServeEngine for Glm5Serve {
         // The caller has already extended `tokens` with the window's ids; the engine's
         // `window` appends what it is given, so hand it exactly that slice.
         ensure!(pos0 + t <= self.e.tokens.len(), "window past the sequence");
+        // The caller extended `tokens` past the window (prefill_span extends by the whole
+        // span first); the engine appends what it runs and reads its position from the
+        // token count — so cut back to `pos0`, run, and put the span's tail back.
         let ids: Vec<u32> = self.e.tokens[pos0..pos0 + t].to_vec();
-        let lg = self.run_window(0, &ids)?;
+        let tail: Vec<u32> = self.e.tokens[pos0 + t..].to_vec();
+        self.e.tokens.truncate(pos0);
+        let lg = self.run_window(0, &ids);
+        self.e.tokens.extend_from_slice(&tail);
+        let lg = lg?;
         Ok((0..t).map(|i| argmax(&lg[i * self.e.m.hp.n_vocab..(i + 1) * self.e.m.hp.n_vocab])).collect())
     }
 
@@ -286,15 +293,29 @@ impl ServeEngine for Glm5Serve {
     }
 
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
-        // One engine window per row (each slot's own state advances one token); the
-        // batched-kernel form (all slots in one launch, the KDA batch axis) is the next
-        // step. Greedy argmax per row.
+        // ONE engine window over every ready slot (`Glm5Engine::window_batch`): the
+        // per-token stages run once for all rows, only the KDA core / DSA attention split
+        // per slot. Greedy argmax per row. `TANG_GLM5_BATCH_RR=1`: one window per row
+        // instead (the round-robin A/B).
         let nv = self.e.m.hp.n_vocab;
+        if std::env::var("TANG_GLM5_BATCH_RR").is_ok_and(|v| v == "1") {
+            let mut out = Vec::with_capacity(rows.len());
+            for &(slot, tok) in rows {
+                let lg = self.run_window(slot, &[tok])?;
+                out.push(argmax(&lg[(lg.len() - nv)..]));
+            }
+            return Ok(out);
+        }
+        let t0 = Instant::now();
+        let lg = self.e.window_batch(rows)?;
+        let secs = t0.elapsed().as_secs_f64();
+        self.last_window = WinStats { t: rows.len(), wall_ms: secs * 1e3, ..WinStats::default() };
+        crate::telemetry::glm5_window(rows.len(), secs);
         let mut out = Vec::with_capacity(rows.len());
-        for &(slot, tok) in rows {
-            self.e.slot_tokens_mut(slot).push(tok);
-            let lg = self.run_window(slot, &[tok])?;
-            out.push(argmax(&lg[(lg.len() - nv)..]));
+        for (i, &(slot, _)) in rows.iter().enumerate() {
+            let row = lg[i * nv..(i + 1) * nv].to_vec();
+            out.push(argmax(&row));
+            self.last_logits[slot] = row;
         }
         Ok(out)
     }
@@ -315,7 +336,8 @@ impl Glm5Serve {
         // and a verify is one decode step. A non-empty draft list would need a state
         // rewind: run the chain, keep the greedy prefix, replay the kept tokens
         // (correct, slow, and currently unreachable).
-        self.e.slot_tokens_mut(slot).push(cur);
+        // the engine appends what it runs (no push here: a pushed `cur` would be counted
+        // twice and put the DSA caches one position out of step)
         let mut lg = self.run_window(slot, &[cur])?;
         let nv = self.e.m.hp.n_vocab;
         let mut kept = vec![argmax(&lg[(lg.len() - nv)..])];
@@ -323,7 +345,6 @@ impl Glm5Serve {
             return Ok(kept);
         }
         for (i, &d) in drafts.iter().enumerate() {
-            self.e.slot_tokens_mut(slot).push(d);
             lg = self.run_window(slot, &[d])?;
             let next = argmax(&lg[(lg.len() - nv)..]);
             if next != d || i + 1 == drafts.len() {

@@ -546,6 +546,17 @@ impl Glm5Engine {
         Ok(self.gpu.is_some())
     }
 
+    /// `slots` sequence slots with the state on the host only (no device; the CPU build,
+    /// the tests). With a GPU use [`Self::use_gpu_slots`], which also sizes the device state.
+    pub fn set_slots_host(&mut self, slots: usize) {
+        let slots = slots.max(1);
+        let nl = self.m.hp.n_layer;
+        self.n_slots = slots;
+        self.slot_tokens = (0..slots).map(|_| Vec::new()).collect();
+        self.kda = (0..slots).map(|_| (0..nl).map(|_| None).collect()).collect();
+        self.dsa = (0..slots).map(|_| vec![DsaCache::default(); nl]).collect();
+    }
+
     /// The slot count (`use_gpu_slots` set; 1 until then).
     pub fn slots(&self) -> usize {
         self.n_slots
@@ -1281,6 +1292,144 @@ impl Glm5Engine {
         Ok(logits)
     }
 
+    /// The batched decode window: row `i` is token `rows[i].1` of sequence `rows[i].0`
+    /// (distinct slots), each at that slot's own position. Everything per-token runs ONCE
+    /// over all rows — embedding, mHC, norms, the KDA projections / gates / o_proj, the
+    /// FFN (the CPU MoE dequantises each routed expert once per window, not per row) and
+    /// the head — and only the per-sequence mixers split: the KDA core steps each row's
+    /// slot state (one launch pair per row), each DSA layer attends row `i` over slot
+    /// `rows[i].0`'s caches. Returns the logits `[rows.len()][n_vocab]`. Numerically the
+    /// same as one [`Self::window_slot`] per row (every stage is per-token).
+    pub fn window_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<f32>> {
+        let t = rows.len();
+        ensure!(t > 0, "empty batch");
+        for (i, &(s, _)) in rows.iter().enumerate() {
+            ensure!(s < self.n_slots, "slot {s} >= {n}", n = self.n_slots);
+            ensure!(rows[..i].iter().all(|r| r.0 != s), "slot {s} twice in one batch");
+        }
+        if t == 1 {
+            return self.window_slot(rows[0].0, &[rows[0].1]);
+        }
+        let hp = self.m.hp.clone();
+        let (n, hc) = (hp.n_embd, hp.hc);
+        use super::trace::{span, span_l};
+        let tr_root = super::trace::window_begin(t, 0);
+        let tr = span("embed");
+        let embd = self.m.g.info("token_embd.weight")?;
+        let mut r = vec![0f32; t * hc * n];
+        for (i, &(_, tok)) in rows.iter().enumerate() {
+            ensure!((tok as usize) < hp.n_vocab, "token {tok} out of range");
+            let e = self.m.g.rows(embd, tok as usize, 1)?;
+            for c in 0..hc {
+                r[(i * hc + c) * n..(i * hc + c + 1) * n].copy_from_slice(&e);
+            }
+        }
+        let mhp = super::mhc::MhcHparams {
+            streams: hc,
+            sinkhorn_iters: hp.hc_sinkhorn_iters as u32,
+            hc_eps: hp.hc_eps,
+            rms_eps: hp.eps,
+        };
+        let fused = self.mhc_fused_begin(&r, t)?;
+        drop(tr);
+        let slots: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        let pos: Vec<usize> = slots.iter().map(|&s| self.slot_tokens(s).len()).collect();
+        for l in 0..hp.n_layer {
+            let _tr_l = span_l("layer", l);
+            let tr = span("mhc_pre.attn");
+            let w_attn = self.hc_weights(l, "hc_attn", &mhp)?;
+            let (x, mixes) = self.mhc_pre_norm(fused, l, 0, &w_attn, &r, t)?;
+            drop(tr);
+            let y = if hp.is_kda[l] {
+                let _tr = span("kda");
+                let wc = self.kda_weights(l)?;
+                self.kda_rows(l, &slots, &x, &wc.0, &wc.1)?
+            } else {
+                let _tr = span("dsa");
+                let w = self.mla_weights(l)?;
+                let mut y = Vec::with_capacity(t * n);
+                for i in 0..t {
+                    y.extend(self.dsa_layer(slots[i], l, &w, &x[i * n..(i + 1) * n], 1, pos[i])?);
+                }
+                y
+            };
+            let tr = span("mhc_post.attn");
+            self.mhc_post_any(fused, l, &mixes, &y, &mut r, t)?;
+            drop(tr);
+            let tr = span("mhc_pre.ffn");
+            let w_ffn = self.hc_weights(l, "hc_ffn", &mhp)?;
+            let (x, mixes) = self.mhc_pre_norm(fused, l, 1, &w_ffn, &r, t)?;
+            drop(tr);
+            let tr = span("ffn");
+            let y = self.ffn(l, &x, t)?;
+            drop(tr);
+            let tr = span("mhc_post.ffn");
+            self.mhc_post_any(fused, l, &mixes, &y, &mut r, t)?;
+            drop(tr);
+        }
+        let tr_head = span("head");
+        let mut h = self.hc_head_all(fused, &r, t)?;
+        self.m.norm_all_exact(&mut h, "output_norm.weight")?;
+        if self.head.is_none() {
+            self.head = Some(self.m.head()?);
+        }
+        let logits = self.head.as_ref().unwrap().apply(&h, t, false);
+        drop(tr_head);
+        for &(s, tok) in rows {
+            self.slot_tokens_mut(s).push(tok);
+        }
+        super::trace::window_end(tr_root, t, 0);
+        Ok(logits)
+    }
+
+    /// KDA layer `l` for a batch of decode rows (row `i` = one token of `slots[i]`): the
+    /// resident layer's batched rows path when it can take them, else one
+    /// [`Self::kda_mixer`] call per row (the CPU / staged / shadow-checked paths).
+    fn kda_rows(
+        &mut self,
+        l: usize,
+        slots: &[usize],
+        x: &[f32],
+        w: &KdaLayerW,
+        cfg: &KdaConfig,
+    ) -> Result<Vec<f32>> {
+        let n = self.m.hp.n_embd;
+        let t = slots.len();
+        #[cfg(feature = "cuda")]
+        if self.kda_dbg.is_none() {
+            if let Some(g) = self.gpu.as_mut() {
+                if let Some(dev) = &mut g.kda_l[l] {
+                    if dev.pf2_on() && t <= g.max_t {
+                        let d = g.dev_of[l];
+                        g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                        // every row's slot slice must be the live device copy
+                        for &s in slots {
+                            if !g.kda_dev_fresh[s][l] {
+                                let st = self.kda[s][l].take().unwrap_or_else(|| {
+                                    (ConvState::zeros(cfg, 1), KdaState::zeros(cfg, 1))
+                                });
+                                dev.seed_at(s, &st.0, &st.1)?;
+                                self.kda[s][l] = Some(st);
+                                g.kda_dev_fresh[s][l] = true;
+                            }
+                        }
+                        return dev.window_rows(slots, x);
+                    }
+                }
+            }
+        }
+        let mut y = Vec::with_capacity(t * n);
+        for (i, &s) in slots.iter().enumerate() {
+            let mut st = self.kda[s][l]
+                .take()
+                .unwrap_or_else(|| (ConvState::zeros(cfg, 1), KdaState::zeros(cfg, 1)));
+            let r = self.kda_mixer(s, l, &x[i * n..(i + 1) * n], 1, w, cfg, &mut st);
+            self.kda[s][l] = Some(st);
+            y.extend(r?);
+        }
+        Ok(y)
+    }
+
     /// Prefill `ids` in windows of `chunk` (slot 0); returns the greedy next token.
     pub fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
         self.prefill_slot(0, ids, chunk)
@@ -1596,6 +1745,7 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     // `--slots N` (N > 1): the batcher bench — N sequence slots, the same prompt in each,
     // decoded round-robin; per-step wall ms + every slot's ids (they must all be equal)
     let mut slots = 1usize;
+    let mut rr = false;
     let push = |ids: &mut Vec<u32>, s: &str| -> Result<()> {
         for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
             if !w.is_empty() {
@@ -1616,6 +1766,9 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
             "--out" => out = Some(PathBuf::from(val()?)),
             "--quiet" => quiet = true,
             "--slots" => slots = val()?.parse::<usize>()?.max(1),
+            // with --slots: one window per slot per step (round-robin) instead of one
+            // batched window over all slots
+            "--rr" => rr = true,
             "-v" | "--verbose" => verbose = true,
             "--temp" => {
                 let t: f32 = val()?.parse()?;
@@ -1670,7 +1823,7 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     if slots > 1 {
-        return slots_bench(&mut e, &ids, n, chunk, slots, out.as_deref());
+        return slots_bench(&mut e, &ids, n, chunk, slots, rr, out.as_deref());
     }
     let t1 = Instant::now();
     let mut cur = e.prefill(&ids, chunk)?;
@@ -1753,20 +1906,38 @@ fn slots_bench(
     n: usize,
     chunk: usize,
     slots: usize,
+    rr: bool,
     out: Option<&Path>,
 ) -> Result<()> {
+    // prefill in lockstep (both modes; prefill is not what this measures): position j of
+    // every slot is one batched window of `slots` rows
     let t1 = Instant::now();
-    let mut cur: Vec<u32> = (0..slots)
-        .map(|s| e.prefill_slot(s, ids, chunk))
-        .collect::<Result<_>>()?;
+    let nv = e.m.hp.n_vocab;
+    let _ = chunk;
+    let mut lg = Vec::new();
+    for &tok in ids {
+        let rows: Vec<(usize, u32)> = (0..slots).map(|s| (s, tok)).collect();
+        lg = e.window_batch(&rows)?;
+    }
+    let mut cur: Vec<u32> = (0..slots).map(|s| argmax(&lg[s * nv..(s + 1) * nv])).collect();
     let prefill_s = t1.elapsed().as_secs_f64();
     let mut gen: Vec<Vec<u32>> = cur.iter().map(|&c| vec![c]).collect();
     let mut step_ms = Vec::new();
     let t2 = Instant::now();
     for _ in 1..n {
         let ts = Instant::now();
+        if rr {
+            for s in 0..slots {
+                cur[s] = e.step_slot(s, cur[s])?;
+            }
+        } else {
+            let rows: Vec<(usize, u32)> = (0..slots).map(|s| (s, cur[s])).collect();
+            let lg = e.window_batch(&rows)?;
+            for s in 0..slots {
+                cur[s] = argmax(&lg[s * nv..(s + 1) * nv]);
+            }
+        }
         for s in 0..slots {
-            cur[s] = e.step_slot(s, cur[s])?;
             gen[s].push(cur[s]);
         }
         step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
@@ -1788,7 +1959,8 @@ fn slots_bench(
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let toks = (slots * step_ms.len()) as f64;
         println!(
-            "slots {slots}: per-step wall {:.1} ms median (min {:.1}, max {:.1}) over {} steps | {:.1} ms/token/slot | aggregate {:.2} tok/s, per stream {:.2} tok/s",
+            "slots {slots} ({}): per-step wall {:.1} ms median (min {:.1}, max {:.1}) over {} steps | {:.1} ms/token/slot | aggregate {:.2} tok/s, per stream {:.2} tok/s",
+            if rr { "round-robin" } else { "batched" },
             v[v.len() / 2],
             v[0],
             v[v.len() - 1],
@@ -2230,6 +2402,69 @@ mod tests {
         );
         assert!(agree as f32 >= 0.98 * total as f32, "top-1 {agree}/{total}");
         assert!(worst <= 0.25, "logits max abs {worst}");
+    }
+
+    /// THE BATCHER's bar on the tiny model (CPU): two slots with DIFFERENT prompts,
+    /// prefilled separately, then decoded together through `window_batch` — every row's
+    /// logits must equal a lone engine running that prompt (no state bleeds between slots,
+    /// batching changes nothing), and the round-robin `window_slot` path must too.
+    #[test]
+    fn engine_slots_batch_matches_separate() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            eprintln!("skip: tiny fixture absent");
+            return;
+        };
+        let prompts = [&ids[..9], &ids[3..15]];
+        let steps = 4;
+        // the references: one engine per prompt, greedy
+        let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut toks: Vec<Vec<u32>> = Vec::new();
+        for p in prompts {
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            let nv = e.m.hp.n_vocab;
+            let lg = e.window(p).unwrap();
+            let mut cur = argmax(&lg[(p.len() - 1) * nv..]);
+            let (mut w, mut tk) = (Vec::new(), vec![cur]);
+            for _ in 0..steps {
+                let lg = e.window(&[cur]).unwrap();
+                cur = argmax(&lg);
+                w.push(lg);
+                tk.push(cur);
+            }
+            want.push(w);
+            toks.push(tk);
+        }
+        for batched in [true, false] {
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            e.set_slots_host(3); // slot 0 left empty: the batch uses slots 1 and 2
+            let nv = e.m.hp.n_vocab;
+            let mut cur = Vec::new();
+            for (k, p) in prompts.iter().enumerate() {
+                let lg = e.window_slot(k + 1, p).unwrap();
+                cur.push(argmax(&lg[(p.len() - 1) * nv..]));
+            }
+            assert_eq!(cur, vec![toks[0][0], toks[1][0]], "prefill next tokens");
+            for step in 0..steps {
+                let got: Vec<Vec<f32>> = if batched {
+                    let lg = e.window_batch(&[(1, cur[0]), (2, cur[1])]).unwrap();
+                    vec![lg[..nv].to_vec(), lg[nv..].to_vec()]
+                } else {
+                    vec![e.window_slot(1, &[cur[0]]).unwrap(), e.window_slot(2, &[cur[1]]).unwrap()]
+                };
+                for k in 0..2 {
+                    let worst = got[k]
+                        .iter()
+                        .zip(&want[k][step])
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(worst <= 1e-4, "batched {batched} slot {k} step {step}: max abs {worst}");
+                    cur[k] = argmax(&got[k]);
+                    assert_eq!(cur[k], toks[k][step + 1], "batched {batched} slot {k} step {step}");
+                }
+            }
+            assert_eq!(e.slot_tokens(1).len(), prompts[0].len() + steps);
+            assert!(e.slot_tokens(0).is_empty(), "slot 0 untouched");
+        }
     }
 
     /// reset() gives a fresh sequence.
