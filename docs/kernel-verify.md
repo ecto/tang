@@ -81,10 +81,41 @@ with the FFNs on the CPU):
    fixed;
 3. prints the one-screen verdict. `--replay` reprints it from the saved logs.
 
-Transcript (mew, RTX 3090, GLM-5.3-Flash UD-Q4_K_XL, real weights):
+Transcript (H200 pod, GLM-5.3-Flash UD-Q4_K_XL, real weights; `-n 1` keeps it to the 20-token prefill window, ~5 min):
 
 ```
-TRANSCRIPT
+
+  ━━ tang-verify: a planted GPU bug, caught in one run ━━
+
+  1. The bug we planted (crates/tang-llm/src/flash/glm5/kda_dev.rs, the q/k/v projection launch)
+    fixed: [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+    planted: [(&self.wq, 0u64), (&self.wk, di as u64), (&self.wv, 2 * di as u64)] {
+    A GPU pointer counts BYTES; the planted line adds a count of FLOATS (4 bytes each).
+    So k is written 1/4 of the way, and v 1/2, into the q block. This exact bug shipped
+    in the GLM-5.3 engine on Oct 26 and was found by this method (fix: cc578187).
+
+  2. One run of the real model with the harness on (GLM-5.3, real weights, layer 0, first window: 20 tokens)
+    Every output buffer is filled with NaN first, so memory no kernel wrote stays NaN.
+      qkv.q  WRONG         0 of 163840 values never written
+      qkv.k  WRONG     81920 of 163840 values never written
+      qkv.v  WRONG    163840 of 163840 values never written
+    Predicted by the offset arithmetic (20 tokens × 8192 floats per section):
+      k: v's misplaced writes stop halfway through k → 20 × 8192/2 = 81920 unwritten  ✓
+      v: nothing writes v's block at all             → 20 × 8192   = 163840 unwritten  ✓
+    Harness verdict:
+      `qkv.k` wrote into `qkv.q`: qkv.q@tok0 h16 d0 holds qkv.k@tok0 h0 d0
+            (writer's base offset in `qkv_pre` is 2048, expected 8192:
+             expected = 4 × actual: an ELEMENT offset added to a BYTE address (size_of::<f32>()))
+          → suspect: k5_gemv attn_k (device)
+    (the naive rule, "first failing stage", would have blamed attn_q: its block is the
+     first to fail, but the values in it are k's)
+
+  3. The same run with the fix
+    SUMMARY: 34 windows checked, 0 failed; first: none (all within tol)
+    ids: 785
+
+  logs: /root/w-verify-demo/planted.log, /root/w-verify-demo/fixed.log
+  DEMO_RC=0
 ```
 
 ## The API
