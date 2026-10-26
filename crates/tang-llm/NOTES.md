@@ -4,6 +4,32 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 — tang-verify: the four ad-hoc tools are now a crate; the KDA shadow check ported onto it (branch frog/kernel-verify-harness)
+
+[`tang-verify`](../../docs/kernel-verify.md) = shadow + NaN poison + first-divergence
+attribution + skip_or_fail, as a reusable API (the same `Stat`/row format/env semantics as
+the old `kda_debug`, so old logs diff cleanly). Core is dependency-free; feature `cuda`
+adds the device side on tang-moe (`Probe::poison`/`read`, `kernel_test!` with
+`TANG_REQUIRE_CUDA`). The attribution now ranks provenance ("these values are `k`'s,
+written at offset 2048 in `qkv_pre` where 8192 was expected = an ELEMENT offset added to a
+BYTE address") over pipeline order — it names the *k* writer for cc578187, where the old
+rule blamed attn_q.
+
+Evidence:
+- Ported check, real model (mew 3090, KDA+DSA+mHC GPU / FFN CPU, `TANG_GLM5_KDA_MAXT=64`,
+  prompt "Write a haiku about the sea.", `-n 8 --temp 0`): ids
+  `785 1196 6801 264 6386 38038 911 279` = the oracle, and
+  `kdadbg SUMMARY: 272 windows checked, 0 failed`, worst rel 2.8e-6 (34 KDA layers × 8).
+- `kda_dev` kernel tests (`TANG_REQUIRE_CUDA=1`, mew 3090, 2/2): the q/k/v GEMVs vs the
+  host matmul at three shapes, plus `k5_gemv_element_offset_bug_is_named`, which plants
+  the bug in the test itself and asserts the verdict names `k`'s writer with the ×4 note.
+- The planted-bug demo on the real model (H200 pod): `scripts/kernel-verify-demo.sh`
+  reverts cc578187's byte scaling in a scratch copy, runs the model once planted and once
+  fixed, and prints the verdict. Planted run: `qkv.k` nonfinite 81920 = 20×8192/2 and
+  `qkv.v` 163840 = 20×8192 (exactly the offset arithmetic), verdict
+  "`qkv.k` wrote into `qkv.q` … → suspect: k5_gemv attn_k (device)"; fixed run 34/34
+  clean, `ids: 785 …`. The transcript is in docs/kernel-verify.md.
+
 ## 2026-10-26 (housekeeping) — GPU tests can no longer silently skip; regressions for both fixture-blind bug classes
 
 `skip_or_fail()` in engine.rs tests: with `TANG_REQUIRE_CUDA=1` a skip panics; without

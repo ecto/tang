@@ -6344,6 +6344,7 @@ dependencies = [
  "tang-otel",
  "tang-tensor",
  "tang-train",
+ "tang-verify",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -6492,6 +6493,13 @@ dependencies = [
  "tang-la",
  "tang-optim",
  "tang-tensor",
+]
+
+[[package]]
+name = "tang-verify"
+version = "0.1.0"
+dependencies = [
+ "tang-moe",
 ]
 
 [[package]]
