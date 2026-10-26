@@ -1089,7 +1089,7 @@ pub mod cuda {
         let o = DevBuf::from_slice(&vec![f32::NAN; t * nh * hd])?;
         // NaN-poison the workspace: a row the core reads but nothing wrote can't hide
         dev.ws.write(0, &vec![f32::NAN; dev.ws_elems()])?;
-        dev.prefill_dev(k, &s, xb.ptr, ch_dim, gb.ptr, nh * hd, bb.ptr, nh, o.ptr, t)?;
+        dev.prefill_dev(k, &s, 0, xb.ptr, ch_dim, gb.ptr, nh * hd, bb.ptr, nh, o.ptr, t)?;
         s.sync()?;
         dev.read_conv(conv)?;
         dev.read_state(state)?;

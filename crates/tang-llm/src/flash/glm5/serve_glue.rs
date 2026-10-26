@@ -206,7 +206,7 @@ impl ServeEngine for Glm5Serve {
     }
 
     fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
-        self.prefill_slot(0, ids, chunk)
+        { let _ = chunk; self.prefill_slot(0, ids) }
     }
 
     fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
@@ -269,6 +269,7 @@ impl ServeEngine for Glm5Serve {
         self.logits_at(0, t)
     }
 
+    #[allow(unused)]
     fn logits_at(&self, slot: usize, t: usize) -> Vec<f32> {
         let nv = self.e.m.hp.n_vocab;
         let lg = &self.last_logits[slot.min(self.slots - 1)];

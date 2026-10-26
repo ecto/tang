@@ -589,14 +589,16 @@ impl Glm5Engine {
         // the device's copy when fresh, else the host's (or zeros when the sequence has
         // not reached this layer's state yet)
         let host = self.kda[slot][l].as_ref();
-        if let (Some(g), Some(dev)) = (self.gpu.as_mut(), host.is_some()) {
-            if g.kda_dev_fresh[slot][l] {
-                if let Some(dev_l) = &mut g.kda_l[l] {
-                    let d = g.dev_of[l];
-                    if g.devs[d].0.bind().is_ok()
-                        && dev_l.read_back_at(slot, &mut conv, &mut state).is_ok()
-                    {
-                        return Some((conv, state));
+        if host.is_some() {
+            if let Some(g) = self.gpu.as_mut() {
+                if g.kda_dev_fresh[slot][l] {
+                    if let Some(dev_l) = &mut g.kda_l[l] {
+                        let d = g.dev_of[l];
+                        if g.devs[d].0.bind().is_ok()
+                            && dev_l.read_back_at(slot, &mut conv, &mut state).is_ok()
+                        {
+                            return Some((conv, state));
+                        }
                     }
                 }
             }
@@ -692,7 +694,7 @@ impl Glm5Engine {
         }
         #[cfg(feature = "cuda")]
         if let Some(g) = self.gpu.as_mut() {
-            g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+            g.kda_dev_fresh.iter_mut().for_each(|row| row.fill(false));
             // re-zero the slot's device state (the host copies are None; the next window
             // seeds from zeros — but the device may hold the old sequence's values, so
             // mark the layer stale AND clear it)
@@ -742,7 +744,7 @@ impl Glm5Engine {
         // conv + recurrent state (the host copies above are the fresh zeros it must get)
         #[cfg(feature = "cuda")]
         if let Some(g) = self.gpu.as_mut() {
-            g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+            g.kda_dev_fresh.iter_mut().for_each(|row| row.fill(false));
             for slot in 0..self.n_slots {
                 g.zero_slot_states(slot);
             }
