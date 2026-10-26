@@ -18,6 +18,8 @@ pub mod kda_debug;
 #[cfg(feature = "cuda")]
 pub mod kda_dev;
 pub mod mhc;
+#[cfg(feature = "cuda")]
+pub mod mhc_fused;
 pub mod mla;
 pub mod moe;
 #[cfg(feature = "cuda")]
