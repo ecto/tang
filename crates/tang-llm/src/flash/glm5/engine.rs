@@ -1563,7 +1563,7 @@ mod tests {
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
-        let _ = &_ids;
+        let _ = &ids;
         let mut flips = Vec::new();
         for (wi, w) in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]]
             .into_iter()
@@ -1845,6 +1845,46 @@ mod tests {
         let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         println!("engine_reset_gpu: max |a - b| {d:.3e}");
         assert!(d < 1e-4, "after reset the GPU window differs from a fresh one: {d}");
+    }
+
+    /// `TANG_GLM5_TRACE` is transparent: the same windows traced and untraced give the
+    /// same logits bit for bit, and the trace saw the GPU (launches, timed kernels by name,
+    /// copies) under the layer-family spans.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_trace_is_transparent() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("no CUDA device");
+            return;
+        }
+        let run = |e: &mut Glm5Engine| {
+            e.reset();
+            let mut v = e.window(&ids[..6]).unwrap();
+            v.extend(e.window(&ids[6..7]).unwrap());
+            v
+        };
+        // traced from before the load, as the CLI does (kernel names are taken at load)
+        super::super::trace::start();
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu().unwrap());
+        let traced = run(&mut e);
+        super::super::trace::stop();
+        let plain = run(&mut e);
+        let r = super::super::trace::report().expect("a trace report");
+        println!("{r}");
+        // the same bound as engine_reset_gpu (a fresh sequence run twice): tracing adds
+        // events and counters only, so anything past run-to-run noise is a bug
+        let d = traced.iter().zip(&plain).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let same = traced.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits());
+        println!("engine_gpu_trace_is_transparent: max |traced - plain| {d:.3e}, bit-identical {same}");
+        assert!(d < 1e-4, "tracing changed the logits: {d}");
+        for want in ["decode, per token", "prefill, totals", "kda", "mhc_pre.attn", "ffn", "lm_head", "kernels by GPU time", "k5_"] {
+            assert!(r.contains(want), "trace report lacks {want:?}:\n{r}");
+        }
     }
 
     /// THE LESSON OF THIS PORT (the engine never wired the built-and-tested GPU structs
