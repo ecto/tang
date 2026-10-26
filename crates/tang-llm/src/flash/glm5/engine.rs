@@ -1100,6 +1100,57 @@ mod tests {
         )
     }
 
+    /// REAL-WEIGHTS BISECTOR: the wired GPU engine vs the CPU engine on the REAL model,
+    /// a tiny sequence. Named the bug the tiny fixture couldn't: if this fails while
+    /// engine_gpu_matches_cpu passes, the divergence is real-weights/real-shape specific.
+    /// Gated on TANG_GLM5_REAL_GGUF (the shard-1 path) so normal test runs stay cheap.
+    #[test]
+    fn engine_real_weights_gpu_matches_cpu() {
+        let Some(real) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let p = Path::new(&real);
+        if !p.exists() {
+            eprintln!("skip: {real} absent");
+            return;
+        }
+        let ids: Vec<u32> = (1000..1008).collect(); // 8 arbitrary in-vocab tokens
+        let mut cpu = Glm5Engine::open(p).unwrap();
+        cpu.use_gpu().unwrap();
+        // force CPU: TANG_GLM5_GPU=0 is read at load; run the CPU engine via a second open
+        std::env::set_var("TANG_GLM5_GPU", "0");
+        let mut cpu2 = Glm5Engine::open(p).unwrap();
+        std::env::remove_var("TANG_GLM5_GPU");
+        let mut gpu = Glm5Engine::open(p).unwrap();
+        gpu.use_gpu().unwrap();
+        let mut cpu_out = Vec::new();
+        cpu_out.extend(cpu2.window(&ids[..5]).unwrap());
+        for &tok in &ids[5..] {
+            cpu_out.extend(cpu2.window(&[tok]).unwrap());
+        }
+        let mut gpu_out = Vec::new();
+        gpu_out.extend(gpu.window(&ids[..5]).unwrap());
+        for &tok in &ids[5..] {
+            gpu_out.extend(gpu.window(&[tok]).unwrap());
+        }
+        let mut worst = 0f32;
+        let mut bad = 0usize;
+        let nv = 154_880;
+        for p in 0..ids.len() {
+            let c = &cpu_out[p * nv..(p + 1) * nv];
+            let g = &gpu_out[p * nv..(p + 1) * nv];
+            let w: f32 = c.iter().zip(g).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            worst = worst.max(w);
+            if argmax(c) != argmax(g) {
+                bad += 1;
+                eprintln!("position {p}: top-1 differs, max abs {w}");
+            }
+        }
+        eprintln!("real-weights bisector: max abs {worst}, top-1 mismatches {bad}/{}", ids.len());
+        assert_eq!(bad, 0, "the wired GPU path diverges from CPU on the real model");
+    }
+
     /// Chunked prefill + token-by-token decode equals one full reference forward.
     #[test]
     fn engine_matches_reference_forward() {
