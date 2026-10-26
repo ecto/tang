@@ -242,6 +242,11 @@ impl DevLayer {
             Some(v) => v,
             None => f32::NAN, // the kernel's softplus-form sentinel
         };
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the layer input, matching kda::kda_layer's `kda cpu x` line: if x already
+            // differs, the divergence is upstream of KDA (not a staging bug)
+            eprintln!("kda gpu x[0..8]: {:?}", &x[..8.min(x.len())]);
+        }
         self.xb.write(0, x)?;
         // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di)
         let qkv = self.qkvb.ptr;
