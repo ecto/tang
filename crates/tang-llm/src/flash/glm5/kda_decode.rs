@@ -38,7 +38,7 @@ use super::DevLayer;
 use super::super::kda::ConvState;
 use anyhow::{ensure, Context, Result};
 use cudarc::driver::sys;
-use tang_moe::gpu::{launch, Graph, Gpu, Module, Stream};
+use tang_moe::gpu::{launch, Event, Graph, Gpu, Module, Stream};
 use tang_moe::args;
 
 /// Which decode path a call takes (env-selected by [`Mode::from_env`]; tests pass it).
@@ -92,7 +92,16 @@ fn grid(n: usize) -> (u32, u32, u32) {
 
 impl DevLayer {
     /// Enqueue the fused decode step on `s` (device pointers only: valid inside a capture).
-    fn enqueue_decode(&self, s: &Stream, gemv8: bool) -> Result<()> {
+    /// `ev` (eager only, the bench's per-stage breakdown): 5 events recorded before the
+    /// projections and after each of proj / gate2 / step / o_proj.
+    fn enqueue_decode(&self, s: &Stream, gemv8: bool, ev: Option<&[Event]>) -> Result<()> {
+        let mark = |i: usize| -> Result<()> {
+            if let Some(e) = ev {
+                e[i].record(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok(())
+        };
+        mark(0)?;
         let fast = self.fast.as_ref().context("kda fused decode: kernels not built")?;
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
@@ -139,6 +148,7 @@ impl DevLayer {
                     self.xb.ptr, qkv, self.g1b.ptr, self.bb.ptr, self.g2a.ptr, di as u32,
                     hd as u32, nh as u32, hidden as u32, r0 as u32],
             )?;
+            mark(1)?;
             launch(
                 fast.gate2,
                 grid(2 * di),
@@ -148,6 +158,7 @@ impl DevLayer {
                 args![self.fb.w, self.gb.w, self.g1b.ptr, self.g2a.ptr, self.dt.ptr,
                     self.rate.ptr, self.gb_out.ptr, self.g2b.ptr, nh as u32, hd as u32, lb],
             )?;
+            mark(2)?;
             launch(
                 fast.step,
                 (nh as u32, 1, 1),
@@ -158,6 +169,7 @@ impl DevLayer {
                     self.bb.ptr, self.core.st.ptr, self.ob.ptr, self.on.ptr, self.g2b.ptr,
                     self.yb.ptr, self.cfg.eps],
             )?;
+            mark(3)?;
             launch(
                 self.gv.gemv,
                 grid(hidden),
@@ -167,6 +179,7 @@ impl DevLayer {
                 args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, 1u32,
                     hidden as u32, di as u32],
             )?;
+            mark(4)?;
         }
         Ok(())
     }
@@ -206,19 +219,19 @@ impl DevLayer {
             Mode::Graph => {
                 // first token (or GEMV8 toggled): run eagerly, then capture for the next
                 // tokens (capture records, it does not execute)
-                self.enqueue_decode(&self.s, gemv8)?;
+                self.enqueue_decode(&self.s, gemv8, None)?;
                 self.s.sync()?;
                 if let Some(f) = self.fast.as_mut() {
                     f.graph = None;
                 }
                 let me = &*self;
                 let gr = Graph::capture(&me.s, |s| {
-                    me.enqueue_decode(s, gemv8).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
+                    me.enqueue_decode(s, gemv8, None).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
                 })
                 .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
                 self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
             }
-            _ => self.enqueue_decode(&self.s, gemv8)?,
+            _ => self.enqueue_decode(&self.s, gemv8, None)?,
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, hidden)?;
@@ -403,6 +416,26 @@ mod tests {
             d.read_back(&mut hc, &mut st).unwrap();
             outs.push(ys);
             states.push((hc, st));
+        }
+        {
+            // per-stage GPU time of the fused step (eager, events between the launches)
+            let d = mk(true);
+            let ev: Vec<Event> = (0..5).map(|_| Event::new(true).unwrap()).collect();
+            let gemv8 = d.gemv8 && [&d.wq, &d.wk, &d.wv].iter().all(|w| w.w.ty == 8);
+            let mut acc = [0f32; 4];
+            for x in &xs {
+                d.xb.write(0, x).unwrap();
+                d.enqueue_decode(&d.s, gemv8, Some(&ev)).unwrap();
+                d.s.sync().unwrap();
+                for i in 0..4 {
+                    acc[i] += ev[i + 1].since(&ev[i]).unwrap();
+                }
+            }
+            let k = xs.len() as f32;
+            eprintln!(
+                "kda decode layer {l} fused stages (GPU us/step, gemv8 {gemv8}): proj {:.0}, gate2 {:.0}, step {:.0}, o_proj {:.0}",
+                acc[0] * 1e3 / k, acc[1] * 1e3 / k, acc[2] * 1e3 / k, acc[3] * 1e3 / k
+            );
         }
         for (mi, name) in [(1, "fused"), (2, "graph")] {
             let diff = outs[mi]
