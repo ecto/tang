@@ -4,6 +4,28 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 (later) — B300 all-GPU verdict: GPU mHC ran the wrong block's weights
+
+B300 (pod 0izjldh4haq9c1, branch 43f12709 = main 89ac0bc9), load log: 34 KDA, "11 DSA
+layers resident (MLA, one per layer), 45 mHC layers resident", 45/45 FFNs on the GPU.
+
+| config | ids |
+|---|---|
+| all GPU | 4615 6540 315 279 … (wrong from token 1) |
+| mHC on CPU, rest GPU | 785 1196 6801 264 6386 38038 911 279 = oracle |
+| FFN on CPU, mHC GPU | 4615 6540 304 … (wrong) |
+
+So GPU FFN/MoE is correct at real weights; GPU mHC was not. Speed of the correct config
+(naive kernels, correctness verdict only): prefill 20 tok / 23.1 s (0.9 tok/s), decode
+7 tok / 11.9 s (0.59 tok/s).
+
+Cause: `Glm5Engine::mhc_pre` called `MhcGpu::pre(0, ..)` for BOTH halves of every layer
+— block 0 is `hc_attn`, so every FFN-half mix ran with the attention half's hc weights.
+The CPU path used the `w` it was handed, hence mHC-on-CPU matching. Every 3090 verify ran
+mHC on the CPU, so none caught it. Fix: `mhc_pre(l, block, ..)` with 0 / 1 at the two
+call sites. Verified on the 3090 (KDA + DSA + mHC on the GPU, FFN CPU): ids = oracle,
+KDA shadow 34/34 clean. Remaining: one all-GPU B300 run (FFN on the GPU too).
+
 ## 2026-10-26 — GLM-5.3 staging: three GPU bugs, one bad test
 
 Branch `frog/glm5-forward`. CPU oracle (mew, `cpu-dump7/8.log`): prompt "Write a haiku
