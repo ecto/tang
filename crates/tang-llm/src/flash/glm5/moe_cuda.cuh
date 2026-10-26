@@ -590,4 +590,42 @@ extern "C" __global__ void __launch_bounds__(128) g5f_down(
     }
 }
 
+// The plain GEMV on the same row kernel: y[t * ystride + r] = (row r of matrix e of w) . x_t for
+// r < rows, t < T (k = row length, k % 8 == 0). Any G5W type (g5f_dot_any). Activations, per token
+// at stride xs elements (xs >= k, xs % 32 == 0): xq / xq2 / xd = g5f_q8 of x (xq2 null = one-level
+// codes; k5_q8's codes + scales also work: xq2 null, xd = its scales, xs = COLS); xf = x f32 (read
+// for F32 / F16 rows only, may be null otherwise). xd's per-token stride is xs / 32.
+// grid (ceil(rows/8), ceil(T/G5F_TT)), block 128: two rows a warp, staged once (row16 > 0; dynamic
+// smem 8 * row16 * 16 B as g5f_down) and dotted against up to G5F_TT tokens, so a prefill window
+// reads W once per G5F_TT tokens instead of once per token.
+#define G5F_TT 8
+extern "C" __global__ void __launch_bounds__(128) g5f_gemv(
+    const G5W w, unsigned e, const float* xf, const unsigned char* xq, const unsigned char* xq2, const float* xd,
+    int xs, float* y, int ystride, int T, int rows, int k, int row16) {
+    extern __shared__ uint4 g5f_sm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.x * 4 + warp) * 2;
+    if (r0 >= rows) return;  // whole warp: no block-level sync below
+    const bool two = r0 + 1 < rows;
+    uint4* sm0 = g5f_sm + (size_t)(warp * 2) * row16;
+    const unsigned char* w0 = g5f_stage(w, e, r0, sm0, row16, lane);
+    const unsigned char* w1 = two ? g5f_stage(w, e, r0 + 1, sm0 + row16, row16, lane) : w0;
+    g5f_stage_wait();
+    const int t0 = blockIdx.y * G5F_TT;
+    const int t1 = t0 + G5F_TT < T ? t0 + G5F_TT : T;
+    for (int t = t0; t < t1; t++) {
+        const size_t o = (size_t)t * xs;
+        const unsigned char* q = xq ? xq + o : 0;
+        const unsigned char* q2 = xq2 ? xq2 + o : 0;
+        const float* d = xd ? xd + o / 32 : 0;
+        const float* f = xf ? xf + o : 0;
+        const float a = g5f_warp_sum(g5f_dot_any(w.ty, w0, q, q2, d, f, k));
+        const float b = two ? g5f_warp_sum(g5f_dot_any(w.ty, w1, q, q2, d, f, k)) : 0.f;
+        if (lane == 0) {
+            y[(size_t)t * ystride + r0] = a;
+            if (two) y[(size_t)t * ystride + r0 + 1] = b;
+        }
+    }
+}
+
 #endif  // fast path

@@ -469,7 +469,7 @@ mod cuda {
     use tang_verify::stat;
     use crate::flash::glm5::moe::gpu::{ffn as gpu_ffn, ffn_host, DevMoe, Kernels};
     use std::time::Instant;
-    use tang_moe::gpu::{DevBuf, Gpu, Stream};
+    use tang_moe::gpu::{self, DevBuf, Gpu, Stream};
 
     /// Every GPU path vs the CPU reference: naive and fast with two-level int8 activations
     /// (q8x2, the default) within `tol`, fast with one-level int8 (q8) within `tol_fast` (all
@@ -698,5 +698,244 @@ mod cuda {
             }
         }
         eprintln!("moebench worst fast-q8x2 rel l2 {worst_fast:.3e}");
+    }
+
+    // ---- g5f_gemv: the fast path's plain GEMV ------------------------------------------------
+
+    use crate::flash::glm5::moe::gpu::{upload, Act, DevW, Kernels5};
+    use crate::gguf::TensorInfo;
+
+    /// `y [t][rows]` = W · x_t on the CPU, f64 accumulation (W dequantised by tang's decoders).
+    fn cpu_gemv(wf: &[f32], x: &[f32], t_len: usize, rows: usize, cols: usize) -> Vec<f32> {
+        let mut y = vec![0f32; t_len * rows];
+        for t in 0..t_len {
+            let xt = &x[t * cols..(t + 1) * cols];
+            for r in 0..rows {
+                let wr = &wf[r * cols..(r + 1) * cols];
+                y[t * rows + r] = wr.iter().zip(xt).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32;
+            }
+        }
+        y
+    }
+
+    /// Device activations for `x [t][cols]`: f32 copy + g5f_q8 codes / residual / scales.
+    struct DevAct {
+        xf: DevBuf,
+        xq: DevBuf,
+        xq2: DevBuf,
+        xd: DevBuf,
+        cols: usize,
+    }
+
+    impl DevAct {
+        fn new(k: &Kernels5, s: &Stream, x: &[f32], t_len: usize, cols: usize) -> Self {
+            let a = DevAct {
+                xf: DevBuf::from_slice(x).unwrap(),
+                xq: DevBuf::zeroed(t_len * cols).unwrap(),
+                xq2: DevBuf::zeroed(t_len * cols).unwrap(),
+                xd: DevBuf::zeroed(t_len * cols / 32 * 4).unwrap(),
+                cols,
+            };
+            k.fast.q8(s, a.xf.ptr, a.xq.ptr, a.xq2.ptr, a.xd.ptr, cols, t_len).unwrap();
+            s.sync().unwrap();
+            a
+        }
+        fn act(&self, act2: bool) -> Act {
+            Act {
+                xf: self.xf.ptr,
+                xq: self.xq.ptr,
+                xq2: if act2 { self.xq2.ptr } else { 0 },
+                xd: self.xd.ptr,
+                xs: self.cols,
+            }
+        }
+    }
+
+    /// NaN-filled `n` f32s (an unwritten output can't pass as a plausible value).
+    fn nan_buf(n: usize) -> DevBuf {
+        DevBuf::from_slice(&vec![f32::NAN; n]).unwrap()
+    }
+
+    /// g5f_gemv vs the CPU on the tiny GGUFs' 2-D weights (F32 / Q8_0 / Q4_K / Q5_K / Q6_K
+    /// rows), T = 1, 3, 9 (9 spans two token tiles), staged and unstaged, q8x2 and q8.
+    #[test]
+    fn gpu_gemv_fast_matches_cpu() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let mut k = Kernels5::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let mut checked = 0;
+        for file in ["glm5-tiny-f32.gguf", "glm5-tiny-q8_0.gguf", "glm5-tiny-q4_k_m.gguf"] {
+            let Some(gg) = tiny(file) else { continue };
+            let mut seen = std::collections::HashSet::new();
+            let ts: Vec<&TensorInfo> = gg
+                .tensors
+                .iter()
+                .filter(|t| t.dims.len() == 2 && t.row_len() % 32 == 0)
+                .filter(|t| {
+                    matches!(t.ty, GgmlType::F32 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+                })
+                .filter(|t| seen.insert((t.ty.name().to_string(), t.row_len())))
+                .collect();
+            for ti in ts {
+                let (rows, cols) = (ti.n_rows(), ti.row_len());
+                let dw: DevW = upload(&W::Gguf(gg, ti), 1, rows, cols).unwrap();
+                let wf = gg.dequantize(ti).unwrap();
+                for t_len in [1, 3, 9] {
+                    let x = synth_x(t_len * cols, (rows * 31 + t_len) as u64);
+                    let want = cpu_gemv(&wf, &x, t_len, rows, cols);
+                    let a = DevAct::new(&k, &s, &x, t_len, cols);
+                    for (stage, act2) in [(true, true), (true, false), (false, true)] {
+                        k.fast.stage = stage;
+                        let y = nan_buf(t_len * rows);
+                        k.fast
+                            .gemv(&s, dw.w, 0, a.act(act2), y.ptr, rows, t_len, rows, cols)
+                            .unwrap();
+                        s.sync().unwrap();
+                        let got = y.read::<f32>(0, t_len * rows).unwrap();
+                        let st = stat(&got, &want, 1e-3);
+                        let bar = if ti.ty == GgmlType::F32 { 1e-5 } else if act2 { 1e-4 } else { 2e-2 };
+                        eprintln!(
+                            "gemv-fast {file} {} {} {rows}x{cols} T{t_len} stage {stage} act2 {act2}: rel {:.3e} nonfinite {}",
+                            ti.name,
+                            ti.ty.name(),
+                            st.rel_l2,
+                            st.nonfinite_gpu
+                        );
+                        assert_eq!(st.nonfinite_gpu, 0, "{}: non-finite / unwritten outputs", ti.name);
+                        assert!(st.rel_l2 <= bar, "{} T{t_len}: rel l2 {} > {bar}", ti.name, st.rel_l2);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        k.fast.stage = true;
+        eprintln!("gemv-fast: {checked} cases");
+    }
+
+    /// The KDA projections of a REAL GLM-5.3 layer (attn_q/k/v 8192x4096, attn_output
+    /// 4096x8192, Q8_0 in UD-Q4_K_XL) through g5f_gemv and k5_gemv8: rel l2 vs the CPU and
+    /// µs per GEMV. `TANG_GLM5_REAL_GGUF=<shard 1>`; `TANG_GLM5_GEMV_BENCH_LAYER` (default:
+    /// the first KDA layer); `TANG_GLM5_GEMV_BENCH_T` (default 1,8). Two timings: `ev` =
+    /// CUDA events over 200 back-to-back launches (kernel only, x pre-quantised); `sync` =
+    /// moebench's per-call wall time with a sync (q8 of x included for g5f / k5).
+    #[test]
+    fn real_kda_gemv_bench() {
+        let Some(path) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let gg = Gguf::open(Path::new(&path)).unwrap();
+        let mut k = Kernels5::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let l = std::env::var("TANG_GLM5_GEMV_BENCH_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                (0..200)
+                    .find(|l| gg.info(&format!("blk.{l}.ssm_f_a.weight")).is_ok())
+                    .expect("no KDA layer")
+            });
+        let ts: Vec<usize> = std::env::var("TANG_GLM5_GEMV_BENCH_T")
+            .unwrap_or_else(|_| "1,8".into())
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        let ev_us = |n: usize, f: &mut dyn FnMut()| -> f64 {
+            f();
+            s.sync().unwrap();
+            let (e0, e1) = (gpu::Event::new(true).unwrap(), gpu::Event::new(true).unwrap());
+            e0.record(&s).unwrap();
+            for _ in 0..n {
+                f();
+            }
+            e1.record(&s).unwrap();
+            e1.sync().unwrap();
+            e1.since(&e0).unwrap() as f64 * 1e3 / n as f64
+        };
+        // per T: (mode -> summed ev µs over the 4 projections)
+        let mut layer_sum: Vec<(usize, &str, f64)> = Vec::new();
+        for name in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+            let ti = gg.info(&format!("blk.{l}.{name}.weight")).unwrap();
+            let (rows, cols) = (ti.n_rows(), ti.row_len());
+            let rb = ti.row_bytes().unwrap();
+            let mb = (rows * rb) as f64 / 1e6;
+            let dw = upload(&W::Gguf(&gg, ti), 1, rows, cols).unwrap();
+            let wf = gg.dequantize(ti).unwrap();
+            eprintln!(
+                "gemvbench l{l} {name} {} {rows}x{cols} ({mb:.1} MB)",
+                ti.ty.name()
+            );
+            for &t_len in &ts {
+                let x = synth_x(t_len * cols, (rows + t_len) as u64);
+                let want = cpu_gemv(&wf, &x, t_len, rows, cols);
+                let a = DevAct::new(&k, &s, &x, t_len, cols);
+                let y = DevBuf::zeroed(t_len * rows * 4).unwrap();
+                let (xq, xq2, xd, xf) = (a.xq.ptr, a.xq2.ptr, a.xd.ptr, a.xf.ptr);
+                for mode in ["g5f-q8x2", "g5f-q8", "g5f-q8x2-nostage", "k5_gemv8"] {
+                    k.fast.stage = !mode.ends_with("nostage");
+                    let act2 = mode.starts_with("g5f-q8x2");
+                    let kk = &k;
+                    let yp = y.ptr;
+                    let mut run = |quant: bool| {
+                        if quant {
+                            kk.fast
+                                .q8(&s, xf, xq, if act2 { xq2 } else { 0 }, xd, cols, t_len)
+                                .unwrap();
+                        }
+                        if mode == "k5_gemv8" {
+                            let smem = (4 * (rb.div_ceil(16) + 1) * 16) as u32;
+                            let (we, ys, tu, ru, cu_) =
+                                (dw.w, rows as u32, t_len as u32, rows as u32, cols as u32);
+                            unsafe {
+                                gpu::launch(
+                                    kk.gemv8,
+                                    (rows.div_ceil(4) as u32, t_len as u32, 1),
+                                    (128, 1, 1),
+                                    smem,
+                                    &s,
+                                    tang_moe::args![we, 0u32, xq, xd, yp, ys, tu, ru, cu_],
+                                )
+                                .unwrap();
+                            }
+                        } else {
+                            kk.fast
+                                .gemv(&s, dw.w, 0, a.act(act2), yp, rows, t_len, rows, cols)
+                                .unwrap();
+                        }
+                    };
+                    run(true);
+                    s.sync().unwrap();
+                    let got = y.read::<f32>(0, t_len * rows).unwrap();
+                    let st = stat(&got, &want, 1e-3);
+                    let us_ev = ev_us(200, &mut || run(false));
+                    let us_sync = time_us(50, || {
+                        run(true);
+                        s.sync().unwrap();
+                    });
+                    eprintln!(
+                        "gemvbench l{l} {name} T{t_len} {mode:<16} rel {:.3e} nonfinite {} | {:.1} us ev ({:.0} GB/s), {:.1} us sync+q8",
+                        st.rel_l2,
+                        st.nonfinite_gpu,
+                        us_ev,
+                        mb * 1e-3 / (us_ev * 1e-6),
+                        us_sync
+                    );
+                    assert_eq!(st.nonfinite_gpu, 0, "{name} {mode}: non-finite");
+                    let bar = if act2 { 1e-4 } else { 2e-2 };
+                    assert!(st.rel_l2 <= bar, "{name} T{t_len} {mode}: rel l2 {} > {bar}", st.rel_l2);
+                    match layer_sum.iter_mut().find(|(t, m, _)| *t == t_len && *m == mode) {
+                        Some(e) => e.2 += us_ev,
+                        None => layer_sum.push((t_len, mode, us_ev)),
+                    }
+                }
+            }
+        }
+        k.fast.stage = true;
+        for (t, m, us) in &layer_sum {
+            eprintln!("gemvbench l{l} T{t} {m:<16} q+k+v+o {us:.1} us (ev, kernels only)");
+        }
     }
 }

@@ -670,12 +670,15 @@ pub struct Kernels5 {
     pub gate: Func,
     pub beta: Func,
     pub norm: Func,
+    /// The fast path's plain GEMV (`g5f_gemv` + `g5f_q8`), for the KDA projections.
+    pub fast: FastGemv,
 }
 
 impl Kernels5 {
     pub fn new(g: &Gpu) -> Result<Self> {
         let m = g.module(super::K5_SRC)?;
         Ok(Kernels5 {
+            fast: FastGemv::new(g, &m)?,
             gemv: m.func("k5_gemv")?,
             gemv8: m.func("k5_gemv8")?,
             q8: m.func("k5_q8")?,
@@ -684,5 +687,110 @@ impl Kernels5 {
             norm: m.func("k5_gated_norm")?,
             _m: m,
         })
+    }
+}
+
+/// Activations for [`FastGemv::gemv`], device pointers, `xs` elements per token: `xq` / `xq2`
+/// / `xd` = [`FastGemv::q8`] of x (`xq2 = 0`: one-level codes, ~1e-2 activation error instead
+/// of ~1e-5; k5_q8's codes + scales also fit: `xq2 = 0`, `xd` = its scales, `xs` = COLS).
+/// `xf` = x in f32, read only by F32 / F16 rows (0 otherwise).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Act {
+    pub xf: u64,
+    pub xq: u64,
+    pub xq2: u64,
+    pub xd: u64,
+    pub xs: usize,
+}
+
+/// The plain GEMV on the fast MoE path's dequant-reuse row kernel (`g5f_gemv`): two rows a
+/// warp staged in shared memory (cp.async), int8 activations and `__dp4a` for quantized
+/// rows, any G5W type; a token tile of 8 reads W once per 8 tokens. Launches are async on
+/// the caller's stream (no sync).
+pub struct FastGemv {
+    pub gemv: Func,
+    pub q8: Func,
+    /// Stage rows in shared memory (`TANG_GLM5_MOE_STAGE=0`: read them from global).
+    pub stage: bool,
+    smem_optin: u32,
+}
+
+impl FastGemv {
+    pub fn new(g: &Gpu, m: &Module) -> Result<Self> {
+        Ok(FastGemv {
+            gemv: m.func("g5f_gemv")?,
+            q8: m.func("g5f_q8")?,
+            stage: !std::env::var("TANG_GLM5_MOE_STAGE").is_ok_and(|v| v == "0"),
+            smem_optin: g
+                .attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+                .unwrap_or(48 * 1024) as u32,
+        })
+    }
+
+    /// `x [t][xs]` f32 → `xq [t][xs]` codes, `xd [t][xs/32]` scales, `xq2` residual codes
+    /// (0 = skip). Quantises the first `k` of each token (`k % 32 == 0`, `k <= xs`).
+    pub fn q8(&self, s: &Stream, x: u64, xq: u64, xq2: u64, xd: u64, k: usize, t: usize) -> Result<()> {
+        ensure!(k % 32 == 0, "g5f_q8: k {k} not a multiple of 32");
+        let ki = k as i32;
+        unsafe {
+            gpu::launch(
+                self.q8,
+                (k.div_ceil(128) as u32, t as u32, 1),
+                (128, 1, 1),
+                0,
+                s,
+                tang_moe::args![x, xq, xq2, xd, ki],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `y[t * ystride + r] = (row r of matrix e of w) · x_t` for `r < rows`, `t < t_len`;
+    /// `cols` = the row length (`% 8 == 0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv(
+        &self,
+        s: &Stream,
+        w: G5W,
+        e: u32,
+        a: Act,
+        y: u64,
+        ystride: usize,
+        t_len: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        ensure!(
+            cols % 8 == 0 && a.xs >= cols && a.xs % 32 == 0,
+            "g5f_gemv: cols {cols}, xs {}",
+            a.xs
+        );
+        ensure!(
+            if w.ty <= 1 { a.xf != 0 } else { a.xq != 0 && a.xd != 0 },
+            "g5f_gemv: ggml type {} needs {} activations",
+            w.ty,
+            if w.ty <= 1 { "f32" } else { "int8" }
+        );
+        // staging: two rows a warp, 4 warps (row16 / smem_for's rule), only up to 48 KB a
+        // block: past that occupancy drops and staging loses (H200, o_proj 4096x8192 Q8_0,
+        // 70 KB: 35.8 us staged vs 23.8 us from global; q/k/v 8192x4096, 35 KB: 23.4 vs 25.9)
+        let r16 = if self.stage { row16(&[w]) } else { 0 };
+        let bytes = (8 * r16 * 16) as u32;
+        let cap = self.smem_optin.min(48 * 1024);
+        let (r16, bytes) = if r16 == 0 || bytes > cap { (0, 0) } else { (r16, bytes) };
+        let (xf, xq, xq2, xd) = (a.xf, a.xq, a.xq2, a.xd);
+        let (xs, ys, ti, ri, ci, r16i) =
+            (a.xs as i32, ystride as i32, t_len as i32, rows as i32, cols as i32, r16 as i32);
+        unsafe {
+            gpu::launch(
+                self.gemv,
+                (rows.div_ceil(8) as u32, t_len.div_ceil(8) as u32, 1),
+                (128, 1, 1),
+                bytes,
+                s,
+                tang_moe::args![w, e, xf, xq, xq2, xd, xs, y, ys, ti, ri, ci, r16i],
+            )?;
+        }
+        Ok(())
     }
 }
