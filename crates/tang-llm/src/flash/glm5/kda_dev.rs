@@ -303,6 +303,20 @@ impl DevLayer {
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
         let beta_h = self.bb.read::<f32>(0, t * nh)?;
+        if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+            // the staging probe (matches kda::kda_layer's CPU dump; layout/units equal):
+            // qkv[0..16] (token 0), g[0..8], beta[0..4], the device state's first 8,
+            // and the host conv copy's first 4
+            let st_h = self.core.st.read::<f32>(0, 8).unwrap_or_default();
+            eprintln!(
+                "kda gpu qkv[0..16]: {:?}\n kda gpu g[0..8]: {:?}\n kda gpu beta[0..4]: {:?}\n kda gpu state[0..8]: {:?}\n kda gpu conv_host[0..4]: {:?}",
+                &qkv_h[..16.min(qkv_h.len())],
+                &g_h[..8.min(g_h.len())],
+                &beta_h[..4.min(beta_h.len())],
+                &st_h,
+                &conv.0[..4.min(conv.0.len())],
+            );
+        }
         // W4's core decode/prefill index state.head(cfg, slot, h) on the host even when the
         // device owns the state — hand it a correctly-sized zero buffer so the indexing is
         // in-bounds (the values are ignored: the device-side state is authoritative).
