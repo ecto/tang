@@ -42,7 +42,11 @@ weights, and at the next window the first DSA layer saw the *last* layer's water
   confirmed in code (mla.rs SeqLru / `contiguous` checks).
 - Fix: `mla_k` is per LAYER (`None` on KDA layers), each `MlaCuda::new_at` built from
   that layer's `mla_weights(l)`. Memory ~70–150 MB × 11.
-- Verify: real model, KDA + DSA resident on the 3090 — see the next entry when it lands.
+- Verify (3090, real model, KDA + DSA on the GPU by default, FFN/mHC CPU, 74192590):
+  ids = the oracle exactly; KDA shadow 34/34 windows clean. That run's log had no MLA
+  residency line (MLA on is inferred from code: default-on, per-layer `new_at` errors
+  would have failed the run). 4ac43280 adds `N DSA layers resident` to the load log so
+  the B300 run proves it.
 
 ### 3. Teardown SIGSEGV at the end of every GPU run
 
