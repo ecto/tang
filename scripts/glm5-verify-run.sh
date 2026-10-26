@@ -21,25 +21,34 @@ cd "$(dirname "$0")/.."
 DEST=${1:?usage: glm5-verify-run.sh root@HOST [-p PORT]}; shift
 PORT=
 if [ "${1:-}" = -p ]; then PORT=$2; shift 2; fi
-SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${PORT:+-p $PORT} $DEST"
-R=~/tang-verify
+SSHOPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+SSH="ssh $SSHOPTS ${PORT:+-p $PORT} $DEST"
+# literal path: a ~ here would expand to the LOCAL home (openrsync quirk)
+R=/root/tang-verify
 SRC=${1:-.}
 
 # 1. source up
+$SSH "mkdir -p $R/src"
 rsync -a --delete --exclude target --exclude .git --exclude .frog --exclude node_modules \
-  ${PORT:+-e "ssh -p $PORT"} "$SRC/" "$DEST:$R/src/"
+  ${PORT:+-e "ssh $SSHOPTS -p $PORT"} "$SRC/" "$DEST:$R/src/"
 
 # 2. md5 the tree, both sides
 L=$(cd "$SRC" && find crates -name '*.rs' -o -name Cargo.toml | LC_ALL=C sort | xargs md5 -r | md5 -q)
-Rp=$($SSH "cd $R/src && find crates -name '*.rs' -o -name Cargo.toml | LC_ALL=C sort | xargs md5sum | awk '{print \$1\" \"\$2}' | md5sum")
-R=$(echo "$Rp" | awk '{print $1}')
-echo "src md5: local=$L pod=$R"
-[ "$L" = "$R" ] || { echo "REFUSING: source md5 mismatch"; exit 1; }
+Rp=$($SSH 'cd '"$R"'/src && find crates -name "*.rs" -o -name Cargo.toml | LC_ALL=C sort | xargs md5sum | awk "{print \$1\" \"\$2}" | md5sum')
+RM=$(echo "$Rp" | awk '{print $1}')
+echo "src md5: local=$L pod=$RM"
+[ "$L" = "$RM" ] || { echo "REFUSING: source md5 mismatch"; exit 1; }
+# md5 output is a single 32-char token; if the ssh banner or an error leaked in,
+# $RM would be multi-word — refuse rather than proceed on garbage
+case "$RM" in *[!0-9a-f]*) echo "REFUSING: bad pod md5 output: $Rp"; exit 1;; esac
 
 # 3. build (cuda feature; NVRTC sm_103 fallback is already on main, ec3890aa)
-$SSH "cd $R/src && cargo build --release -p tang-llm --bin tang-llm --features cuda \
+$SSH "[ -f /root/.cargo/bin/cargo ] || { curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable; }
+export PATH=/root/.cargo/bin:/usr/local/cuda/bin:\$PATH
+[ -x /usr/local/cuda/bin/nvcc ] || { echo 'REFUSING: no nvcc on the pod'; exit 1; }
+cd $R/src && CUDA_PATH=/usr/local/cuda cargo build --release -p tang-llm --bin tang-llm --features cuda \
   > $R/build.log 2>&1 && echo BUILD_RC=0 >> $R/build.log || { echo BUILD_RC=\$? >> $R/build.log; tail -30 $R/build.log; exit 1; }"
-$SSH "grep -E 'BUILD_RC|error' $R/build.log | tail -5"
+$SSH "export PATH=/root/.cargo/bin:\$PATH; grep -E 'BUILD_RC|error' $R/build.log | tail -5"
 
 # 4. run with the dump on. The pod was created with no volume, so treat every
 #    start as COLD: if the shards are missing, fetch them first
