@@ -220,7 +220,7 @@ impl DevLayer {
         let (nh, di, hidden) = (self.nh, self.d_inner, self.hidden);
         // kda_dev's per-matrix rule (the x pre-pass): gemv8 only when q/k/v are all Q8_0
         // (the kernel reads 34-byte Q8_0 blocks; the f32 tiny fixture must take k5_gemv)
-        let g8 = |w: &super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
+        let g8 = |w: &super::super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
         let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv);
         // the core's prefill path uses its own stream: make sure it has drained (it syncs
         // at the end of every call, so this is free; it keeps the ordering explicit)
@@ -268,7 +268,7 @@ impl DevLayer {
             // the device is fresh — `read_back` syncs it before any CPU use)
             return Ok(out);
         };
-        use super::kda_debug::tap;
+        use super::super::kda_debug::tap;
         // the host conv shift (DevKda::decode's side effect), from qkv PRE-conv (the same
         // qkv the step kernel consumed)
         let qkv_h = self.qkvb.read::<f32>(0, 3 * di)?;
@@ -280,7 +280,7 @@ impl DevLayer {
                 next[c * m + s2] = if s2 + 1 < m { conv.0[c * m + s2 + 1] } else { qkv_h[c] };
             }
         }
-        *conv = next;
+        *conv = ConvState(next);
         p.put(tap::QKV, qkv_h);
         p.put(tap::G, self.gb_out.read::<f32>(0, di)?);
         p.put(tap::BETA, self.bb.read::<f32>(0, nh)?);

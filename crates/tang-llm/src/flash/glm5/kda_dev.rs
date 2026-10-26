@@ -805,6 +805,8 @@ mod tests {
                 assert!(ecpu < 1e-3 && escpu < 1e-3, "pf2 vs CPU at T={t}");
             }
         }
+    }
+}
 
 /// k5_gemv8 vs k5_gemv on one real-shaped layer of the tiny GLM-5 fixture, in-process:
 /// the same x through the same DevLayer with the projection kernel flipped, the device
