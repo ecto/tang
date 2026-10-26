@@ -297,8 +297,11 @@ impl ServeEngine for Glm5Serve {
     }
 
     fn alloc_slot(&mut self) -> Result<usize> {
-        // the engine keeps all slots alive from load (the device state is allocated once);
-        // hand out the emptiest
+        // The engine keeps every slot alive from load (the device state is allocated once,
+        // no per-slot alloc churn); hand out the first empty one, else the emptiest RESET
+        // to fresh (the caller restores a snapshot into it or prefills the whole prompt —
+        // the batcher only calls this when no parked slot's tokens matched, so dropping
+        // the shortest sequence loses nothing reusable).
         let mut best = 0;
         let mut best_len = usize::MAX;
         for s in 0..self.slots {
@@ -311,8 +314,7 @@ impl ServeEngine for Glm5Serve {
                 best = s;
             }
         }
-        // all occupied: the batcher evicts (`free_slot`) before it retries; still, hand
-        // out the shortest (it will be reset by the caller's restore)
+        self.free_slot(best);
         Ok(best)
     }
 
