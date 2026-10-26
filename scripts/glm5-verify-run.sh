@@ -21,7 +21,8 @@ cd "$(dirname "$0")/.."
 DEST=${1:?usage: glm5-verify-run.sh root@HOST [-p PORT]}; shift
 PORT=
 if [ "${1:-}" = -p ]; then PORT=$2; shift 2; fi
-SSHOPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+# keepalives: the cold-start download holds one ssh session for ~30 min
+SSHOPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 SSH="ssh $SSHOPTS ${PORT:+-p $PORT} $DEST"
 # literal path: a ~ here would expand to the LOCAL home (openrsync quirk)
 R=/root/tang-verify
@@ -60,14 +61,17 @@ G5=${GLM5_GGUF:-/workspace/glm53/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00
 # Extra env for the run, e.g. the shadow check (kda_debug.rs):
 #   GLM5_ENV='TANG_GLM5_KDA_DEBUG=1 TANG_GLM5_KDA_DEBUG_DIR=/root/tang-verify/kdadbg'
 GLM5_ENV=${GLM5_ENV:-TANG_GLM5_KDA_DEBUG=1 TANG_GLM5_KDA_DEBUG_DIR=$R/kdadbg}
-$SSH "if [ ! -f $G5 ]; then
-  echo 'weights missing — cold start, downloading unsloth/GLM-5.3-Flash-GGUF UD-Q4_K_XL';
+# all six shards, not just shard 1 (it lands first; a run on a partial set errors out)
+$SSH "n=\$(ls \$(dirname $G5)/*-of-00006.gguf 2>/dev/null | wc -l)
+if [ \"\$n\" != 6 ]; then
+  echo \"weights incomplete (\$n/6) — cold start, downloading unsloth/GLM-5.3-Flash-GGUF UD-Q4_K_XL\";
   command -v hf >/dev/null || pip install -q --break-system-packages -U huggingface_hub;
   hf download unsloth/GLM-5.3-Flash-GGUF --include '*UD-Q4_K_XL*' \\
     --local-dir /workspace/glm53 >> $R/download.log 2>&1;
 fi
-ls -la $G5 || { echo 'weights still missing after download attempt; set GLM5_GGUF'; exit 1; }
-mkdir -p $R/kdadbg
+ls -la \$(dirname $G5); n=\$(ls \$(dirname $G5)/*-of-00006.gguf 2>/dev/null | wc -l)
+[ \"\$n\" = 6 ] || { echo \"weights still incomplete (\$n/6); set GLM5_GGUF\"; exit 1; }"
+$SSH "mkdir -p $R/kdadbg
 cd $R/src && env $GLM5_ENV timeout 5400 target/release/tang-llm flash-generate '$G5' \
   --prompt 'Write a haiku about the sea.' -n 8 --temp 0 --out $R/verify.ids \
   > $R/verify-run.log 2>&1; echo RUN_RC=\$? | tee -a $R/verify-run.log"
