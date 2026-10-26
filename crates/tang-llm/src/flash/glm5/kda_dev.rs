@@ -130,6 +130,9 @@ pub struct DevLayer {
     /// The fused decode kernels + captured graph ([`decode`]); built at load when the env
     /// selects a fused mode, else `None` (the naive path).
     fast: Option<decode::Fast>,
+    /// `TANG_GLM5_GEMV8=1` at construction: the q/k/v projections on k5_gemv8 (a field,
+    /// not an env read per window, so a test can A/B one layer in-process).
+    pub gemv8: bool,
 }
 
 /// The G5W descriptor of one `KdaLayerW` matrix, from the GGUF's raw tensor (the weights
@@ -237,6 +240,7 @@ impl DevLayer {
                 decode::Mode::Naive => None,
                 _ => Some(decode::Fast::new(g, cfg)?),
             },
+            gemv8: std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -311,7 +315,10 @@ impl DevLayer {
         // every GEMV reads the int8 codes; one row per warp, the whole 8.7 KB row in
         // flight through shared memory. The gates' small GEMVs (f_a: 128 outs, beta: 64)
         // stay on k5_gemv — too few rows to amortise the staging.
-        let gemv8 = std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1");
+        // gemv8 is Q8_0-only (its dp4a reads 34-byte Q8_0 blocks): any other weight type —
+        // e.g. the f32 tiny fixture — must take k5_gemv, or the kernel reads f32 rows as
+        // Q8_0 blocks (NaN logits on the first tiny run)
+        let gemv8 = self.gemv8 && [&self.wq, &self.wk, &self.wv].iter().all(|w| w.w.ty == 8);
         unsafe {
             if gemv8 {
                 launch(
@@ -320,7 +327,7 @@ impl DevLayer {
                     (32, 1, 1),
                     0,
                     &self.s,
-                    args![self.xb.ptr, self.xq8.ptr, hidden as u32, t as u32],
+                    args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],  // MAXT: the codes array's row cap (scales follow it), NOT t
                 )?;
                 let codes = self.xq8.ptr;
                 let scales = codes + (self.max_t * hidden) as u64;
@@ -560,5 +567,81 @@ impl DevLayer {
             eprintln!("kda gpu y[0..8]: {:?}", &out[..8.min(out.len())]);
         }
         Ok(out)
+    }
+}
+
+/// k5_gemv8 vs k5_gemv on one real-shaped layer of the tiny GLM-5 fixture, in-process:
+/// the same x through the same DevLayer with the projection kernel flipped, the device
+/// taps compared in full. Isolates the kernel from the engine (the gemv8 bring-up's first
+/// three failures — no smem, misaligned u64, missing __syncwarp + overlapping staging,
+/// and the k5_q8 MAXT argument — would each have shown here as a q/k/v divergence).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // the Q8_0 fixture: gemv8 only takes Q8_0 rows (the f32 fixture routes to k5_gemv)
+    const TINY: &str = "/private/tmp/glm5-tiny/glm5-tiny-q8_0.gguf";
+
+    #[test]
+    fn gemv8_matches_gemv_on_tiny_layer() {
+        let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
+        let Some(g) = Gpu::for_test() else {
+            assert!(!required, "no CUDA device but TANG_REQUIRE_CUDA=1");
+            return;
+        };
+        if !Path::new(TINY).exists() {
+            assert!(!required, "tiny fixture absent but TANG_REQUIRE_CUDA=1");
+            return;
+        }
+        let r = super::super::forward::Glm5Ref::open(Path::new(TINY)).unwrap();
+        let hp = &r.hp;
+        let l = (0..hp.n_layer).find(|&l| hp.is_kda[l]).unwrap();
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let conv = ConvState::zeros(&cfg, 1);
+        let state = KdaState::zeros(&cfg, 1);
+        g.bind().unwrap();
+        let mut layer = DevLayer::new_gguf(&g, &r.g, l, &cfg, hp.n_embd, &conv, &state, 64).unwrap();
+        let t = 20usize;
+        let mut seed = 7u64;
+        let x: Vec<f32> = (0..t * hp.n_embd)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect();
+        let run = |layer: &mut DevLayer, on: bool| {
+            layer.gemv8 = on;
+            layer.debug = true;
+            let mut c = ConvState::zeros(&cfg, 1);
+            layer.seed(&c, &KdaState::zeros(&cfg, 1)).unwrap();
+            let y = layer.window(&x, t, &mut c).unwrap();
+            layer.debug = false;
+            (y, layer.taps.take().unwrap())
+        };
+        assert!(
+            [&layer.wq, &layer.wk, &layer.wv].iter().all(|w| w.w.ty == 8),
+            "fixture q/k/v must be Q8_0 for this test to exercise k5_gemv8"
+        );
+        let (y0, t0) = run(&mut layer, false);
+        let (y1, t1) = run(&mut layer, true);
+        let di = cfg.heads * cfg.head_dim;
+        for (sec, name) in [(0, "q"), (1, "k"), (2, "v")] {
+            let a = super::super::kda_debug::section(&t0.qkv_pre, t, di, sec);
+            let b = super::super::kda_debug::section(&t1.qkv_pre, t, di, sec);
+            let s = super::super::kda_debug::stat(&b, &a, 1e-2);
+            eprintln!("qkv.{name}: rel {:.3e} max {:.3e} nonfinite {} zeros {}/{}", s.rel_l2, s.max_abs, s.nonfinite_gpu, s.zeros_gpu, s.zeros_cpu);
+            // int8 activations vs f32: the fe_gemv8 band, not bitwise
+            assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 1e-2, "gemv8 qkv.{name} diverges: {s:?}");
+        }
+        let s = super::super::kda_debug::stat(&y1, &y0, 1e-2);
+        eprintln!("layer out: rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
+        assert!(s.nonfinite_gpu == 0 && s.rel_l2 < 2e-2, "gemv8 layer output diverges: {s:?}");
     }
 }
