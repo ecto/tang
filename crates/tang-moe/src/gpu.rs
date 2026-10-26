@@ -141,15 +141,19 @@ impl Module {
 /// - counters: launches, host→device / device→host bytes and calls, the host time spent in
 ///   synchronous copies (which includes waiting for the work they order after), and
 ///   `cuMemAlloc`/`cuMemFree` calls and time;
-/// - every [`launch`] outside graph capture is bracketed by two timing events and queued
-///   with the caller's current [`trace::tag`], the kernel (named at [`Module::func`]) and an
-///   optional byte count the caller declared for it ([`trace::bytes`]); [`trace::drain`]
-///   resolves the queue into GPU milliseconds.
+/// - every [`launch`] outside graph capture gets one timing event recorded after it and is
+///   queued (thread-local: one thread drives the GPU) with the caller's current
+///   [`trace::tag`], the kernel (named at [`Module::func`]) and an optional byte count the
+///   caller declared for it ([`trace::bytes`]). The previous launch's end event on the same
+///   stream is the next one's start (the stream orders them), so it is one driver call per
+///   launch; [`trace::drain`] resolves the queue into GPU milliseconds, one event sync per
+///   stream, not per launch.
 ///
 /// The process drives the GPU from one thread at a time, so a global tag is enough.
 pub mod trace {
     use super::sys;
     use std::collections::HashMap;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
     use std::sync::Mutex;
 
@@ -217,13 +221,24 @@ pub mod trace {
         tag: u32,
         func: usize,
         bytes: u64,
-        /// (context, start, end) — `None` inside graph capture (no timing).
+        /// (stream, start, end) — `None` inside graph capture (no timing). `start` is the
+        /// previous launch's end event on that stream (0: none was recorded, unmeasurable).
         ev: Option<(usize, usize, usize)>,
     }
 
-    static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
-    /// Reusable timing events, with the context each belongs to.
-    static POOL: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    thread_local! {
+        /// Stream-capture depth ([`super::Graph::capture`] brackets its body): launches
+        /// inside it are counted but get no timing events (a recorded event would be
+        /// captured into the graph).
+        static CAPTURE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// This thread's queued launches (the GPU is driven from one thread at a time).
+        static PENDING: RefCell<Vec<Pending>> = const { RefCell::new(Vec::new()) };
+        /// Reusable timing events (no context: one event works across contexts).
+        static POOL: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        /// Per stream: the last end event recorded there (the next launch's start), kept
+        /// across drains (0: none).
+        static LAST: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+    }
     static NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
 
     /// A resolved launch: its tag, kernel, declared bytes and GPU time (`None`: captured).
@@ -238,6 +253,12 @@ pub mod trace {
     /// Turn tracing on or off (process-wide).
     pub fn enable(on: bool) {
         ON.store(on, Relaxed);
+    }
+
+    /// Bracket a graph capture: launches inside get no timing events (counted only).
+    /// [`super::Graph::capture`] calls this around its body; nesting is fine.
+    pub fn capture(on: bool) {
+        CAPTURE.set(if on { CAPTURE.get() + 1 } else { CAPTURE.get() - 1 });
     }
 
     #[inline(always)]
@@ -312,12 +333,10 @@ pub mod trace {
         C[ALLOC_NS].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     }
 
-    fn event(ctx: usize) -> Option<usize> {
-        {
-            let mut p = POOL.lock().unwrap();
-            if let Some(i) = p.iter().position(|&(c, _)| c == ctx) {
-                return Some(p.swap_remove(i).1);
-            }
+    fn event() -> Option<usize> {
+        let from_pool = POOL.with_borrow_mut(|p| p.pop());
+        if from_pool.is_some() {
+            return from_pool;
         }
         let mut e: sys::CUevent = std::ptr::null_mut();
         let r = unsafe { sys::cuEventCreate(&mut e, sys::CUevent_flags::CU_EVENT_DEFAULT as u32) };
@@ -325,68 +344,72 @@ pub mod trace {
     }
 
     /// Before a launch on `s`: the start event (outside capture), the kernel's declared bytes.
-    pub(super) fn before(s: sys::CUstream) -> (Option<(usize, usize)>, u64) {
+    pub(super) fn before(s: sys::CUstream) -> u64 {
         C[LAUNCHES].fetch_add(1, Relaxed);
         let bytes = HINT.swap(0, Relaxed);
         let mut st = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
         let capturing = unsafe { sys::cuStreamIsCapturing(s, &mut st) } != sys::CUresult::CUDA_SUCCESS
             || st != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        if capturing {
-            return (None, bytes);
+        // a stream's first traced launch since tracing started has no base event: record
+        // one (the next launch measures from it); graph capture gets nothing recorded
+        if !capturing && LAST.with_borrow(|m| !m.contains_key(&(s as usize))) {
+            if let Some(e) = event() {
+                unsafe { sys::cuEventRecord(e as sys::CUevent, s) };
+                LAST.with_borrow_mut(|m| m.insert(s as usize, e));
+            }
         }
-        let mut ctx: sys::CUcontext = std::ptr::null_mut();
-        unsafe { sys::cuCtxGetCurrent(&mut ctx) };
-        let ctx = ctx as usize;
-        let Some(e0) = event(ctx) else { return (None, bytes) };
-        unsafe { sys::cuEventRecord(e0 as sys::CUevent, s) };
-        (Some((ctx, e0)), bytes)
+        bytes
     }
 
-    pub(super) fn after(f: sys::CUfunction, s: sys::CUstream, start: Option<(usize, usize)>, bytes: u64) {
-        let ev = start.and_then(|(ctx, e0)| {
-            let e1 = event(ctx)?;
+    pub(super) fn after(f: sys::CUfunction, s: sys::CUstream, bytes: u64) {
+        // the previous end event on this stream is this launch's start; record ours
+        let ev = LAST.with_borrow_mut(|m| {
+            let prev = m.get(&(s as usize)).copied().unwrap_or(0);
+            let Some(e1) = event() else { return None };
             unsafe { sys::cuEventRecord(e1 as sys::CUevent, s) };
-            Some((ctx, e0, e1))
+            m.insert(s as usize, e1);
+            (prev != 0).then_some((s as usize, prev, e1))
         });
-        PENDING.lock().unwrap().push(Pending {
-            tag: TAG.load(Relaxed),
-            func: f as usize,
-            bytes,
-            ev,
+        PENDING.with_borrow_mut(|q| {
+            q.push(Pending {
+                tag: TAG.load(Relaxed),
+                func: f as usize,
+                bytes,
+                ev,
+            })
         });
     }
 
     /// Resolve every queued launch (waits for each one's end event) and return them in
     /// launch order; their events go back to the pool.
     pub fn drain() -> Vec<Launch> {
-        let pend = std::mem::take(&mut *PENDING.lock().unwrap());
-        let mut cur: sys::CUcontext = std::ptr::null_mut();
-        unsafe { sys::cuCtxGetCurrent(&mut cur) };
+        let pend = PENDING.take();
+        // the last end event per stream: sync it once — everything earlier on that stream
+        // is complete by then
+        let mut last: HashMap<usize, usize> = HashMap::new();
+        for p in &pend {
+            if let Some((s, _, e1)) = p.ev {
+                last.insert(s, e1);
+            }
+        }
+        for &e1 in last.values() {
+            unsafe { sys::cuEventSynchronize(e1 as sys::CUevent) };
+        }
         let mut out = Vec::with_capacity(pend.len());
-        let mut back = Vec::with_capacity(pend.len() * 2);
+        let mut back = Vec::with_capacity(pend.len());
         for p in pend {
-            let gpu_ms = p.ev.and_then(|(ctx, e0, e1)| {
-                let push = ctx != cur as usize;
+            let gpu_ms = p.ev.and_then(|(stream, e0, e1)| {
                 unsafe {
-                    if push {
-                        sys::cuCtxPushCurrent_v2(ctx as sys::CUcontext);
-                    }
                     let mut ms = 0f32;
-                    let ok = sys::cuEventSynchronize(e1 as sys::CUevent) == sys::CUresult::CUDA_SUCCESS
-                        && sys::cuEventElapsedTime(&mut ms, e0 as sys::CUevent, e1 as sys::CUevent)
-                            == sys::CUresult::CUDA_SUCCESS;
-                    if push {
-                        let mut popped: sys::CUcontext = std::ptr::null_mut();
-                        sys::cuCtxPopCurrent_v2(&mut popped);
-                    }
-                    back.push((ctx, e0));
-                    back.push((ctx, e1));
+                    let ok = sys::cuEventElapsedTime(&mut ms, e0 as sys::CUevent, e1 as sys::CUevent)
+                        == sys::CUresult::CUDA_SUCCESS;
+                    back.push(e1); // the start event stays as the stream's base
                     ok.then_some(ms)
                 }
             });
             out.push(Launch { tag: p.tag, func: p.func, bytes: p.bytes, gpu_ms });
         }
-        POOL.lock().unwrap().extend(back);
+        POOL.with_borrow_mut(|p| p.extend(back));
         out
     }
 }
@@ -620,9 +643,9 @@ pub unsafe fn launch(
     args: &mut [*mut c_void],
 ) -> Result<()> {
     if trace::on() {
-        let (ev, bytes) = trace::before(s.0);
+        let bytes = trace::before(s.0);
         let r = launch_raw(f, grid, block, smem, s, args);
-        trace::after(f, s.0, ev, bytes);
+        trace::after(f, s.0, bytes);
         return r;
     }
     launch_raw(f, grid, block, smem, s, args)
@@ -673,6 +696,13 @@ impl Graph {
     /// Record everything `body` enqueues on `s` (which must not be the legacy default stream)
     /// and instantiate it.
     pub fn capture(s: &Stream, body: impl FnOnce(&Stream) -> Result<()>) -> Result<Self> {
+        trace::capture(true);
+        let out = Self::capture_body(s, body);
+        trace::capture(false);
+        out
+    }
+
+    fn capture_body(s: &Stream, body: impl FnOnce(&Stream) -> Result<()>) -> Result<Self> {
         ck!(sys::cuStreamBeginCapture_v2(
             s.0,
             sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL

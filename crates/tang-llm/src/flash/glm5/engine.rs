@@ -1885,6 +1885,31 @@ mod tests {
         for want in ["decode, per token", "prefill, totals", "kda", "mhc_pre.attn", "ffn", "lm_head", "kernels by GPU time", "k5_"] {
             assert!(r.contains(want), "trace report lacks {want:?}:\n{r}");
         }
+        // the hook's cost where it is largest: the tiny model's decode windows are almost
+        // all launches (~0.1 ms of GPU work each). Interleaved rounds, median per mode.
+        let mut ms = [Vec::new(), Vec::new()];
+        for round in 0..10 {
+            for traced in [round % 2 == 0, round % 2 != 0] {
+                e.reset();
+                e.window(&ids[..6]).unwrap();
+                if traced {
+                    super::super::trace::start();
+                }
+                let t0 = Instant::now();
+                for i in 0..16 {
+                    e.window(&[ids[(6 + i) % ids.len()]]).unwrap();
+                }
+                ms[traced as usize].push(t0.elapsed().as_secs_f64() * 1e3 / 16.0);
+                super::super::trace::stop();
+            }
+        }
+        // min per mode: the CPU-side noise here is one-sided (background work only adds)
+        let mn = |v: &mut Vec<f64>| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (off, on) = (mn(&mut ms[0]), mn(&mut ms[1]));
+        println!(
+            "engine_gpu_trace_is_transparent: tiny decode window {off:.3} ms plain, {on:.3} ms traced ({:+.1}%)",
+            100.0 * (on / off - 1.0)
+        );
     }
 
     /// THE LESSON OF THIS PORT (the engine never wired the built-and-tested GPU structs

@@ -31,7 +31,7 @@
 //! launch (two events + a capture check) and one event sync per launch at window end.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Instant, SystemTime};
 
@@ -97,6 +97,8 @@ impl Io {
 struct Span {
     name: &'static str,
     parent: Option<usize>,
+    /// The interned stage path ([`State::path_of`]; [`NO_PATH`] for the window/layer levels).
+    pid: u32,
     layer: Option<usize>,
     t0: Instant,
     t1: Instant,
@@ -134,11 +136,14 @@ struct Phase {
     wall_ms: f64,
     gpu_ms: f64,
     io: Io,
-    /// By stage path (below the layer level: `kda/proj`, `ffn/moe.experts`, ...).
-    stages: BTreeMap<String, Agg>,
-    /// By (kernel, stage path).
-    kernels: BTreeMap<(String, String), KAgg>,
+    /// By interned stage path (below the layer level: `kda/proj`, `ffn/moe.experts`, ...).
+    stages: Vec<Agg>,
+    /// By (kernel, interned stage path). Names are looked up only at [`report`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    kernels: HashMap<(usize, u32), KAgg>,
 }
+
+const NO_PATH: u32 = u32::MAX;
 
 struct State {
     spans: Vec<Span>,
@@ -150,6 +155,9 @@ struct State {
     t_last: Instant,
     /// The memory bandwidth SOL is measured against, GB/s, and where it came from.
     sol: Option<(f64, String)>,
+    /// Stage paths interned by (parent path, name): no allocation per span once warm.
+    path_of: HashMap<(u32, &'static str), u32>,
+    paths: Vec<String>,
 }
 
 thread_local! {
@@ -186,6 +194,8 @@ pub fn start() {
             t_first: None,
             t_last: Instant::now(),
             sol: None,
+            path_of: HashMap::new(),
+            paths: Vec::new(),
         })
     });
     ON.store(true, Relaxed);
@@ -242,9 +252,26 @@ fn open(name: &'static str, layer: Option<usize>) -> Guard {
     let ok = with(|s| {
         let i = s.spans.len();
         let parent = s.stack.last().copied();
+        // the window and layer levels carry no path; their children start one
+        let pid = if name == "glm5.window" || name == "layer" {
+            NO_PATH
+        } else {
+            let pp = parent.map_or(NO_PATH, |p| s.spans[p].pid);
+            let next = s.paths.len() as u32;
+            let id = *s.path_of.entry((pp, name)).or_insert(next);
+            if id == next {
+                let full = match pp {
+                    NO_PATH => name.to_string(),
+                    _ => format!("{}/{name}", s.paths[pp as usize]),
+                };
+                s.paths.push(full);
+            }
+            id
+        };
         s.spans.push(Span {
             name,
             parent,
+            pid,
             layer,
             t0: Instant::now(),
             t1: Instant::now(),
@@ -330,19 +357,20 @@ pub fn window_end(root: Guard, t: usize, pos0: usize) {
                 s.spans[p].bytes_ms += bm;
             }
         }
-        let paths: Vec<String> = (0..n).map(|i| path(&s.spans, i)).collect();
+        let n_paths = s.paths.len();
         let ph = &mut s.phases[if t == 1 { 0 } else { 1 }];
+        ph.stages.resize(n_paths, Agg::default());
         let root = &s.spans[0];
         ph.windows += 1;
         ph.tokens += t as u64;
         ph.wall_ms += ms(root.t0, root.t1);
         ph.gpu_ms += root.gpu_ms;
         ph.io.add(&root.io);
-        for (i, sp) in s.spans.iter().enumerate().skip(1) {
-            if sp.name == "layer" {
+        for sp in s.spans.iter().skip(1) {
+            if sp.pid == NO_PATH {
                 continue;
             }
-            let a = ph.stages.entry(paths[i].clone()).or_default();
+            let a = &mut ph.stages[sp.pid as usize];
             a.calls += 1;
             a.wall_ms += ms(sp.t0, sp.t1);
             a.gpu_ms += sp.gpu_ms;
@@ -352,10 +380,7 @@ pub fn window_end(root: Guard, t: usize, pos0: usize) {
         }
         #[cfg(feature = "cuda")]
         for (i, f, gms, b) in kern {
-            let k = ph
-                .kernels
-                .entry((tang_moe::gpu::trace::name(f), paths[i].clone()))
-                .or_default();
+            let k = ph.kernels.entry((f, s.spans[i].pid)).or_default();
             k.launches += 1;
             k.gpu_ms += gms;
             if b > 0 {
@@ -369,24 +394,6 @@ pub fn window_end(root: Guard, t: usize, pos0: usize) {
 
 fn ms(a: Instant, b: Instant) -> f64 {
     b.duration_since(a).as_secs_f64() * 1e3
-}
-
-/// The span's stage path below the window/layer levels: `kda/proj`, `head/lm_head`.
-fn path(spans: &[Span], mut i: usize) -> String {
-    let mut parts = Vec::new();
-    loop {
-        let sp = &spans[i];
-        if sp.name == "glm5.window" || sp.name == "layer" {
-            break;
-        }
-        parts.push(sp.name);
-        match sp.parent {
-            Some(p) => i = p,
-            None => break,
-        }
-    }
-    parts.reverse();
-    parts.join("/")
 }
 
 fn export(s: &State, t: usize, pos0: usize) {
@@ -467,6 +474,21 @@ fn render(s: &State) -> Option<String> {
             continue;
         }
         // decode is shown per token (what tok/s is made of); prefill as totals
+        // names for the interned paths and kernels (only here, off the per-window path)
+        let stages: BTreeMap<String, Agg> = ph
+            .stages
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.calls > 0)
+            .map(|(i, a)| (s.paths[i].clone(), a.clone()))
+            .collect();
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut kernels: BTreeMap<(String, String), KAgg> = BTreeMap::new();
+        #[cfg(feature = "cuda")]
+        for (&(f, pid), a) in &ph.kernels {
+            let path = s.paths.get(pid as usize).cloned().unwrap_or_default();
+            kernels.insert((tang_moe::gpu::trace::name(f), path), a.clone());
+        }
         let (label, div) = if pi == 0 {
             ("decode, per token", ph.windows as f64)
         } else {
@@ -498,10 +520,10 @@ fn render(s: &State) -> Option<String> {
             "stage", "calls", "wall ms", "%wall", "gpu ms", "launch", "H2D MB", "D2H MB", "copy ms",
             "alloc ms", "GB/s", "%SOL"
         );
-        let mut rows: Vec<(&String, &Agg)> = ph.stages.iter().collect();
+        let mut rows: Vec<(&String, &Agg)> = stages.iter().collect();
         // tree order (paths sort parents before children), each depth by wall
         rows.sort_by(|a, b| {
-            let (ka, kb) = (sort_key(&ph.stages, a.0), sort_key(&ph.stages, b.0));
+            let (ka, kb) = (sort_key(&stages, a.0), sort_key(&stages, b.0));
             ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
         });
         for (p, a) in rows {
@@ -529,14 +551,14 @@ fn render(s: &State) -> Option<String> {
                 },
             );
         }
-        if !ph.kernels.is_empty() {
+        if !kernels.is_empty() {
             let _ = writeln!(o, "\nkernels by GPU time ({label}):");
             let _ = writeln!(
                 o,
                 "{:<24} {:<26} {:>7} {:>9} {:>8} {:>6} {:>8} {:>6}",
                 "kernel", "stage", "launch", "gpu ms", "avg µs", "%gpu", "GB/s", "%SOL"
             );
-            let mut ks: Vec<_> = ph.kernels.iter().collect();
+            let mut ks: Vec<_> = kernels.iter().collect();
             ks.sort_by(|a, b| b.1.gpu_ms.partial_cmp(&a.1.gpu_ms).unwrap_or(std::cmp::Ordering::Equal));
             for ((k, st), a) in ks.iter().take(24) {
                 let gbs = (a.bytes > 0 && a.bytes_ms > 0.0).then(|| a.bytes as f64 / a.bytes_ms / 1e6);
@@ -560,7 +582,7 @@ fn render(s: &State) -> Option<String> {
         // the ranking: top-level stages by wall, how much of it the GPU covers
         let _ = writeln!(o, "\nbottlenecks ({label}; top-level stages by wall, host = wall − GPU):");
         let mut top: Vec<(&String, &Agg)> =
-            ph.stages.iter().filter(|(p, _)| !p.contains('/')).collect();
+            stages.iter().filter(|(p, _)| !p.contains('/')).collect();
         top.sort_by(|a, b| b.1.wall_ms.partial_cmp(&a.1.wall_ms).unwrap_or(std::cmp::Ordering::Equal));
         for (i, (p, a)) in top.iter().take(8).enumerate() {
             let host = (a.wall_ms - a.gpu_ms).max(0.0);
