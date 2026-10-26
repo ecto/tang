@@ -4,6 +4,24 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 (housekeeping) — GPU tests can no longer silently skip; regressions for both fixture-blind bug classes
+
+`skip_or_fail()` in engine.rs tests: with `TANG_REQUIRE_CUDA=1` a skip panics; without
+it the skip prints a loud banner. `engine_gpu_matches_cpu` and `engine_gpu_mla_matches_cpu`
+use it — the old silent `return` is how the GLM-5.3 GPU bugs survived a review cycle.
+
+New regressions:
+- `mhc_gpu_pre_block1_matches_cpu_block1` — the mHC block-index bug (324e7f6b). Checks
+  the resident pre against the CPU for BOTH blocks and that the blocks differ.
+- `mla_resident_is_per_layer` — the DSA geometry invariant behind 74192590 (11 DSA
+  layers, first at 3), paired with the load-log residency line.
+
+Tiny-test "flap" explained (the 118-flip episode): the failing runs at 13:19–13:24 used
+a binary built before the mHC fix — deterministic failure, identical flip set — and the
+passing run at 13:21 was a pre-relink artifact. With the current binary: 16/16 pass
+(all-off 8/8, default 8/8), logits max abs 9.6e-5 stable. The test is trustworthy again;
+the skip-guard is what keeps it honest.
+
 ## 2026-10-26 (final) — THE TREE VERDICT: all-GPU = the CPU oracle, 8/8 ids
 
 Pod tree-verdict-b300-4 (0izjldh4haq9c1, B300 188 GB, EUR-IS-1), branch head 43f12709
