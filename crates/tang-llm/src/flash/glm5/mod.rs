@@ -14,6 +14,7 @@ pub mod gguf;
 pub mod kda;
 #[cfg(feature = "cuda")]
 pub mod kda_cuda;
+pub mod kda_debug;
 #[cfg(feature = "cuda")]
 pub mod kda_dev;
 pub mod mhc;

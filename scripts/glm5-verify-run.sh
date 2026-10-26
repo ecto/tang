@@ -54,19 +54,24 @@ $SSH "export PATH=/root/.cargo/bin:\$PATH; grep -E 'BUILD_RC|error' $R/build.log
 #    start as COLD: if the shards are missing, fetch them first
 #    (unsloth/GLM-5.3-Flash-GGUF UD-Q4_K_XL, six shards, ~186 GB — on the B300
 #    pod this took ~30 min; budget ~45 min to verify-ready on a cold disk).
-G5=${GLM5_GGUF:-/workspace/glm53/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
+# (the hf download nests the shards under UD-Q4_K_XL/; the pod image ships `hf`, not
+# `huggingface-cli`, and its system pip needs --break-system-packages — B300, Oct 26)
+G5=${GLM5_GGUF:-/workspace/glm53/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
+# Extra env for the run, e.g. the shadow check (kda_debug.rs):
+#   GLM5_ENV='TANG_GLM5_KDA_DEBUG=1 TANG_GLM5_KDA_DEBUG_DIR=/root/tang-verify/kdadbg'
+GLM5_ENV=${GLM5_ENV:-TANG_GLM5_KDA_DEBUG=1 TANG_GLM5_KDA_DEBUG_DIR=$R/kdadbg}
 $SSH "if [ ! -f $G5 ]; then
   echo 'weights missing — cold start, downloading unsloth/GLM-5.3-Flash-GGUF UD-Q4_K_XL';
-  pip install -q -U huggingface_hub 2>/dev/null | tail -1 || pip3 install -q -U huggingface_hub;
-  python3 -m huggingface_hub.commands.huggingface_cli download unsloth/GLM-5.3-Flash-GGUF \
-    --include '*UD-Q4_K_XL*' --local-dir /workspace/glm53 >> $R/download.log 2>&1 \\
-    || huggingface-cli download unsloth/GLM-5.3-Flash-GGUF --include '*UD-Q4_K_XL*' \\
+  command -v hf >/dev/null || pip install -q --break-system-packages -U huggingface_hub;
+  hf download unsloth/GLM-5.3-Flash-GGUF --include '*UD-Q4_K_XL*' \\
     --local-dir /workspace/glm53 >> $R/download.log 2>&1;
 fi
 ls -la $G5 || { echo 'weights still missing after download attempt; set GLM5_GGUF'; exit 1; }
-cd $R/src && TANG_GLM5_KDA_DUMP=1 timeout 3600 target/release/tang-llm flash-generate '$G5' \
+mkdir -p $R/kdadbg
+cd $R/src && env $GLM5_ENV timeout 5400 target/release/tang-llm flash-generate '$G5' \
   --prompt 'Write a haiku about the sea.' -n 8 --temp 0 --out $R/verify.ids \
   > $R/verify-run.log 2>&1; echo RUN_RC=\$? | tee -a $R/verify-run.log"
 echo "---- ids ----"; $SSH "cat $R/verify.ids; echo; echo expected: 785 1196 6801 264 6386 38038 911 279"
+echo "---- shadow check ----"; $SSH "grep -E 'kdadbg (ON|FIRST|SUMMARY)' $R/verify-run.log | head -20"
 echo "---- log tail ----"; $SSH "tail -8 $R/verify-run.log"
-echo "next: pull $R/verify-run.log and diff its 'kda gpu' lines against the CPU oracle's 'kda cpu' lines layer by layer"
+echo "full per-stage rows: grep kdadbg $R/verify-run.log; tensors in $R/kdadbg"
