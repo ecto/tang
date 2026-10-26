@@ -41,9 +41,20 @@ $SSH "cd $R/src && cargo build --release -p tang-llm --bin tang-llm --features c
   > $R/build.log 2>&1 && echo BUILD_RC=0 >> $R/build.log || { echo BUILD_RC=\$? >> $R/build.log; tail -30 $R/build.log; exit 1; }"
 $SSH "grep -E 'BUILD_RC|error' $R/build.log | tail -5"
 
-# 4. run with the dump on
-G5=${GLM5_GGUF:-/root/glm53/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
-$SSH "ls -la $G5 || { echo 'weights not found, set GLM5_GGUF'; exit 1; }
+# 4. run with the dump on. The pod was created with no volume, so treat every
+#    start as COLD: if the shards are missing, fetch them first
+#    (unsloth/GLM-5.3-Flash-GGUF UD-Q4_K_XL, six shards, ~186 GB — on the B300
+#    pod this took ~30 min; budget ~45 min to verify-ready on a cold disk).
+G5=${GLM5_GGUF:-/workspace/glm53/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
+$SSH "if [ ! -f $G5 ]; then
+  echo 'weights missing — cold start, downloading unsloth/GLM-5.3-Flash-GGUF UD-Q4_K_XL';
+  pip install -q -U huggingface_hub 2>/dev/null | tail -1 || pip3 install -q -U huggingface_hub;
+  python3 -m huggingface_hub.commands.huggingface_cli download unsloth/GLM-5.3-Flash-GGUF \
+    --include '*UD-Q4_K_XL*' --local-dir /workspace/glm53 >> $R/download.log 2>&1 \\
+    || huggingface-cli download unsloth/GLM-5.3-Flash-GGUF --include '*UD-Q4_K_XL*' \\
+    --local-dir /workspace/glm53 >> $R/download.log 2>&1;
+fi
+ls -la $G5 || { echo 'weights still missing after download attempt; set GLM5_GGUF'; exit 1; }
 cd $R/src && TANG_GLM5_KDA_DUMP=1 timeout 3600 target/release/tang-llm flash-generate '$G5' \
   --prompt 'Write a haiku about the sea.' -n 8 --temp 0 --out $R/verify.ids \
   > $R/verify-run.log 2>&1; echo RUN_RC=\$? | tee -a $R/verify-run.log"
