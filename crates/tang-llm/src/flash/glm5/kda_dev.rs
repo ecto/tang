@@ -319,8 +319,10 @@ impl DevLayer {
                 Vec::new()
             });
             eprintln!(
-                "kda gpu qkv[0..16]: {:?}\n kda gpu g[0..8]: {:?}\n kda gpu beta[0..4]: {:?}\n kda gpu state[0..8]: {:?}\n kda gpu conv_host[0..4]: {:?}",
+                "kda gpu qkv[0..16]: {:?}\n kda gpu qkv_k[0..8]: {:?}\n kda gpu qkv_v[0..8]: {:?}\n kda gpu g[0..8]: {:?}\n kda gpu beta[0..4]: {:?}\n kda gpu state[0..8]: {:?}\n kda gpu conv_host[0..4]: {:?}",
                 &qkv_h[..16.min(qkv_h.len())],
+                &qkv_h[di..di + 8.min(qkv_h.len() - di)],
+                &qkv_h[2 * di..2 * di + 8.min(qkv_h.len() - 2 * di)],
                 &g_h[..8.min(g_h.len())],
                 &beta_h[..4.min(beta_h.len())],
                 &st_h,
