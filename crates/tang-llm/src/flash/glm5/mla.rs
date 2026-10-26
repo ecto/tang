@@ -2528,10 +2528,11 @@ pub mod cuda {
         let cu = MlaCuda::new(&w).unwrap();
 
         let width = w.select_width();
-        let mut lat_mirror = vec![0u16; t * w.kv_lora];
-        let mut idx_k = vec![0f32; t * w.idx_dim];
-        let mut idx_g = vec![0f32; t * w.idx_dim];
-        let mut valid = vec![0u8; t];
+        // +1 row: the decode append below writes row `t` of the mirror (pos0 = t)
+        let mut lat_mirror = vec![0u16; (t + 1) * w.kv_lora];
+        let mut idx_k = vec![0f32; (t + 1) * w.idx_dim];
+        let mut idx_g = vec![0f32; (t + 1) * w.idx_dim];
+        let mut valid = vec![0u8; t + 1];
         // window 1: full prefill (contiguous from 0)
         cu.kv_append(&w.kv_a, &w.kv_a_norm, &x, t, 0, &mut lat_mirror, &stream)
             .unwrap();
@@ -2558,7 +2559,7 @@ pub mod cuda {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let q = w.gemv_q_b(&q_resid, 1); // q for token 0 as a stand-in decode query
+        let q = w.gemv_q_b(&q_resid[..w.q_lora], 1); // q for token 0 as a stand-in decode query
         let wk: Vec<f32> = (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect();
         let wv: Vec<f32> = (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect();
         let mut out_resident = vec![0f32; w.n_head * w.v_head];

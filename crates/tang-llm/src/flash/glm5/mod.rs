@@ -23,6 +23,8 @@ pub mod mhc_fused;
 pub mod mla;
 pub mod moe;
 #[cfg(feature = "cuda")]
+pub mod moe_debug;
+#[cfg(feature = "cuda")]
 pub mod serve_glue;
 
 use crate::gguf::Gguf;
