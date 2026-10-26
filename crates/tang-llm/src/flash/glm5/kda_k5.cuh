@@ -99,7 +99,7 @@ extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
     const G5W w, unsigned e, const unsigned char* xq, const float* xd,
     float* y, unsigned ystride, unsigned T, unsigned ROWS, unsigned COLS) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    extern __shared__ uint4 dsm[]; // per warp: 2 rows of ceil(row_bytes/16) uint4s
+    extern __shared__ uint4 dsm[]; // per warp: one row, ceil(row_bytes/16)+1 uint4s
     const unsigned rb = w.row_bytes;
     const int row16 = (int)((rb + 15) >> 4);
     const unsigned long long mbase = w.base + (unsigned long long)e * w.estride;
@@ -111,11 +111,16 @@ extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
         const unsigned row = blockIdx.x * K5_WARPS + warp;
         if (row >= ROWS) return;
         const unsigned char* src = (const unsigned char*)(mbase + (unsigned long long)row * rb);
-        uint4* sm = dsm + (size_t)warp * row16;
+        // +1 granule per warp: an unaligned row (delta > 0) spans row16+1 granules; spacing
+        // warps by row16 let each warp's staging overwrite the next warp's first granule
+        uint4* sm = dsm + (size_t)warp * (row16 + 1);
         const unsigned long long a = (unsigned long long)src & ~15ull;
         const int delta = (int)((unsigned long long)src - a);
         const int n16 = (delta + (int)rb + 15) >> 4;
         for (int i = lane; i < n16; i += 32) sm[i] = __ldg((const uint4*)a + i);
+        // lanes read granules other lanes staged: the warp must sync first (missing in the
+        // first 3090 run — the shadow check failed 68/68 windows at qkv.q)
+        __syncwarp();
         const unsigned char* rowp = (const unsigned char*)sm + delta;
         float acc = 0.f;
         for (int e0 = lane * 8; e0 < (int)COLS; e0 += 256) {

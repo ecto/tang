@@ -311,7 +311,7 @@ impl DevLayer {
                     // dynamic shared memory: one staged row per warp, 16-byte granules
                     // (the kernel's `extern __shared__ uint4 dsm[]`); 0 here wrote past
                     // the allocation — CUDA_ERROR_ILLEGAL_ADDRESS on the first real run
-                    let smem = (K5_WARPS * (w.w.row_bytes as usize).div_ceil(16) * 16) as u32;
+                    let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
                     launch(
                         self.gv.gemv8,
                         (di.div_ceil(K5_WARPS) as u32, t as u32, 1),
