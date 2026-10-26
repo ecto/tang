@@ -1116,19 +1116,23 @@ mod tests {
             return;
         }
         let ids: Vec<u32> = (1000..1008).collect(); // 8 arbitrary in-vocab tokens
-        let mut cpu = Glm5Engine::open(p).unwrap();
-        cpu.use_gpu().unwrap();
-        // force CPU: TANG_GLM5_GPU=0 is read at load; run the CPU engine via a second open
+        // CPU outputs FIRST, engine dropped before the GPU engine opens: two resident
+        // engines (2 × ~250 GB) exceed the 274 GB card. The CPU engine holds no resident
+        // experts (mmap dequant per layer), so it's cheap — but dropping it keeps the
+        // peak at one resident set.
         std::env::set_var("TANG_GLM5_GPU", "0");
-        let mut cpu2 = Glm5Engine::open(p).unwrap();
+        let cpu_out = {
+            let mut cpu2 = Glm5Engine::open(p).unwrap();
+            let mut out = Vec::new();
+            out.extend(cpu2.window(&ids[..5]).unwrap());
+            for &tok in &ids[5..] {
+                out.extend(cpu2.window(&[tok]).unwrap());
+            }
+            out
+        };
         std::env::remove_var("TANG_GLM5_GPU");
         let mut gpu = Glm5Engine::open(p).unwrap();
         gpu.use_gpu().unwrap();
-        let mut cpu_out = Vec::new();
-        cpu_out.extend(cpu2.window(&ids[..5]).unwrap());
-        for &tok in &ids[5..] {
-            cpu_out.extend(cpu2.window(&[tok]).unwrap());
-        }
         let mut gpu_out = Vec::new();
         gpu_out.extend(gpu.window(&ids[..5]).unwrap());
         for &tok in &ids[5..] {
