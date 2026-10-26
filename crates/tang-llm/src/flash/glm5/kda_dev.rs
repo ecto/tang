@@ -118,11 +118,11 @@ pub struct DevLayer {
     nh: usize,
     hd: usize,
     max_t: usize,
-    /// `TANG_GLM5_KDA_DEBUG`: when set by the engine for this window, [`Self::window`]
-    /// poisons its scratch with NaN first and leaves every intermediate in [`Self::taps`]
-    /// for the shadow check ([`super::kda_debug`]).
-    pub debug: bool,
-    pub taps: Option<super::kda_debug::KdaTaps>,
+    /// `TANG_GLM5_KDA_DEBUG` / `TANG_KERNEL_VERIFY`: when the engine sets a probe for
+    /// this window, [`Self::window`] poisons its scratch with NaN first (per the probe) and
+    /// leaves every intermediate in the probe's taps for the shadow check
+    /// ([`super::kda_debug`], names in [`super::kda_debug::tap`]). `None`: zero cost.
+    pub probe: Option<tang_verify::Probe>,
 }
 
 /// The G5W descriptor of one `KdaLayerW` matrix, from the GGUF's raw tensor (the weights
@@ -224,8 +224,7 @@ impl DevLayer {
             nh,
             hd,
             max_t,
-            debug: false,
-            taps: None,
+            probe: None,
         })
     }
 
@@ -264,24 +263,16 @@ impl DevLayer {
             eprintln!("kda gpu x[0..8]: {:?}", &x[..8.min(x.len())]);
         }
         self.xb.write(0, x)?;
-        if self.debug && super::kda_debug::poison_on() {
-            // NaN-fill every output scratch this window writes: a region no kernel
-            // touches then reads NaN in the shadow check, not a plausible 0.0
-            let nan = |n: usize| vec![f32::NAN; n];
-            self.qkvb.write(0, &nan(t * 3 * di))?;
-            self.g1b.write(0, &nan(t * hd))?;
-            self.gb_out.write(0, &nan(t * di))?;
-            self.bb.write(0, &nan(t * nh))?;
-            self.g2a.write(0, &nan(t * hd))?;
-            self.g2b.write(0, &nan(t * di))?;
-            self.yb.write(0, &nan(t * di))?;
-            self.outb.write(0, &nan(t * hidden))?;
-            // the core's own scratch (conv output, core output) for the device paths
-            let c = t.min(64);
-            self.core.yb.write(0, &nan(c * 3 * di))?;
-            self.core.ob.write(0, &nan(c * di))?;
+        let mut tp = self.probe.take();
+        if let Some(p) = &tp {
+            // NaN-fill every output scratch this window writes (whole buffers): a region
+            // no kernel touches then reads NaN in the shadow check, not a plausible 0.0.
+            // Includes the core's own scratch (conv output, core output).
+            p.poison(&[
+                &self.qkvb, &self.g1b, &self.gb_out, &self.bb, &self.g2a, &self.g2b, &self.yb,
+                &self.outb, &self.core.yb, &self.core.ob,
+            ])?;
         }
-        let mut tp = self.debug.then(super::kda_debug::KdaTaps::default);
         // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di FLOATS).
         // The device pointer is a BYTE address: the offsets must be scaled by
         // size_of::<f32>(). Unscaled (the GLM-5.3 staging bug, Oct 2026) k landed di/4 and
@@ -381,15 +372,13 @@ impl DevLayer {
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
         let beta_h = self.bb.read::<f32>(0, t * nh)?;
-        if let Some(tp) = tp.as_mut() {
-            tp.qkv_pre = qkv_h.clone();
-            tp.g = g_h.clone();
-            tp.beta = beta_h.clone();
-            // the device conv path's output is only observable per 64-chunk (core.yb);
-            // NaN marks rows no path filled (decode fuses the conv into the step kernel)
-            if t > 1 {
-                tp.conv_out = vec![f32::NAN; t * 3 * di];
-            }
+        if let Some(p) = tp.as_mut() {
+            use super::kda_debug::tap;
+            p.put(tap::QKV, qkv_h.clone());
+            p.put(tap::G, g_h.clone());
+            p.put(tap::BETA, beta_h.clone());
+            // the device conv path's output is only observable per 64-chunk (core.yb),
+            // filled below; decode fuses the conv into the step kernel (no conv tap)
         }
         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
             // the staging probe (matches kda::kda_layer's CPU dump; layout/units equal):
@@ -436,9 +425,8 @@ impl DevLayer {
                     64,
                 )?;
                 o[off * di..(off + 64) * di].copy_from_slice(&o64);
-                if let Some(tp) = tp.as_mut() {
-                    let y64 = self.core.yb.read::<f32>(0, 64 * 3 * di)?;
-                    tp.conv_out[off * 3 * di..(off + 64) * 3 * di].copy_from_slice(&y64);
+                if let Some(p) = tp.as_mut() {
+                    p.read_at(super::kda_debug::tap::CONV, off * 3 * di, &self.core.yb, 64 * 3 * di)?;
                 }
                 off += 64;
             }
@@ -475,8 +463,8 @@ impl DevLayer {
                     64,
                 )?;
                 o[off * di..t * di].copy_from_slice(&oc);
-                if let Some(tp) = tp.as_mut() {
-                    tp.conv_out[off * 3 * di..t * 3 * di].copy_from_slice(&yc);
+                if let Some(p) = tp.as_mut() {
+                    p.taps.put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
                 }
                 self.seed(&hconv, &hstate)?;
                 *conv = hconv;
@@ -530,12 +518,13 @@ impl DevLayer {
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, t * hidden)?;
-        if let Some(mut tp) = tp {
-            tp.o = o;
-            tp.g2 = self.g2b.read::<f32>(0, t * di)?;
-            tp.y_norm = self.yb.read::<f32>(0, t * di)?;
-            tp.out = out.clone();
-            self.taps = Some(tp);
+        if let Some(mut p) = tp {
+            use super::kda_debug::tap;
+            p.put(tap::O, o);
+            p.read(tap::G2, &self.g2b, t * di)?;
+            p.read(tap::Y_NORM, &self.yb, t * di)?;
+            p.put(tap::OUT, out.clone());
+            self.probe = Some(p);
         }
         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
             // the layer OUTPUT (post gated-norm + o_proj): pins the divergence to the
@@ -544,4 +533,103 @@ impl DevLayer {
         }
         Ok(out)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Kernel tests on the tang-verify harness (docs/kernel-verify.md): NaN-poisoned
+    //! outputs, every element compared against the host math, fail (not skip) under
+    //! `TANG_REQUIRE_CUDA=1`. Pod/mew: `TANG_REQUIRE_CUDA=1 cargo test --release -p tang-llm
+    //! --features cuda --lib kda_dev`.
+    use super::*;
+    use tang_verify::{Cases, CaseResult, Layout, Probe, Spec, Taps};
+
+    fn rnd(s: &mut u64) -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }
+
+    /// The q/k/v projections as the engine launches them: three `k5_gemv`s writing the
+    /// stacked `[t][3·di]` layout at destination bases 0, di, 2·di — scaled to BYTES unless
+    /// `elem_offsets` (the GLM-5.3 staging bug, cc578187) — vs the host matmul.
+    fn stacked_qkv(
+        kv: &super::super::moe::gpu::Kernels5,
+        s: &Stream,
+        (t, di, hidden): (usize, usize, usize),
+        elem_offsets: bool,
+        p: &mut Probe,
+    ) -> CaseResult {
+        let mut seed = (t * 1_000_003 + di * 31 + hidden) as u64;
+        let x: Vec<f32> = (0..t * hidden).map(|_| rnd(&mut seed)).collect();
+        let ws: Vec<Vec<f32>> =
+            (0..3).map(|_| (0..di * hidden).map(|_| rnd(&mut seed)).collect()).collect();
+        let xb = DevBuf::from_slice(&x)?;
+        let qkv = p.output(t * 3 * di)?;
+        let unit = if elem_offsets { 1 } else { std::mem::size_of::<f32>() as u64 };
+        for (k, w) in ws.iter().enumerate() {
+            let dw = super::super::moe::gpu::upload(&super::super::moe::W::F32(w), 1, di, hidden)?;
+            let dst = qkv.ptr + k as u64 * di as u64 * unit;
+            unsafe {
+                launch(
+                    kv.gemv,
+                    grid(t * di),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    args![dw.w, 0u32, xb.ptr, dst, (3 * di) as u32, t as u32, di as u32, hidden as u32],
+                )?;
+            }
+            s.sync()?;
+        }
+        p.read("qkv", &qkv, t * 3 * di)?;
+        let mut cpu = vec![0f32; t * 3 * di];
+        for ti in 0..t {
+            for (k, w) in ws.iter().enumerate() {
+                for r in 0..di {
+                    let dot: f64 = (0..hidden)
+                        .map(|c| w[r * hidden + c] as f64 * x[ti * hidden + c] as f64)
+                        .sum();
+                    cpu[ti * 3 * di + k * di + r] = dot as f32;
+                }
+            }
+        }
+        let mut c = Taps::new();
+        c.put("qkv", cpu);
+        let lay = Layout::new().dim("tok", 0).dim("r", di);
+        let spec = Spec::new("k5_gemv").stacked(
+            "qkv",
+            &[("q", di, "k5_gemv W_q"), ("k", di, "k5_gemv W_k"), ("v", di, "k5_gemv W_v")],
+            lay,
+            &[],
+        );
+        Ok((spec, c))
+    }
+
+    const SHAPES: &[(usize, usize, usize)] = &[(1, 64, 32), (5, 256, 96), (20, 128, 200)];
+
+    tang_verify::kernel_test!(k5_gemv_stacked_qkv_matches_cpu, {
+        let Some(g) = tang_verify::device::gpu_or_skip("k5_gemv") else { return };
+        let kv = super::super::moe::gpu::Kernels5::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        Cases::new("k5_gemv")
+            .shapes(SHAPES)
+            .dtypes(&["f32"])
+            .run(|&shape, _, p| stacked_qkv(&kv, &s, shape, false, p));
+    });
+
+    // The harness on the real kernel with the staging bug put back: it must fail every
+    // case and name k's writer (not q's) with the ×4 element-vs-byte diagnosis.
+    tang_verify::kernel_test!(k5_gemv_element_offset_bug_is_named, {
+        let Some(g) = tang_verify::device::gpu_or_skip("k5_gemv") else { return };
+        let kv = super::super::moe::gpu::Kernels5::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let fails = Cases::new("k5_gemv-buggy")
+            .shapes(SHAPES)
+            .check(|&shape, _, p| stacked_qkv(&kv, &s, shape, true, p));
+        assert_eq!(fails.len(), SHAPES.len(), "{fails:#?}");
+        for f in &fails {
+            assert!(f.contains("`k` wrote into `q`") && f.contains("k5_gemv W_k"), "{f}");
+            assert!(f.contains("ELEMENT offset added to a BYTE address"), "{f}");
+        }
+    });
 }
