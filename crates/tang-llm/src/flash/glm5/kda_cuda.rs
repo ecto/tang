@@ -414,7 +414,11 @@ pub mod cuda {
             g.bind()?;
             // fail fast if the weights are the wrong shape
             anyhow::ensure!(wconv.len() == ch_dim * cfg.d_conv, "conv weight shape");
-            let s = Stream::new()?;
+            // BLOCKING: decode/prefill stage x/g/beta (and seed stages h0/st) with the
+            // synchronous DevBuf::write, which lands on the legacy default stream — a
+            // NON_BLOCKING stream would let the core kernels read them before the copy
+            // completes (gpu.rs Stream::blocking; it bit the GLM-5.3 staging run too)
+            let s = Stream::blocking()?;
             g.bind()?;
             Ok(DevKda {
                 wconv: DevBuf::from_slice(wconv)?,

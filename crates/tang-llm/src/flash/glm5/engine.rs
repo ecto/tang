@@ -1275,20 +1275,35 @@ mod tests {
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
         let _ = &ids;
-        for w in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]] {
+        let mut flips = Vec::new();
+        for (wi, w) in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]]
+            .into_iter()
+            .enumerate()
+        {
             let a = cpu.window(w).unwrap();
             let b = gpu.window(w).unwrap();
             for p in 0..w.len() {
-                assert_eq!(
-                    argmax(&a[p * nv..(p + 1) * nv]),
-                    argmax(&b[p * nv..(p + 1) * nv]),
-                    "top-1 differs"
-                );
+                let (ra, rb) = (&a[p * nv..(p + 1) * nv], &b[p * nv..(p + 1) * nv]);
+                let (ta, tb) = (argmax(ra), argmax(rb));
+                let row: f32 = ra.iter().zip(rb).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+                if ta != tb {
+                    // a near-tie flip (|cpu margin| ≲ the row's max abs diff) is numerics; a
+                    // wide margin is a real divergence — print both so the log says which
+                    let margin = ra[ta as usize] - ra[tb as usize];
+                    eprintln!(
+                        "window {wi} pos {p}: top-1 cpu {ta} gpu {tb}; cpu margin {margin:.3e}, \
+                         row max abs {row:.3e}, gpu logits {:.5}/{:.5}",
+                        rb[ta as usize], rb[tb as usize]
+                    );
+                    flips.push((wi, p, margin, row));
+                }
             }
             for (x, y) in a.iter().zip(&b) {
                 worst = worst.max((x - y).abs());
             }
         }
+        eprintln!("GPU vs CPU: {} top-1 flips {flips:?}", flips.len());
+        assert!(flips.is_empty(), "top-1 differs at {} positions", flips.len());
         eprintln!("GPU (FFN + KDA + mHC) vs CPU: logits max abs {worst:.3e}");
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }

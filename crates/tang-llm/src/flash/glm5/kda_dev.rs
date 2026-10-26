@@ -273,10 +273,15 @@ impl DevLayer {
             self.core.ob.write(0, &nan(c * di))?;
         }
         let mut tp = self.debug.then(super::kda_debug::KdaTaps::default);
-        // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di)
+        // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di FLOATS).
+        // The device pointer is a BYTE address: the offsets must be scaled by
+        // size_of::<f32>(). Unscaled (the GLM-5.3 staging bug, Oct 2026) k landed di/4 and
+        // v di/2 floats into the q block — q corrupted past 2048, half of k and all of v
+        // never written (zeros on a fresh buffer → the core output was exactly 0).
         let qkv = self.qkvb.ptr;
+        let f = std::mem::size_of::<f32>() as u64;
         unsafe {
-            for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64), (&self.wv, 2 * di as u64)] {
+            for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
                 launch(
                     self.gv.gemv,
                     grid(t * di),
