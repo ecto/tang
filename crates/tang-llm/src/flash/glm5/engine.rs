@@ -1456,7 +1456,7 @@ mod tests {
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
-        let _ = &_ids;
+        let _ = &ids;
         let mut flips = Vec::new();
         for (wi, w) in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]]
             .into_iter()
