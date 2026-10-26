@@ -20,7 +20,7 @@
 //! - `TANG_GLM5_MOE_DEBUG_POISON=0`     don't NaN-fill (read by moe::gpu::Kernels)
 //!
 //! Output lines start with `moedbg`.
-use super::kda_debug::{stat, Stat};
+use tang_verify::{stat, Stat};
 use super::moe::{self, MoeParams};
 use anyhow::Result;
 
