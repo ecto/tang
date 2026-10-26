@@ -691,6 +691,7 @@ pub fn kda_layer(
     );
     let beta = beta_gate(x, &w.b_proj, cfg, b, t);
     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        eprintln!("kda cpu qkv[0..16]: {:?}", &qkv[..16.min(qkv.len())]);
         eprintln!("kda cpu g[0..8]: {:?}", &g[..8.min(g.len())]);
         eprintln!("kda cpu beta[0..4]: {:?}", &beta[..4.min(beta.len())]);
     }
@@ -700,6 +701,10 @@ pub fn kda_layer(
     } else {
         kda_chunk(&qkv, &g, &beta, state, cfg, b, t, 64)?
     };
+    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        // the core output and the final layer output, matching kda_dev's `kda gpu o`/`y`
+        eprintln!("kda cpu o[0..8]: {:?}", &o[..8.min(o.len())]);
+    }
     // gated output norm: y = RMSNorm(o) * o_norm * σ(g2), g2 = g_b(g_a(x))
     let ga = matmul(&w.g_a, hd, hidden, x, b * t);
     let g2 = matmul(&w.g_b, nh * hd, hd, &ga, b * t);
@@ -714,7 +719,11 @@ pub fn kda_layer(
             }
         }
     }
-    Ok(matmul(&w.o_proj, hidden, nh * hd, &y, b * t))
+    let out = matmul(&w.o_proj, hidden, nh * hd, &y, b * t);
+    if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
+        eprintln!("kda cpu y[0..8]: {:?}", &out[..8.min(out.len())]);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
