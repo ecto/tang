@@ -118,11 +118,11 @@ pub struct DevLayer {
     /// (no CPU tail), the decode step from device pointers; qkv/g/beta never visit the
     /// host. Off: the original host-staged path (64-chunks on the device + CPU tail).
     pf2: bool,
-    /// `TANG_GLM5_KDA_DEBUG`: when set by the engine for this window, [`Self::window`]
-    /// poisons its scratch with NaN first and leaves every intermediate in [`Self::taps`]
-    /// for the shadow check ([`super::kda_debug`]).
-    pub debug: bool,
-    pub taps: Option<super::kda_debug::KdaTaps>,
+    /// `TANG_GLM5_KDA_DEBUG` / `TANG_KERNEL_VERIFY`: when the engine sets a probe for
+    /// this window, [`Self::window`] poisons its scratch with NaN first (per the probe) and
+    /// leaves every intermediate in the probe's taps for the shadow check
+    /// ([`super::kda_debug`], names in [`super::kda_debug::tap`]). `None`: zero cost.
+    pub probe: Option<tang_verify::Probe>,
 }
 
 /// The G5W descriptor of one `KdaLayerW` matrix, from the GGUF's raw tensor (the weights
@@ -226,8 +226,7 @@ impl DevLayer {
             hd,
             max_t,
             pf2,
-            debug: false,
-            taps: None,
+            probe: None,
         })
     }
 
@@ -266,28 +265,17 @@ impl DevLayer {
             eprintln!("kda gpu x[0..8]: {:?}", &x[..8.min(x.len())]);
         }
         self.xb.write(0, x)?;
-        if self.debug && super::kda_debug::poison_on() {
-            // NaN-fill every output scratch this window writes: a region no kernel
-            // touches then reads NaN in the shadow check, not a plausible 0.0
-            let nan = |n: usize| vec![f32::NAN; n];
-            self.qkvb.write(0, &nan(t * 3 * di))?;
-            self.g1b.write(0, &nan(t * hd))?;
-            self.gb_out.write(0, &nan(t * di))?;
-            self.bb.write(0, &nan(t * nh))?;
-            self.g2a.write(0, &nan(t * hd))?;
-            self.g2b.write(0, &nan(t * di))?;
-            self.yb.write(0, &nan(t * di))?;
-            self.outb.write(0, &nan(t * hidden))?;
-            self.ob.write(0, &nan(t * di))?;
-            if self.pf2 {
-                self.core.ws.write(0, &nan(self.core.ws_elems()))?;
-            }
-            // the core's own scratch (conv output, core output) for the device paths
-            let c = t.min(64);
-            self.core.yb.write(0, &nan(c * 3 * di))?;
-            self.core.ob.write(0, &nan(c * di))?;
+        let mut tp = self.probe.take();
+        if let Some(p) = &tp {
+            // NaN-fill every output scratch this window writes (whole buffers): a region
+            // no kernel touches then reads NaN in the shadow check, not a plausible 0.0.
+            // Includes the core's own scratch (conv output, core output) and PF2's
+            // workspace (the pf_state temporaries).
+            p.poison(&[
+                &self.qkvb, &self.g1b, &self.gb_out, &self.bb, &self.g2a, &self.g2b, &self.yb,
+                &self.outb, &self.ob, &self.core.yb, &self.core.ob, &self.core.ws,
+            ])?;
         }
-        let mut tp = self.debug.then(super::kda_debug::KdaTaps::default);
         let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
         let t_win = std::time::Instant::now();
         // projections → the stacked q|k|v layout (base offsets q=0, k=di, v=2·di FLOATS).
@@ -372,15 +360,13 @@ impl DevLayer {
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
         let beta_h = self.bb.read::<f32>(0, t * nh)?;
-        if let Some(tp) = tp.as_mut() {
-            tp.qkv_pre = qkv_h.clone();
-            tp.g = g_h.clone();
-            tp.beta = beta_h.clone();
-            // the device conv path's output is only observable per 64-chunk (core.yb);
-            // NaN marks rows no path filled (decode fuses the conv into the step kernel)
-            if t > 1 {
-                tp.conv_out = vec![f32::NAN; t * 3 * di];
-            }
+        if let Some(p) = tp.as_mut() {
+            use super::kda_debug::tap;
+            p.put(tap::QKV, qkv_h.clone());
+            p.put(tap::G, g_h.clone());
+            p.put(tap::BETA, beta_h.clone());
+            // the device conv path's output is only observable per 64-chunk (core.yb),
+            // filled below; decode fuses the conv into the step kernel (no conv tap)
         }
         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
             // the staging probe (matches kda::kda_layer's CPU dump; layout/units equal):
@@ -427,9 +413,8 @@ impl DevLayer {
                     64,
                 )?;
                 o[off * di..(off + 64) * di].copy_from_slice(&o64);
-                if let Some(tp) = tp.as_mut() {
-                    let y64 = self.core.yb.read::<f32>(0, 64 * 3 * di)?;
-                    tp.conv_out[off * 3 * di..(off + 64) * 3 * di].copy_from_slice(&y64);
+                if let Some(p) = tp.as_mut() {
+                    p.read_at(super::kda_debug::tap::CONV, off * 3 * di, &self.core.yb, 64 * 3 * di)?;
                 }
                 off += 64;
             }
@@ -466,8 +451,8 @@ impl DevLayer {
                     64,
                 )?;
                 o[off * di..t * di].copy_from_slice(&oc);
-                if let Some(tp) = tp.as_mut() {
-                    tp.conv_out[off * 3 * di..t * 3 * di].copy_from_slice(&yc);
+                if let Some(p) = tp.as_mut() {
+                    p.taps.put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
                 }
                 self.seed(&hconv, &hstate)?;
                 *conv = hconv;
@@ -590,15 +575,19 @@ impl DevLayer {
             eprintln!("glm5: prof kda out: {:.2} ms", t_out.elapsed().as_secs_f32() * 1e3);
         }
         let out = self.outb.read::<f32>(0, t * hidden)?;
-        if let Some(mut tp) = tp {
-            tp.o = match o {
+        if let Some(mut p) = tp {
+            use super::kda_debug::tap;
+            // the host-staged path hands back the core output it read; PF2 leaves it in
+            // `ob` (device-resident) — read it here for the tap either way
+            let o = match o {
                 Some(o) => o,
                 None => self.ob.read::<f32>(0, t * di)?,
             };
-            tp.g2 = self.g2b.read::<f32>(0, t * di)?;
-            tp.y_norm = self.yb.read::<f32>(0, t * di)?;
-            tp.out = out.clone();
-            self.taps = Some(tp);
+            p.put(tap::O, o);
+            p.read(tap::G2, &self.g2b, t * di)?;
+            p.read(tap::Y_NORM, &self.yb, t * di)?;
+            p.put(tap::OUT, out.clone());
+            self.probe = Some(p);
         }
         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
             // the layer OUTPUT (post gated-norm + o_proj): pins the divergence to the

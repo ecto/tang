@@ -498,14 +498,14 @@ impl Glm5Engine {
                 dbg.prime(l, &st.0, &st.1);
                 let (mut c_in, mut s_in) = (st.0.clone(), st.1.clone());
                 dev.read_back(&mut c_in, &mut s_in)?;
-                dev.debug = true;
+                dev.probe = Some(dbg.probe());
                 let y = dev.window(x, t, &mut st.0);
-                dev.debug = false;
+                let probe = dev.probe.take();
                 let y = y?;
-                let taps = dev.taps.take().unwrap_or_default();
+                let taps = probe.map(|p| p.taps).unwrap_or_default();
                 let (mut c_out, mut s_out) = (st.0.clone(), st.1.clone());
                 dev.read_back(&mut c_out, &mut s_out)?;
-                dbg.check(l, x, t, w, cfg, &taps, &st.0, &c_out, &s_out, Some(&s_in))?;
+                dbg.check(l, x, t, w, cfg, taps, &st.0, &c_out, &s_out, Some(&s_in))?;
                 return Ok(y);
             }
         }
@@ -1165,13 +1165,9 @@ mod tests {
     /// the GLM-5.3 GPU bugs for a cycle (the "tiny fixture passes" that never ran). With
     /// `TANG_REQUIRE_CUDA=1` a skip is a FAILURE instead; without it, the skip prints a
     /// loud banner. `reason` says what's missing.
+    /// (Now [`tang_verify::skip_or_fail`], shared by every kernel test.)
     fn skip_or_fail(reason: &str) {
-        let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
-        let msg = format!("SKIP: {reason} (set TANG_REQUIRE_CUDA=1 to make this a failure)");
-        if required {
-            panic!("{msg} — but TANG_REQUIRE_CUDA=1");
-        }
-        eprintln!("==================== {msg} ====================");
+        tang_verify::skip_or_fail(reason)
     }
 
     fn seq1() -> Option<Vec<u32>> {
@@ -1387,17 +1383,17 @@ mod tests {
             return;
         }
         let r = Glm5Ref::open(Path::new(TINY)).unwrap();
-        let mhp = super::super::mhc::MhcHparams {
+        let mhp = crate::flash::glm5::mhc::MhcHparams {
             streams: r.hp.hc,
             sinkhorn_iters: r.hp.hc_sinkhorn_iters as u32,
             hc_eps: r.hp.hc_eps,
             rms_eps: r.hp.eps,
         };
-        let wa = super::super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
-        let wf = super::super::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
+        let wa = crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
+        let wf = crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
         let mut g = tang_moe::gpu::Gpu::for_test().unwrap();
         g.bind().unwrap();
-        let mh = super::super::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
+        let mh = crate::flash::glm5::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
         // four streams of nonzero state
         let t = 3usize;
         let n = r.hp.n_embd;
@@ -1457,18 +1453,15 @@ mod tests {
         // the engine's own accounting on any loaded model. The load-log line
         // "N DSA layers resident (MLA, one per layer)" is the real-model proof; this test
         // pins the invariant so a future per-device revert fails construction-time asserts.
-        // (Hparams has no Default: the geometry is just the per-layer kind flags)
+        // (Hparams has no Default; the layer-kind mask is all the invariant needs)
         let dsa_layers = |is_kda: &[bool]| -> Vec<usize> {
             (0..is_kda.len()).filter(|&l| !is_kda[l]).collect()
         };
         // the real GLM-5.3 geometry: 11 DSA layers, first at layer 3
-        let is_kda = {
-            let mut v = vec![true; 45];
-            for l in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] {
-                v[l] = false;
-            }
-            v
-        };
+        let mut is_kda = vec![true; 45];
+        for l in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] {
+            is_kda[l] = false;
+        }
         let dsa = dsa_layers(&is_kda);
         assert_eq!(dsa.len(), 11, "GLM-5.3 DSA layer count");
         assert_eq!(dsa[0], 3, "first DSA layer (the sample-layer bug's source)");

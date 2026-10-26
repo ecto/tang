@@ -664,7 +664,7 @@ pub fn kda_layer_taps(
     state: &mut KdaState,
     b: usize,
     t: usize,
-    mut taps: Option<&mut super::kda_debug::KdaTaps>,
+    mut taps: Option<&mut tang_verify::Taps>,
 ) -> Result<Vec<f32>> {
     let (nh, hd) = (cfg.heads, cfg.head_dim);
     let hidden = w.hidden;
@@ -689,17 +689,13 @@ pub fn kda_layer_taps(
     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
         eprintln!("kda cpu qkv[0..16]: {:?}", &qkv[..16.min(qkv.len())]);
     }
-    if let Some(tp) = taps.as_deref_mut() {
-        tp.qkv_pre = qkv.clone();
-    }
+    tang_verify::tap(&mut taps, super::kda_debug::tap::QKV, || qkv.clone());
     let qkv = if t == 1 {
         conv1d_decode(&qkv, &w.conv, conv, cfg, b)?
     } else {
         conv1d_prefill(&qkv, &w.conv, conv, cfg, b, t)?
     };
-    if let Some(tp) = taps.as_deref_mut() {
-        tp.conv_out = qkv.clone();
-    }
+    tang_verify::tap(&mut taps, super::kda_debug::tap::CONV, || qkv.clone());
     // gates
     let g = forget_gate(
         x,
@@ -717,10 +713,8 @@ pub fn kda_layer_taps(
         eprintln!("kda cpu g[0..8]: {:?}", &g[..8.min(g.len())]);
         eprintln!("kda cpu beta[0..4]: {:?}", &beta[..4.min(beta.len())]);
     }
-    if let Some(tp) = taps.as_deref_mut() {
-        tp.g = g.clone();
-        tp.beta = beta.clone();
-    }
+    tang_verify::tap(&mut taps, super::kda_debug::tap::G, || g.clone());
+    tang_verify::tap(&mut taps, super::kda_debug::tap::BETA, || beta.clone());
     // core
     let o = if t == 1 {
         kda_decode(&qkv, &g, &beta, state, cfg, b)?
@@ -750,10 +744,11 @@ pub fn kda_layer_taps(
         eprintln!("kda cpu y[0..8]: {:?}", &out[..8.min(out.len())]);
     }
     if let Some(tp) = taps {
-        tp.o = o;
-        tp.g2 = g2;
-        tp.y_norm = y;
-        tp.out = out.clone();
+        use super::kda_debug::tap;
+        tp.put(tap::O, o);
+        tp.put(tap::G2, g2);
+        tp.put(tap::Y_NORM, y);
+        tp.put(tap::OUT, out.clone());
     }
     Ok(out)
 }
