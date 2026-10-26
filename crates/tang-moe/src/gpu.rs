@@ -103,8 +103,18 @@ impl Gpu {
             arch: Some(arch),
             ..Default::default()
         };
-        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
-            .map_err(|e| Error(format!("nvrtc: {e:?}")))?;
+        // NVRTC from an older CUDA doesn't know newer architectures (e.g. B300's sm_103
+        // on the CUDA 12.8 wheel). PTX without --arch compiles to the NVRTC default and
+        // JITs to the actual device at cuModuleLoadData, so retry arch-less on that error.
+        let ptx = match cudarc::nvrtc::compile_ptx_with_opts(src, opts.clone()) {
+            Ok(p) => p,
+            Err(e) if format!("{e:?}").contains("INVALID_OPTION") || format!("{e:?}").contains("invalid value") => {
+                let opts = cudarc::nvrtc::CompileOptions { arch: None, ..Default::default() };
+                cudarc::nvrtc::compile_ptx_with_opts(src, opts)
+                    .map_err(|e| Error(format!("nvrtc: {e:?}")))?
+            }
+            Err(e) => return Err(Error(format!("nvrtc: {e:?}"))),
+        };
         let src = CString::new(ptx.to_src()).unwrap();
         let mut m: sys::CUmodule = std::ptr::null_mut();
         ck!(sys::cuModuleLoadData(&mut m, src.as_ptr() as *const c_void))?;
