@@ -61,7 +61,12 @@ pub struct GpuFfn {
     kda_kernels: Vec<super::kda_cuda::cuda::Kernels>,
     /// The resident scratch's window cap (TANG_GLM5_KDA_MAXT, default 512).
     max_t: usize,
-    /// W3's MLA + indexer kernels per device (`TANG_GLM5_GPU_MLA=0`: DSA stays on the CPU).
+    /// W3's MLA + indexer per DSA LAYER (`None` for KDA layers; `TANG_GLM5_GPU_MLA=0`:
+    /// DSA stays on the CPU). One per layer, not per device: an `MlaCuda` stages its
+    /// layer's kv_a / indexer / K-V decompress weights once and keeps the latent + indexer
+    /// caches and their watermarks per sequence — shared across layers it ran every DSA
+    /// layer on the first layer's weights and let the next window's first DSA layer
+    /// attend over the last layer's latents (the watermark matched, so no re-upload).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
     /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
     /// scratch pool on the device; `TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
@@ -69,6 +74,31 @@ pub struct GpuFfn {
     layers: Vec<super::moe::gpu::DevMoe>,
     dev_of: Vec<usize>,
     pub split: usize,
+}
+
+/// Everything device-owned goes before the contexts it lives in. Fields drop in
+/// declaration order, so without this `devs` (the contexts) went first and every DevLayer
+/// stream / MLA buffer / module unload after it hit a destroyed context — the SIGSEGV at
+/// the end of every GPU run (compute-sanitizer: cuModuleUnload INVALID_HANDLE,
+/// cuStreamDestroy CONTEXT_IS_DESTROYED).
+#[cfg(feature = "cuda")]
+impl Drop for GpuFfn {
+    fn drop(&mut self) {
+        if let Some((g, _)) = self.devs.first() {
+            let _ = g.bind();
+        }
+        self.kda_l.clear();
+        self.mla_k.clear();
+        self.mhc_g.clear();
+        self.layers.clear();
+        self.kda_kernels.clear();
+        // each device's kernels (a module) before the device itself
+        for (g, k) in self.devs.drain(..) {
+            let _ = g.bind();
+            drop(k);
+            drop(g);
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -86,10 +116,11 @@ impl GpuFfn {
     }
 
     /// Upload every layer's FFN. `Ok(None)` when there is no CUDA device or `TANG_GLM5_GPU=0`.
+    /// `mla_w(l)` builds DSA layer `l`'s weights (each gets its own resident `MlaCuda`).
     pub fn load(
         g: &crate::gguf::Gguf,
         hp: &super::Hparams,
-        mla_sample: Option<&MlaWeights>,
+        mla_w: &dyn Fn(usize) -> Result<MlaWeights>,
     ) -> Result<Option<Self>> {
         use tang_moe::gpu::Gpu;
         let n_layer = hp.n_layer;
@@ -134,13 +165,6 @@ impl GpuFfn {
                 // the staged fallback is only reachable when some KDA layer exists; a
                 // placeholder keeps the vec indexed — an Err surfaces if it is ever used
                 super::kda_cuda::cuda::load(&gpu, &kda_cfg)?
-            });
-            mla_k.push(match (mla_on, mla_sample) {
-                (true, Some(w)) => Some(
-                    super::mla::cuda::MlaCuda::new_at(w, ord)
-                        .map_err(|e| anyhow::anyhow!("MLA kernels on GPU {ord}: {e}"))?,
-                ),
-                _ => None,
             });
             let _ = &mhc_on; // the resident layers are built in the per-layer loop below
             let mk = super::moe::gpu::Kernels::new(&gpu)?;
@@ -190,6 +214,18 @@ impl GpuFfn {
                     mhc_g.push(Some(mh));
                 } else {
                     mhc_g.push(None);
+                }
+                // MLA resident per DSA layer, from that layer's own weights
+                if mla_on && !hp.is_kda[l] {
+                    let d = usize::from(l >= split);
+                    devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+                    let w = mla_w(l).with_context(|| format!("mla weights blk.{l}"))?;
+                    mla_k.push(Some(
+                        super::mla::cuda::MlaCuda::new_at(&w, d)
+                            .map_err(|e| anyhow::anyhow!("MLA layer {l} on GPU {d}: {e}"))?,
+                    ));
+                } else {
+                    mla_k.push(None);
                 }
                 if !hp.is_kda[l] || !kda_on {
                     kda_l.push(None);
@@ -327,11 +363,8 @@ impl Glm5Engine {
     /// Returns whether they moved.
     #[cfg(feature = "cuda")]
     pub fn use_gpu(&mut self) -> Result<bool> {
-        let sample = match self.m.hp.is_kda.iter().position(|&k| !k) {
-            Some(l) => Some(self.m.mla_weights(l)?),
-            None => None,
-        };
-        self.gpu = GpuFfn::load(&self.m.g, &self.m.hp, sample.as_ref())?;
+        let m = &self.m;
+        self.gpu = GpuFfn::load(&m.g, &m.hp, &|l| m.mla_weights(l))?;
         Ok(self.gpu.is_some())
     }
 
@@ -478,7 +511,7 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
             let d = g.dev_of[l];
-            if let Some(cu) = &g.mla_k[d] {
+            if let Some(cu) = &g.mla_k[l] {
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[l]);
             }
@@ -1329,8 +1362,14 @@ mod tests {
         let mut gpu = Glm5Engine::open(Path::new(TINY)).unwrap();
         assert!(gpu.use_gpu().unwrap(), "GPU did not load");
         assert!(
-            gpu.gpu.as_ref().unwrap().mla_k.iter().all(|k| k.is_some()),
-            "MLA kernels did not load"
+            gpu.gpu
+                .as_ref()
+                .unwrap()
+                .mla_k
+                .iter()
+                .zip(&gpu.m.hp.is_kda)
+                .all(|(k, &kda)| k.is_some() != kda),
+            "MLA kernels: one per DSA layer, none on KDA layers"
         );
         let nv = cpu.m.hp.n_vocab;
         let (mut worst, mut agree, mut total) = (0f32, 0usize, 0usize);
