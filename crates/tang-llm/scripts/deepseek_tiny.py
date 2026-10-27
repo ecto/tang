@@ -25,7 +25,8 @@ Outputs under --out:
     step{s}_spec_logits    [block, V] DSpark draft logits
     step{s}_spec_conf      [block] DSpark confidence
   ref/meta.json          ids, start position and greedy next id per step
-Step 0 is the prefill; steps 1.. feed back the greedy token one at a time.
+Step 0 is the prefill; steps 1.. feed back the greedy token one at a time; the last step feeds
+the last step's DSpark block [token, drafts] as one chunk (a speculative verify window).
 """
 import argparse
 import json
@@ -214,7 +215,10 @@ def main():
     ids = torch.randint(3, c["vocab_size"], (args.prefill,), generator=g)
     meta, pos = {"steps": []}, 0
     with torch.inference_mode():
-        for step in range(args.decode + 1):
+        for step in range(args.decode + 2):
+            if step == args.decode + 1:
+                # the last step is a verify window at sp > 0: the greedy token and its drafts
+                ids = spec[0].clone()
             step_of["s"] = step
             logits, main_hidden = model.forward(ids, pos, lambda n, t: dump(f"step{step}_{n}", t))
             dump(f"step{step}_logits", logits)
