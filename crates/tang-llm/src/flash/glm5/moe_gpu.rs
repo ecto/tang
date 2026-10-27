@@ -308,6 +308,8 @@ fn mlp(
     let (t, ffi, hidi) = (t_len as i32, ff as i32, hid as i32);
     let (gw, uw, dw, hp) = (m.0.w, m.1.w, m.2.w, h.ptr);
     unsafe {
+        // TANG_GLM5_TRACE: matrix 0's weight bytes (estride = one matrix)
+        gpu::trace::bytes(gw.estride + uw.estride);
         gpu::launch(
             k.gu,
             grid(t_len * ff),
@@ -316,6 +318,7 @@ fn mlp(
             s,
             tang_moe::args![gw, uw, null, one, zero, x, hp, t, ffi, hidi, lim],
         )?;
+        gpu::trace::bytes(dw.estride);
         gpu::launch(
             k.down,
             grid(t_len * hid),
@@ -342,7 +345,9 @@ pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) ->
 fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
     let p = &m.p;
     let hid = p.hidden;
+    use super::super::trace::span;
     if let Some(d) = &m.dense {
+        let _tr = span("dense");
         return mlp(k, s, d, p.ff_dense, hid, p.limit_shexp, x, y, t_len);
     }
     let router = m.router.as_ref().context("no router")?;
@@ -359,6 +364,7 @@ fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) 
     let yp = DevBuf::alloc(np * hid * 4)?;
     let ysh = match &m.sh {
         Some(sh) => {
+            let _tr = span("moe.shared");
             let b = DevBuf::alloc(t_len * hid * 4)?;
             mlp(k, s, sh, p.ff_shexp, hid, p.limit_shexp, x, b.ptr, t_len)?;
             Some(b)
@@ -390,7 +396,12 @@ fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) 
         yp.ptr,
         p.limit_exp,
     );
+    // the experts a window can touch: every routed pair, at most every expert (an upper
+    // bound on the bytes for prefill; exact for decode's distinct top-k)
+    let n_touch = np.min(p.n_expert) as u64;
     unsafe {
+        let tr = span("moe.router");
+        gpu::trace::bytes(rw.estride);
         gpu::launch(
             k.logits,
             grid(t_len * p.n_expert),
@@ -407,6 +418,9 @@ fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) 
             s,
             tang_moe::args![scp, bias, idp, wtp, t, ne, kk, ng, tg, norm, scale],
         )?;
+        drop(tr);
+        let tr = span("moe.experts");
+        gpu::trace::bytes(n_touch * (gw.estride + uw.estride));
         gpu::launch(
             k.gu,
             grid(np * p.ff_exp),
@@ -415,6 +429,7 @@ fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) 
             s,
             tang_moe::args![gw, uw, idp, kk, ne, x, hp, npi, ff, hidi, lim],
         )?;
+        gpu::trace::bytes(n_touch * dw.estride);
         gpu::launch(
             k.down,
             grid(np * hid),
@@ -423,6 +438,8 @@ fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) 
             s,
             tang_moe::args![dw, idp, ne, hp, ypp, npi, ff, hidi],
         )?;
+        drop(tr);
+        let _tr = span("moe.combine");
         gpu::launch(
             k.combine,
             grid(t_len * hid),
@@ -432,6 +449,7 @@ fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) 
             tang_moe::args![ypp, wtp, yshp, y, t, kk, hidi],
         )?;
     }
+    let _tr = span("sync");
     s.sync()?;
     Ok(())
 }

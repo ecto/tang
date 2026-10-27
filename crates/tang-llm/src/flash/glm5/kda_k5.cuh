@@ -30,11 +30,21 @@ extern "C" __global__ void k5_gate_finish(float* g1, const float* dt, const floa
 // beta[t][h] = sigmoid(dot(b_proj row h, x[t])).
 extern "C" __global__ void k5_beta(const G5W bp, const float* x, float* beta,
                                    unsigned T, unsigned HID, unsigned NH) {
-    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned t = i / NH, h = i % NH;
+    // one WARP per (t, h): the naive form gave one thread a serial 4096-element
+    // dequant+dot (1.28 ms/launch, 45.8 ms per decode token across 34 layers, ~0 B read
+    // because each thread streams its row alone). Warp lanes split the row 128-wide in
+    // 8-element steps with the shuffle reduce — the same shape as k5_gemv8's dot.
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const unsigned i = blockIdx.x * (blockDim.x >> 5) + warp;
+    const unsigned t = i / NH, h = i % NH;
     if (t >= T) return;
-    float a = g5_dot(bp, 0u, h, x + (unsigned long long)t * HID, HID);
-    beta[(unsigned long long)t * NH + h] = 1.f / (1.f + expf(-a));
+    float a = 0.f;
+    for (int e0 = lane * 8; e0 < (int)HID; e0 += 256) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) a = fmaf(g5_deq(bp.ty, bp.base + (unsigned long long)h * bp.row_bytes, e0 + q), x[(size_t)t * HID + e0 + q], a);
+    }
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (lane == 0) beta[(unsigned long long)t * NH + h] = 1.f / (1.f + expf(-a));
 }
 
 // y[t][c] = rms_norm(o[t][h..])[c] * on[c] * sigmoid(g2[t][c]), h = c / HD.

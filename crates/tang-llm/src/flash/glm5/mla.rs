@@ -1641,6 +1641,8 @@ pub mod cuda {
             let mut eps = self.eps;
             // write straight into the resident cache at row pos0
             let y_ptr = lat_ptr + (pos0 * self.dl * 2) as u64;
+            // TANG_GLM5_TRACE: the f32 kv_a weight it streams
+            gpu::trace::bytes((self.dl * self.hid * 4) as u64);
             unsafe {
                 gpu::launch(
                     f,
@@ -2169,6 +2171,9 @@ pub mod cuda {
             let mut scale = 1.0f32 / (self.dk as f32).sqrt();
             let sel_ptr = sd.map(|b| b.ptr).unwrap_or(0);
             let smem = ((self.dk + self.dv) * 4) as u32;
+            // TANG_GLM5_TRACE: the resident f32 K/V decompress weights + the bf16 latents
+            // it attends over, once each (the ideal; the naive kernel re-reads per query)
+            gpu::trace::bytes((self.nh * self.dl * (self.dk + self.dv) * 4 + width * self.dl * 2) as u64);
             unsafe {
                 gpu::launch(
                     f,

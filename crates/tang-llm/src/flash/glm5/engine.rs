@@ -21,6 +21,8 @@
 //! (`hidden ≤ 1024`, i.e. the tiny fixture), or with `TANG_GLM5_CACHE=1`, they are cached.
 
 use super::forward::Glm5Ref;
+#[cfg(feature = "cuda")]
+use tang_moe::{args, gpu::launch};
 use super::kda::{ConvState, KdaConfig, KdaLayerW, KdaState};
 use super::mla::MlaWeights;
 use anyhow::{bail, ensure, Context, Result};
@@ -48,12 +50,29 @@ struct DsaCache {
 /// (`TANG_SPLIT_AT`, default: the cut that balances routed-expert bytes). Activations cross
 /// through the host for now (naive; one copy each way per FFN).
 #[cfg(feature = "cuda")]
+/// warps per k5_gemv8 block (kda_k5.cuh's K5_WARPS: one staged row per warp).
+const K5_WARPS: usize = 4;
+
+/// The LM head resident (TANG_GLM5_GPU_HEAD=1): weights, k5_q8 scratch (codes + scales
+/// after them, MAXT rows), the logits row, the k5 kernels, and a blocking stream
+/// (DevBuf::write is a synchronous legacy-stream copy; a NON_BLOCKING stream would not
+/// order against it — gpu.rs's doc).
+struct HeadDev {
+    dw: super::moe::gpu::DevW,
+    xq8: super::moe::gpu::DevBuf,
+    out: super::moe::gpu::DevBuf,
+    k5: super::moe::gpu::Kernels5,
+    s: tang_moe::gpu::Stream,
+}
+
 pub struct GpuFfn {
     devs: Vec<(tang_moe::gpu::Gpu, super::moe::gpu::Kernels)>,
     /// The resident KDA layers ([`super::kda_dev::DevLayer`], W4's DevKda core + the
     /// projections as device GEMVs), one per KDA layer, `None` when
     /// `TANG_GLM5_GPU_KDA=0`. The free-kernel path (`kda_gpu`) stays as the fallback for
     /// windows past `max_t`.
+    /// The device LM head (None unless TANG_GLM5_GPU_HEAD=1).
+    head_dev: Option<HeadDev>,
     kda_l: Vec<Option<super::kda_dev::DevLayer>>,
     /// Per KDA layer: does the device hold the live state (vs the engine's host copies)?
     kda_dev_fresh: Vec<bool>,
@@ -356,6 +375,7 @@ impl GpuFfn {
             kda_l,
             kda_dev_fresh,
             kda_kernels: kda_kernels,
+            head_dev,
             max_t,
             mla_k,
             mla_p,
@@ -371,6 +391,41 @@ impl GpuFfn {
         if mhc_fused {
             f.enable_mhc_fused(g, hp)?;
         }
+        // the LM head on the GPU (TANG_GLM5_GPU_HEAD=1): t==1 decode only. The host
+        // tiled Mat::apply was 39.6 ms/token (trace); one k5_q8 + k5_gemv8 is ~150 us.
+        let head_dev = if std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
+            devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
+            let info = match g.get("output.weight") {
+                Some(t) => t,
+                None => g.info("token_embd.weight")?,
+            };
+            let rows = info.dims[1] as usize; // n_vocab
+            let cols = info.dims[0] as usize; // hidden
+            anyhow::ensure!(
+                info.ty == crate::gguf::GgmlType::Q8_0,
+                "lm head: want Q8_0 (k5_gemv8), got {:?}",
+                info.ty
+            );
+            let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, rows, cols)
+                .map_err(|e| anyhow::anyhow!("lm head upload: {e}"))?;
+            let k5 = super::moe::gpu::Kernels5::new(&devs[0].0)
+                .map_err(|e| anyhow::anyhow!("k5 (head): {e}"))?;
+            // scratch: k5_q8 codes [MAXT][cols] + scales after them (the gemv8 kernel
+            // reads scales at xq8 + MAXT*cols); here MAXT = 1
+            let xq8 = tang_moe::gpu::DevBuf::zeroed_elems::<u8>(cols + cols.div_ceil(32) * 4)
+                .map_err(|e| anyhow::anyhow!("head xq8: {e}"))?;
+            let out = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(rows)
+                .map_err(|e| anyhow::anyhow!("head out: {e}"))?;
+            let hs = tang_moe::gpu::Stream::blocking()
+                .map_err(|e| anyhow::anyhow!("head stream: {e}"))?;
+            eprintln!(
+                "glm5: LM head resident on the GPU ({} MB)",
+                dw.w.row_bytes * rows / 1_000_000
+            );
+            Some(HeadDev { dw, xq8, out, k5, s: hs })
+        } else {
+            None
+        };
         Ok(Some(f))
     }
 
@@ -564,8 +619,10 @@ impl Glm5Engine {
             // not resident (TANG_GLM5_GPU_FFN=0 / _LAYERS): fall through to the CPU path.
         }
         if self.m.hp.is_dense(l) {
+            let _tr = super::trace::span("dense.cpu");
             self.m.dense_ffn(l, x, t)
         } else {
+            let _tr = super::trace::span("moe.cpu");
             let p = super::moe::MoeParams::from_gguf(&self.m.g, l)?;
             super::moe::moe_layer(&p, x, t)
         }
@@ -657,15 +714,18 @@ impl Glm5Engine {
                         if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
                             eprintln!("kda wiring: read_back layer {l} (window {t} > max_t)");
                         }
+                        let _tr = super::trace::span("read_back");
                         dev.read_back(&mut st.0, &mut st.1)?;
                         g.kda_dev_fresh[l] = false;
                     }
+                    let _tr = super::trace::span("staged");
                     return kda_gpu(x, t, w, cfg, &g.kda_kernels[d], &g.devs[d].0, &mut st.0, &mut st.1);
                 }
                 if !g.kda_dev_fresh[l] {
                     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
                         eprintln!("kda wiring: seed layer {l} (host -> device)");
                     }
+                    let _tr = super::trace::span("seed");
                     dev.seed(&st.0, &st.1)?;
                     g.kda_dev_fresh[l] = true;
                 }
@@ -689,6 +749,7 @@ impl Glm5Engine {
                 return Ok(y);
             }
         }
+        let _tr = super::trace::span("cpu");
         super::kda::kda_layer(x, w, cfg, &mut st.0, &mut st.1, 1, t)
     }
 
@@ -713,6 +774,7 @@ impl Glm5Engine {
                 return dsa_gpu(l, w, cu, x, t, pos0, &mut self.dsa[l], dbg);
             }
         }
+        let _tr = super::trace::span("cpu");
         self.dsa_cpu(l, w, x, t, pos0)
     }
 
@@ -891,6 +953,7 @@ impl Glm5Engine {
         let _ = fused;
         let (mut x, mixes) = self.mhc_pre(l, block, w, r, t)?;
         let norm = if block == 0 { "attn_norm.weight" } else { "ffn_norm.weight" };
+        let _tr = super::trace::span("norm");
         self.m.norm_all(&mut x, l, norm)?;
         Ok((x, mixes))
     }
@@ -952,8 +1015,13 @@ impl Glm5Engine {
         let hp = self.m.hp.clone();
         let (n, hc, t) = (hp.n_embd, hp.hc, ids.len());
         let pos0 = self.tokens.len();
+        // TANG_GLM5_TRACE: the window's span tree (trace.rs); every guard below is a no-op
+        // when it's off
+        use super::trace::{span, span_l};
+        let tr_root = super::trace::window_begin(t, pos0);
 
         // ---- embedding into every stream
+        let tr = span("embed");
         let embd = self.m.g.info("token_embd.weight")?;
         let mut r = vec![0f32; t * hc * n];
         for (i, &tok) in ids.iter().enumerate() {
@@ -971,17 +1039,24 @@ impl Glm5Engine {
         };
 
         let fused = self.mhc_fused_begin(&r, t)?;
+        drop(tr);
         let mut t_embd = Instant::now();
         for l in 0..hp.n_layer {
+            let _tr_l = span_l("layer", l);
             // ---- attention half
             let t0 = Instant::now();
+            let tr = span("mhc_pre.attn");
             let w_attn = self.hc_weights(l, "hc_attn", &mhp)?;
             let (x, mixes) = self.mhc_pre_norm(fused, l, 0, &w_attn, &r, t)?;
+            drop(tr);
             stage("mhc_pre+norm(attn)", &t0);
             let t1 = Instant::now();
             let y = if hp.is_kda[l] {
+                let _tr = span("kda");
                 let t_w = Instant::now();
+                let tr = span("weights");
                 let wc = self.kda_weights(l)?;
+                drop(tr);
                 stage("kda weights", &t_w);
                 // no wc.0.clone(): the free-function paths only read the weights, and the
                 // resident path doesn't touch them at all — pass the Arc's ref
@@ -995,8 +1070,11 @@ impl Glm5Engine {
                 stage("kda mixer", &t_m);
                 y?
             } else {
+                let _tr = span("dsa");
                 let t_w = Instant::now();
+                let tr = span("weights");
                 let w = self.mla_weights(l)?;
+                drop(tr);
                 stage("mla weights", &t_w);
                 let t_m = Instant::now();
                 let y = self.dsa_layer(l, &w, &x, t, pos0)?;
@@ -1004,17 +1082,25 @@ impl Glm5Engine {
                 y
             };
             let t2 = Instant::now();
+            let tr = span("mhc_post.attn");
             self.mhc_post_any(fused, l, &mixes, &y, &mut r, t)?;
+            drop(tr);
             stage("mhc_post(attn)", &t2);
 
             // ---- FFN half
             let t3 = Instant::now();
+            let tr = span("mhc_pre.ffn");
             let w_ffn = self.hc_weights(l, "hc_ffn", &mhp)?;
             let (x, mixes) = self.mhc_pre_norm(fused, l, 1, &w_ffn, &r, t)?;
+            drop(tr);
             stage("mhc_pre+norm(ffn)", &t3);
+            let tr = span("ffn");
             let y = self.ffn(l, &x, t)?;
+            drop(tr);
             let t4 = Instant::now();
+            let tr = span("mhc_post.ffn");
             self.mhc_post_any(fused, l, &mixes, &y, &mut r, t)?;
+            drop(tr);
             stage("ffn", &t3);
             stage("mhc_post(ffn)", &t4);
             // W0's R3 bisector: dump the last position's post-FFN streams (no-op
@@ -1028,13 +1114,60 @@ impl Glm5Engine {
         stage("layers", &t_embd);
         // ---- head: unweighted stream mean, output norm, lm_head
         let t5 = Instant::now();
+        let tr_head = span("head");
+        let tr = span("head.mean");
         let mut h = self.hc_head_all(fused, &r, t)?;
+        drop(tr);
+        let tr = span("head.norm");
         self.m.norm_all_exact(&mut h, "output_norm.weight")?;
-        if self.head.is_none() {
-            self.head = Some(self.m.head()?);
-        }
-        let head = self.head.as_ref().unwrap();
-        let logits = head.apply(&h, t, false);
+        drop(tr);
+        let tr = span("lm_head");
+        let logits = match self.gpu.as_ref().and_then(|g| g.head_dev.as_ref()) {
+            // decode (t=1): the normed h row on the device, one k5_q8 + one k5_gemv8. The
+            // host tiled path measured 39.6 ms/token (TANG_GLM5_TRACE); the kernel is
+            // ~150 us. The logits row lands in the `out` buffer, then one D2H read.
+            Some(hd) if t == 1 => {
+                let (gpu, _) = &g.devs[0];
+                gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+                let n = self.m.hp.n_embd;
+                let nv = self.m.hp.n_vocab;
+                let row = &h[(t - 1) * n..t * n];
+                hd.xq8.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
+                unsafe {
+                    // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
+                    tang_moe::gpu::launch(
+                        hd.k5.q8,
+                        ((n / 32) as u32, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &hd.s,
+                        args![row.as_ptr() as *mut std::ffi::c_void, hd.xq8.ptr, n as u32, 1u32],
+                    )?;
+                    // k5_gemv8: grid (rows/K5_WARPS, T=1), ROWS = n_vocab, COLS = n;
+                    // scales live at xq8 + 1*n bytes (the MAXT offset)
+                    tang_moe::gpu::launch(
+                        hd.k5.gemv8,
+                        ((nv / K5_WARPS) as u32, 1, 1),
+                        (128, 1, 1),
+                        (4 * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                        &hd.s,
+                        args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
+                            1u32, 1u32, nv as u32, n as u32],
+                    )?;
+                }
+                hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
+                hd.out.read::<f32>(0, nv).map_err(|e| anyhow::anyhow!("head read: {e}"))?
+            }
+            _ => {
+                if self.head.is_none() {
+                    self.head = Some(self.m.head()?);
+                }
+                let head = self.head.as_ref().unwrap();
+                head.apply(&h, t, false)
+            }
+        };
+        drop(tr);
+        drop(tr_head);
         stage("head", &t5);
         self.tokens.extend_from_slice(ids);
         // W0's R3 bisector: write the dump (no-op without TANG_DUMP_DIR).
@@ -1047,6 +1180,7 @@ impl Glm5Engine {
                 hp.n_vocab,
             )?;
         }
+        super::trace::window_end(tr_root, t, pos0);
         if self.verbose {
             eprintln!(
                 "glm5: window t={t} at {pos0}: {:.2} s",
@@ -1138,7 +1272,9 @@ fn kda_gpu(
     let (nh, hd) = (cfg.heads, cfg.head_dim);
     let hidden = w.hidden;
     ensure!(x.len() == t * hidden, "layer input");
+    use super::trace::span;
     // projections, stacked q|k|v per token (the reference's layout)
+    let tr = span("proj.host");
     let qp = matmul(&w.q, nh * hd, hidden, x, t);
     let kp = matmul(&w.k, nh * hd, hidden, x, t);
     let vp = matmul(&w.v, nh * hd, hidden, x, t);
@@ -1151,7 +1287,9 @@ fn kda_gpu(
         qkv[i * ch + 2 * nh * hd..(i + 1) * ch]
             .copy_from_slice(&vp[i * nh * hd..(i + 1) * nh * hd]);
     }
+    drop(tr);
     // gates: gpre (pre-exp, per key dim) and beta (post-sigmoid, per head)
+    let tr = span("gates.host");
     let fg = super::kda::ForgetGateW {
         f_a: w.f_a.clone(),
         f_b: w.f_b.clone(),
@@ -1161,6 +1299,8 @@ fn kda_gpu(
     let (b, c) = (1usize, 64usize);
     let gpre = super::kda::forget_gate(x, &fg, cfg, t);
     let beta = super::kda::beta_gate(x, &w.b_proj, cfg, b, t);
+    drop(tr);
+    let tr = span("core");
     let mut y = vec![0f32; t * nh * hd];
     let mut off = 0usize;
     if t == 1 {
@@ -1202,7 +1342,9 @@ fn kda_gpu(
         )?;
         y[off * nh * hd..t * nh * hd].copy_from_slice(&oc);
     }
+    drop(tr);
     // gated output norm (host, same as the reference), then o_proj
+    let _tr = span("out.host");
     let ga = matmul(&w.g_a, hd, hidden, x, t);
     let g2 = matmul(&w.g_b, nh * hd, hd, &ga, t);
     for i in 0..t {
@@ -1243,14 +1385,20 @@ fn dsa_gpu(
     let kv_len = pos0 + t;
     ensure!(x.len() == t * n, "layer input");
     ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
+    use super::trace::span;
+    let tr = span("q_a.host");
     let q_resid = w.gemv_q_a(x, t);
+    drop(tr);
     if dbg.as_ref().is_some_and(|d| d.poison()) {
         cu.debug_poison(pos0, t).map_err(gerr)?;
     }
     // caches grow by t rows; the launchers write rows [pos0, kv_len)
+    let tr = span("kv_append");
     c.lat16.resize(kv_len * dl, 0);
     cu.kv_append(&w.kv_a, &w.kv_a_norm, x, t, pos0, &mut c.lat16, &s)
         .map_err(gerr)?;
+    drop(tr);
+    let tr = span("idx_append");
     c.idx_k.resize(kv_len * idd, 0.0);
     c.idx_g.resize(kv_len * idd, 0.0);
     c.valid.resize(kv_len, 0);
@@ -1268,6 +1416,8 @@ fn dsa_gpu(
         &s,
     )
     .map_err(gerr)?;
+    drop(tr);
+    let tr = span("idx_select");
     let mut pool_dbg = None;
     let sel = if super::mla::indexer_is_dense(kv_len, w.topk) {
         None
@@ -1298,14 +1448,22 @@ fn dsa_gpu(
         .map_err(gerr)?;
         Some(sel)
     };
+    drop(tr);
+    let tr = span("q_b.host");
     let q = w.gemv_q_b(&q_resid, t);
+    drop(tr);
+    let tr = span("attend.gather");
     let wk: Vec<f32> = (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect();
     let wv: Vec<f32> = (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect();
+    drop(tr);
+    let tr = span("attend");
     let hv = w.n_head * w.v_head;
     let mut out_v = vec![0f32; t * hv];
     cu.attend(&wk, &wv, &q, &c.lat16, kv_len, t, pos0, sel.as_deref(), &mut out_v, &s)
         .map_err(gerr)?;
+    drop(tr);
     // o_proj on the host
+    let _tr = span("o_proj.host");
     let mut out = vec![0f32; t * n];
     for i in 0..t {
         for r in 0..n {
@@ -1471,11 +1629,22 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     ensure!(!ids.is_empty(), "no prompt (--prompt-ids, --ids-file or --prompt)");
     ensure!(n >= 1, "-n must be at least 1");
 
+    // TANG_GLM5_TRACE=1: span tree + bottleneck table (trace.rs), otel export with the
+    // `otel` feature. Before the GPU loads, so kernel names are recorded.
+    let traced = super::trace::init();
+    let _otel = if traced { crate::telemetry::init() } else { None };
     let t0 = Instant::now();
     let mut e = Glm5Engine::open(&path)?;
     e.verbose = verbose;
     #[cfg(feature = "cuda")]
     e.use_gpu()?;
+    #[cfg(feature = "cuda")]
+    if traced {
+        if let Some(g) = &e.gpu {
+            let (gbs, what) = sol_gbs(&g.devs[0].0);
+            super::trace::set_sol(gbs, what);
+        }
+    }
     let hp = &e.m.hp;
     eprintln!(
         "glm5: {} layers ({} KDA, {} DSA), hidden {}, {} experts top-{}, vocab {}; open {:.1} s",
@@ -1523,7 +1692,39 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     if let Some(o) = out {
         std::fs::write(&o, format!("{line}\n"))?;
     }
+    if let Some(r) = super::trace::report() {
+        eprint!("{r}");
+    }
     Ok(())
+}
+
+/// The device's memory bandwidth ceiling for %-of-SOL, GB/s: `TANG_SOL_GBS`, else the
+/// datasheet figure for a known card, else bus width × memory clock × 2 (DDR) from the
+/// driver (which under-reports HBM3e: the H200 reads ~4.0 TB/s there vs 4.8 spec).
+#[cfg(feature = "cuda")]
+fn sol_gbs(g: &tang_moe::gpu::Gpu) -> (f64, String) {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let name = g.ctx.name().unwrap_or_default();
+    if let Some(v) = std::env::var("TANG_SOL_GBS").ok().and_then(|v| v.parse::<f64>().ok()) {
+        return (v, format!("{name}, TANG_SOL_GBS"));
+    }
+    const KNOWN: &[(&str, f64)] = &[
+        ("H200", 4800.0),
+        ("H100 NVL", 3900.0),
+        ("H100 PCIe", 2000.0),
+        ("H100", 3350.0),
+        ("B300", 8000.0),
+        ("B200", 8000.0),
+        ("A100", 2039.0),
+        ("RTX 4090", 1008.0),
+        ("RTX 3090", 936.0),
+    ];
+    if let Some(&(_, v)) = KNOWN.iter().find(|(k, _)| name.contains(k)) {
+        return (v, format!("{name}, datasheet"));
+    }
+    let clk = g.attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE).unwrap_or(0) as f64; // kHz
+    let bus = g.attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH).unwrap_or(0) as f64; // bits
+    (clk * 1e3 * 2.0 * bus / 8.0 / 1e9, format!("{name}, driver clock × bus"))
 }
 
 #[cfg(test)]
@@ -2065,6 +2266,71 @@ mod tests {
         let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         println!("engine_reset_gpu: max |a - b| {d:.3e}");
         assert!(d < 1e-4, "after reset the GPU window differs from a fresh one: {d}");
+    }
+
+    /// `TANG_GLM5_TRACE` is transparent: the same windows traced and untraced give the
+    /// same logits bit for bit, and the trace saw the GPU (launches, timed kernels by name,
+    /// copies) under the layer-family spans.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_trace_is_transparent() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("no CUDA device");
+            return;
+        }
+        let run = |e: &mut Glm5Engine| {
+            e.reset();
+            let mut v = e.window(&ids[..6]).unwrap();
+            v.extend(e.window(&ids[6..7]).unwrap());
+            v
+        };
+        // traced from before the load, as the CLI does (kernel names are taken at load)
+        super::super::trace::start();
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu().unwrap());
+        let traced = run(&mut e);
+        super::super::trace::stop();
+        let plain = run(&mut e);
+        let r = super::super::trace::report().expect("a trace report");
+        println!("{r}");
+        // the same bound as engine_reset_gpu (a fresh sequence run twice): tracing adds
+        // events and counters only, so anything past run-to-run noise is a bug
+        let d = traced.iter().zip(&plain).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let same = traced.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits());
+        println!("engine_gpu_trace_is_transparent: max |traced - plain| {d:.3e}, bit-identical {same}");
+        assert!(d < 1e-4, "tracing changed the logits: {d}");
+        for want in ["decode, per token", "prefill, totals", "kda", "mhc_pre.attn", "ffn", "lm_head", "kernels by GPU time", "k5_"] {
+            assert!(r.contains(want), "trace report lacks {want:?}:\n{r}");
+        }
+        // the hook's cost where it is largest: the tiny model's decode windows are almost
+        // all launches (~0.1 ms of GPU work each). Interleaved rounds, median per mode.
+        let mut ms = [Vec::new(), Vec::new()];
+        for round in 0..10 {
+            for traced in [round % 2 == 0, round % 2 != 0] {
+                e.reset();
+                e.window(&ids[..6]).unwrap();
+                if traced {
+                    super::super::trace::start();
+                }
+                let t0 = Instant::now();
+                for i in 0..16 {
+                    e.window(&[ids[(6 + i) % ids.len()]]).unwrap();
+                }
+                ms[traced as usize].push(t0.elapsed().as_secs_f64() * 1e3 / 16.0);
+                super::super::trace::stop();
+            }
+        }
+        // min per mode: the CPU-side noise here is one-sided (background work only adds)
+        let mn = |v: &mut Vec<f64>| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (off, on) = (mn(&mut ms[0]), mn(&mut ms[1]));
+        println!(
+            "engine_gpu_trace_is_transparent: tiny decode window {off:.3} ms plain, {on:.3} ms traced ({:+.1}%)",
+            100.0 * (on / off - 1.0)
+        );
     }
 
     /// THE LESSON OF THIS PORT (the engine never wired the built-and-tested GPU structs

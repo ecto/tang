@@ -30,6 +30,7 @@ pub mod moe;
 pub mod moe_debug;
 #[cfg(feature = "cuda")]
 pub mod serve_glue;
+pub mod trace;
 
 use crate::gguf::Gguf;
 use anyhow::{bail, ensure, Context, Result};
