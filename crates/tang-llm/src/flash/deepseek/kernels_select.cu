@@ -252,6 +252,44 @@ extern "C" __global__ void ds_linear_csr(DsW w, const float* x, float* y, int t,
     if (lane == 0) y[(long long)ti * w.rows + n] = round ? bf(s) : s;
 }
 
+// Grouped MoE plan, one thread: elist[0..cap) = the experts with rows that this rank owns
+// (mask[e] != 0), ascending, then -1.
+extern "C" __global__ void ds_moe_plan(const int* counts, const int* mask, int* elist, int ne, int cap) {
+    if (threadIdx.x || blockIdx.x) return;
+    int j = 0;
+    for (int e = 0; e < ne && j < cap; e++)
+        if (counts[e] > 0 && mask[e]) elist[j++] = e;
+    for (; j < cap; j++) elist[j] = -1;
+}
+
+// y [t][d] = Σ over token ti's local experts in ascending id of part[slot] (slot = the token's
+// CSR position under that expert): the per-expert loop's scatter order, from 0.
+extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
+                                         const int* mask, int t, int k, int d) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)t * d) return;
+    int ti = (int)(i / d), c = (int)(i % d);
+    const int* id = ids + (long long)ti * k;
+    float s = 0.f;
+    int done = -1;
+    for (int q = 0; q < k; q++) {
+        int best = 0x7fffffff;
+        for (int r = 0; r < k; r++)
+            if (id[r] > done && id[r] < best) best = id[r];
+        if (best == 0x7fffffff) break;
+        done = best;
+        if (!mask[best]) continue;
+        int o = off[best], n = off[best + 1] - o, p = o;
+        for (int j = 0; j < n; j++)
+            if (rows[o + j] == ti) {
+                p = o + j;
+                break;
+            }
+        s += part[(long long)p * d + c];
+    }
+    y[i] = s;
+}
+
 // n ints set to v (a verify window's [t][k] selection, -1 = no entry).
 extern "C" __global__ void ds_fill_i32(int* p, int v, long long n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
