@@ -616,6 +616,16 @@ pub struct Glm5Engine {
     /// `TANG_GLM5_MLA_DEBUG=1`: the CPU shadow of every GPU DSA window ([`super::mla_debug`]).
     #[cfg(feature = "cuda")]
     pub(crate) mla_dbg: Option<super::mla_debug::Shadow>,
+    /// The last window's post-`output_norm` hidden rows `[t][n_embd]` (the MTP layer's `h`,
+    /// llama.cpp's `t_h_nextn`; [`super::mtp`]).
+    pub(crate) last_h: Vec<f32>,
+}
+
+/// A rewind point for speculative verify ([`Glm5Engine::snapshot`]): the position and the
+/// host copies of every KDA state (the DSA caches are append-only and rewind by truncation).
+pub(crate) struct Snap {
+    pos: usize,
+    kda: Vec<Option<(ConvState, KdaState)>>,
 }
 
 impl Glm5Engine {
@@ -642,6 +652,7 @@ impl Glm5Engine {
             moe_dbg: super::moe_debug::Shadow::from_env(nl),
             #[cfg(feature = "cuda")]
             mla_dbg: super::mla_debug::Shadow::from_env(),
+            last_h: Vec::new(),
         })
     }
 
@@ -695,6 +706,46 @@ impl Glm5Engine {
         }
         for c in &mut self.dsa {
             *c = DsaCache::default();
+        }
+    }
+
+    /// A rewind point at the current position (MTP verify). Resident KDA layers read their
+    /// device state back into the host copies first, so the snapshot is complete.
+    pub(crate) fn snapshot(&mut self) -> Result<Snap> {
+        #[cfg(feature = "cuda")]
+        if let Some(g) = self.gpu.as_mut() {
+            for l in 0..self.kda.len() {
+                if !g.kda_dev_fresh[l] {
+                    continue;
+                }
+                if let (Some(dev), Some(st)) = (g.kda_l[l].as_mut(), self.kda[l].as_mut()) {
+                    g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                    dev.read_back(&mut st.0, &mut st.1)?;
+                }
+            }
+        }
+        Ok(Snap { pos: self.tokens.len(), kda: self.kda.clone() })
+    }
+
+    /// Rewind to `s`: KDA states back to the snapshot (resident layers re-seed from the host
+    /// on their next window), DSA caches truncated to the snapshot's position (the device
+    /// latent rows are position-indexed, so the next window overwrites them).
+    pub(crate) fn restore(&mut self, s: Snap) {
+        let hp = &self.m.hp;
+        let (kl, idd) = (hp.kv_lora_rank, hp.idx_dim);
+        let pos = s.pos;
+        self.tokens.truncate(pos);
+        self.kda = s.kda;
+        #[cfg(feature = "cuda")]
+        if let Some(g) = self.gpu.as_mut() {
+            g.kda_dev_fresh.iter_mut().for_each(|f| *f = false);
+        }
+        for c in &mut self.dsa {
+            c.latent.truncate(pos * kl);
+            c.lat16.truncate(pos * kl);
+            c.idx_k.truncate(pos * idd);
+            c.idx_g.truncate(pos * idd);
+            c.valid.truncate(pos);
         }
     }
 
@@ -1172,6 +1223,8 @@ impl Glm5Engine {
         drop(tr);
         let tr = span("head.norm");
         self.m.norm_all_exact(&mut h, "output_norm.weight")?;
+        self.last_h.clear();
+        self.last_h.extend_from_slice(&h);
         drop(tr);
         let tr = span("lm_head");
         // decode (t=1) on the device LM head when TANG_GLM5_GPU_HEAD=1 (GpuFfn::head_logits)
@@ -1617,6 +1670,8 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     let path = PathBuf::from(it.next().context("first argument: the first GGUF shard")?);
     let (mut ids, mut prompt, mut n, mut chunk) = (Vec::<u32>::new(), None, 32usize, 64usize);
     let (mut out, mut quiet, mut verbose) = (None::<PathBuf>, false, false);
+    // --mtp K: draft K tokens per trunk pass with the NextN layer (super::mtp); 0 = plain
+    let mut mtp_k = std::env::var("TANG_GLM5_MTP").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
     let push = |ids: &mut Vec<u32>, s: &str| -> Result<()> {
         for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
             if !w.is_empty() {
@@ -1642,7 +1697,8 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
                 ensure!(t == 0.0, "glm5: only greedy (--temp 0) for now");
             }
             "--eager" | "--no-think" => {}
-            "--draft" | "--seed" | "--ctx" | "--mtp" | "--bw" => {
+            "--mtp" => mtp_k = val()?.parse()?,
+            "--draft" | "--seed" | "--ctx" | "--bw" => {
                 val()?;
             }
             s if s.parse::<u32>().is_ok() => ids.push(s.parse()?),
@@ -1683,6 +1739,9 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         hp.n_vocab,
         t0.elapsed().as_secs_f64()
     );
+    if mtp_k > 0 {
+        return super::mtp::cli_run(&mut e, &ids, n, chunk, mtp_k, out.as_deref(), quiet || bench);
+    }
     let t1 = Instant::now();
     let mut cur = e.prefill(&ids, chunk)?;
     let prefill_s = t1.elapsed().as_secs_f64();
