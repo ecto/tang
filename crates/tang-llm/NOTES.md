@@ -29,6 +29,50 @@ the same lane*8 + 256i steps with the same fmaf and reduce. The test now asserts
 G5F=2. NOT yet measured: G5F=2 parity, fused bit-equality, ids gate, trace kda ms/token.
 >3 TB/s not reached (best 2.74 merged).
 
+### B300, 2026-10-27: verified (src md5-matched; Compiling tang-llm in the build log; all 45 FFN layers on the GPU)
+Base flags: `MOE=fast GEMV8=1 KDA_PF2=1 MHC_FUSED=1 MLA_RESIDENT=1 GPU_HEAD=1`.
+
+The real-layer-0 bench: T=1, CUDA events, kernel only, median of 50.
+
+| matrix | MB | k5_gemv8 µs | g5f_gemv µs | k5_qgemv µs (TB/s) |
+|---|---|---|---|---|
+| q / k / v (8192×4096) | 35.7 | 22.5 | 19.2 | 15.3 (2.33) |
+| f_a / g_a (128×4096) | 0.6 | 11.1 | 11.4 | 8.0 |
+| o (4096×8192) | 35.7 | 30.4 | 19.6 | 17.5 (2.03) |
+| merged q\|k\|v\|f_a\|g_a | 108.1 | — | — | 35.6 (**3.04**) |
+| per layer, 6 matrices | 143.8 | 120.0 | 99.9 | 79.5; merged + o **53.1** |
+
+- Parity, 32 decode steps.
+  - G5F=1 vs gemv8: bit-identical. This is by construction: the same lane dot and the same order.
+  - G5F=2 vs gemv8: out rel 1.7e-5, state rel 2.5e-7.
+  - Fused and graph vs naive: 0 differing bits in output and state, at both G5F=1 and G5F=2.
+- Fused per-stage GPU µs/step (proj / gate2 / step / o_proj / total):
+
+| G5F | proj | gate2 | step | o_proj | total |
+|---|---|---|---|---|---|
+| 0 | 1347 | 52 | 36 | 38 | 1473 |
+| 1 | 109 | 52 | 36 | 40 | 237 |
+| 2 | 68 | 52 | 26 | 23 | 169 |
+
+  This CONFIRMS the fused regression. With gemv8, `k5d_proj` computes only beta, one thread per
+  4096-wide row, and that is 1.28 ms of the 1.35 ms proj stage. Under G5F the fused path runs
+  beta on k5_beta.
+- ids gate (n 8, temp 0): all = `785 1196 6801 264 6386 38038 911 279` at G5F=0, 1 and 2. The
+  -n 32 trace runs produce the same 32 ids at all three settings.
+- TRACE -n 32, decode per token (kda = host wall; the trace's GPU column is unreliable on the B300):
+
+| G5F | kda ms/token | launches/token | decode tok/s |
+|---|---|---|---|
+| 0 | 12.91 | 1111 | 23.75 |
+| 1 | 12.73 | 1111 | 23.85 |
+| 2 | **10.34** | 975 | **25.60** |
+
+Reading:
+- The KDA stage on the naive path is ~300 µs/layer of host wall against ~170 µs of GPU work.
+  The rest is launch and sync overhead.
+- The fused+graph path at G5F=2 is now 187 µs/step host in the bench, vs 224 for naive.
+- It has not been A/B'd end-to-end with G5F=2 yet. That is the next step: graph + G5F=2.
+
 Ops: my sync script's `rsync --delete` wiped the run scripts and logs I had written inside the
 synced dir (/root/w-gemv, /root/w-gemv2). Nothing on the pod deletes files. Keep run artifacts
 outside the rsync target.
