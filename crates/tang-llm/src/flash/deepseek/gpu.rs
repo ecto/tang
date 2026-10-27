@@ -88,6 +88,8 @@ pub struct Kernels {
     rope: Func,
     sparse_attn: Func,
     sinkhorn: Func,
+    /// `ds_lin_f{fmt}_t{tm}_g{gu}`, by (fmt - 2, log2 tm, gu).
+    fast: [[[Func; 2]; 4]; 2],
     /// Every other kernel, by name, for [`Kernels::go`].
     more: std::collections::HashMap<&'static str, Func>,
 }
@@ -129,6 +131,20 @@ impl Kernels {
             rope: m.func("ds_rope")?,
             sparse_attn: m.func("ds_sparse_attn")?,
             sinkhorn: m.func("ds_sinkhorn")?,
+            fast: {
+                let f = |fmt: usize, tm: usize, gu: usize| {
+                    m.func(&format!("ds_lin_f{}_t{}_g{gu}", fmt + 2, 1 << tm))
+                };
+                let mut a = [[[std::ptr::null_mut(); 2]; 4]; 2];
+                for (fi, af) in a.iter_mut().enumerate() {
+                    for (ti, at) in af.iter_mut().enumerate() {
+                        for (gi, ag) in at.iter_mut().enumerate() {
+                            *ag = f(fi, ti, gi)?;
+                        }
+                    }
+                }
+                a
+            },
             more: MORE
                 .iter()
                 .map(|&n| Ok((n, m.func(n)?)))
@@ -169,6 +185,74 @@ impl Kernels {
                 s,
                 tang_moe::args![wv, x, y, ti, r],
             )?
+        }
+        Ok(())
+    }
+
+    /// Whether [`Kernels::linear_fast`] takes `w`: fp8 or fp4 with whole 32-column groups.
+    pub fn fast_ok(w: &DsW) -> bool {
+        w.fmt >= 2 && w.cols % 32 == 0 && w.cols > 0
+    }
+
+    /// `linear` for fp8/fp4 weights ([`Kernels::fast_ok`]), bit-identical to [`Kernels::linear`]
+    /// (after [`Kernels::fp8_qdq`] when `qdq`), at near memory bandwidth for small `t`: weights
+    /// are read once per 8 token rows. With `w3` (same shape and format as `w`), the fused
+    /// SwiGLU: `y` = `ds_swiglu(bf(x·w1ᵀ), bf(x·w3ᵀ), rw, lim)`, `rw` per-token weights or 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_fast(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        w3: Option<&DsW>,
+        x: u64,
+        y: u64,
+        t: usize,
+        round: bool,
+        qdq: bool,
+        rw: u64,
+        lim: f32,
+    ) -> Result<()> {
+        if !Self::fast_ok(w) {
+            bail!("linear_fast: fmt {} cols {}", w.fmt, w.cols);
+        }
+        if let Some(w3) = w3 {
+            if (w3.fmt, w3.rows, w3.cols) != (w.fmt, w.rows, w.cols) {
+                bail!("linear_fast: w1/w3 mismatch");
+            }
+        }
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        let gu = w3.is_some() as usize;
+        let per_warp = if gu == 1 { 2 } else { 4 };
+        let grid = blocks(rows.div_ceil(per_warp), 4);
+        let (r, q) = (round as i32, qdq as i32);
+        let mut t0 = 0;
+        while t0 < t {
+            let n = (t - t0).min(8);
+            let tm = match n {
+                1 => 0,
+                2 => 1,
+                3 | 4 => 2,
+                _ => 3,
+            };
+            let f = self.fast[w.fmt as usize - 2][tm][gu];
+            let (wv, w3v) = (*w, *w3.unwrap_or(w));
+            let (xo, yo, ni) = (
+                x + (t0 * cols * 4) as u64,
+                y + (t0 * rows * 4) as u64,
+                n as i32,
+            );
+            let rwo = if rw == 0 { 0 } else { rw + (t0 * 4) as u64 };
+            unsafe {
+                gpu::launch(
+                    f,
+                    grid,
+                    (128, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![wv, w3v, xo, yo, ni, r, q, rwo, lim],
+                )?
+            }
+            t0 += n;
         }
         Ok(())
     }
@@ -553,6 +637,265 @@ mod tests {
             assert!(
                 rel(&gc[ti * hc * hc..(ti + 1) * hc * hc], &wc) < 1e-5,
                 "sinkhorn comb"
+            );
+        }
+    }
+
+    /// Activations with group magnitudes spread over a few binades, so the fused activation
+    /// quant sees varied scales.
+    fn acts(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = data(n, seed, 2.0);
+        for (g, c) in x.chunks_mut(32).enumerate() {
+            let m = 2f32.powi((g % 7) as i32 - 3);
+            for v in c {
+                *v = bf(*v * m);
+            }
+        }
+        x
+    }
+
+    /// The slow path: fp8_qdq on a copy, then ds_linear (bf16 out).
+    fn slow(k: &Kernels, s: &Stream, w: &DsW, x: &[f32], t: usize) -> Vec<f32> {
+        let dx = DevBuf::from_slice(x).unwrap();
+        k.fp8_qdq(s, dx.ptr, x.len()).unwrap();
+        let dy = DevBuf::alloc(t * w.rows as usize * 4).unwrap();
+        k.linear(s, w, dx.ptr, dy.ptr, t, true).unwrap();
+        s.sync().unwrap();
+        dy.read::<f32>(0, t * w.rows as usize).unwrap()
+    }
+
+    /// The fast GEMV against the slow path, bit for bit, for every fp8/fp4 weight shape in
+    /// the fixture, with the activation quant fused and not, over decode and verify widths
+    /// (and t > 8, which runs in launches of 8).
+    #[test]
+    fn fast_linear_is_bit_exact() {
+        let Some((_g, k, s, m)) = setup() else { return };
+        let mut seen = std::collections::HashSet::new();
+        let mut names: Vec<&str> = m.st.names().filter(|n| n.ends_with("weight")).collect();
+        names.sort();
+        let mut checked = 0;
+        for name in names {
+            let info = m.st.info(name).unwrap();
+            if !matches!(info.dtype, Dtype::F8E4M3 | Dtype::I8 | Dtype::U8) || info.shape.len() != 2
+            {
+                continue;
+            }
+            if !seen.insert((info.dtype as u8, info.shape.clone())) {
+                continue;
+            }
+            let Ok(w) = DevW::upload(&m.st, name) else {
+                continue;
+            };
+            assert!(Kernels::fast_ok(&w.v), "{name}");
+            let (rows, cols) = (w.v.rows as usize, w.v.cols as usize);
+            for t in [1, 2, 3, 4, 5, 6, 8, 11] {
+                let x = acts(t * cols, 11 + t as u64);
+                let want = slow(&k, &s, &w.v, &x, t);
+                let dy = DevBuf::alloc(t * rows * 4).unwrap();
+                // fused qdq
+                let dx = DevBuf::from_slice(&x).unwrap();
+                k.linear_fast(&s, &w.v, None, dx.ptr, dy.ptr, t, true, true, 0, 0.0)
+                    .unwrap();
+                s.sync().unwrap();
+                assert_eq!(
+                    dy.read::<f32>(0, t * rows).unwrap(),
+                    want,
+                    "{name} t {t} fused"
+                );
+                // pre-quantized
+                k.fp8_qdq(&s, dx.ptr, x.len()).unwrap();
+                k.linear_fast(&s, &w.v, None, dx.ptr, dy.ptr, t, true, false, 0, 0.0)
+                    .unwrap();
+                s.sync().unwrap();
+                assert_eq!(dy.read::<f32>(0, t * rows).unwrap(), want, "{name} t {t}");
+            }
+            eprintln!("{name} fmt {} [{rows}, {cols}]: exact", w.v.fmt);
+            checked += 1;
+        }
+        assert!(checked >= 8, "only {checked} shapes");
+    }
+
+    /// The fused w1/w3 GEMV + SwiGLU against two slow GEMVs and ds_swiglu, bit for bit.
+    #[test]
+    fn fast_swiglu_is_bit_exact() {
+        let Some((_g, k, s, m)) = setup() else { return };
+        let lim = m.cfg.swiglu_limit;
+        for p in ["layers.0.ffn.experts.0", "layers.0.ffn.shared_experts"] {
+            let w1 = DevW::upload(&m.st, &format!("{p}.w1.weight")).unwrap();
+            let w3 = DevW::upload(&m.st, &format!("{p}.w3.weight")).unwrap();
+            let (inter, cols) = (w1.v.rows as usize, w1.v.cols as usize);
+            for t in [1, 2, 5, 6, 8, 11] {
+                for routed in [false, true] {
+                    let x = acts(t * cols, 21 + t as u64);
+                    let g = DevBuf::from_slice(&slow(&k, &s, &w1.v, &x, t)).unwrap();
+                    let u = DevBuf::from_slice(&slow(&k, &s, &w3.v, &x, t)).unwrap();
+                    let rw = DevBuf::from_slice(&data(t, 5, 1.5)).unwrap();
+                    let rwp = if routed { rw.ptr } else { 0 };
+                    let h = DevBuf::alloc(t * inter * 4).unwrap();
+                    let (nn, ii) = ((t * inter) as i64, inter as i32);
+                    unsafe {
+                        k.go(
+                            "ds_swiglu",
+                            blocks(t * inter, 256),
+                            (256, 1, 1),
+                            0,
+                            &s,
+                            tang_moe::args![g.ptr, u.ptr, rwp, h.ptr, nn, ii, lim],
+                        )
+                        .unwrap()
+                    };
+                    s.sync().unwrap();
+                    let want = h.read::<f32>(0, t * inter).unwrap();
+                    let dx = DevBuf::from_slice(&x).unwrap();
+                    k.linear_fast(
+                        &s,
+                        &w1.v,
+                        Some(&w3.v),
+                        dx.ptr,
+                        h.ptr,
+                        t,
+                        true,
+                        true,
+                        rwp,
+                        lim,
+                    )
+                    .unwrap();
+                    s.sync().unwrap();
+                    assert_eq!(
+                        h.read::<f32>(0, t * inter).unwrap(),
+                        want,
+                        "{p} t {t} routed {routed}"
+                    );
+                }
+            }
+            eprintln!("{p} fmt {}: swiglu exact", w1.v.fmt);
+        }
+    }
+
+    /// Bandwidth on the real model's shapes with random weights (manual: `--ignored
+    /// --nocapture fast_linear_bench`). Bytes = weights + scales read once per launch.
+    #[test]
+    #[ignore]
+    fn fast_linear_bench() {
+        let Some(_g) = Gpu::for_test() else { return };
+        _g.bind().unwrap();
+        let k = Kernels::new(&_g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let peak: f64 = std::env::var("DS_PEAK_GBS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(936.0);
+        let rand_bytes = |n: usize, seed: u64| -> Vec<u8> {
+            let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let mk = |fmt: i32, rows: usize, cols: usize, seed: u64| -> (DevBuf, DevBuf, DsW, usize) {
+            let mut wb = rand_bytes(
+                if fmt == 3 {
+                    rows * cols / 2
+                } else {
+                    rows * cols
+                },
+                seed,
+            );
+            if fmt == 2 {
+                for b in &mut wb {
+                    if *b & 0x7f == 0x7f {
+                        *b = 0x10; // no NaN codes
+                    }
+                }
+            }
+            let ns = if fmt == 3 {
+                rows * cols / 32
+            } else {
+                rows.div_ceil(32) * cols / 32
+            };
+            let sb: Vec<u8> = rand_bytes(ns, seed + 1)
+                .iter()
+                .map(|b| 118 + b % 8)
+                .collect();
+            let (w, sc) = (
+                DevBuf::from_slice(&wb).unwrap(),
+                DevBuf::from_slice(&sb).unwrap(),
+            );
+            let v = DsW {
+                w: w.ptr,
+                s: sc.ptr,
+                rows: rows as i32,
+                cols: cols as i32,
+                fmt,
+                _pad: 0,
+            };
+            (w, sc, v, wb.len() + sb.len())
+        };
+        let time = |f: &dyn Fn()| -> f64 {
+            f();
+            s.sync().unwrap();
+            let n = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            s.sync().unwrap();
+            t0.elapsed().as_secs_f64() / n as f64
+        };
+        let shapes: &[(&str, i32, usize, usize)] = &[
+            ("expert w1", 3, 2304, 5120),
+            ("expert w2", 3, 5120, 2304),
+            ("wq_b", 2, 32768, 1280),
+            ("wo_a", 2, 8192, 4096),
+            ("wo_b", 2, 5120, 8192),
+            ("wkv", 2, 512, 5120),
+        ];
+        for &(label, fmt, rows, cols) in shapes {
+            let (_w, _s, w, bytes) = mk(fmt, rows, cols, rows as u64 + cols as u64);
+            for t in [1, 6, 8] {
+                let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
+                let y = DevBuf::alloc(t * rows * 4).unwrap();
+                let tf = time(&|| {
+                    k.linear_fast(&s, &w, None, x.ptr, y.ptr, t, true, true, 0, 0.0)
+                        .unwrap()
+                });
+                let ts = if t == 1 {
+                    time(&|| {
+                        k.fp8_qdq(&s, x.ptr, t * cols).unwrap();
+                        k.linear(&s, &w, x.ptr, y.ptr, t, true).unwrap()
+                    })
+                } else {
+                    f64::NAN
+                };
+                let gbs = bytes as f64 / tf / 1e9;
+                eprintln!(
+                    "{label:10} fmt {fmt} [{rows:5}, {cols:5}] t {t}: fast {:7.1} us {gbs:6.1} GB/s ({:4.1}% of {peak}) | slow {:8.1} us ({:5.1}x)",
+                    tf * 1e6,
+                    100.0 * gbs / peak,
+                    ts * 1e6,
+                    ts / tf
+                );
+            }
+        }
+        // fused w1/w3 + SwiGLU
+        let (_a, _b, w1, b1) = mk(3, 2304, 5120, 1);
+        let (_c, _d, w3, b3) = mk(3, 2304, 5120, 2);
+        for t in [1, 6, 8] {
+            let x = DevBuf::from_slice(&data(t * 5120, 3, 2.0)).unwrap();
+            let h = DevBuf::alloc(t * 2304 * 4).unwrap();
+            let tf = time(&|| {
+                k.linear_fast(&s, &w1, Some(&w3), x.ptr, h.ptr, t, true, true, 0, 10.0)
+                    .unwrap()
+            });
+            let gbs = (b1 + b3) as f64 / tf / 1e9;
+            eprintln!(
+                "expert gu  fmt 3 [2x2304, 5120] t {t}: fast {:7.1} us {gbs:6.1} GB/s ({:4.1}% of {peak})",
+                tf * 1e6,
+                100.0 * gbs / peak
             );
         }
     }

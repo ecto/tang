@@ -72,6 +72,9 @@ pub struct GpuModel {
     experts: RefCell<ExpertCache>,
     /// Routed-expert tensors kept on the device (`DS_EXPERT_SLOTS`; 0 = all).
     pub expert_slots: usize,
+    /// The fast GEMV path (`ds_lin_*`: fused activation quant and SwiGLU), bit-identical to
+    /// the naive `ds_linear` path kept for A/B (`DS_SLOW=1` turns it off).
+    pub fast: bool,
     tabs: Vec<DevBuf>,
     win: Vec<DevBuf>,
     ckv: HashMap<usize, DevBuf>,
@@ -146,6 +149,7 @@ impl GpuModel {
             cand: Vec::new(),
             force: None,
             taps: RefCell::new(Vec::new()),
+            fast: std::env::var_os("DS_SLOW").is_none(),
         })
     }
 
@@ -240,7 +244,11 @@ impl GpuModel {
         let w = self.dw(name)?;
         let (k, n) = (w.v.cols as usize, w.v.rows as usize);
         let y = fbuf(t * n)?;
-        if w.v.fmt >= 2 {
+        if self.fast && Kernels::fast_ok(&w.v) {
+            self.k
+                .linear_fast(&self.s, &w.v, None, x.ptr, y.ptr, t, true, true, 0, 0.0)?;
+            self.expert_fence(name)?;
+        } else if w.v.fmt >= 2 {
             let xq = fbuf(t * k)?;
             self.copy(xq.ptr, x.ptr, t * k)?;
             self.k.fp8_qdq(&self.s, xq.ptr, t * k)?;
@@ -702,7 +710,36 @@ impl GpuModel {
         Ok(h)
     }
 
+    /// An evicted expert's memory is freed at once: drain kernels reading it first.
+    fn expert_fence(&self, name: &str) -> Result<()> {
+        if self.expert_slots > 0 && name.contains(".ffn.experts.") {
+            self.s.sync()?;
+        }
+        Ok(())
+    }
+
     fn mlp(&self, p: &str, x: &DevBuf, n: usize, w: u64) -> Result<DevBuf> {
+        let (n1, n3) = (format!("{p}.w1.weight"), format!("{p}.w3.weight"));
+        if self.fast {
+            let (w1, w3) = (self.dw(&n1)?, self.dw(&n3)?);
+            if Kernels::fast_ok(&w1.v) && Kernels::fast_ok(&w3.v) {
+                let h = fbuf(n * w1.v.rows as usize)?;
+                self.k.linear_fast(
+                    &self.s,
+                    &w1.v,
+                    Some(&w3.v),
+                    x.ptr,
+                    h.ptr,
+                    n,
+                    true,
+                    true,
+                    w,
+                    self.cpu.cfg.swiglu_limit,
+                )?;
+                self.expert_fence(&n1)?;
+                return self.lin(&h, n, &format!("{p}.w2.weight"));
+            }
+        }
         let g = self.lin(x, n, &format!("{p}.w1.weight"))?;
         let u = self.lin(x, n, &format!("{p}.w3.weight"))?;
         let inter = self.dw(&format!("{p}.w1.weight"))?.v.rows as usize;

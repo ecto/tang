@@ -104,7 +104,7 @@ extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int
     int ti = warp / w.rows, n = warp % w.rows;
     const float* xr = x + (long long)ti * w.cols;
     float s = 0.f;
-    for (int k = lane; k < w.cols; k += 32) s += xr[k] * wget(w, n, k);
+    for (int k = lane; k < w.cols; k += 32) s = fmaf(xr[k], wget(w, n, k), s);
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
     if (lane == 0) y[(long long)ti * w.rows + n] = round ? bf(s) : s;
 }
@@ -322,17 +322,20 @@ extern "C" __global__ void ds_mean_hc(const float* x, float* out, int t, int hc,
     out[i] = bf(s / hc);
 }
 
-// h[r][j] = bf(w[r] * silu(min(g, lim)) * clamp(u, ±lim)); w null for the shared expert.
-extern "C" __global__ void ds_swiglu(const float* g, const float* u, const float* w, float* h, long long n, int inter, float lim) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float gv = g[i], uv = u[i];
+__device__ __forceinline__ float swiglu1(float gv, float uv, const float* w, float lim) {
     if (lim > 0.f) {
         gv = fminf(gv, lim);
         uv = fminf(fmaxf(uv, -lim), lim);
     }
     float v = gv / (1.f + expf(-gv)) * uv;
-    h[i] = bf(w ? w[i / inter] * v : v);
+    return bf(w ? *w * v : v);
+}
+
+// h[r][j] = bf(w[r] * silu(min(g, lim)) * clamp(u, ±lim)); w null for the shared expert.
+extern "C" __global__ void ds_swiglu(const float* g, const float* u, const float* w, float* h, long long n, int inter, float lim) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    h[i] = swiglu1(g[i], u[i], w ? w + i / inter : 0, lim);
 }
 
 // The router for one token per thread: raw [t][ne] gate logits (f32) -> ids/weights [t][k].
@@ -487,3 +490,149 @@ extern "C" __global__ void ds_engram_gate(const float* x, const float* kv, const
     float* o = out + ((long long)ti * hc + c) * d;
     for (int i = threadIdx.x; i < d; i += blockDim.x) o[i] = bf(h[i] + gate * val[i]);
 }
+
+// ---- fast GEMV (decode, t <= 8 per launch) for fp8 (fmt 2) and fp4 (fmt 3) weights ----
+//
+// Bit-identical to ds_linear: lane l of the warp owning a row accumulates x[k] * w[k] for
+// k = l, l + 32, ... in increasing k with fmaf, then the same xor butterfly. The weights are
+// read with one 16-byte load per lane (32 fp4 / 16 fp8 values), decoded in registers and
+// transposed through shared memory so each lane gets its k = l (mod 32) column. Each warp owns
+// LR = 4 weight rows (8 lanes load each row's consecutive 128 bytes per tile), so one
+// activation read serves 4 rows, and all t <= TM token rows share each weight read.
+// `qdq` fuses ds_fp8_qdq: each 32-group is exactly one warp-wide column step, so its amax is a
+// warp max and the result is bit-identical to quantizing first.
+// GU: rows 0,1 come from w (w1) and rows 2,3 from w3 at the same output rows; the epilogue
+// emits h = swiglu1(bf(g), bf(u)) (ds_swiglu), `rw` the per-token route weights or null.
+
+#define LR 4
+#define LU 4  // tiles in flight per lane
+
+__device__ __forceinline__ float fp4v(unsigned int c) {
+    unsigned int m = c & 7, e = m >> 1;
+    unsigned int b = e ? (((e + 126u) << 23) | ((m & 1u) << 22)) : ((m & 1u) ? (126u << 23) : 0u);
+    return __uint_as_float(b | ((c & 8u) << 28));
+}
+
+__device__ __forceinline__ float e4m3v(unsigned int v) {
+    unsigned int e = (v >> 3) & 0xf, m = v & 7;
+    float a = e ? __uint_as_float(((e + 120u) << 23) | (m << 20)) : (float)m * 0.001953125f;
+    return (v & 0x80) ? -a : a;
+}
+
+template <int FMT, int TM, int GU>
+__device__ __forceinline__ void lin_fast(DsW w, DsW w3, const float* __restrict__ x, float* __restrict__ y, int t,
+                                         int round, int qdq, const float* __restrict__ rw, float lim) {
+    // chunks (32 columns) per tile per row: 8 lanes x 16 bytes
+    const int CT = FMT == 3 ? 8 : 4;
+    __shared__ float sh[4][LR][8][33];
+    int wib = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float(*S)[8][33] = sh[wib];
+    const int OUT = GU ? LR / 2 : LR;
+    int n0 = (blockIdx.x * (blockDim.x >> 5) + wib) * OUT;
+    int cols = w.cols, nch = cols / 32;
+    int r = lane >> 3, sub = lane & 7;
+    // the row this lane loads
+    int nr = GU ? n0 + (r & 1) : n0 + r;
+    const DsW& wr = (GU && r >= 2) ? w3 : w;
+    bool rv = nr < w.rows;
+    long long rbytes = FMT == 3 ? cols / 2 : cols;
+    const unsigned char* wp = (const unsigned char*)wr.w + (rv ? (long long)nr * rbytes : 0);
+    const unsigned char* sp = (const unsigned char*)wr.s;
+    float acc[LR][TM];
+#pragma unroll
+    for (int i = 0; i < LR; i++)
+#pragma unroll
+        for (int j = 0; j < TM; j++) acc[i][j] = 0.f;
+    int ntiles = (nch + CT - 1) / CT;
+    for (int tg = 0; tg < ntiles; tg += LU) {
+        uint4 buf[LU];
+        float scl[LU];
+#pragma unroll
+        for (int u = 0; u < LU; u++) {
+            int tile = tg + u;
+            // fp4: this lane's chunk; fp8: this lane's half chunk
+            int c = FMT == 3 ? tile * 8 + sub : (tile * 8 + sub) >> 1;
+            bool ok = rv && tile < ntiles && c < nch;
+            buf[u] = make_uint4(0, 0, 0, 0);
+            scl[u] = 0.f;
+            if (ok) {
+                buf[u] = __ldg((const uint4*)(wp + (long long)(tile * 8 + sub) * 16));
+                unsigned char sv = FMT == 3 ? __ldg(sp + (long long)nr * nch + c) : __ldg(sp + (long long)(nr / 32) * nch + c);
+                scl[u] = e8m0(sv);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < LU; u++) {
+            int tile = tg + u;
+            if (tile >= ntiles) break;
+            unsigned int q[4] = {buf[u].x, buf[u].y, buf[u].z, buf[u].w};
+            if (FMT == 3) {
+                float* d = &S[r][sub][0];
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+#pragma unroll
+                    for (int b = 0; b < 8; b++) d[i * 8 + b] = fp4v((q[i] >> (4 * b)) & 15u) * scl[u];
+            } else {
+                float* d = &S[r][sub >> 1][(sub & 1) * 16];
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+#pragma unroll
+                    for (int b = 0; b < 4; b++) d[i * 4 + b] = e4m3v((q[i] >> (8 * b)) & 255u) * scl[u];
+            }
+            __syncwarp();
+            int nj = min(CT, nch - tile * CT);
+            for (int j = 0; j < nj; j++) {
+                int k = (tile * CT + j) * 32 + lane;
+#pragma unroll
+                for (int ti = 0; ti < TM; ti++) {
+                    if (ti < t) {
+                        float xv = x[(long long)ti * cols + k];
+                        if (qdq) {
+                            float a = fabsf(xv);
+#pragma unroll
+                            for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+                            float s = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
+                            xv = bf(round_e4m3(fminf(fmaxf(xv / s, -448.f), 448.f)) * s);
+                        }
+#pragma unroll
+                        for (int i = 0; i < LR; i++) acc[i][ti] = fmaf(xv, S[i][j][lane], acc[i][ti]);
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < LR; i++)
+#pragma unroll
+        for (int ti = 0; ti < TM; ti++)
+#pragma unroll
+            for (int o = 16; o; o >>= 1) acc[i][ti] += __shfl_xor_sync(0xffffffffu, acc[i][ti], o);
+    if (lane != 0) return;
+#pragma unroll
+    for (int i = 0; i < OUT; i++) {
+        int n = n0 + i;
+        if (n >= w.rows) break;
+#pragma unroll
+        for (int ti = 0; ti < TM; ti++) {
+            if (ti >= t) break;
+            if (GU) {
+                y[(long long)ti * w.rows + n] = swiglu1(bf(acc[i][ti]), bf(acc[i + 2][ti]), rw ? rw + ti : 0, lim);
+            } else {
+                float s = acc[i][ti];
+                y[(long long)ti * w.rows + n] = round ? bf(s) : s;
+            }
+        }
+    }
+}
+
+#define DS_LIN(F, T, G)                                                                                       \
+    extern "C" __global__ void __launch_bounds__(128) ds_lin_f##F##_t##T##_g##G(                             \
+        DsW w, DsW w3, const float* x, float* y, int t, int round, int qdq, const float* rw, float lim) {     \
+        lin_fast<F, T, G>(w, w3, x, y, t, round, qdq, rw, lim);                                               \
+    }
+#define DS_LIN_T(F, G) DS_LIN(F, 1, G) DS_LIN(F, 2, G) DS_LIN(F, 4, G) DS_LIN(F, 8, G)
+DS_LIN_T(2, 0)
+DS_LIN_T(3, 0)
+DS_LIN_T(2, 1)
+DS_LIN_T(3, 1)

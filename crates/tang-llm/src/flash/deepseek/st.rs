@@ -120,6 +120,11 @@ impl St {
         Ok(Self { maps, index })
     }
 
+    /// Every tensor name, unordered.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.index.keys().map(|k| k.as_str())
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.index.contains_key(name)
     }
