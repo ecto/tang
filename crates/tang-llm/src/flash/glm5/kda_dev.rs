@@ -633,11 +633,25 @@ impl DevLayer {
 
     /// The per-row core of a batched decode window: row `i`'s qkv / g / beta (already
     /// projected for all rows) step slot `slots[i]`'s conv + recurrent state, writing row
-    /// `i` of `ob`. Two launches per row on the layer stream (a slot-index kernel taking
-    /// the whole batch in one launch is the next step).
+    /// `i` of `ob`. ONE `kda_step` launch for all rows + one batched conv commit when the
+    /// rows are in slot order (the usual case: `window_batch` walks slots 0..n).
     fn core_rows(&mut self, slots: &[usize]) -> Result<()> {
         let (nh, di) = (self.nh, self.d_inner);
         let f = std::mem::size_of::<f32>() as u64;
+        // kda_step indexes the state by `blockIdx.y` — which is the ROW index, so it hits
+        // slot i's state only when row i IS slot i. Otherwise the per-row fallback.
+        if slots.iter().enumerate().all(|(i, &s)| s == i) {
+            self.core.decode_dev_rows(
+                &self.kers,
+                &self.s,
+                slots,
+                self.qkvb.ptr,
+                self.gb_out.ptr,
+                self.bb.ptr,
+                self.ob.ptr,
+            )?;
+            return Ok(());
+        }
         for (i, &slot) in slots.iter().enumerate() {
             let i = i as u64;
             self.core.decode_dev(

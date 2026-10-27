@@ -78,6 +78,23 @@ extern "C" __global__ void kda_conv_commit(float* __restrict__ H0, const float* 
         H0[ch * (KDA_KC - 1) + s] = p < KDA_KC - 1 ? old[p] : X[(p - (KDA_KC - 1)) * stride + ch];
     }
 }
+
+// batched decode commit: same shift, but the row `bi` belongs to SLOT[bi] — the state
+// offset is `SLOT[bi] * KDA_CONV`, not `bi * KDA_CONV` (T = 1, one row per slot).
+extern "C" __global__ void kda_conv_commit_rows(float* __restrict__ H0, const float* __restrict__ X,
+                                                const unsigned int* __restrict__ SLOT) {
+    unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int bi = blockIdx.y;
+    if (ch >= KDA_CONV) return;
+    X += (u64)bi * KDA_CONV;
+    H0 += (u64)SLOT[bi] * KDA_CONV;
+    float old[KDA_KC - 1];
+    for (unsigned int s = 0; s < KDA_KC - 1; s++) old[s] = H0[ch * (KDA_KC - 1) + s];
+    for (unsigned int s = 0; s < KDA_KC - 1; s++) {
+        unsigned long long p = 1 + s;
+        H0[ch * (KDA_KC - 1) + s] = p < KDA_KC - 1 ? old[p] : X[ch];
+    }
+}
 "#;
 
 /// `kda_step`: the fused conv + delta-rule decode step for one token (all heads in one
@@ -588,6 +605,8 @@ pub mod cuda {
         pub conv_ip: sys::CUfunction,
         pub pf_intra: sys::CUfunction,
         pub pf_state: sys::CUfunction,
+        /// the batched decode commit (`kda_conv_commit_rows`: the rows are slots)
+        pub conv_commit_rows: sys::CUfunction,
         pub _mod: tang_moe::gpu::Module,
     }
 
@@ -610,6 +629,7 @@ pub mod cuda {
             conv_ip: m.func("kda_conv_ip")?,
             pf_intra: m.func("kda_pf_intra")?,
             pf_state: m.func("kda_pf_state")?,
+            conv_commit_rows: m.func("kda_conv_commit_rows")?,
             _mod: m,
         })
     }
@@ -630,6 +650,8 @@ pub mod cuda {
         pub wconv: DevBuf,
         pub h0: DevBuf,
         pub st: DevBuf,
+        /// u32 slot ids of the current batched decode window ([`Self::decode_dev_rows`])
+        slots_dev: DevBuf,
         /// preallocated: chunk-64 x/g/beta/o/scratch for prefill, reused for decode
         pub xb: DevBuf,
         pub gb: DevBuf,
@@ -688,6 +710,7 @@ pub mod cuda {
                 wconv: DevBuf::from_slice(wconv)?,
                 h0: DevBuf::from_slice(&h0)?,
                 st: DevBuf::from_slice(&st)?,
+                slots_dev: DevBuf::zeroed(slots * 4)?,
                 xb: DevBuf::zeroed(slots * chunk * ch_dim * 4)?,
                 gb: DevBuf::zeroed(slots * chunk * nh * hd * 4)?,
                 bb: DevBuf::zeroed(slots * chunk * nh * 4)?,
@@ -959,6 +982,49 @@ pub mod cuda {
                 self.h0.ptr + slot as u64 * self.ch_dim as u64 * self.d_conv_m1 as u64 * f,
                 self.st.ptr + slot as u64 * self.nh as u64 * self.hd as u64 * self.hd as u64 * f,
             )
+        }
+
+        /// The batched decode step: row `i` (its qkv `[conv_dim]`, g `[H·D]`, beta `[H]`,
+        /// o `[H·D]` at byte offset `i·<width>·4`) steps `slots[i]`'s state and commits its
+        /// conv history — the SAME launches the per-row [`Self::decode_dev`] issues, N
+        /// rows in two launches (`kda_step`'s `bi` already indexes QKV/G/S/O rows; only
+        /// the commit's H0 offset needs the slot id). `slots` must be distinct (two rows
+        /// on one slot would interleave the state updates — the engine never does it).
+        pub fn decode_dev_rows(
+            &mut self,
+            k: &Kernels,
+            s: &Stream,
+            slots: &[usize],
+            qkv: u64,
+            g: u64,
+            beta: u64,
+            o: u64,
+        ) -> Result<()> {
+            let n = slots.len();
+            ensure!(n > 0 && n <= self.slots_dev.len() / 4, "k5 rows: {n} rows");
+            let ids: Vec<u32> = slots.iter().map(|&s| s as u32).collect();
+            self.slots_dev.write(0, &ids)?;
+            let f = std::mem::size_of::<f32>() as u64;
+            let (nh, hd) = (self.nh, self.hd);
+            unsafe {
+                launch(
+                    k.step,
+                    (nh as u32, n as u32, 1),
+                    (hd as u32, 1, 1),
+                    (3 * hd * 4) as u32,
+                    s,
+                    args![qkv, self.h0.ptr, self.wconv.ptr, g, beta, self.st.ptr, o],
+                )?;
+                launch(
+                    k.conv_commit_rows,
+                    (self.ch_dim.div_ceil(256) as u32, n as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    args![self.h0.ptr, qkv, self.slots_dev.ptr],
+                )?;
+            }
+            Ok(())
         }
 
         /// Read the conv history back (for a CPU fallback window or a checkpoint).
