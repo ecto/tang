@@ -13,6 +13,7 @@
 use super::quant::{bf, bf_all, fp4_qdq, fp8_qdq};
 use super::st::{Dtype, St};
 use super::{Config, EngramMeta};
+use crate::engine::{Finish, Usage};
 use anyhow::{ensure, Result};
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -262,9 +263,11 @@ pub struct Model {
 
 /// The DSpark draft of one decode step.
 pub struct Draft {
-    /// The sampled token, then `block` greedy drafts.
+    /// The sampled token, then `block` drafts (greedy, or drawn from `logits` by
+    /// [`Model::forward_spec_with`]).
     pub ids: Vec<usize>,
-    /// [block][vocab]
+    /// [block][vocab] draft logits, Markov bias included: draft `i` was drawn from row `i`
+    /// (the q of speculative sampling, before temperature / top-p).
     pub logits: Vec<f32>,
     /// [block]
     pub conf: Vec<f32>,
@@ -1277,6 +1280,19 @@ impl Model {
         main_hidden: &[f32],
         sp: usize,
     ) -> Result<Option<Draft>> {
+        self.forward_spec_with(token, main_hidden, sp, &mut |q: &[f32]| argmax(q))
+    }
+
+    /// [`Self::forward_spec`] with the drafts drawn by `draw` from each position's draft logits
+    /// (Markov bias included, the q of rejection sampling): argmax when greedy, a sample from
+    /// q otherwise. The next position's Markov bias follows the drawn token.
+    pub fn forward_spec_with(
+        &mut self,
+        token: usize,
+        main_hidden: &[f32],
+        sp: usize,
+        draw: &mut dyn FnMut(&[f32]) -> usize,
+    ) -> Result<Option<Draft>> {
         let c = self.cfg.clone();
         let (hc, d, blk, n_mtp) = (c.hc_mult, c.dim, c.dspark_block_size, c.n_mtp_layers);
         let t = main_hidden.len() / (d * c.dspark_target_layer_ids.len());
@@ -1323,13 +1339,7 @@ impl Model {
             for (a, b) in li.iter_mut().zip(&bias) {
                 *a += b;
             }
-            let mut best = 0;
-            for j in 1..v {
-                if li[j] > li[best] {
-                    best = j;
-                }
-            }
-            out.push(best);
+            out.push(draw(li));
             let feat: Vec<f32> = x[i * d..(i + 1) * d].iter().chain(memb).copied().collect();
             conf.push(matmul(&feat, 1, &proj)[0]);
         }
@@ -1365,10 +1375,173 @@ pub struct SpecStep {
     pub sp: usize,
 }
 
-/// Greedy pick (temperature 0). Sampling would replace this and the accept rule with the
-/// standard rejection test over the draft and target distributions.
 pub fn argmax(v: &[f32]) -> usize {
     (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b })
+}
+
+/// Splitmix64, for seeded sampling.
+pub fn next_u64(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+fn uniform(rng: &mut u64) -> f64 {
+    (next_u64(rng) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// How [`Model::decode_spec`] picks tokens: the drafts from the drafter's logits, and at each
+/// verify row the kept token. Greedy ([`Greedy`]) or speculative sampling ([`SpecSampler`]);
+/// the GPU engine takes the same object.
+pub trait SpecPick {
+    /// A draft from draft logits `q` (Markov bias included).
+    fn draft(&mut self, q: &[f32]) -> usize;
+    /// The token at a verify row with target logits `p`. With `Some((q, d))` the row checks
+    /// draft `d` drawn from `q`: returns `(d, true)` to accept it, else `(replacement, false)`.
+    /// With `None` (every draft accepted, or no drafts) the bonus token from `p`.
+    fn verify(&mut self, p: &[f32], draft: Option<(&[f32], usize)>) -> (usize, bool);
+}
+
+/// Temperature 0: argmax drafts, a draft is kept iff it is the target's argmax.
+pub struct Greedy;
+
+impl SpecPick for Greedy {
+    fn draft(&mut self, q: &[f32]) -> usize {
+        argmax(q)
+    }
+    fn verify(&mut self, p: &[f32], draft: Option<(&[f32], usize)>) -> (usize, bool) {
+        let t = argmax(p);
+        (t, draft.is_some_and(|(_, d)| d == t))
+    }
+}
+
+/// Temperature + nucleus sampling, and speculative sampling (Leviathan et al. / Chen et al.)
+/// over it. Both the target p and the draft q go through the same transform (softmax of
+/// logits / temperature, then top-p truncation and renormalisation), and rejection sampling
+/// runs between the transformed P and Q, so each emitted token is distributed exactly as a
+/// plain draw from P: what [`Self::sample`] would give decoding one token at a time. At
+/// temperature 0 it is [`Greedy`] (the transform is a point mass at the argmax).
+pub struct SpecSampler {
+    pub temp: f32,
+    pub top_p: f32,
+    pub rng: u64,
+}
+
+impl SpecSampler {
+    pub fn new(temp: f32, top_p: f32, seed: u64) -> Self {
+        Self {
+            temp,
+            top_p,
+            rng: seed,
+        }
+    }
+
+    pub fn greedy(&self) -> bool {
+        self.temp <= 0.0
+    }
+
+    /// The transformed distribution: (token, probability) by decreasing probability (ties
+    /// by token), cut to the smallest prefix holding `top_p` of the mass, renormalised.
+    pub fn dist(&self, logits: &[f32]) -> Vec<(usize, f64)> {
+        if self.greedy() {
+            return vec![(argmax(logits), 1.0)];
+        }
+        let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let w: Vec<f64> = logits
+            .iter()
+            .map(|&l| (((l - mx) / self.temp) as f64).exp())
+            .collect();
+        let z: f64 = w.iter().sum();
+        let by = |a: &usize, b: &usize| w[*b].partial_cmp(&w[*a]).unwrap().then(a.cmp(b));
+        let mut idx: Vec<usize> = (0..w.len()).collect();
+        if self.top_p < 1.0 {
+            // partial selection: grow the head until it holds top_p of the mass
+            let mut k = 256.min(idx.len());
+            loop {
+                if k < idx.len() {
+                    idx.select_nth_unstable_by(k - 1, by);
+                }
+                let head: f64 = idx[..k].iter().map(|&i| w[i]).sum();
+                if head / z >= self.top_p as f64 || k == idx.len() {
+                    break;
+                }
+                k = (k * 4).min(idx.len());
+            }
+            idx.truncate(k);
+        }
+        idx.sort_unstable_by(by);
+        let mut keep = idx.len();
+        if self.top_p < 1.0 {
+            let mut acc = 0.0;
+            for (j, &i) in idx.iter().enumerate() {
+                acc += w[i] / z;
+                if acc >= self.top_p as f64 {
+                    keep = j + 1;
+                    break;
+                }
+            }
+        }
+        idx.truncate(keep);
+        let total: f64 = idx.iter().map(|&i| w[i]).sum();
+        idx.into_iter().map(|i| (i, w[i] / total)).collect()
+    }
+
+    fn draw(&mut self, d: &[(usize, f64)]) -> usize {
+        let mut r = uniform(&mut self.rng) * d.iter().map(|x| x.1).sum::<f64>();
+        for &(i, p) in d {
+            r -= p;
+            if r <= 0.0 {
+                return i;
+            }
+        }
+        d.last().unwrap().0
+    }
+
+    /// One token from `logits`: argmax at temperature 0, else a draw from [`Self::dist`].
+    pub fn sample(&mut self, logits: &[f32]) -> usize {
+        if self.greedy() {
+            return argmax(logits);
+        }
+        let d = self.dist(logits);
+        self.draw(&d)
+    }
+}
+
+impl SpecPick for SpecSampler {
+    fn draft(&mut self, q: &[f32]) -> usize {
+        self.sample(q)
+    }
+
+    fn verify(&mut self, p: &[f32], draft: Option<(&[f32], usize)>) -> (usize, bool) {
+        if self.greedy() {
+            return Greedy.verify(p, draft);
+        }
+        let pd = self.dist(p);
+        let Some((q, d)) = draft else {
+            return (self.draw(&pd), false);
+        };
+        let qd = self.dist(q);
+        let at = |x: &[(usize, f64)], t: usize| x.iter().find(|e| e.0 == t).map_or(0.0, |e| e.1);
+        let (pp, qq) = (at(&pd, d), at(&qd, d));
+        // accept with probability min(1, P(d) / Q(d))
+        if qq > 0.0 && uniform(&mut self.rng) * qq < pp {
+            return (d, true);
+        }
+        // else draw from norm(max(0, P - Q))
+        let mut qm: HashMap<usize, f64> = qd.into_iter().collect();
+        let res: Vec<(usize, f64)> = pd
+            .iter()
+            .map(|&(i, x)| (i, (x - qm.remove(&i).unwrap_or(0.0)).max(0.0)))
+            .filter(|e| e.1 > 0.0)
+            .collect();
+        if res.is_empty() {
+            // P == Q up to rounding: the residual is empty, P itself is exact
+            return (self.draw(&pd), false);
+        }
+        (self.draw(&res), false)
+    }
 }
 
 impl Model {
@@ -1402,37 +1575,35 @@ impl Model {
         }
     }
 
-    /// One greedy speculative step. `token` is the sampled, not yet fed, token at position
-    /// `sp + rows(main)`; `main` the target hiddens of positions `sp..`. Drafts with DSpark,
-    /// verifies `[token, drafts]` as one window, keeps the longest prefix the main model agrees
-    /// with and rewinds the rest. `edit(pos, drafts)` may rewrite the drafts, the first at
-    /// position `pos` (tests force wrong ones).
+    /// One speculative step. `token` is the sampled, not yet fed, token at position
+    /// `sp + rows(main)`; `main` the target hiddens of positions `sp..`. Drafts with DSpark
+    /// (each draft from `pick.draft`), verifies `[token, drafts]` as one window, walks the rows
+    /// with `pick.verify` until the first rejection (whose replacement, or the bonus token
+    /// after a fully accepted window, ends the step) and rewinds the rest. With [`Greedy`] this
+    /// is greedy decoding; with [`SpecSampler`] speculative sampling. `edit(pos, drafts)` may
+    /// rewrite the drafts, the first at position `pos` (tests force wrong ones; sampling's
+    /// guarantee assumes unedited drafts).
     pub fn decode_spec(
         &mut self,
         token: usize,
         main: &[f32],
         sp: usize,
         edit: &mut dyn FnMut(usize, &mut [usize]),
+        pick: &mut dyn SpecPick,
     ) -> Result<SpecStep> {
         let c = &self.cfg;
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
         let draft = self
-            .forward_spec(token, main, sp)?
+            .forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q))?
             .ok_or_else(|| anyhow::anyhow!("decode_spec needs sp > 0"))?;
         let mut ids = draft.ids;
         edit(pos0 + 1, &mut ids[1..]);
         let snap = self.snapshot();
         let (logits, mains) = self.forward_all(&ids, pos0)?;
         let n = ids.len();
-        let mut k = 0;
-        while k + 1 < n && argmax(&logits[k * v..(k + 1) * v]) == ids[k + 1] {
-            k += 1;
-        }
-        let next = argmax(&logits[k * v..(k + 1) * v]);
+        let (k, tokens) = verify_rows(&logits, &draft.logits, &ids, v, pick);
         self.rewind(&snap, pos0 + k + 1, pos0 + n);
-        let mut tokens = ids[1..=k].to_vec();
-        tokens.push(next);
         Ok(SpecStep {
             tokens,
             drafted: n - 1,
@@ -1441,6 +1612,157 @@ impl Model {
             sp: pos0,
         })
     }
+}
+
+/// The accept walk of a verify window: `logits` [n][v] of the window `ids` (the fed token,
+/// then n-1 drafts drawn from the rows of `q` [n-1][v]). Returns the accepted count k and the
+/// new tokens (`ids[1..=k]`, then the replacement or bonus token).
+pub fn verify_rows(
+    logits: &[f32],
+    q: &[f32],
+    ids: &[usize],
+    v: usize,
+    pick: &mut dyn SpecPick,
+) -> (usize, Vec<usize>) {
+    let n = ids.len();
+    let mut tokens = Vec::with_capacity(n);
+    let mut k = 0;
+    loop {
+        let row = &logits[k * v..(k + 1) * v];
+        if k + 1 == n {
+            tokens.push(pick.verify(row, None).0);
+            return (k, tokens);
+        }
+        let (t, ok) = pick.verify(row, Some((&q[k * v..(k + 1) * v], ids[k + 1])));
+        tokens.push(t);
+        if !ok {
+            return (k, tokens);
+        }
+        k += 1;
+    }
+}
+
+/// The model side of [`generate`]: the CPU [`Model`] here, the GPU engine in `serve`.
+pub trait Decoder {
+    fn config(&self) -> &Config;
+    /// Feed `ids` at `sp`: the last logits and the DSpark target hiddens.
+    fn feed(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)>;
+    /// Seed the drafter's windows with the prompt's hiddens.
+    fn seed_drafter(&mut self, main: &[f32]) -> Result<()>;
+    /// Whether [`Self::spec_step`] supports this pick (greedy or sampled).
+    fn spec_ok(&self, greedy: bool) -> bool;
+    /// [`Model::decode_spec`] without the edit hook.
+    fn spec_step(
+        &mut self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        pick: &mut dyn SpecPick,
+    ) -> Result<SpecStep>;
+}
+
+impl Decoder for Model {
+    fn config(&self) -> &Config {
+        &self.cfg
+    }
+    fn feed(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward(ids, sp, &mut |_, _| {})
+    }
+    fn seed_drafter(&mut self, main: &[f32]) -> Result<()> {
+        self.forward_spec(0, main, 0).map(|_| ())
+    }
+    fn spec_ok(&self, _: bool) -> bool {
+        true
+    }
+    fn spec_step(
+        &mut self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        pick: &mut dyn SpecPick,
+    ) -> Result<SpecStep> {
+        self.decode_spec(token, main, sp, &mut |_, _| {}, pick)
+    }
+}
+
+/// Decode after a prompt: prefill `ids` at position 0, then up to `max_new` tokens, each
+/// handed to `on` (which ends the run by returning a [`Finish`]). With `spec`, every forward
+/// after the first decode step is a DSpark verify window ([`Decoder::spec_step`]) at any
+/// temperature the engine supports; the window's extra tokens are emitted one by one, so EOS,
+/// `on`'s stop and `max_new` cut a window short exactly where plain decoding would stop.
+/// Fills `usage`'s token counts, rates, draft/accepted counts and `decode_steps` (forwards
+/// after the prefill; `completion_tokens / decode_steps` is the tokens per forward).
+#[allow(clippy::too_many_arguments)]
+pub fn generate(
+    m: &mut dyn Decoder,
+    ids: &[usize],
+    max_new: usize,
+    pick: &mut SpecSampler,
+    spec: bool,
+    eos: &[usize],
+    usage: &mut Usage,
+    on: &mut dyn FnMut(usize) -> Option<Finish>,
+) -> Result<Finish> {
+    let ctx = m.config().max_seq_len;
+    let blk = m.config().dspark_block_size;
+    let t0 = std::time::Instant::now();
+    let (mut logits, mut main) = m.feed(ids, 0)?;
+    usage.prompt_tokens = ids.len();
+    usage.prefill_chunks += 1;
+    usage.prefill_tok_s = ids.len() as f64 / t0.elapsed().as_secs_f64().max(1e-9);
+    let spec = spec && m.spec_ok(pick.greedy());
+    if spec {
+        m.seed_drafter(&main)?;
+    }
+    let t1 = std::time::Instant::now();
+    // tokens a verify window produced: (token, already fed)
+    let mut queue: std::collections::VecDeque<(usize, bool)> = Default::default();
+    // the start position of `main`'s rows, once it holds a decode step's hiddens
+    let mut main_sp: Option<usize> = None;
+    let mut pos = ids.len();
+    let mut finish = Finish::Length;
+    let mut n = 0;
+    while n < max_new {
+        let (next, fed) = queue
+            .pop_front()
+            .unwrap_or_else(|| (pick.sample(&logits), false));
+        if eos.contains(&next) {
+            finish = Finish::Stop;
+            break;
+        }
+        n += 1;
+        usage.completion_tokens += 1;
+        if let Some(f) = on(next) {
+            finish = f;
+            break;
+        }
+        if n == max_new || pos + 1 >= ctx {
+            break;
+        }
+        if fed {
+            pos += 1;
+            continue;
+        }
+        usage.decode_steps += 1;
+        match main_sp {
+            Some(sp) if spec && pos + blk + 1 < ctx => {
+                let s = m.spec_step(next, &main, sp, pick)?;
+                usage.draft_tokens += s.drafted;
+                usage.accepted_tokens += s.accepted;
+                let k = s.tokens.len();
+                queue.extend(s.tokens.iter().enumerate().map(|(i, &t)| (t, i + 1 < k)));
+                main = s.main;
+                main_sp = Some(s.sp);
+            }
+            _ => {
+                (logits, main) = m.feed(&[next], pos)?;
+                main_sp = Some(pos);
+            }
+        }
+        pos += 1;
+    }
+    usage.decode_tok_s = usage.completion_tokens as f64 / t1.elapsed().as_secs_f64().max(1e-9);
+    Ok(finish)
 }
 
 #[cfg(test)]
@@ -1725,7 +2047,7 @@ pub(crate) mod tests {
         let (mut sp, mut drafted, mut accepted) = (n, 0, 0);
         while out.len() < len {
             let s = m
-                .decode_spec(*out.last().unwrap(), &main, sp, edit)
+                .decode_spec(*out.last().unwrap(), &main, sp, edit, &mut Greedy)
                 .unwrap();
             drafted += s.drafted;
             accepted += s.accepted;
@@ -1786,5 +2108,337 @@ pub(crate) mod tests {
             );
             assert_eq!(got, want, "{name}");
         }
+    }
+
+    /// Total variation between an empirical histogram (`n` draws) and exact probabilities,
+    /// over the `top` most likely tokens plus everything else as one bucket; and the TV a
+    /// sampler that is exactly right would show on average (sum of E|freq - p| / 2).
+    fn tv(
+        counts: &HashMap<usize, usize>,
+        n: usize,
+        exact: &[(usize, f64)],
+        top: usize,
+    ) -> (f64, f64) {
+        let (mut tv, mut noise, mut rest_p) = (0.0, 0.0, 1.0);
+        let mut rest_c = n;
+        for &(t, p) in exact.iter().take(top) {
+            let c = counts.get(&t).copied().unwrap_or(0);
+            tv += (c as f64 / n as f64 - p).abs();
+            noise += (2.0 * p * (1.0 - p) / (std::f64::consts::PI * n as f64)).sqrt();
+            rest_p -= p;
+            rest_c -= c;
+        }
+        let rest_p = rest_p.max(0.0);
+        tv += (rest_c as f64 / n as f64 - rest_p).abs();
+        noise += (2.0 * rest_p * (1.0 - rest_p) / (std::f64::consts::PI * n as f64)).sqrt();
+        (tv / 2.0, noise / 2.0)
+    }
+
+    /// The rejection rule alone, on random logits: draft from Q, verify against P, and the
+    /// kept token is distributed as P (temperature and top-p applied to both).
+    #[test]
+    fn spec_sampler_matches_target() {
+        let v = 40;
+        let mut r = 9u64;
+        let mut logits = |scale: f32| -> Vec<f32> {
+            (0..v)
+                .map(|_| (uniform(&mut r) as f32 - 0.5) * scale)
+                .collect()
+        };
+        for (temp, top_p) in [(1.0, 1.0), (0.7, 0.9), (1.3, 0.6)] {
+            let (p, q) = (logits(6.0), logits(6.0));
+            let mut s = SpecSampler::new(temp, top_p, 42);
+            let exact = s.dist(&p);
+            let n = 200_000;
+            let mut counts = HashMap::new();
+            let mut acc = 0;
+            for _ in 0..n {
+                let d = s.draft(&q);
+                let (t, ok) = s.verify(&p, Some((&q, d)));
+                acc += ok as usize;
+                *counts.entry(t).or_insert(0) += 1;
+            }
+            let (tv, noise) = tv(&counts, n, &exact, 50);
+            let (tvq, _) = tv_of(&s.dist(&q), &exact);
+            eprintln!(
+                "T {temp} top-p {top_p}: TV {tv:.4} (noise {noise:.4}), accept {:.3} = 1 - TV(P,Q) {:.3}",
+                acc as f64 / n as f64,
+                1.0 - tvq
+            );
+            assert!(tv < 0.01 && tv < 4.0 * noise, "TV {tv}");
+            assert!((acc as f64 / n as f64 - (1.0 - tvq)).abs() < 0.01);
+        }
+    }
+
+    fn tv_of(a: &[(usize, f64)], b: &[(usize, f64)]) -> (f64, ()) {
+        let mut m: HashMap<usize, f64> = a.iter().copied().collect();
+        let mut tv = 0.0;
+        for &(i, p) in b {
+            tv += (m.remove(&i).unwrap_or(0.0) - p).abs();
+        }
+        tv += m.values().sum::<f64>();
+        (tv / 2.0, ())
+    }
+
+    /// The prompt, then one plain step: the state a speculative step starts from. Returns
+    /// (model, the unfed token, its main hiddens, sp).
+    fn spec_start() -> Option<(Model, usize, Vec<f32>, usize)> {
+        let (mut m, ids) = prompt()?;
+        let n = ids.len();
+        let (l, main) = m.forward(&ids, 0, &mut |_, _| {}).unwrap();
+        let t0 = argmax(&l);
+        m.forward_spec(t0, &main, 0).unwrap();
+        let (l, main) = m.forward(&[t0], n, &mut |_, _| {}).unwrap();
+        Some((m, argmax(&l), main, n))
+    }
+
+    /// Speculative sampling on the tiny model: from one fixed state, 20000 spec steps (each
+    /// rewound) against the exact target distributions. The first new token must follow P at
+    /// that position, and the second (when the first was an accepted draft) P given the first.
+    #[test]
+    fn tiny_spec_sampling_distribution() {
+        let Some((mut m, token, main, sp)) = spec_start() else {
+            return;
+        };
+        let v = m.cfg.vocab_size;
+        let w = main.len();
+        let pos0 = sp + main.len() / w;
+        let (temp, top_p) = (0.8, 0.95);
+        let s = SpecSampler::new(temp, top_p, 0);
+        // exact P at pos0 + 1 and, for its likely tokens, P at pos0 + 2
+        let snap = m.snapshot();
+        let (l0, _) = m.forward_all(&[token], pos0).unwrap();
+        m.rewind(&snap, pos0, pos0 + 1);
+        let p0 = s.dist(&l0);
+        // draft distribution of the first draft, to show the test has power
+        let dr = m.forward_spec(token, &main, sp).unwrap().unwrap();
+        let q0 = s.dist(&dr.logits[..v]);
+        let n = 20_000;
+        let mut s = SpecSampler::new(temp, top_p, 7);
+        let mut first: HashMap<usize, usize> = HashMap::new();
+        let mut second: HashMap<usize, HashMap<usize, usize>> = HashMap::new();
+        let (mut drafted, mut accepted) = (0, 0);
+        for _ in 0..n {
+            let outer = m.snapshot();
+            let st = m
+                .decode_spec(token, &main, sp, &mut |_, _| {}, &mut s)
+                .unwrap();
+            m.rewind(&outer, pos0, pos0 + st.drafted + 1);
+            drafted += st.drafted;
+            accepted += st.accepted;
+            *first.entry(st.tokens[0]).or_insert(0) += 1;
+            if st.tokens.len() > 1 {
+                *second
+                    .entry(st.tokens[0])
+                    .or_default()
+                    .entry(st.tokens[1])
+                    .or_insert(0) += 1;
+            }
+        }
+        // the state really was rewound: the next plain step matches a fresh one
+        let (l0b, _) = m.forward_all(&[token], pos0).unwrap();
+        assert_eq!(l0b, l0);
+        let (tv0, noise0) = tv(&first, n, &p0, 50);
+        let (tvq, _) = tv_of(&q0, &p0);
+        eprintln!(
+            "first token: TV {tv0:.4} (noise {noise0:.4}) over {} tokens; TV(P, Q) {tvq:.3}; accepted {accepted}/{drafted}",
+            p0.len()
+        );
+        assert!(tv0 < 0.02, "first-token TV {tv0}");
+        // the most common first token that was an accepted draft
+        let (&t, cond) = second
+            .iter()
+            .max_by_key(|(_, c)| c.values().sum::<usize>())
+            .expect("no draft was ever accepted");
+        let cn: usize = cond.values().sum();
+        let snap = m.snapshot();
+        let (l1, _) = m.forward_all(&[token, t], pos0).unwrap();
+        m.rewind(&snap, pos0, pos0 + 2);
+        let p1 = SpecSampler::new(temp, top_p, 0).dist(&l1[v..]);
+        let (tv1, noise1) = tv(cond, cn, &p1, 50);
+        eprintln!("second token given {t}: TV {tv1:.4} (noise {noise1:.4}) from {cn} draws");
+        assert!(tv1 < 4.0 * noise1 + 0.01, "second-token TV {tv1}");
+    }
+
+    /// After sampled spec steps the state is exactly that of feeding the same tokens one at a
+    /// time: the next logits are bit-identical.
+    #[test]
+    fn tiny_spec_sampling_state_exact() {
+        let Some((mut a, token, mut main, mut sp)) = spec_start() else {
+            return;
+        };
+        let Some((mut b, ids)) = prompt() else { return };
+        let n = ids.len();
+        let mut s = SpecSampler::new(1.0, 0.9, 3);
+        let mut out = vec![token];
+        let (mut drafted, mut accepted) = (0, 0);
+        while out.len() < 30 {
+            let st = a
+                .decode_spec(*out.last().unwrap(), &main, sp, &mut |_, _| {}, &mut s)
+                .unwrap();
+            drafted += st.drafted;
+            accepted += st.accepted;
+            out.extend(st.tokens);
+            main = st.main;
+            sp = st.sp;
+        }
+        eprintln!(
+            "sampled {} tokens, accepted {accepted}/{drafted}",
+            out.len()
+        );
+        // b: the prompt, the first plain token, then `out` one at a time
+        let (l, _) = b.forward(&ids, 0, &mut |_, _| {}).unwrap();
+        let mut fed = vec![argmax(&l)];
+        fed.extend(&out);
+        let mut want = Vec::new();
+        for (i, &t) in fed.iter().enumerate() {
+            want = b.forward(&[t], n + i, &mut |_, _| {}).unwrap().0;
+        }
+        // a has fed all but the last token of `out`
+        let (got, _) = a
+            .forward(&[*out.last().unwrap()], n + fed.len() - 1, &mut |_, _| {})
+            .unwrap();
+        assert_eq!(got, want);
+        // and one more step stays equal
+        let t = argmax(&want);
+        let x = a.forward(&[t], n + fed.len(), &mut |_, _| {}).unwrap().0;
+        let y = b.forward(&[t], n + fed.len(), &mut |_, _| {}).unwrap().0;
+        assert_eq!(x, y);
+    }
+
+    fn run(
+        spec: bool,
+        temp: f32,
+        max_new: usize,
+        eos: &[usize],
+        stop_after: usize,
+    ) -> Option<(Vec<usize>, Finish, Usage)> {
+        let (mut m, ids) = prompt()?;
+        let mut out = Vec::new();
+        let mut usage = Usage::default();
+        let mut pick = SpecSampler::new(temp, 0.95, 11);
+        let f = generate(
+            &mut m,
+            &ids,
+            max_new,
+            &mut pick,
+            spec,
+            eos,
+            &mut usage,
+            &mut |t| {
+                out.push(t);
+                (out.len() == stop_after).then_some(Finish::Stop)
+            },
+        )
+        .unwrap();
+        Some((out, f, usage))
+    }
+
+    /// The serve loop: spec == plain at temperature 0, and EOS, a stop and `max_new` cut a
+    /// verify window exactly where plain decoding stops.
+    #[test]
+    fn tiny_generate_spec_limits() {
+        let Some((plain, f, u0)) = run(false, 0.0, 40, &[], 0) else {
+            return;
+        };
+        assert_eq!(f, Finish::Length);
+        let (spec, _, u1) = run(true, 0.0, 40, &[], 0).unwrap();
+        assert_eq!(spec, plain);
+        assert_eq!(u1.completion_tokens, 40);
+        eprintln!(
+            "plain {} forwards, spec {} forwards ({}/{} accepted)",
+            u0.decode_steps, u1.decode_steps, u1.accepted_tokens, u1.draft_tokens
+        );
+        assert_eq!(u0.decode_steps, 39);
+        assert!(u1.decode_steps <= u0.decode_steps);
+        for max in [1, 2, 7, 13] {
+            let (o, f, u) = run(true, 0.0, max, &[], 0).unwrap();
+            assert_eq!((o.as_slice(), f), (&plain[..max], Finish::Length));
+            assert_eq!(u.completion_tokens, max);
+        }
+        for j in [3, 10, 25] {
+            let e = plain[j];
+            let first = plain.iter().position(|&t| t == e).unwrap();
+            let (o, f, _) = run(true, 0.0, 40, &[e], 0).unwrap();
+            assert_eq!((o.as_slice(), f), (&plain[..first], Finish::Stop));
+        }
+        let (o, f, _) = run(true, 0.0, 40, &[], 9).unwrap();
+        assert_eq!((o.as_slice(), f), (&plain[..9], Finish::Stop));
+        // sampled, seeded: reproducible, and spec runs at any temperature
+        let (a, _, ua) = run(true, 0.8, 30, &[], 0).unwrap();
+        let (b, _, _) = run(true, 0.8, 30, &[], 0).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 30);
+        assert!(ua.draft_tokens > 0);
+        eprintln!(
+            "sampled: {} tokens in {} forwards ({}/{} accepted)",
+            a.len(),
+            ua.decode_steps,
+            ua.accepted_tokens,
+            ua.draft_tokens
+        );
+    }
+
+    /// Acceptance on the real checkpoint (`DS41_REAL=/workspace/ds41`): greedy spec over a code
+    /// prompt for 200 tokens; prints accepted/drafted and tokens per verify. CPU f32, slow:
+    /// `cargo test --release --lib real_acceptance -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_acceptance() {
+        let Ok(dir) = std::env::var("DS41_REAL") else {
+            eprintln!("skip: set DS41_REAL to the checkpoint dir");
+            return;
+        };
+        let dir = Path::new(&dir);
+        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let msgs = serde_json::json!([{"role": "user", "content": "Write a Rust function that \
+            parses a CSV line into fields, handling quoted fields with escaped quotes, plus \
+            unit tests."}]);
+        let prompt = crate::chat::Template::load(dir)
+            .unwrap()
+            .render(&msgs, None, Some(false))
+            .unwrap();
+        let ids: Vec<usize> = tok
+            .encode(prompt.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&i| i as usize)
+            .collect();
+        let n = std::env::var("DS41_REAL_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let mut m = Model::open(dir).unwrap();
+        let mut usage = Usage::default();
+        let mut out = Vec::new();
+        let mut pick = SpecSampler::new(0.0, 1.0, 0);
+        let t = std::time::Instant::now();
+        generate(
+            &mut m,
+            &ids,
+            n,
+            &mut pick,
+            true,
+            &[],
+            &mut usage,
+            &mut |t| {
+                out.push(t as u32);
+                None
+            },
+        )
+        .unwrap();
+        eprintln!("{}", tok.decode(&out, false).unwrap());
+        let verifies = usage.decode_steps.max(1);
+        eprintln!(
+            "{} tokens in {} forwards ({:.2} tokens/forward), accepted {}/{} drafts ({:.1}%), {:.1} s",
+            usage.completion_tokens,
+            verifies,
+            usage.completion_tokens as f64 / verifies as f64,
+            usage.accepted_tokens,
+            usage.draft_tokens,
+            100.0 * usage.accepted_tokens as f64 / usage.draft_tokens.max(1) as f64,
+            t.elapsed().as_secs_f64()
+        );
     }
 }
