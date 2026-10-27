@@ -4,6 +4,39 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 — the all-GPU B300 baseline: 22.9 tok/s decode (scripts/glm5-bench.sh)
+
+New harness `scripts/glm5-bench.sh` (+ `glm5-bench-remote.sh`, `glm5-bench-prompt.txt`;
+how-to in `docs/glm5-bench.md`): rsync + md5 guard + cuda build, then the ids gate
+(haiku, -n 8 = the CPU oracle) and a timed -n 128 decode on a 238-token prompt with
+`TANG_GLM5_TRACE=1`, all 45 FFNs on the GPU (`TANG_GLM5_GPU_FFN*` unset). B300
+tree-verdict-b300 (q9ce4c6w5bjmpv), tree 66aa4b5e (frog/glm5-forward), src md5
+e6102a1a… both sides, binary 61ba4e0d…, weights already present (no refetch).
+Every row's ids gate passed (8/8 = the oracle). Stage columns are wall ms per decode token.
+
+base = `MOE=fast GEMV8=1 KDA_PF2=1 MHC_FUSED=1` (all `TANG_GLM5_`)
+
+| config | prefill tok/s | decode tok/s | kda | dsa | mhc | ffn | head |
+|---|---|---|---|---|---|---|---|
+| (a) naive (no flags) | 1.3 | 0.34 | 359.05 | 1654.01 | 294.82 | 589.84 | 12.06 |
+| (b) base | 3.0 | 0.62 | 13.26 | 1565.90 | 8.73 | 11.48 | 12.86 |
+| (c) base + KDA_FUSED=1 | 2.9 | 0.60 | 52.70 | 1564.09 | 8.81 | 11.39 | 13.23 |
+| (d) base + KDA_GRAPH=1 | 2.9 | 0.60 | 50.85 | 1572.86 | 8.58 | 11.35 | 11.93 |
+| **(e) base + MLA_RESIDENT=1 GPU_HEAD=1** | **12.8** | **22.87** | 12.91 | 6.86 | 8.23 | 11.19 | 0.52 |
+| (e) + KDA_FUSED=1 | 12.7 | 12.06 | 52.36 | 6.88 | 8.34 | 11.16 | 0.52 |
+| (e) + KDA_GRAPH=1 | 12.8 | 12.55 | 50.45 | 6.89 | 8.25 | 11.13 | 0.57 |
+
+- **(b) is not the speed config**: without `TANG_GLM5_MLA_RESIDENT=1` DSA stays on the
+  host-staged MLA path (1.57 s/token, 97% of wall). The real all-GPU baseline is (e),
+  **22.9 tok/s** (traced run: 25.1 tok/s, 39.8 ms/token). Quote (e) as base from now on.
+- **KDA_FUSED and KDA_GRAPH regress on the B300**: kda 12.9 → ~51 ms/token, decode
+  22.9 → ~12 tok/s (GEMV8 held fixed across the pair). Correct ids, slower. Unexplained.
+- Budget at (e): kda 12.9, ffn 11.2, mhc 8.2 (pre.attn 3.8 + pre.ffn 3.8, both ~0.08 ms
+  ×45 with a 0.74 MB D2H each), dsa 6.9, head 0.5. 1111 launches/token, 226 D2H calls.
+- The trace's per-stage `gpu ms` column is not trustworthy on this box (kda −15.7 ms,
+  sum 164 ms > 39.8 ms wall) — use wall.
+- The "52 tok/s" in the program brief is the verdict's 0.52 tok/s.
+
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
 clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree
