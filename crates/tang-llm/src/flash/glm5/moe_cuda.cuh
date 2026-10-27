@@ -678,6 +678,57 @@ extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down(
     }
 }
 
+// The split down: yp[t*S + j][c] = w_j * (row c of slot j's down matrix . h[t*S + j]) — one warp
+// per (slot, row pair), single-shot like g5f_gu, so every slot's rows stream at once instead of
+// a warp walking 2-3 slots in turn; g5f_sum adds the S partials (fixed order). Sentinel ids
+// write 0. grid (ceil(hid/8), S, T), block 128, staging as g5f_down.
+extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down_split(
+    const G5W down, const G5W sdown, const unsigned* ids, const float* wts, int k, int ne,
+    const float* h, const unsigned char* hq, const unsigned char* hq2, const float* hd, int hs, float* yp, int ff,
+    int ffs, int hid, int row16) {
+    extern __shared__ uint4 g5f_sm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = blockIdx.y, t = blockIdx.z;
+    const int nr = ids ? k : 1, ns = sdown.base ? 1 : 0, S = nr + ns;
+    const int c0 = (blockIdx.x * 4 + warp) * 2;
+    if (c0 >= hid) return;
+    const bool two = c0 + 1 < hid, sh = j >= nr;
+    const size_t row = (size_t)t * S + j;
+    float* out = yp + row * hid;
+    const unsigned e = sh ? 0u : (ids ? ids[(size_t)t * k + j] : 0u);
+    if (!sh && ids && e >= (unsigned)ne) {
+        if (lane == 0) { out[c0] = 0.f; if (two) out[c0 + 1] = 0.f; }
+        return;
+    }
+    const float wj = sh ? 1.f : (ids ? wts[(size_t)t * k + j] : 1.f);
+    const G5W w = sh ? sdown : down;
+    const int kk = sh ? ffs : ff;
+    uint4* sm0 = g5f_sm + (size_t)(warp * 2) * row16;
+    uint4* sm1 = sm0 + row16;
+    const unsigned char* q = hq + row * hs;
+    const unsigned char* q2 = hq2 ? hq2 + row * hs : 0;
+    const float* d = hd + row * (hs / 32);
+    const float* f = h + row * hs;
+    const unsigned char* w0 = g5f_stage(w, e, c0, sm0, row16, lane);
+    const unsigned char* w1 = two ? g5f_stage(w, e, c0 + 1, sm1, row16, lane) : w0;
+    g5f_stage_wait();
+    const float a = g5f_warp_sum(g5f_dot_any(w.ty, w0, q, q2, d, f, kk));
+    const float b = two ? g5f_warp_sum(g5f_dot_any(w.ty, w1, q, q2, d, f, kk)) : 0.f;
+    if (lane == 0) {
+        out[c0] = wj * a;
+        if (two) out[c0 + 1] = wj * b;
+    }
+}
+
+// y[t][c] = sum_{j < S} yp[t*S + j][c], j ascending. grid (ceil(hid/128), T), block 128.
+extern "C" __global__ void g5f_sum(const float* yp, float* y, int S, int hid) {
+    const int c = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
+    if (c >= hid) return;
+    const float* p = yp + (size_t)t * S * hid + c;
+    float acc = 0.f;
+    for (int j = 0; j < S; j++) acc += p[(size_t)j * hid];
+    y[(size_t)t * hid + c] = acc;
+}
+
 // The plain GEMV on the same row kernel: y[t * ystride + r] = (row r of matrix e of w) . x_t for
 // r < rows, t < T (k = row length, k % 8 == 0). Any G5W type (g5f_dot_any). Activations, per token
 // at stride xs elements (xs >= k, xs % 32 == 0): xq / xq2 / xd = g5f_q8 of x (xq2 null = one-level

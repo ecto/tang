@@ -50,7 +50,8 @@ const P_HQ: usize = 8;
 const P_HD: usize = 9;
 const P_XQ2: usize = 10;
 const P_HQ2: usize = 11;
-const P_N: usize = 12;
+const P_YP: usize = 12;
+const P_N: usize = 13;
 
 /// Device scratch reused across calls (grown on demand), plus the stream `ffn_host` runs on.
 #[derive(Default)]
@@ -58,7 +59,7 @@ struct Pool {
     bufs: Vec<Option<DevBuf>>,
     stream: Option<Stream>,
     /// dynamic-smem opt-in already set on g5f_gu / g5f_down (bytes)
-    smem_set: [u32; 2],
+    smem_set: [u32; 3],
 }
 
 impl Pool {
@@ -91,6 +92,8 @@ pub struct Kernels {
     f_select: Func,
     f_gu: Func,
     f_down: Func,
+    f_down_split: Func,
+    f_sum: Func,
     /// The fast path (`TANG_GLM5_MOE=fast`). Tests flip it directly.
     pub fast: bool,
     /// Two-level int8 activations (codes + residual codes; `TANG_GLM5_MOE_ACT=q8` turns it
@@ -98,6 +101,9 @@ pub struct Kernels {
     pub act2: bool,
     /// Stage weight rows in shared memory (`TANG_GLM5_MOE_STAGE=0`: read them from global).
     pub stage: bool,
+    /// Routed layers' down as one warp per (slot, row pair) + `g5f_sum`
+    /// (`TANG_GLM5_MOE_DOWN_SPLIT`, default on); off = `g5f_down` with `down_sw` warps a pair.
+    pub down_split: bool,
     /// Warps sharing one down row pair on routed layers (1, 2, 4; `TANG_GLM5_MOE_DOWN_SW`).
     pub down_sw: usize,
     /// NaN-fill h / y before each fast call (`TANG_GLM5_MOE_DEBUG=1`, unless `..._POISON=0`).
@@ -144,8 +150,11 @@ impl Kernels {
             f_select: m.func("g5f_select")?,
             f_gu: m.func("g5f_gu")?,
             f_down: m.func("g5f_down")?,
+            f_down_split: m.func("g5f_down_split")?,
+            f_sum: m.func("g5f_sum")?,
             fast: std::env::var("TANG_GLM5_MOE").is_ok_and(|v| v == "fast"),
             stage: env_on("TANG_GLM5_MOE_STAGE", true),
+            down_split: env_on("TANG_GLM5_MOE_DOWN_SPLIT", true),
             down_sw: match std::env::var("TANG_GLM5_MOE_DOWN_SW").ok().as_deref() {
                 Some("1") => 1,
                 Some("2") => 2,
@@ -663,7 +672,12 @@ fn ffn_fast(
         nan_fill(y, t * hid, s)?;
     }
     let (r16g, smg) = smem_for(k, pool, 0, k.f_gu, row16(&[gate, up, sg, su]), 1)?;
-    let (r16d, smd) = smem_for(k, pool, 1, k.f_down, row16(&[down, sd]), 1)?;
+    let split = k.down_split && slots >= 4;
+    let (r16d, smd) = if split {
+        smem_for(k, pool, 2, k.f_down_split, row16(&[down, sd]), 1)?
+    } else {
+        smem_for(k, pool, 1, k.f_down, row16(&[down, sd]), 1)?
+    };
     let lims = p.limit_shexp;
     // warps sharing a down row pair: the routed layers' 9 slots spread over a block's 4 warps
     // (TANG_GLM5_MOE_DOWN_SW overrides: 1, 2 or 4); dense has one slot, so one warp a pair
@@ -696,14 +710,35 @@ fn ffn_fast(
             tang_moe::args![h, hq, hq2, hd, hsi],
         )?;
         gpu::trace::bytes(dn_b);
-        gpu::launch(
-            k.f_down,
-            (hid.div_ceil(8 / sw) as u32, t as u32, 1),
-            blk,
-            smd,
-            s,
-            tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d, swi],
-        )?;
+        if split {
+            let yp = pool.get(P_YP, t * slots * hid * 4)?;
+            gpu::launch(
+                k.f_down_split,
+                (hid.div_ceil(8) as u32, slots as u32, t as u32),
+                blk,
+                smd,
+                s,
+                tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi, r16d],
+            )?;
+            let si = slots as i32;
+            gpu::launch(
+                k.f_sum,
+                (hid.div_ceil(128) as u32, t as u32, 1),
+                blk,
+                0,
+                s,
+                tang_moe::args![yp, y, si, hidi],
+            )?;
+        } else {
+            gpu::launch(
+                k.f_down,
+                (hid.div_ceil(8 / sw) as u32, t as u32, 1),
+                blk,
+                smd,
+                s,
+                tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d, swi],
+            )?;
+        }
     }
     Ok(())
 }
