@@ -635,7 +635,7 @@ mod tests {
             let mb = w.w.estride as f64 / 1e6;
             eprintln!(
                 "g5f bench {name:>3} {rows}x{cols} ({mb:.1} MB): k5_gemv8 {t8:.1} us ({:.2} TB/s), g5f_gemv {tf:.1} us ({:.2} TB/s), k5_qgemv {tq:.1} us ({:.2} TB/s)",
-                mb / t8 as f64 / 1e6, mb / tf as f64 / 1e6, mb / tq as f64 / 1e6
+                mb / t8 as f64, mb / tf as f64, mb / tq as f64
             );
             if name == "o" {
                 to = tq;
@@ -651,7 +651,7 @@ mod tests {
         let tm = time(&|| unsafe {
             d.qgemv_launch(&d.s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * di + 2 * hd, 0, codes, codes + (d.max_t * hid) as u64, hid).unwrap()
         });
-        eprintln!("g5f bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)", mb5 / tm as f64 / 1e6);
+        eprintln!("g5f bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)", mb5 / tm as f64);
         eprintln!(
             "g5f bench per layer (6 matrices, separate launches): k5_gemv8 {:.1} us, g5f_gemv {:.1} us, k5_qgemv {:.1} us; merged x-launch + o: {:.1} us",
             tot[0], tot[1], tot[2], tm + to
@@ -683,7 +683,12 @@ mod tests {
             let (eo, es) = (rel64(&nv.0, &base.0), rel64(&nv.1 .0, &base.1 .0));
             eprintln!("g5f parity G5F={g5f} naive vs gemv8 naive: out rel {eo:.3e}, state rel {es:.3e} ({:.0} vs {:.0} us/step host)", nv.2, base.2);
             assert!(eo < 1e-2 && es < 1e-2, "G5F={g5f} diverges from the gemv8 path");
-            assert!(eo > 0.0, "G5F={g5f} bit-identical to gemv8: did it run?");
+            // G5F=1 is EXPECTED bit-identical: g5f_gemv's Q8_0 lane dot on k5_q8's codes walks
+            // the same e0 = lane*8 + 256i steps with the same fmaf and xor reduce as k5_gemv8
+            // (measured: rel 0 on real layer 0). k5_qgemv sums 32 per dp4a chain: must differ.
+            if g5f == 2 {
+                assert!(eo > 0.0, "G5F=2 bit-identical to gemv8: did k5_qgemv run?");
+            }
             for m in [Mode::Fused, Mode::Graph] {
                 let fv = run(g5f, m);
                 let diff = fv.0.iter().zip(&nv.0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();

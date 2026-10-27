@@ -4,6 +4,35 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 — TANG_GLM5_KDA_G5F: fast row kernels on the KDA projections (branch claude/glm5-kda-gemv)
+
+Flag, read at load, default 0: `=1` puts q/k/v, f_a, g_a, o_proj on `g5f_gemv` (with k5_q8's codes);
+`=2` uses `k5_qgemv` (kda_k5.cuh). That kernel does q|k|v|f_a|g_a in ONE T=1 Q8_0 launch: per lane,
+all 16 B nc loads are issued first, then staged in smem, then one dp4a chain per 32 elements.
+o_proj gets its own launch. Wired into the naive PF2 path (the one that ships) and into the fused
+path. When G5F is on, the fused path runs beta on k5_beta instead of k5d_proj. k5d_proj's beta is one
+THREAD per 4096-wide row, ~1.34 ms/layer on the H200. That is the likely cause of the B300's
+fused 13 → 51 ms/token regression (34 × 1.34 ≈ 45 ms). The regression cause is not measured yet.
+
+H200, real layer 0, CUDA events, kernel only, T=1, median of 50 (`kda_g5f_real_bench`):
+
+| matrix | MB | k5_gemv8 µs | g5f_gemv µs | k5_qgemv µs | qgemv TB/s |
+|---|---|---|---|---|---|
+| q / k / v (8192×4096) | 35.7 | 23.3 | 21.2 | 16.3 | 2.19 |
+| f_a / g_a (128×4096) | 0.6 | 10.0 | 10.4 | 6.9 | — |
+| o (4096×8192) | 35.7 | 30.5 | 19.5 | 18.7 | 1.91 |
+| merged q\|k\|v\|f_a\|g_a | 108.1 | — | — | 39.4 | 2.74 |
+| per layer, 6 matrices | 143.8 | 120.2 | 103.8 | 81.4 (merged + o: 58.1) | 2.47 |
+
+Parity: G5F=1 vs gemv8 naive is BIT-IDENTICAL (rel 0). This is expected: g5f's Q8_0 lane dot walks
+the same lane*8 + 256i steps with the same fmaf and reduce. The test now asserts nonzero only for
+G5F=2. NOT yet measured: G5F=2 parity, fused bit-equality, ids gate, trace kda ms/token.
+>3 TB/s not reached (best 2.74 merged).
+
+Ops: my sync script's `rsync --delete` wiped the run scripts and logs I had written inside the
+synced dir (/root/w-gemv, /root/w-gemv2). Nothing on the pod deletes files. Keep run artifacts
+outside the rsync target.
+
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
 clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree
