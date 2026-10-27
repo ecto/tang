@@ -6,11 +6,15 @@
 //!   activations.
 //! - [`gpu`] (cuda): weights on the device in their checkpoint format and the kernels
 //!   (`kernels.cu`), each tested against its CPU twin.
+//! - [`engine`] (cuda): the forward on the device, the CPU reference's control flow over
+//!   [`gpu`]'s kernels; selection steps (top-k, routing lists) still on the host.
 //! - [`forward`]: the CPU f32 reference forward, a transcription of `scripts/deepseek_ref.py`
 //!   (itself DeepSeek's `inference/model.py` in plain torch), checked against its dumps.
 //!
 //! See `docs/deepseek-v41-plan.md` for the architecture and the port's milestones.
 
+#[cfg(feature = "cuda")]
+pub mod engine;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;

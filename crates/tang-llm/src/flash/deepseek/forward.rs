@@ -390,10 +390,14 @@ impl Model {
         let t = x.len() / c.dim;
         let mut qr = self.linear(x, t, &format!("{p}.attn.wq_a.weight"))?;
         self.rms(&mut qr, &format!("{p}.attn.q_norm.weight"))?;
+        self.tap(&format!("{p}.qr"), &qr);
         let mut q = self.linear(&qr, t, &format!("{p}.attn.wq_b.weight"))?;
+        self.tap(&format!("{p}.q0"), &q);
         let tab = self.freqs[lid].clone();
         rope(&mut q, hd, rd, h, &tab, |i| sp + i, false);
+        self.tap(&format!("{p}.q"), &q);
         let (mut kv, mut idxs) = self.window_kv(p, lid, x, sp)?;
+        self.tap(&format!("{p}.wkv"), &kv);
         if r > 0 {
             let offset = kv.len() / hd;
             let (ckv, cidx) = self.compress_kv(p, lid, x, &qr, sp, offset)?;
@@ -430,6 +434,7 @@ impl Model {
         let t = idxs.len();
         let sink = self.v(&format!("{p}.attn.attn_sink"))?;
         let mut o = sparse_attn(q, h, hd, kv, &sink.data, idxs, (hd as f32).powf(-0.5));
+        self.tap(&format!("{p}.sa"), &o);
         rope(&mut o, hd, rd, h, tab, |i| pos0 + i, true);
         fp8_qdq(&mut o, 32);
         // wo_a is block-diagonal over groups; the checkpoint's fp8 is dequantized to bf16
@@ -716,7 +721,7 @@ impl Model {
 
     /// Level one of the two-level top-k: the best `candidate_topk_blocks` blocks per query, the
     /// one holding its newest position pinned in.
-    fn candidates(&self, score: &[f32], width: usize, lens: &[usize]) -> Vec<Vec<bool>> {
+    pub(crate) fn candidates(&self, score: &[f32], width: usize, lens: &[usize]) -> Vec<Vec<bool>> {
         let (bs, kb) = (
             self.cfg.candidate_block_size,
             self.cfg.candidate_topk_blocks,
@@ -916,7 +921,9 @@ impl Model {
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
         let am = self.hc_mixes(p, "attn", &x)?;
         let mut h = self.hc_pre(&x, pre_mix);
+        self.tap(&format!("{p}.attn_pre"), &h);
         self.rms(&mut h, &format!("{p}.attn_norm.weight"))?;
+        self.tap(&format!("{p}.attn_in"), &h);
         let h = attn(self, &h)?;
         self.tap(&format!("{p}.attn"), &h);
         let x = self.hc_post(&h, &x, &am);
@@ -934,7 +941,7 @@ impl Model {
     // engram
 
     /// Hash ids [T][n_engram_layers][cols] of the n-grams ending at each new position.
-    fn engram_hash(&mut self, ids: &[usize], sp: usize) -> Vec<Vec<Vec<i64>>> {
+    pub(crate) fn engram_hash(&mut self, ids: &[usize], sp: usize) -> Vec<Vec<Vec<i64>>> {
         let em = self.engram.as_ref().unwrap();
         let n = self.cfg.engram_max_ngram_size;
         for (i, &id) in ids.iter().enumerate() {
@@ -990,7 +997,9 @@ impl Model {
                 })
             })
             .collect();
+        self.tap(&format!("{p}.eg_rows"), &rows);
         let kv = self.linear(&rows, t, &format!("{p}.engram.wkv.weight"))?;
+        self.tap(&format!("{p}.eg_kv"), &kv);
         let qw = self.v(&format!("{p}.engram.q_weight"))?;
         let kw = self.v(&format!("{p}.engram.k_weight"))?;
         let mut out = vec![0f32; x.len()];

@@ -88,10 +88,34 @@ pub struct Kernels {
     rope: Func,
     sparse_attn: Func,
     sinkhorn: Func,
+    /// Every other kernel, by name, for [`Kernels::go`].
+    more: std::collections::HashMap<&'static str, Func>,
 }
 
-fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
-    (n.div_ceil(per) as u32, 1, 1)
+/// The kernels launched through [`Kernels::go`].
+const MORE: &[&str] = &[
+    "ds_copy",
+    "ds_hc_scale",
+    "ds_hc_pre",
+    "ds_hc_post",
+    "ds_embed",
+    "ds_mean_hc",
+    "ds_swiglu",
+    "ds_router",
+    "ds_gather_rows",
+    "ds_scatter_add",
+    "ds_add_round",
+    "ds_scale_round",
+    "ds_round",
+    "ds_pool",
+    "ds_index_score",
+    "ds_wo_a",
+    "ds_engram_gate",
+];
+
+pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
+    // at least one block: every kernel bounds-checks, and a zero grid is a launch error
+    (n.div_ceil(per).max(1) as u32, 1, 1)
 }
 
 impl Kernels {
@@ -105,8 +129,32 @@ impl Kernels {
             rope: m.func("ds_rope")?,
             sparse_attn: m.func("ds_sparse_attn")?,
             sinkhorn: m.func("ds_sinkhorn")?,
+            more: MORE
+                .iter()
+                .map(|&n| Ok((n, m.func(n)?)))
+                .collect::<Result<_>>()?,
             _m: m,
         })
+    }
+
+    /// Launch kernel `name` (one of [`MORE`]).
+    ///
+    /// # Safety
+    /// As [`gpu::launch`]: `args` must match the kernel's parameters.
+    pub unsafe fn go(
+        &self,
+        name: &str,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        smem: u32,
+        s: &Stream,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<()> {
+        let f = *self
+            .more
+            .get(name)
+            .with_context(|| format!("no kernel {name}"))?;
+        Ok(gpu::launch(f, grid, block, smem, s, args)?)
     }
 
     /// `y = x · wᵀ` for `t` rows (`x` already activation-quantized when the weight is).
@@ -314,7 +362,7 @@ mod tests {
         }
         g.bind().unwrap();
         let k = Kernels::new(&g).unwrap();
-        let s = Stream::new().unwrap();
+        let s = Stream::blocking().unwrap();
         Some((g, k, s, Model::open(&dir).unwrap()))
     }
 
@@ -354,6 +402,10 @@ mod tests {
             "layers.0.ffn.experts.3.w2.weight",    // fp4
             "layers.2.attn.compressor.wkv.weight", // bf16
             "layers.0.ffn.gate.weight",            // bf16 router
+            "layers.1.engram.wkv.weight",
+            "layers.0.attn.wo_b.weight",
+            "layers.0.ffn.shared_experts.w2.weight",
+            "mtp.0.main_proj.weight",
         ] {
             let w = DevW::upload(&m.st, name).unwrap();
             let cols = w.v.cols as usize;
@@ -364,7 +416,7 @@ mod tests {
             if w.v.fmt >= 2 {
                 k.fp8_qdq(&s, dx.ptr, x.len()).unwrap();
             }
-            let dy = DevBuf::zeroed_elems::<f32>(t * rows).unwrap();
+            let dy = DevBuf::alloc((t * rows) * 4).unwrap();
             k.linear(&s, &w.v, dx.ptr, dy.ptr, t, true).unwrap();
             s.sync().unwrap();
             let got = dy.read::<f32>(0, t * rows).unwrap();
@@ -432,7 +484,7 @@ mod tests {
         );
         let flat_idx: Vec<i32> = idxs.iter().flatten().copied().collect();
         let di = DevBuf::from_slice(&flat_idx).unwrap();
-        let o = DevBuf::zeroed_elems::<f32>(t * h * d).unwrap();
+        let o = DevBuf::alloc((t * h * d) * 4).unwrap();
         k.sparse_attn(
             &s,
             dq.ptr,
@@ -463,9 +515,9 @@ mod tests {
             DevBuf::from_slice(&base).unwrap(),
         );
         let (pre, post, comb) = (
-            DevBuf::zeroed_elems::<f32>(t * hc).unwrap(),
-            DevBuf::zeroed_elems::<f32>(t * hc).unwrap(),
-            DevBuf::zeroed_elems::<f32>(t * hc * hc).unwrap(),
+            DevBuf::alloc((t * hc) * 4).unwrap(),
+            DevBuf::alloc((t * hc) * 4).unwrap(),
+            DevBuf::alloc((t * hc * hc) * 4).unwrap(),
         );
         k.sinkhorn(
             &s,
