@@ -104,12 +104,15 @@ impl Gpu {
             ..Default::default()
         };
         // NVRTC from an older CUDA doesn't know newer architectures (e.g. B300's sm_103
-        // on the CUDA 12.8 wheel). PTX without --arch compiles to the NVRTC default and
-        // JITs to the actual device at cuModuleLoadData, so retry arch-less on that error.
+        // on the CUDA 12.8 wheel). Retry at sm_90, NOT arch-less: arch-less PTX targets
+        // the NVRTC default (compute_75 on the 12.8 wheel), where __dp4a is UNDEFINED
+        // (the whole point of an explicit arch — tang-compute's flash.rs compiles its
+        // dp4a kernels at sm_86 for the same reason). PTX JITs to the actual device at
+        // cuModuleLoadData.
         let ptx = match cudarc::nvrtc::compile_ptx_with_opts(src, opts.clone()) {
             Ok(p) => p,
             Err(e) if format!("{e:?}").contains("INVALID_OPTION") || format!("{e:?}").contains("invalid value") => {
-                let opts = cudarc::nvrtc::CompileOptions { arch: None, ..Default::default() };
+                let opts = cudarc::nvrtc::CompileOptions { arch: Some("sm_90"), ..Default::default() };
                 cudarc::nvrtc::compile_ptx_with_opts(src, opts)
                     .map_err(|e| Error(format!("nvrtc: {e:?}")))?
             }
