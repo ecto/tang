@@ -21,7 +21,13 @@ pub mod mhc;
 #[cfg(feature = "cuda")]
 pub mod mhc_fused;
 pub mod mla;
+#[cfg(feature = "cuda")]
+pub mod mla_debug;
+#[cfg(feature = "cuda")]
+pub mod mla_dev;
 pub mod moe;
+#[cfg(feature = "cuda")]
+pub mod moe_debug;
 #[cfg(feature = "cuda")]
 pub mod serve_glue;
 pub mod trace;
