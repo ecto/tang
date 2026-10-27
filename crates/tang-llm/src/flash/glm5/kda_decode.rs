@@ -605,7 +605,7 @@ mod tests {
         let mk = |g5f: u8, fast: bool| {
             std::env::set_var("TANG_GLM5_KDA_G5F", g5f.to_string());
             std::env::set_var("TANG_GLM5_GEMV8", "1");
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64).unwrap();
+            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
             std::env::remove_var("TANG_GLM5_KDA_G5F");
             d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
             d
