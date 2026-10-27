@@ -198,6 +198,8 @@ pub struct GpuModel {
     /// Skip the logits/hiddens read-back (and its sync): `forward` returns empty vectors.
     /// For expert-parallel ranks whose output nobody reads.
     pub skip_readback: bool,
+    /// The step timeline ([`super::obs`]; `DS_OBS`).
+    pub obs: super::obs::Obs,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -315,6 +317,7 @@ impl GpuModel {
             moe_tabs: RefCell::new(HashMap::new()),
             reduce_graphable: false,
             skip_readback: false,
+            obs: Default::default(),
         })
     }
 
@@ -393,12 +396,29 @@ impl GpuModel {
     /// Start a step: drain the stream (its staging may still be read), then release the
     /// last step's scratch and staging.
     fn begin_step(&mut self) -> Result<()> {
-        self.s.sync()?;
+        self.sync()?;
         self.arena.borrow_mut().reset()?;
         self.stage.borrow_mut().reset()?;
         let g = self.gen();
         self.graphs.retain(|_, c| c.gen == g);
         Ok(())
+    }
+
+    /// Drain the stream (counted: [`super::obs`]).
+    fn sync(&self) -> Result<()> {
+        super::obs::sync();
+        Ok(self.s.sync()?)
+    }
+
+    /// Open a timeline span ([`super::obs::Obs::span`]).
+    #[inline(always)]
+    fn span(&self, name: &'static str) -> u32 {
+        self.obs.span(&self.s, name, None)
+    }
+
+    #[inline(always)]
+    fn end(&self, id: u32) {
+        self.obs.end(&self.s, id)
     }
 
     fn gen(&self) -> (u64, u64) {
@@ -438,10 +458,11 @@ impl GpuModel {
                 .min_by_key(|(_, (_, t))| *t)
                 .map(|(k, _)| k.clone())
                 .unwrap();
-            self.s.sync()?;
+            self.sync()?;
             ex.map.remove(&oldest);
         }
         ex.misses += 1;
+        super::obs::expert_upload();
         let w = Rc::new(DevW::upload(&self.cpu.st, name)?);
         ex.map.insert(name.to_string(), (w.clone(), tick));
         Ok(w)
@@ -461,7 +482,8 @@ impl GpuModel {
     }
 
     fn read(&self, b: Buf, n: usize) -> Result<Vec<f32>> {
-        self.s.sync()?;
+        self.sync()?;
+        super::obs::d2h(n * 4);
         Ok(b.dev().read::<f32>(0, n)?)
     }
 
@@ -582,6 +604,7 @@ impl GpuModel {
             stride: 1,
             fixed: None,
         };
+        let s = self.span("q");
         let qr = self.lin(x, t, &format!("{p}.attn.wq_a.weight"))?;
         self.rms(qr, t, &format!("{p}.attn.q_norm.weight"))?;
         self.tap(&format!("{p}.qr"), qr, t * c.q_lora_rank)?;
@@ -589,24 +612,31 @@ impl GpuModel {
         self.tap(&format!("{p}.q0"), q, t * h * hd)?;
         self.rope(q, t, h, hd, lid, at0, false)?;
         self.tap(&format!("{p}.q"), q, t * h * hd)?;
+        self.end(s);
+        let s = self.span("window_kv");
         let kv = self.lin(x, t, &format!("{p}.attn.wkv.weight"))?;
         self.rms(kv, t, &format!("{p}.attn.kv_norm.weight"))?;
         self.rope(kv, t, 1, hd, lid, at0, false)?;
         self.k.fp8_qdq(&self.s, kv.ptr, t * hd)?;
         self.ring_seed(lid, kv, t)?;
         self.tap(&format!("{p}.wkv"), kv, t * hd)?;
+        self.end(s);
         let nw = t.min(c.window_size);
         let (mut kc, mut kv1) = (0, 0);
         if c.compress_ratios[lid] > 0 {
+            let s = self.span("compress");
             let (src, k) = self.compress_kv_prefill(p, lid, x, qr, t)?;
             kc = k;
             kv1 = self.ckv[&src].ptr;
+            self.end(s);
         }
+        let s = self.span("sparse_attn");
         let idx = self.win_idx(t, nw + kc, nw, 0, 0, 0)?;
         if kc > 0 {
             let tk = self.topk.as_ref().context("no top-k")?.0;
             self.idx_cat(idx, tk, t, kc, nw + kc, nw)?;
         }
+        self.end(s);
         self.attn_out(p, q, (kv, t, kv1), idx, t, nw + kc, lid, at0)
     }
 
@@ -619,10 +649,13 @@ impl GpuModel {
             stride: 1,
             fixed_r: 0,
         };
+        let s = self.span("q");
         let qr = self.lin(x, t, &format!("{p}.attn.wq_a.weight"))?;
         self.rms(qr, t, &format!("{p}.attn.q_norm.weight"))?;
         let q = self.lin(qr, t, &format!("{p}.attn.wq_b.weight"))?;
         self.rope(q, t, h, hd, lid, at, false)?;
+        self.end(s);
+        let s = self.span("window_kv");
         let kv = self.lin(x, t, &format!("{p}.attn.wkv.weight"))?;
         self.rms(kv, t, &format!("{p}.attn.kv_norm.weight"))?;
         self.rope(kv, t, 1, hd, lid, at, false)?;
@@ -639,12 +672,16 @@ impl GpuModel {
             self.ring_write(ring, kv, 1, hd, win, 0)?;
             (ring, win, 1)
         };
+        self.end(s);
         let (mut kc, mut kv1) = (0, 0);
         if c.compress_ratios[lid] > 0 {
+            let s = self.span("compress");
             let src = self.compress_dyn(p, lid, x, qr, t, split)?;
             kc = self.topk.as_ref().context("no top-k")?.1;
             kv1 = self.ckv[&src].ptr;
+            self.end(s);
         }
+        let s = self.span("sparse_attn");
         let idx = self.fbuf(t * (win + kc))?;
         let (ti, st, ni, mi, pp, wi) = (
             t as i32,
@@ -668,6 +705,7 @@ impl GpuModel {
             let tk = self.topk.as_ref().unwrap().0;
             self.idx_cat(idx, tk, t, kc, win + kc, win)?;
         }
+        self.end(s);
         self.attn_out(p, q, (kv0, split, kv1), idx, t, win + kc, lid, at)
     }
 
@@ -771,6 +809,7 @@ impl GpuModel {
     ) -> Result<Buf> {
         let c = &self.cpu.cfg;
         let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
+        let s = self.span("sparse_attn");
         let sink = self.dw(&format!("{p}.attn.attn_sink"))?;
         let o = self.fbuf(t * h * hd)?;
         let (kv0, split, kv1) = (kv.0.ptr, kv.1 as i32, kv.2);
@@ -787,6 +826,8 @@ impl GpuModel {
             )?
         };
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
+        self.end(s);
+        let s = self.span("wo");
         self.rope(o, t, h, hd, lid, at, true)?;
         self.k.fp8_qdq(&self.s, o.ptr, t * h * hd)?;
         let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
@@ -802,7 +843,9 @@ impl GpuModel {
                 args![o.ptr, wv, mid.ptr, ti, gi, oli],
             )?
         };
-        self.lin(mid, t, &format!("{p}.attn.wo_b.weight"))
+        let y = self.lin(mid, t, &format!("{p}.attn.wo_b.weight"));
+        self.end(s);
+        y
     }
 
     fn ring_seed(&self, lid: usize, kv: Buf, t: usize) -> Result<()> {
@@ -905,7 +948,10 @@ impl GpuModel {
             self.topk = if clen == 0 {
                 None
             } else {
-                Some(self.indexer_prefill(p, lid, x, qr, latent, t)?)
+                let s = self.span("indexer");
+                let r = self.indexer_prefill(p, lid, x, qr, latent, t)?;
+                self.end(s);
+                Some(r)
             };
         }
         let kc = self.topk.as_ref().map_or(0, |(_, k)| *k);
@@ -1014,7 +1060,8 @@ impl GpuModel {
             )?
         };
         if std::env::var_os("DS_TAP").is_some() {
-            self.s.sync()?;
+            self.sync()?;
+            super::obs::d2h(t * k * 4);
             let v = out.dev().read::<i32>(0, t * k)?;
             self.taps
                 .borrow_mut()
@@ -1088,6 +1135,7 @@ impl GpuModel {
                 None
             };
             if let Some(tk) = tk {
+                let s = self.span("indexer");
                 self.indexer_dyn(
                     p,
                     lid,
@@ -1100,6 +1148,7 @@ impl GpuModel {
                     cand_out.map(|cb| cb.at(e * wmax)),
                     cand_in.map(|(cb, st)| cb.at(e * st)),
                 )?;
+                self.end(s);
             }
             if let Some(lat) = latent {
                 let at = At::Dev {
@@ -1338,6 +1387,7 @@ impl GpuModel {
         let c = &self.cpu.cfg;
         let (ne, topk) = c.moe(lid);
         let d = c.dim;
+        let s = self.span("router");
         let raw = self.raw(x.ptr, t, &format!("{p}.ffn.gate.weight"))?;
         let bias = self.dw(&format!("{p}.ffn.gate.bias"))?;
         let (ids, wts) = (self.fbuf(t * topk)?, self.fbuf(t * topk)?);
@@ -1358,7 +1408,9 @@ impl GpuModel {
                 args![raw.ptr, bias.v.w, ids.ptr, wts.ptr, ti, nei, ki, norm, rs],
             )?
         };
+        self.end(s);
         // per-expert CSR on the device
+        let s = self.span("route");
         let (counts, off) = (self.fbuf(ne)?, self.fbuf(ne + 1)?);
         let (rows, rw) = (self.fbuf(t * topk)?, self.fbuf(t * topk)?);
         self.k.route(
@@ -1369,6 +1421,7 @@ impl GpuModel {
         } else {
             None
         };
+        self.end(s);
         if let Some(tab) = tab {
             let y = self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?;
             return self.moe_finish(p, x, t, y);
@@ -1376,7 +1429,8 @@ impl GpuModel {
         // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
         // (and not upload) unrouted experts
         let live: Vec<bool> = if self.expert_slots > 0 {
-            self.s.sync()?;
+            self.sync()?;
+            super::obs::d2h(ne * 4);
             counts
                 .dev()
                 .read::<i32>(0, ne)?
@@ -1386,6 +1440,7 @@ impl GpuModel {
         } else {
             vec![true; ne]
         };
+        let s = self.span("experts");
         let y = self.zbuf(t * d)?;
         // one set of expert scratch, reused expert after expert (the stream orders it)
         let inter =
@@ -1435,6 +1490,7 @@ impl GpuModel {
                 )?
             };
         }
+        self.end(s);
         self.moe_finish(p, x, t, y)
     }
 
@@ -1457,6 +1513,7 @@ impl GpuModel {
         let d = self.cpu.cfg.dim;
         let (n, inter) = (t * topk, tab.inter);
         let slots = n.min(tab.local);
+        let s = self.span("grouped_gu");
         let elist = self.fbuf(slots)?;
         let (nei, ci) = (ne as i32, slots as i32);
         unsafe {
@@ -1477,6 +1534,8 @@ impl GpuModel {
             h.ptr, t, slots, inter, lim,
         )?;
         self.k.fp8_qdq(&self.s, h.ptr, n * inter)?;
+        self.end(s);
+        let s = self.span("grouped_down");
         let part = self.fbuf(n * d)?;
         self.k.moe_down(
             &self.s, tab.fmt, tab.w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d,
@@ -1503,6 +1562,7 @@ impl GpuModel {
                 ],
             )?
         };
+        self.end(s);
         Ok(y)
     }
 
@@ -1561,9 +1621,14 @@ impl GpuModel {
     fn moe_finish(&self, p: &str, x: Buf, t: usize, y: Buf) -> Result<Buf> {
         let d = self.cpu.cfg.dim;
         if let Some(reduce) = &self.moe_reduce {
+            let s = self.span("reduce");
             reduce(&y.dev(), t * d, &self.s)?;
+            self.end(s);
         }
+        let s = self.span("shared");
         let sh = self.mlp(&format!("{p}.ffn.shared_experts"), x, t, 0)?;
+        self.end(s);
+        let s = self.span("finish");
         let nn = (t * d) as i64;
         unsafe {
             self.k.go(
@@ -1575,6 +1640,7 @@ impl GpuModel {
                 args![y.ptr, sh.ptr, nn],
             )?
         };
+        self.end(s);
         Ok(y)
     }
 
@@ -1665,24 +1731,34 @@ impl GpuModel {
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
         let d = self.cpu.cfg.dim;
+        let s = self.span("hc");
         let am = self.hc_mixes(p, "attn", x, t)?;
         let h = self.hc_pre(x, pre_mix, t)?;
         self.tap(&format!("{p}.attn_pre"), h, t * d)?;
         self.rms(h, t, &format!("{p}.attn_norm.weight"))?;
         self.tap(&format!("{p}.attn_in"), h, t * d)?;
+        self.end(s);
+        let s = self.span("attn");
         let h = match attn {
             Attn::Main => self.attention(p, lid, h, t, sp)?,
             Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
         };
+        self.end(s);
         self.tap(&format!("{p}.attn"), h, t * d)?;
+        let s = self.span("hc");
         let x = self.hc_post(h, x, &am, t)?;
         let fm = self.hc_mixes(p, "ffn", x, t)?;
         let h = self.hc_pre(x, am.pre, t)?;
         self.rms(h, t, &format!("{p}.ffn_norm.weight"))?;
+        self.end(s);
         self.tap(&format!("{p}.moe_in"), h, t * d)?;
+        let s = self.span("moe");
         let h = self.moe(p, h, t, lid)?;
+        self.end(s);
         self.tap(&format!("{p}.moe"), h, t * d)?;
+        let s = self.span("hc");
         let x = self.hc_post(h, x, &fm, t)?;
+        self.end(s);
         Ok((x, fm.pre))
     }
 
@@ -1831,6 +1907,7 @@ impl GpuModel {
             && self.expert_slots == 0
             && (self.moe_reduce.is_none() || self.reduce_graphable)
             && std::env::var_os("DS_TAP").is_none()
+            && !super::obs::force_direct()
     }
 
     fn forward_impl(
@@ -1843,6 +1920,12 @@ impl GpuModel {
         let c = self.cpu.cfg.clone();
         let (d, t, v) = (c.dim, ids.len(), c.vocab_size);
         self.begin_step()?;
+        let kind = match (sp, all && t > 1) {
+            (0, _) => "prefill",
+            (_, true) => "verify",
+            _ => "decode",
+        };
+        self.obs.begin(&self.s, kind, t, sp);
         let hashes = if c.engram_layer_ids.is_empty() {
             None
         } else {
@@ -1868,6 +1951,9 @@ impl GpuModel {
         }
         let out = if self.graphable(sp, hook.is_some()) {
             if let Some(cg) = self.graphs.get(&key) {
+                self.obs.path(true, false);
+                super::obs::replay();
+                super::obs::h2d(inp.copies.iter().map(|u| u.n).sum());
                 cg.g.launch(&self.s)?;
                 self.graph_stats.replays += 1;
                 cg.out.clone()
@@ -1875,6 +1961,9 @@ impl GpuModel {
                 // warmed up at this generation: every weight is resident and the arena fits
                 // the step, so the capture allocates nothing
                 let s = ManuallyDrop::new(Stream(self.s.0));
+                // no timeline events inside the capture
+                self.obs.path(true, true);
+                super::obs::capture();
                 self.arena.borrow_mut().frozen = true;
                 let mut out = None;
                 let g = Graph::capture(&s, |s| {
@@ -1907,14 +1996,17 @@ impl GpuModel {
                 );
                 out
             } else {
+                self.obs.path(false, false);
                 let out = self.direct(&inp, t, bsp, all, None)?;
                 // a step that grew the arena moves it at the next start: warm up again
                 self.warm.insert(key, self.gen_after());
                 out
             }
         } else {
+            self.obs.path(false, false);
             self.direct(&inp, t, bsp, all, hook)?
         };
+        self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
         if self.journal_on && sp > 0 {
             self.journal_steps += 1;
             self.journal = out
@@ -1924,9 +2016,12 @@ impl GpuModel {
                 .collect();
         }
         if self.skip_readback {
+            // its events complete by the next step's start, which emits it
+            self.obs.finish();
             return Ok((Vec::new(), Vec::new()));
         }
-        self.s.sync()?;
+        self.sync()?;
+        super::obs::d2h((out.rows * v + out.mains.len() * t * d) * 4);
         let logits = out.logits.dev().read::<f32>(0, out.rows * v)?;
         let n = out.mains.len();
         let mut main = vec![0f32; t * d * n];
@@ -1937,6 +2032,7 @@ impl GpuModel {
                     .copy_from_slice(&mv[ti * d..(ti + 1) * d]);
             }
         }
+        self.obs.finish();
         Ok((logits, main))
     }
 
@@ -1974,20 +2070,26 @@ impl GpuModel {
         let c = self.cpu.cfg.clone();
         let (hc, d) = (c.hc_mult, c.dim);
         self.jrows.clear();
+        let sp_embed = self.span("embed");
         let mut h = self.embed_hc(inp.ids, t, hc)?;
+        self.end(sp_embed);
         let mut pre_mix = inp.one_hot;
         let mut mains: Vec<Buf> = Vec::new();
         for i in 0..c.n_layers {
             let p = format!("layers.{i}");
+            let sp_layer = self.obs.span(&self.s, "layer", Some(i));
             if let Some(f) = &self.force {
                 let (a, bb) = (f[i].0.clone(), f[i].1.clone());
                 h = self.up(&a)?;
                 pre_mix = self.up(&bb)?;
             }
             if let Some(j) = c.engram_layer_ids.iter().position(|&l| l == i) {
+                let se = self.span("engram");
                 h = self.engram(&p, i, h, inp.engram[j], t)?;
+                self.end(se);
             }
             if c.dspark_target_layer_ids.contains(&i) {
+                let sh = self.span("hc");
                 let m = self.fbuf(t * d)?;
                 let (ti, hci, di) = (t as i32, hc as i32, d as i32);
                 unsafe {
@@ -2001,18 +2103,22 @@ impl GpuModel {
                     )?
                 };
                 mains.push(m);
+                self.end(sh);
             }
             let (nh, npm) = self.block(&p, i, h, t, sp, pre_mix, Attn::Main)?;
             h = nh;
             pre_mix = npm;
+            self.end(sp_layer);
             if let Some(hk) = hook.as_mut() {
                 hk(&format!("layer{i}"), &self.read(h, t * hc * d)?);
             }
         }
+        let sp_head = self.span("head");
         let x = self.hc_pre(h, pre_mix, t)?;
         self.rms(x, t, "norm.weight")?;
         let rows = if all { t } else { 1 };
         let logits = self.raw(x.ptr + ((t - rows) * d * 4) as u64, rows, "head.weight")?;
+        self.end(sp_head);
         Ok(StepOut {
             logits,
             rows,
@@ -2101,6 +2207,7 @@ impl GpuModel {
             c.vocab_size,
         );
         self.begin_step()?;
+        self.obs.begin(&self.s, "draft", blk, sp);
         let t = main_hidden.len() / (d * c.dspark_target_layer_ids.len());
         let mh = self.up(main_hidden)?;
         let main_x = self.lin(mh, t, "mtp.0.main_proj.weight")?;
@@ -2121,6 +2228,8 @@ impl GpuModel {
             pre_mix = npm;
         }
         if sp == 0 {
+            self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
+            self.obs.finish();
             return Ok(None);
         }
         let last = format!("mtp.{}", n_mtp - 1);
@@ -2128,6 +2237,7 @@ impl GpuModel {
         let xh = self.read(x, blk * d)?;
         self.rms(x, blk, &format!("{last}.norm.weight"))?;
         let logits = self.raw(x.ptr, blk, "head.weight")?;
+        self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
         let mut logits = self.read(logits, blk * v)?;
         // host: the Markov head samples left to right, then the confidence head
         let rank = c.dspark_markov_rank;
@@ -2147,6 +2257,7 @@ impl GpuModel {
             let feat: Vec<f32> = xh[i * d..(i + 1) * d].iter().chain(memb).copied().collect();
             conf.push(super::forward::matmul(&feat, 1, &proj)[0]);
         }
+        self.obs.finish();
         Ok(Some(super::forward::Draft {
             ids: out,
             logits,
@@ -2236,16 +2347,31 @@ impl GpuModel {
         let c = self.cpu.cfg.clone();
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
+        let (start, t0) = (std::time::SystemTime::now(), std::time::Instant::now());
         let draft = self
             .forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q))?
             .context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
         edit(pos0 + 1, &mut ids[1..]);
+        let t1 = std::time::Instant::now();
         let snap = self.snapshot()?;
         let (logits, mains) = self.forward_all(&ids, pos0)?;
         let n = ids.len();
         let (k, tokens) = super::forward::verify_rows(&logits, &draft.logits, &ids, v, pick);
+        let t2 = std::time::Instant::now();
         self.rewind(&snap, pos0 + k + 1, pos0 + n)?;
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        if super::obs::level() > 0 || crate::telemetry::ds_enabled() {
+            super::obs::spec(super::obs::SpecRec {
+                drafted: n - 1,
+                accepted: k,
+                draft_ms: ms(t0, t1),
+                verify_ms: ms(t1, t2),
+                rewind_ms: ms(t2, std::time::Instant::now()),
+                rank: self.obs.rank.get(),
+                start,
+            });
+        }
         Ok(SpecStep {
             tokens,
             drafted: n - 1,

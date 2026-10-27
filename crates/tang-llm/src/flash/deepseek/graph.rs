@@ -88,6 +88,7 @@ impl Arena {
             bail!("arena overflow while capturing");
         }
         let d = DevBuf::alloc(n)?;
+        super::obs::alloc();
         let b = Buf {
             ptr: d.ptr,
             len: bytes,
@@ -104,6 +105,7 @@ impl Arena {
             self.extra.clear();
             self.main = None;
             self.main = Some(DevBuf::alloc((cap + cap / 2).next_multiple_of(ALIGN))?);
+            super::obs::alloc();
             self.extra_bytes = 0;
             self.gen += 1;
         }
@@ -125,6 +127,7 @@ struct Pinned(*mut u8, usize);
 
 impl Pinned {
     fn new(n: usize) -> Result<Self> {
+        super::obs::alloc();
         let mut p: *mut c_void = std::ptr::null_mut();
         gpu::check(
             unsafe { sys::cuMemAllocHost_v2(&mut p, n.max(1)) },
@@ -201,6 +204,7 @@ impl Upload {
         if self.n == 0 {
             return Ok(());
         }
+        super::obs::h2d(self.n);
         gpu::check(
             unsafe { sys::cuMemcpyHtoDAsync_v2(self.dst, self.src as *const c_void, self.n, s.0) },
             "cuMemcpyHtoDAsync",
@@ -255,6 +259,6 @@ impl GKernels {
             .f
             .get(name)
             .with_context(|| format!("no kernel {name}"))?;
-        Ok(gpu::launch(f, grid, block, smem, s, args)?)
+        Ok(super::obs::launch(f, grid, block, smem, s, args)?)
     }
 }

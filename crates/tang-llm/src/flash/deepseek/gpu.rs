@@ -308,7 +308,7 @@ impl Kernels {
             .more
             .get(name)
             .with_context(|| format!("no kernel {name}"))?;
-        Ok(gpu::launch(f, grid, block, smem, s, args)?)
+        Ok(super::obs::launch(f, grid, block, smem, s, args)?)
     }
 
     /// In place: -inf past each row's causal prefix (`causal`, ratio `r`) and where the u8
@@ -450,7 +450,7 @@ impl Kernels {
     pub fn linear(&self, s: &Stream, w: &DsW, x: u64, y: u64, t: usize, round: bool) -> Result<()> {
         let (wv, ti, r) = (*w, t as i32, round as i32);
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.linear,
                 blocks(t * w.rows as usize * 32, 256),
                 (256, 1, 1),
@@ -537,7 +537,7 @@ impl Kernels {
             );
             let rwo = if rw == 0 { 0 } else { rw + (t0 * 4) as u64 };
             unsafe {
-                gpu::launch(
+                super::obs::launch(
                     f,
                     grid,
                     (128, 1, 1),
@@ -594,7 +594,7 @@ impl Kernels {
             let ng = (n * nch) as i32;
             let xo = x + (t0 * cols * 4) as u64;
             unsafe {
-                gpu::launch(
+                super::obs::launch(
                     self.ks_quant,
                     blocks(n * nch * 32, 256),
                     (256, 1, 1),
@@ -627,7 +627,7 @@ impl Kernels {
             let (si, sbi, bri) = (sp as i32, sb as i32, br as i32);
             let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
             unsafe {
-                gpu::launch(
+                super::obs::launch(
                     f,
                     (grid as u32, 1, 1),
                     (256, 1, 1),
@@ -669,7 +669,7 @@ impl Kernels {
         let f = self.moe[fmt as usize - 2][tm_index(t)?][0];
         let grid = (inter.div_ceil(2).div_ceil(4) as u32, slots.max(1) as u32, 1);
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 f,
                 grid,
                 (128, 1, 1),
@@ -700,7 +700,7 @@ impl Kernels {
         let f = self.moe[fmt as usize - 2][tm_index(t)?][1];
         let grid = (d.div_ceil(4).div_ceil(4) as u32, slots.max(1) as u32, 1);
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 f,
                 grid,
                 (128, 1, 1),
@@ -715,7 +715,7 @@ impl Kernels {
     pub fn fp8_qdq(&self, s: &Stream, v: u64, n: usize) -> Result<()> {
         let g = (n / 32) as i32;
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.fp8_qdq,
                 blocks(n, 256),
                 (256, 1, 1),
@@ -737,7 +737,7 @@ impl Kernels {
     ) -> Result<()> {
         let (g, b, e) = ((n / block) as i32, block as i32, e4m3_scale as i32);
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.fp4_qdq,
                 blocks(n / block, 128),
                 (128, 1, 1),
@@ -752,7 +752,7 @@ impl Kernels {
     pub fn rms(&self, s: &Stream, x: u64, w: &DsW, rows: usize, eps: f32) -> Result<()> {
         let (wv, n) = (*w, w.cols);
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.rms,
                 (rows as u32, 1, 1),
                 (1024, 1, 1),
@@ -793,7 +793,7 @@ impl Kernels {
             inverse as i32,
         );
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.rope,
                 blocks(n, 256),
                 (256, 1, 1),
@@ -828,7 +828,7 @@ impl Kernels {
             let den = pr + (t * h * k * 4) as u64;
             let ti = t as i32;
             unsafe {
-                gpu::launch(
+                super::obs::launch(
                     self.attn_qk,
                     ((t * (h / 64) * k.div_ceil(32) * (d / 64)) as u32, 1, 1),
                     (256, 1, 1),
@@ -836,7 +836,7 @@ impl Kernels {
                     s,
                     tang_moe::args![q, kv, idxs, part, hi, di, ki],
                 )?;
-                gpu::launch(
+                super::obs::launch(
                     self.attn_soft,
                     blocks(t * h * 32, 256),
                     (256, 1, 1),
@@ -844,7 +844,7 @@ impl Kernels {
                     s,
                     tang_moe::args![part, sink, idxs, pr, den, ti, hi, di, ki, scale],
                 )?;
-                gpu::launch(
+                super::obs::launch(
                     self.attn_pv,
                     ((t * (h / 8) * (d / 64)) as u32, 1, 1),
                     (256, 1, 1),
@@ -857,7 +857,7 @@ impl Kernels {
         }
         let threads = d.clamp(32, 1024) as u32;
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.sparse_attn,
                 ((t * h) as u32, 1, 1),
                 (threads, 1, 1),
@@ -886,7 +886,7 @@ impl Kernels {
     ) -> Result<()> {
         let (ti, hci, it) = (t as i32, hc as i32, iters as i32);
         unsafe {
-            gpu::launch(
+            super::obs::launch(
                 self.sinkhorn,
                 blocks(t, 64),
                 (64, 1, 1),

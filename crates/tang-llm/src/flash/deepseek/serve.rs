@@ -40,6 +40,26 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// One GPU, or expert-parallel over `devices` (more than one; needs the `ep` feature).
+    pub fn open(dir: &Path, devices: &[usize]) -> Result<Self> {
+        if devices.len() <= 1 {
+            return Ok(Engine::Single(GpuModel::open_on(
+                dir,
+                devices.first().copied().unwrap_or(0),
+            )?));
+        }
+        #[cfg(feature = "ep")]
+        {
+            Ok(Engine::Ep(super::ep::EpGroup::open(
+                dir,
+                devices,
+                super::ep::Backend::Nccl,
+            )?))
+        }
+        #[cfg(not(feature = "ep"))]
+        bail!("--devices needs a build with --features ep")
+    }
+
     fn reset(&mut self) -> Result<()> {
         match self {
             Engine::Single(m) => m.reset(),
@@ -115,20 +135,7 @@ impl DsServe {
     /// means a single GPU.
     pub fn load_on(dir: &Path, devices: &[usize]) -> Result<Self> {
         let t = Instant::now();
-        let m = if devices.len() <= 1 {
-            Engine::Single(GpuModel::open(dir)?)
-        } else {
-            #[cfg(feature = "ep")]
-            {
-                Engine::Ep(super::ep::EpGroup::open(
-                    dir,
-                    devices,
-                    super::ep::Backend::Nccl,
-                )?)
-            }
-            #[cfg(not(feature = "ep"))]
-            bail!("--devices needs a build with --features ep")
-        };
+        let m = Engine::open(dir, devices)?;
         let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
         let tpl = Template::load(dir)?;
@@ -435,6 +442,204 @@ impl Backend for DsServe {
     fn context_window(&self) -> usize {
         self.ctx
     }
+}
+
+/// `tang-llm deepseek-profile`'s settings.
+#[derive(Clone, Debug)]
+pub struct ProfileOpts {
+    /// Decode / verify forwards after the prefill.
+    pub steps: usize,
+    pub prompt_tokens: usize,
+    /// Force the direct path (`DS_OBS_DIRECT=1`) so decode steps' interiors are timed.
+    pub direct: bool,
+    /// Print each change of a step kind's path (graph capture / replay / direct).
+    pub graph_debug: bool,
+    /// Speculative decoding with DSpark (as `serve`; `DS_SPEC=0` turns it off).
+    pub spec: bool,
+}
+
+/// Load the model, prefill a synthetic prompt and run `steps` decode or verify forwards
+/// (greedy) with the step timeline at `DS_OBS=2` on every step; the table as text.
+pub fn profile(dir: &Path, devices: &[usize], o: &ProfileOpts) -> Result<String> {
+    use super::obs;
+    obs::set(2, 1, o.direct);
+    obs::quiet(true);
+    let t0 = Instant::now();
+    let mut m = Engine::open(dir, devices)?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let vocab = m.config().vocab_size;
+    let blk = m.config().dspark_block_size;
+    let ids: Vec<usize> = (0..o.prompt_tokens.max(1))
+        .map(|i| (i * 7919 + 13) % vocab)
+        .collect();
+    obs::collect(true);
+    let mut usage = Usage::default();
+    let mut pick = SpecSampler::new(0.0, 1.0, 0);
+    let steps = o.steps;
+    forward::generate(
+        &mut m,
+        &ids,
+        steps * (blk + 2) + 1,
+        &mut pick,
+        o.spec,
+        &[],
+        &mut usage,
+        &mut |_| (obs::kept(&["decode", "verify"]) >= steps).then_some(Finish::Length),
+    )?;
+    let recs = obs::take();
+    obs::collect(false);
+    crate::telemetry::ds_flush_orphans();
+    Ok(profile_table(&recs, o, load_s, &usage))
+}
+
+fn profile_table(recs: &[super::obs::StepRec], o: &ProfileOpts, load_s: f64, u: &Usage) -> String {
+    use super::obs;
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let r0: Vec<&obs::StepRec> = recs.iter().filter(|r| r.rank == 0).collect();
+    let _ = writeln!(
+        s,
+        "deepseek-profile: load {load_s:.1} s, prompt {} tokens, {} forwards, {} tokens out, drafts {}/{} accepted{}",
+        u.prompt_tokens,
+        r0.len(),
+        u.completion_tokens,
+        u.accepted_tokens,
+        u.draft_tokens,
+        if o.direct { ", direct path (DS_OBS_DIRECT)" } else { "" }
+    );
+    let _ = writeln!(
+        s,
+        "\n{:>4} {:<8} {:>3} {:>6} {:<14} {:>10} {:>10} {:>10} {:>8} {:>5} {:>10} {:>10} {:>6} {:>6}",
+        "step", "kind", "t", "sp", "path", "wall_ms", "gpu_ms", "host_ms", "launches", "syncs",
+        "d2h", "h2d", "allocs", "expup"
+    );
+    for r in &r0 {
+        let c = &r.counts;
+        let path = format!("{}{}", r.path, if r.captured { "+capture" } else { "" });
+        let _ = writeln!(
+            s,
+            "{:>4} {:<8} {:>3} {:>6} {:<14} {:>10.3} {:>10.3} {:>10.3} {:>8} {:>5} {:>10} {:>10} {:>6} {:>6}",
+            r.step, r.kind, r.t, r.sp, path, r.wall_ms, r.gpu_ms, r.host_ms, c.launches,
+            c.syncs, c.d2h_bytes, c.h2d_bytes, c.allocs, c.expert_uploads
+        );
+    }
+    if o.graph_debug {
+        let _ = writeln!(s, "\ngraph transitions:");
+        let mut last: std::collections::HashMap<(&str, usize), (&str, bool)> = Default::default();
+        for r in &r0 {
+            let now = (r.path, r.captured);
+            let prev = last.insert((r.kind, r.t), now);
+            if prev != Some(now) {
+                let _ = writeln!(
+                    s,
+                    "  step {} {} t={}: {} -> {}{} (captures {}, replays {})",
+                    r.step,
+                    r.kind,
+                    r.t,
+                    prev.map_or("start".to_string(), |p| p.0.to_string()),
+                    r.path,
+                    if r.captured { " (captured)" } else { "" },
+                    r.counts.captures,
+                    r.counts.replays
+                );
+            }
+        }
+    }
+    // per kind: means over its steps after the first (the first uploads weights and sizes
+    // the arena)
+    for kind in ["prefill", "draft", "decode", "verify"] {
+        let all: Vec<&&obs::StepRec> = r0.iter().filter(|r| r.kind == kind).collect();
+        if all.is_empty() {
+            continue;
+        }
+        let warm: Vec<&&obs::StepRec> = if all.len() > 1 {
+            all[1..].to_vec()
+        } else {
+            all.clone()
+        };
+        let n = warm.len() as f64;
+        let mean = |f: &dyn Fn(&obs::StepRec) -> f64| warm.iter().map(|r| f(r)).sum::<f64>() / n;
+        let gpu = mean(&|r| r.gpu_ms);
+        let _ = writeln!(
+            s,
+            "\n{kind}: {} steps (means over {}): wall {:.3} ms, gpu {:.3} ms, host {:.3} ms, launches {:.0}, syncs {:.1}, reduce_wait {:.3} ms",
+            all.len(),
+            warm.len(),
+            mean(&|r| r.wall_ms),
+            gpu,
+            mean(&|r| r.host_ms),
+            mean(&|r| r.counts.launches as f64),
+            mean(&|r| r.counts.syncs as f64),
+            mean(&|r| r.reduce_wait_ms),
+        );
+        let inner: Vec<&&&obs::StepRec> = warm.iter().filter(|r| !r.spans.is_empty()).collect();
+        if inner.is_empty() {
+            let _ = writeln!(
+                s,
+                "  (no interior spans: graph steps are opaque; rerun with --direct)"
+            );
+            continue;
+        }
+        let ni = inner.len() as f64;
+        let mut ops: Vec<(String, f64, f64)> = Vec::new();
+        for r in &inner {
+            for (name, ms, cnt) in obs::breakdown(r) {
+                match ops.iter_mut().find(|(n, _, _)| *n == name) {
+                    Some(e) => {
+                        e.1 += ms;
+                        e.2 += cnt as f64;
+                    }
+                    None => ops.push((name, ms, cnt as f64)),
+                }
+            }
+        }
+        let gi = inner.iter().map(|r| r.gpu_ms).sum::<f64>() / ni;
+        let _ = writeln!(
+            s,
+            "  {:<28} {:>11} {:>7} {:>7} {:>11}",
+            "op", "ms/step", "%step", "n/step", "ms/each"
+        );
+        for (name, ms, cnt) in ops {
+            let per = ms / ni;
+            let _ = writeln!(
+                s,
+                "  {:<28} {:>11.4} {:>6.1}% {:>7.1} {:>11.4}",
+                name,
+                per,
+                100.0 * per / gi.max(1e-9),
+                cnt / ni,
+                ms / cnt.max(1.0)
+            );
+        }
+        let cov = inner.iter().map(|r| obs::covered_ms(r)).sum::<f64>() / ni;
+        let _ = writeln!(
+            s,
+            "  covered by embed+layers+head: {:.1}% of {:.3} ms gpu",
+            100.0 * cov / gi.max(1e-9),
+            gi
+        );
+    }
+    let others: Vec<&obs::StepRec> = recs.iter().filter(|r| r.rank != 0).collect();
+    if !others.is_empty() {
+        let _ = writeln!(s, "\nother ranks (mean per step):");
+        let mut ranks: Vec<usize> = others.iter().map(|r| r.rank).collect();
+        ranks.sort();
+        ranks.dedup();
+        for rk in ranks {
+            let rs: Vec<&&obs::StepRec> = others.iter().filter(|r| r.rank == rk).collect();
+            let n = rs.len() as f64;
+            let _ = writeln!(
+                s,
+                "  rank {rk}: {} steps, gpu {:.3} ms, wall {:.3} ms, reduce_wait {:.3} ms, launches {:.0}",
+                rs.len(),
+                rs.iter().map(|r| r.gpu_ms).sum::<f64>() / n,
+                rs.iter().map(|r| r.wall_ms).sum::<f64>() / n,
+                rs.iter().map(|r| r.reduce_wait_ms).sum::<f64>() / n,
+                rs.iter().map(|r| r.counts.launches as f64).sum::<f64>() / n,
+            );
+        }
+    }
+    s
 }
 
 #[cfg(test)]

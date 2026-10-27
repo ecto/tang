@@ -383,6 +383,11 @@ fn main() -> Result<()> {
     if cmd == "deepseek-serve" {
         return deepseek_serve(&args[1..]);
     }
+    // deepseek-profile <dir> [--devices ..] [--steps N] [--prompt-tokens N] [--direct]
+    #[cfg(feature = "cuda")]
+    if cmd == "deepseek-profile" {
+        return deepseek_profile(&args[1..]);
+    }
     // GLM-5.3-Flash (`glm5-next`) runs on its own engine, on any build.
     if matches!(cmd, "flash-generate" | "flash-bench")
         && tang_llm::flash::glm5::engine::is_glm5(&dir)
@@ -626,6 +631,45 @@ fn serve_flash(args: &[String]) -> Result<()> {
         hardware: probe(Backend::Cuda),
     };
     tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
+}
+
+/// Where a DeepSeek step's time goes: prefill + N decode/verify forwards with the step
+/// timeline on (docs/observability.md, "DeepSeek").
+#[cfg(feature = "cuda")]
+fn deepseek_profile(args: &[String]) -> Result<()> {
+    let usage = "deepseek-profile <checkpoint dir> [--devices 0,1,..] [--steps N] [--prompt-tokens N] [--direct] [--graph-debug] [--no-spec] [--ctx N]";
+    let dir = PathBuf::from(args.first().context(usage)?);
+    let mut devices: Vec<usize> = Vec::new();
+    let mut o = tang_llm::flash::deepseek::serve::ProfileOpts {
+        steps: 20,
+        prompt_tokens: 64,
+        direct: false,
+        graph_debug: false,
+        spec: std::env::var("DS_SPEC").map_or(true, |v| v != "0"),
+    };
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--steps" => o.steps = val()?.parse()?,
+            "--prompt-tokens" => o.prompt_tokens = val()?.parse()?,
+            "--direct" => o.direct = true,
+            "--graph-debug" => o.graph_debug = true,
+            "--no-spec" => o.spec = false,
+            "--ctx" => std::env::set_var("DS41_CTX", val()?),
+            "--devices" => {
+                devices = val()?
+                    .split(',')
+                    .map(|d| d.trim().parse::<usize>())
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            other => bail!("unknown option {other} ({usage})"),
+        }
+    }
+    let _otel = tang_llm::telemetry::init();
+    let table = tang_llm::flash::deepseek::serve::profile(&dir, &devices, &o)?;
+    print!("{table}");
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]

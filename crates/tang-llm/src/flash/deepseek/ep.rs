@@ -44,6 +44,9 @@ struct HostReduce {
 
 impl HostReduce {
     fn reduce(&self, rank: usize, y: &DevBuf, n: usize, s: &Stream) -> Result<()> {
+        super::obs::sync();
+        super::obs::d2h(n * 4);
+        super::obs::h2d(n * 4);
         s.sync()?;
         let v = y.read::<f32>(0, n)?;
         self.slots.lock().unwrap()[rank] = v;
@@ -86,13 +89,16 @@ enum Reply {
 }
 
 struct Rank {
-    tx: Sender<Cmd>,
+    /// Commands with the group's sequence number: each rank's timeline records it as its
+    /// steps' `parent`, so a step's per-rank records (and OTel spans) line up.
+    tx: Sender<(u64, Cmd)>,
     rx: Receiver<Result<Reply>>,
     h: Option<JoinHandle<()>>,
 }
 
 pub struct EpGroup {
     ranks: Vec<Rank>,
+    seq: std::cell::Cell<u64>,
     cfg: super::Config,
 }
 
@@ -113,7 +119,7 @@ impl EpGroup {
         };
         let mut ranks = Vec::new();
         for (rank, &dev) in devices.iter().enumerate() {
-            let (tx, crx) = channel::<Cmd>();
+            let (tx, crx) = channel::<(u64, Cmd)>();
             let (rtx, rx) = channel::<Result<Reply>>();
             let dir: PathBuf = dir.to_path_buf();
             let host = host.clone();
@@ -124,6 +130,7 @@ impl EpGroup {
                 .spawn(move || {
                     let init = || -> Result<GpuModel> {
                         let mut m = GpuModel::open_on(&dir, dev)?;
+                        m.obs.rank.set(rank);
                         m.owns_expert = Box::new(move |e| owner(e, world) == rank);
                         m.moe_reduce = match backend {
                             Backend::Host => {
@@ -152,7 +159,8 @@ impl EpGroup {
                             return;
                         }
                     };
-                    for cmd in crx {
+                    for (seq, cmd) in crx {
+                        m.obs.parent.set(seq);
                         let r = match cmd {
                             Cmd::Forward(ids, sp) => {
                                 // only rank 0's output is read: the others skip the read-back
@@ -185,7 +193,11 @@ impl EpGroup {
                 dir.join("config.json")
             }
         })?;
-        let g = EpGroup { ranks, cfg };
+        let g = EpGroup {
+            ranks,
+            seq: std::cell::Cell::new(0),
+            cfg,
+        };
         g.collect()?;
         Ok(g)
     }
@@ -199,8 +211,11 @@ impl EpGroup {
     }
 
     fn send(&self, mk: impl Fn() -> Cmd) -> Result<Vec<Reply>> {
+        let seq = self.seq.get() + 1;
+        self.seq.set(seq);
         for r in &self.ranks {
-            r.tx.send(mk()).map_err(|_| anyhow!("ep rank exited"))?;
+            r.tx.send((seq, mk()))
+                .map_err(|_| anyhow!("ep rank exited"))?;
         }
         self.collect()
     }
@@ -284,7 +299,7 @@ impl Drop for EpGroup {
     fn drop(&mut self) {
         for r in &mut self.ranks {
             // closing the channel ends the rank's loop
-            let (tx, _) = channel();
+            let (tx, _) = channel::<(u64, Cmd)>();
             drop(std::mem::replace(&mut r.tx, tx));
         }
         for r in &mut self.ranks {
