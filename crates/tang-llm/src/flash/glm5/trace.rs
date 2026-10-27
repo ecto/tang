@@ -48,6 +48,8 @@ pub struct Io {
     pub copy_ns: u64,
     pub allocs: u64,
     pub alloc_ns: u64,
+    pub syncs: u64,
+    pub sync_ns: u64,
 }
 
 impl Io {
@@ -64,6 +66,8 @@ impl Io {
                 copy_ns: s.copy_ns,
                 allocs: s.allocs,
                 alloc_ns: s.alloc_ns,
+                syncs: s.syncs,
+                sync_ns: s.sync_ns,
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -79,6 +83,8 @@ impl Io {
             copy_ns: self.copy_ns - e.copy_ns,
             allocs: self.allocs - e.allocs,
             alloc_ns: self.alloc_ns - e.alloc_ns,
+            syncs: self.syncs - e.syncs,
+            sync_ns: self.sync_ns - e.sync_ns,
         }
     }
     fn add(&mut self, o: &Io) {
@@ -90,6 +96,8 @@ impl Io {
         self.copy_ns += o.copy_ns;
         self.allocs += o.allocs;
         self.alloc_ns += o.alloc_ns;
+        self.syncs += o.syncs;
+        self.sync_ns += o.sync_ns;
     }
 }
 
@@ -498,7 +506,7 @@ fn render(s: &State) -> Option<String> {
             o,
             "\n-- {label}: {} windows, {} tokens, wall {:.1} ms{}, GPU {:.1} ms ({:.0}% of wall), \
              {} launches, H2D {:.2} MB / {} calls, D2H {:.2} MB / {} calls, sync-copy {:.1} ms, \
-             allocs {} ({:.1} ms)",
+             allocs {} ({:.1} ms), syncs {} ({:.1} ms)",
             ph.windows,
             ph.tokens,
             ph.wall_ms / div,
@@ -513,11 +521,13 @@ fn render(s: &State) -> Option<String> {
             ph.io.copy_ns as f64 / 1e6 / div,
             (ph.io.allocs as f64 / div).round(),
             ph.io.alloc_ns as f64 / 1e6 / div,
+            (ph.io.syncs as f64 / div).round(),
+            ph.io.sync_ns as f64 / 1e6 / div,
         );
         let _ = writeln!(
             o,
-            "{:<26} {:>6} {:>10} {:>6} {:>9} {:>7} {:>9} {:>9} {:>8} {:>8} {:>8} {:>6}",
-            "stage", "calls", "wall ms", "%wall", "gpu ms", "launch", "H2D MB", "D2H MB", "copy ms",
+            "{:<26} {:>6} {:>10} {:>6} {:>9} {:>7} {:>6} {:>6} {:>6} {:>9} {:>9} {:>8} {:>8} {:>8} {:>6}",
+            "stage", "calls", "wall ms", "%wall", "gpu ms", "launch", "h2d#", "d2h#", "sync#", "H2D MB", "D2H MB", "copy ms",
             "alloc ms", "GB/s", "%SOL"
         );
         let mut rows: Vec<(&String, &Agg)> = stages.iter().collect();
@@ -533,13 +543,16 @@ fn render(s: &State) -> Option<String> {
             let gbs = (a.bytes > 0 && a.bytes_ms > 0.0).then(|| a.bytes as f64 / a.bytes_ms / 1e6);
             let _ = writeln!(
                 o,
-                "{:<26} {:>6} {:>10.2} {:>5.1}% {:>9.2} {:>7.0} {:>9.3} {:>9.3} {:>8.2} {:>8.2} {:>8} {:>6}",
+                "{:<26} {:>6} {:>10.2} {:>5.1}% {:>9.2} {:>7.0} {:>6.0} {:>6.0} {:>6.0} {:>9.3} {:>9.3} {:>8.2} {:>8.2} {:>8} {:>6}",
                 name,
                 (a.calls as f64 / div).round(),
                 a.wall_ms / div,
                 100.0 * a.wall_ms / ph.wall_ms.max(1e-9),
                 a.gpu_ms / div,
                 a.io.launches as f64 / div,
+                a.io.h2d_calls as f64 / div,
+                a.io.d2h_calls as f64 / div,
+                a.io.syncs as f64 / div,
                 mb(a.io.h2d_bytes) / div,
                 mb(a.io.d2h_bytes) / div,
                 a.io.copy_ns as f64 / 1e6 / div,

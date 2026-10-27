@@ -178,6 +178,10 @@ pub mod trace {
         pub alloc_bytes: u64,
         /// Host nanoseconds inside cuMemAlloc + cuMemFree.
         pub alloc_ns: u64,
+        /// Explicit host waits: `Stream::sync` + `Event::sync` (sync copies are d2h/h2d_calls).
+        pub syncs: u64,
+        /// Host nanoseconds blocked in those waits.
+        pub sync_ns: u64,
     }
 
     impl Snap {
@@ -193,6 +197,8 @@ pub mod trace {
                 allocs: self.allocs - e.allocs,
                 alloc_bytes: self.alloc_bytes - e.alloc_bytes,
                 alloc_ns: self.alloc_ns - e.alloc_ns,
+                syncs: self.syncs - e.syncs,
+                sync_ns: self.sync_ns - e.sync_ns,
             }
         }
         pub fn add(&mut self, o: &Snap) {
@@ -205,10 +211,12 @@ pub mod trace {
             self.allocs += o.allocs;
             self.alloc_bytes += o.alloc_bytes;
             self.alloc_ns += o.alloc_ns;
+            self.syncs += o.syncs;
+            self.sync_ns += o.sync_ns;
         }
     }
 
-    static C: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    static C: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
     const LAUNCHES: usize = 0;
     const H2D_B: usize = 1;
     const H2D_N: usize = 2;
@@ -218,6 +226,8 @@ pub mod trace {
     const ALLOCS: usize = 6;
     const ALLOC_B: usize = 7;
     const ALLOC_NS: usize = 8;
+    const SYNCS: usize = 9;
+    const SYNC_NS: usize = 10;
 
     /// One traced launch.
     struct Pending {
@@ -282,6 +292,12 @@ pub mod trace {
         }
     }
 
+    /// A host wait ended (`t0`: when it began).
+    pub fn sync(t0: std::time::Instant) {
+        C[SYNCS].fetch_add(1, Relaxed);
+        C[SYNC_NS].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+
     pub fn snap() -> Snap {
         let g = |i: usize| C[i].load(Relaxed);
         Snap {
@@ -294,6 +310,8 @@ pub mod trace {
             allocs: g(ALLOCS),
             alloc_bytes: g(ALLOC_B),
             alloc_ns: g(ALLOC_NS),
+            syncs: g(SYNCS),
+            sync_ns: g(SYNC_NS),
         }
     }
 
@@ -336,6 +354,11 @@ pub mod trace {
         C[ALLOC_NS].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     }
 
+    fn exact() -> bool {
+        static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *E.get_or_init(|| std::env::var("TANG_TRACE_EXACT").is_ok_and(|v| v == "1"))
+    }
+
     fn event() -> Option<usize> {
         let from_pool = POOL.with_borrow_mut(|p| p.pop());
         if from_pool.is_some() {
@@ -355,9 +378,15 @@ pub mod trace {
             || st != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
         // a stream's first traced launch since tracing started has no base event: record
         // one (the next launch measures from it); graph capture gets nothing recorded
-        if !capturing && LAST.with_borrow(|m| !m.contains_key(&(s as usize))) {
+        // TANG_TRACE_EXACT=1: a fresh start event right before every launch, so a launch's
+        // time is its own execution — the default (start = the previous launch's end on
+        // the stream) also counts the host gap before it, which overstates GPU busy
+        // whenever the host is the bottleneck
+        if !capturing && (exact() || LAST.with_borrow(|m| !m.contains_key(&(s as usize)))) {
             if let Some(e) = event() {
                 unsafe { sys::cuEventRecord(e as sys::CUevent, s) };
+                // the replaced base (exact mode) is still some pending launch's end event:
+                // drain() returns those to the pool, so just overwrite the slot
                 LAST.with_borrow_mut(|m| m.insert(s as usize, e));
             }
         }
@@ -407,6 +436,9 @@ pub mod trace {
                     let ok = sys::cuEventElapsedTime(&mut ms, e0 as sys::CUevent, e1 as sys::CUevent)
                         == sys::CUresult::CUDA_SUCCESS;
                     back.push(e1); // the start event stays as the stream's base
+                    if exact() {
+                        back.push(e0); // exact mode: each launch's own start event
+                    }
                     ok.then_some(ms)
                 }
             });
@@ -470,7 +502,12 @@ impl Stream {
     }
 
     pub fn sync(&self) -> Result<()> {
-        ck!(sys::cuStreamSynchronize(self.0))
+        let t0 = trace::on().then(std::time::Instant::now);
+        let r = ck!(sys::cuStreamSynchronize(self.0));
+        if let Some(t0) = t0 {
+            trace::sync(t0);
+        }
+        r
     }
 
     /// True when all work is done (`cuStreamQuery`).
@@ -510,7 +547,12 @@ impl Event {
     }
 
     pub fn sync(&self) -> Result<()> {
-        ck!(sys::cuEventSynchronize(self.0))
+        let t0 = trace::on().then(std::time::Instant::now);
+        let r = ck!(sys::cuEventSynchronize(self.0));
+        if let Some(t0) = t0 {
+            trace::sync(t0);
+        }
+        r
     }
 
     pub fn done(&self) -> bool {

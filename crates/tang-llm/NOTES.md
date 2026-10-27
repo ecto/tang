@@ -166,6 +166,56 @@ base = `MOE=fast GEMV8=1 KDA_PF2=1 MHC_FUSED=1` (all `TANG_GLM5_`)
   sum 164 ms > 39.8 ms wall) — use wall.
 - The "52 tok/s" in the program brief is the verdict's 0.52 tok/s.
 
+## 2026-10-27 — decode-step audit: every host round trip per token, and what blocks a whole-step graph (branch claude/glm5-step-graph)
+
+Trace now counts host waits (`syncs`: Stream/Event sync, per stage) and `TANG_TRACE_EXACT=1`
+times each launch from its own start event (the default start = previous launch's end
+counts host gaps as GPU: tiny q8_0 on the 3090 read 6.5 ms "GPU" per 2.9 ms token;
+exact 2.1; nsys kernel sum 1.68).
+
+H200 gate (GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT GPU_HEAD):
+ids `785 1196 6801 264 6386 38038 911 279` = oracle.
+
+Per decode token the structure is fixed: every mixer/FFN takes a host `x` and returns a
+host `y`, so each stage is H2D + launches + sync + D2H. The B300 count (226 D2H/token)
+decomposes exactly (34 KDA, 11 DSA dense, 45 FFN, 45×2 mHC pre):
+
+| site (file:line) | stage | D2H/token | why |
+|---|---|---|---|
+| kda_dev.rs:717 sync, :721 `outb.read` (finish) | kda/sync+read | 34 | y to host for mhc post |
+| mhc_fused.rs:501 sync, :502 `x.read` (pre) | mhc_pre.attn/.ffn | 90 | normed x to host for the mixer/FFN |
+| moe_gpu.rs:643 sync (ffn_fast), :666 `P_Y.read` (ffn_host) | ffn | 45 | y to host; routing top-k is already on device (g5f_select) |
+| mla_dev.rs:251 sync, :252 `y.read` | dsa/o_proj | 11 | y to host |
+| mla.rs:2468 refresh_mirrors → debug_rows :2622-2625 (4 reads) | dsa/mirrors | 44 | host cache mirrors, only for re-upload/CPU fallback |
+| mla.rs:2225-2226 `sd_out.read` (sparse only, kv_len > top_k) | dsa/idx_select | 0 (11 when sparse) | top-k selection to host, re-fed to attend |
+| mhc_fused.rs:561-563 `h.read` (end) | head.mean | 1 | h to host for output_norm (CPU) |
+| engine.rs:178-180 head sync + logits read (620 KB) | lm_head | 1 | argmax on host |
+| **total** | | **226** | |
+
+H2D per token: embed (host gather, 1), mhc post y (90), kda xb (34), ffn x (45), mla x (11),
+head x (1). Tiny (5 layers) measured: 126 launches, 23 H2D, 27 D2H, 23 syncs; wall 2.66 ms vs
+kernel busy 1.68 ms (nsys) — 37% host overhead even on 5 layers.
+
+**Whole-step graph: not prototyped — every stage blocks capture**, and the fixes are in
+files other workstreams own. What each needs (a `*_dev(s, x_ptr, y_ptr)` entry, no sync, no
+host copy, on the ONE capturing stream or event-joined):
+1. KDA (kda_dev.rs / kda_decode.rs, KDA owner): decode from a device x into a device y, no
+   `s.sync`/`outb.read`; own stream `self.s` + `core.s` must join the step stream. Do NOT
+   reuse the KDA_FUSED/KDA_GRAPH mixer graph: 4× slower on the B300 (kda 13 → 51 ms/token),
+   cause unknown.
+2. MoE (moe_gpu.rs, MoE owner): `ffn` without the trailing `s.sync()` (:643); pooled stream
+   is per call (`pool.stream.take()`), needs the caller's stream.
+3. mHC fused (mhc_fused.rs, unowned): `pre` leaving x on device (drop :501-502), `post`
+   taking a device y ptr (:541 write), `end` leaving h on device.
+4. DSA (mla_dev.rs / mla.rs, MLA owner): drop the y read + mirrors (make mirrors lazy, on
+   fallback only); `kv_len`/`pos0` are kernel args → per-token graph update
+   (cuGraphExecKernelNodeSetParams) or a device position counter; dense→sparse switch is a
+   host branch (needs two graphs, switch at kv_len = top_k); sparse `sel` must stay on device.
+5. Engine (mine): output_norm on device, device argmax + token feedback, embed gather on
+   device, graph per (kv_len bucket) — waits on 1-4.
+Unverified: H200 exact-timed trace (queued behind other agents' runs for >1 h at
+/root/w-graph/trace1.log); ms/token with a step graph (not buildable yet).
+
 ## 2026-10-27 — GLM-5.3 server batcher: N sequence slots, one batched decode window (branch frog/glm5-batcher)
 
 What was built:
