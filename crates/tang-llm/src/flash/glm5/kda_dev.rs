@@ -248,9 +248,13 @@ impl DevLayer {
             max_t,
             pf2,
             probe: None,
-            fast: match decode::Mode::from_env() {
-                decode::Mode::Naive => None,
-                _ => Some(decode::Fast::new(g, cfg)?),
+            fast: {
+                let mode = decode::Mode::from_env();
+                decode::log_load(mode);
+                match mode {
+                    decode::Mode::Naive => None,
+                    _ => Some(decode::Fast::new(g, cfg)?),
+                }
             },
             gemv8: std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1"),
         })

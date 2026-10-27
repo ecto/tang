@@ -60,7 +60,33 @@ impl Mode {
             Mode::Naive
         }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Naive => "naive",
+            Mode::Fused => "fused",
+            Mode::Graph => "graph",
+        }
+    }
 }
+
+/// Once per process: the decode mode the KDA layers were built with (gate logs grep
+/// `glm5 kda: decode mode`, so a run's path is auditable from its log).
+pub fn log_load(mode: Mode) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("glm5 kda: decode mode {} (load)", mode.name()));
+}
+
+/// Once per process per event: the fused path's first eager step, first graph capture,
+/// first graph replay — proof in the log that the path actually ran, not just loaded.
+fn log_once(flag: &std::sync::atomic::AtomicBool, msg: impl FnOnce() -> String) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{}", msg());
+    }
+}
+static LOG_EAGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOG_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOG_REPLAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The fused kernels of one layer's device + the captured graph.
 pub struct Fast {
@@ -257,6 +283,7 @@ impl DevLayer {
             Mode::Graph if self.fast.as_ref().and_then(|f| f.graph.as_ref()).is_some_and(|g| g.1 == gemv8) => {
                 let f = self.fast.as_ref().unwrap();
                 f.graph.as_ref().unwrap().0.launch(&self.s).map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
+                log_once(&LOG_REPLAY, || format!("glm5 kda: decode mode graph engaged (first replay, gemv8={gemv8})"));
             }
             Mode::Graph => {
                 // first token (or GEMV8 toggled): run eagerly, then capture for the next
@@ -272,8 +299,12 @@ impl DevLayer {
                 })
                 .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
                 self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
+                log_once(&LOG_CAPTURE, || format!("glm5 kda: decode mode graph captured (first decode ran eager, gemv8={gemv8})"));
             }
-            _ => self.enqueue_decode(&self.s, gemv8, None)?,
+            _ => {
+                self.enqueue_decode(&self.s, gemv8, None)?;
+                log_once(&LOG_EAGER, || format!("glm5 kda: decode mode fused engaged (first eager step, gemv8={gemv8})"));
+            }
         }
         self.s.sync()?;
         let out = self.outb.read::<f32>(0, hidden)?;
