@@ -4,6 +4,24 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
+The worker session died twice mid-iteration; the manager committed its dirty tree as
+clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree
+md5-matched to 68dc73a8, 1127 files):
+- build rc 0; flash::glm5::mla 11/11; engine_gpu 5/5; gate + dbg + trace ids all = the
+  oracle `785 1196 6801 264 6386 38038 911 279`.
+- MLA shadow: 88 windows checked, 0 failed; worst rel 5.7e-4 (lat, tol 1e-3).
+- Trace (TANG_GLM5_TRACE=1, -n 32, GPU_FFN=0): decode per token — dsa **6.00 ms** (was
+  123 at 337d454c, 1,552 before MLA went resident), kda 13.05, mhc ~10.4, head 0.76,
+  embed 0.32. The GPU-side decode budget is ~30 ms/token.
+What the WIP added (now verified): the cache appends are device-side (kv_a / indexer
+wk / pool gate as g5f_gemv straight into the resident rows, `mla_lat_norm_bf16` +
+`mla_idx_ln` finishing in place; no host staging, no sync), pool keys stay on the
+device, and the attend is the coalesced absorbed form (`mla_fold_q2` +
+`mla_attn_abs2`); `o_proj` reads the attention output in place. Pre-abs2 the o_proj
+sync waited on `mla_attn_naive` (r14 trace: dsa 68.35 ms/token).
+Forward fast-forwarded to 68dc73a8.
+
 ## 2026-10-26 — MLA: both divergence signals were real bugs (3 of them); device-resident projections (branch frog/glm5-mla-divergence)
 
 Method: a new MLA shadow (`mla_debug.rs`, `TANG_GLM5_MLA_DEBUG=1`, on tang-verify) runs
