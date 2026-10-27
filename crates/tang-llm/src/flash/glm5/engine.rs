@@ -59,8 +59,10 @@ const K5_WARPS: usize = 4;
 /// order against it — gpu.rs's doc).
 struct HeadDev {
     dw: super::moe::gpu::DevW,
-    xq8: super::moe::gpu::DevBuf,
-    out: super::moe::gpu::DevBuf,
+    /// the normed h row, f32 (k5_q8 reads device memory, not the host row)
+    xf: tang_moe::gpu::DevBuf,
+    xq8: tang_moe::gpu::DevBuf,
+    out: tang_moe::gpu::DevBuf,
     k5: super::moe::gpu::Kernels5,
     s: tang_moe::gpu::Stream,
 }
@@ -370,6 +372,45 @@ impl GpuFfn {
                 String::new()
             }
         );
+        // the LM head on the GPU (TANG_GLM5_GPU_HEAD=1): t==1 decode only. The host
+        // tiled Mat::apply was 39.6 ms/token (trace); one k5_q8 + k5_gemv8 is ~150 us.
+        // Built here, before `devs` moves into Self.
+        let head_dev = if std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
+            devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
+            let info = match g.get("output.weight") {
+                Some(t) => t,
+                None => g.info("token_embd.weight")?,
+            };
+            let rows = info.dims[1] as usize; // n_vocab
+            let cols = info.dims[0] as usize; // hidden
+            anyhow::ensure!(
+                info.ty == crate::gguf::GgmlType::Q8_0,
+                "lm head: want Q8_0 (k5_gemv8), got {:?}",
+                info.ty
+            );
+            anyhow::ensure!(cols % 32 == 0, "lm head: hidden {cols} not a multiple of 32");
+            let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, rows, cols)
+                .map_err(|e| anyhow::anyhow!("lm head upload: {e}"))?;
+            let k5 = super::moe::gpu::Kernels5::new(&devs[0].0)
+                .map_err(|e| anyhow::anyhow!("k5 (head): {e}"))?;
+            let xf = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(cols)
+                .map_err(|e| anyhow::anyhow!("head xf: {e}"))?;
+            // scratch: k5_q8 codes [MAXT][cols] + f32 scales after them (the gemv8
+            // kernel reads scales at xq8 + MAXT*cols); here MAXT = 1
+            let xq8 = tang_moe::gpu::DevBuf::zeroed_elems::<u8>(cols + cols / 32 * 4)
+                .map_err(|e| anyhow::anyhow!("head xq8: {e}"))?;
+            let out = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(rows)
+                .map_err(|e| anyhow::anyhow!("head out: {e}"))?;
+            let hs = tang_moe::gpu::Stream::blocking()
+                .map_err(|e| anyhow::anyhow!("head stream: {e}"))?;
+            eprintln!(
+                "glm5: LM head resident on the GPU ({} MB)",
+                dw.w.row_bytes as usize * rows / 1_000_000
+            );
+            Some(HeadDev { dw, xf, xq8, out, k5, s: hs })
+        } else {
+            None
+        };
         let mut f = Self {
             devs,
             kda_l,
@@ -391,41 +432,6 @@ impl GpuFfn {
         if mhc_fused {
             f.enable_mhc_fused(g, hp)?;
         }
-        // the LM head on the GPU (TANG_GLM5_GPU_HEAD=1): t==1 decode only. The host
-        // tiled Mat::apply was 39.6 ms/token (trace); one k5_q8 + k5_gemv8 is ~150 us.
-        let head_dev = if std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
-            devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
-            let info = match g.get("output.weight") {
-                Some(t) => t,
-                None => g.info("token_embd.weight")?,
-            };
-            let rows = info.dims[1] as usize; // n_vocab
-            let cols = info.dims[0] as usize; // hidden
-            anyhow::ensure!(
-                info.ty == crate::gguf::GgmlType::Q8_0,
-                "lm head: want Q8_0 (k5_gemv8), got {:?}",
-                info.ty
-            );
-            let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, rows, cols)
-                .map_err(|e| anyhow::anyhow!("lm head upload: {e}"))?;
-            let k5 = super::moe::gpu::Kernels5::new(&devs[0].0)
-                .map_err(|e| anyhow::anyhow!("k5 (head): {e}"))?;
-            // scratch: k5_q8 codes [MAXT][cols] + scales after them (the gemv8 kernel
-            // reads scales at xq8 + MAXT*cols); here MAXT = 1
-            let xq8 = tang_moe::gpu::DevBuf::zeroed_elems::<u8>(cols + cols.div_ceil(32) * 4)
-                .map_err(|e| anyhow::anyhow!("head xq8: {e}"))?;
-            let out = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(rows)
-                .map_err(|e| anyhow::anyhow!("head out: {e}"))?;
-            let hs = tang_moe::gpu::Stream::blocking()
-                .map_err(|e| anyhow::anyhow!("head stream: {e}"))?;
-            eprintln!(
-                "glm5: LM head resident on the GPU ({} MB)",
-                dw.w.row_bytes * rows / 1_000_000
-            );
-            Some(HeadDev { dw, xq8, out, k5, s: hs })
-        } else {
-            None
-        };
         Ok(Some(f))
     }
 
@@ -1122,37 +1128,42 @@ impl Glm5Engine {
         self.m.norm_all_exact(&mut h, "output_norm.weight")?;
         drop(tr);
         let tr = span("lm_head");
-        let logits = match self.gpu.as_ref().and_then(|g| g.head_dev.as_ref()) {
+        let logits = match self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.head_dev.as_ref().map(|hd| (&g.devs[0].0, hd)))
+        {
             // decode (t=1): the normed h row on the device, one k5_q8 + one k5_gemv8. The
             // host tiled path measured 39.6 ms/token (TANG_GLM5_TRACE); the kernel is
             // ~150 us. The logits row lands in the `out` buffer, then one D2H read.
-            Some(hd) if t == 1 => {
-                let (gpu, _) = &g.devs[0];
+            #[cfg(feature = "cuda")]
+            Some((gpu, hd)) if t == 1 => {
                 gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
                 let n = self.m.hp.n_embd;
                 let nv = self.m.hp.n_vocab;
                 let row = &h[(t - 1) * n..t * n];
-                hd.xq8.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
+                // synchronous legacy-stream copy; hd.s is blocking, so it orders after
+                hd.xf.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
                 unsafe {
                     // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
-                    tang_moe::gpu::launch(
+                    launch(
                         hd.k5.q8,
                         ((n / 32) as u32, 1, 1),
                         (32, 1, 1),
                         0,
                         &hd.s,
-                        args![row.as_ptr() as *mut std::ffi::c_void, hd.xq8.ptr, n as u32, 1u32],
+                        args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32],
                     )?;
-                    // k5_gemv8: grid (rows/K5_WARPS, T=1), ROWS = n_vocab, COLS = n;
+                    // k5_gemv8: grid (ceil(rows/K5_WARPS), T=1), ROWS = n_vocab, COLS = n;
                     // scales live at xq8 + 1*n bytes (the MAXT offset)
-                    tang_moe::gpu::launch(
+                    launch(
                         hd.k5.gemv8,
-                        ((nv / K5_WARPS) as u32, 1, 1),
+                        (nv.div_ceil(K5_WARPS) as u32, 1, 1),
                         (128, 1, 1),
-                        (4 * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                        (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                         &hd.s,
                         args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
-                            1u32, 1u32, nv as u32, n as u32],
+                            nv as u32, 1u32, nv as u32, n as u32],
                     )?;
                 }
                 hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
