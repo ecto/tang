@@ -48,8 +48,16 @@ q_a + `mla_rms_norm`, q_b, o_proj and the indexer's wq_b / weights_proj run on `
   `785 1196 6801 264 6386 38038 911 279` = the oracle, with and without the shadow.
   Shadow: `88 windows checked, 0 failed`; q_resid rel ≤ 1.6e-5, q ≤ 1.3e-5, out ≤ 2.1e-5.
   Selection was not exercised: the prompt is dense.
-- mla mixer per step (sum of 11 DSA layers, `TANG_GLM5_PROF=1`), resident: prefill
-  (20 tok) 200.6 ms, decode 84.0 → 98.9 ms. Naive baseline: see below.
+- mla mixer per step (sum of 11 DSA layers, `TANG_GLM5_PROF=1`, same binary
+  ba50fdfb, both runs ids = oracle):
+
+  | | naive (host GEMVs) | resident | |
+  |---|---|---|---|
+  | prefill (20 tok) | 6466.9 ms | 200.6 ms | 32× |
+  | decode / step | 1440.6–1583.8 ms | 84.0–98.9 ms | ~16× |
+
+  Resident decode grows ~2.5 ms/step with kv_len. Next: the remaining ~8 ms/layer
+  (cache appends staged from the host, mirror read-backs, the pool host copy, syncs).
 
 `test result` lines (H200): `flash::glm5::mla` 11 passed; `engine_gpu*` 4 passed;
 `engine_reset_gpu` ok.
