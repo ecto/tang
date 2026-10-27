@@ -49,7 +49,7 @@ extern "C" __global__ void kda_conv(const float* __restrict__ X, unsigned int st
     unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int bi = blockIdx.y;
     if (ch >= KDA_CONV) return;
-    X += (u64)bi * T * stride; Y += (u64)bi * T * KDA_CONV; H0 += (u64)bi * KDA_CONV;
+    X += (u64)bi * T * stride; Y += (u64)bi * T * KDA_CONV; H0 += (u64)bi * KDA_CONV * (KDA_KC - 1);
     float w[KDA_KC];
     for (unsigned int i = 0; i < KDA_KC; i++) w[i] = W[ch * KDA_KC + i];
     for (unsigned int t = 0; t < T; t++) {
@@ -70,7 +70,7 @@ extern "C" __global__ void kda_conv_commit(float* __restrict__ H0, const float* 
     unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int bi = blockIdx.y;
     if (ch >= KDA_CONV) return;
-    X += (u64)bi * T * stride; H0 += (u64)bi * KDA_CONV;
+    X += (u64)bi * T * stride; H0 += (u64)bi * KDA_CONV * (KDA_KC - 1);
     float old[KDA_KC - 1];
     for (unsigned int s = 0; s < KDA_KC - 1; s++) old[s] = H0[ch * (KDA_KC - 1) + s];
     for (unsigned int s = 0; s < KDA_KC - 1; s++) {
@@ -80,14 +80,14 @@ extern "C" __global__ void kda_conv_commit(float* __restrict__ H0, const float* 
 }
 
 // batched decode commit: same shift, but the row `bi` belongs to SLOT[bi] — the state
-// offset is `SLOT[bi] * KDA_CONV`, not `bi * KDA_CONV` (T = 1, one row per slot).
+// offset is `SLOT[bi] * KDA_CONV * (KDA_KC-1)`, not `bi * ...` (T = 1, one row per slot).
 extern "C" __global__ void kda_conv_commit_rows(float* __restrict__ H0, const float* __restrict__ X,
                                                 const unsigned int* __restrict__ SLOT) {
     unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int bi = blockIdx.y;
     if (ch >= KDA_CONV) return;
     X += (u64)bi * KDA_CONV;
-    H0 += (u64)SLOT[bi] * KDA_CONV;
+    H0 += (u64)SLOT[bi] * KDA_CONV * (KDA_KC - 1);
     float old[KDA_KC - 1];
     for (unsigned int s = 0; s < KDA_KC - 1; s++) old[s] = H0[ch * (KDA_KC - 1) + s];
     for (unsigned int s = 0; s < KDA_KC - 1; s++) {
