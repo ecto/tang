@@ -8,6 +8,8 @@
 //!   (`kernels.cu`), each tested against its CPU twin.
 //! - [`engine`] (cuda): the forward on the device, the CPU reference's control flow over
 //!   [`gpu`]'s kernels; selection steps (top-k, routing lists) still on the host.
+//! - [`ep`] (cuda): expert parallelism, one [`engine::GpuModel`] per GPU with routed experts
+//!   sharded by id and the MoE combined by all-reduce (`docs/deepseek-ep.md`).
 //! - [`serve`] (cuda): the OpenAI-compatible backend (`tang-llm deepseek-serve <dir>`): chat
 //!   template, tokenizer, DSML tool calls.
 //! - [`forward`]: the CPU f32 reference forward, a transcription of `scripts/deepseek_ref.py`
@@ -17,6 +19,8 @@
 
 #[cfg(feature = "cuda")]
 pub mod engine;
+#[cfg(feature = "cuda")]
+pub mod ep;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;

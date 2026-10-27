@@ -14,6 +14,9 @@ include = ["src/**/*", "README.md", "DESIGN.md"]
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# NCCL collectives (src/nccl.rs). cudarc loads libnccl at run time, so this builds without it;
+# only creating a `Comm` needs libnccl.so.2 present.
+nccl = ["cuda", "cudarc/nccl"]
 
 [dependencies]
 libc = "0.2"
