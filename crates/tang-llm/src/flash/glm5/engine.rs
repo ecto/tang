@@ -1227,11 +1227,23 @@ impl Glm5Engine {
         self.last_h.extend_from_slice(&h);
         drop(tr);
         let tr = span("lm_head");
-        // decode (t=1) on the device LM head when TANG_GLM5_GPU_HEAD=1 (GpuFfn::head_logits)
+        // on the device LM head when TANG_GLM5_GPU_HEAD=1 (GpuFfn::head_logits)
         #[cfg(feature = "cuda")]
         let dev = match self.gpu.as_ref() {
-            Some(g) if t == 1 => g.head_logits(&h, self.m.hp.n_embd, self.m.hp.n_vocab)?,
-            _ => None,
+            // every row of a window too, one at a time: an MTP verify window must see the
+            // same (q8-activation) head numerics as the t=1 decode it replaces
+            Some(g) => {
+                let (n, nv) = (self.m.hp.n_embd, self.m.hp.n_vocab);
+                let mut all = Vec::with_capacity(t * nv);
+                for i in 0..t {
+                    match g.head_logits(&h[i * n..(i + 1) * n], n, nv)? {
+                        Some(l) => all.extend_from_slice(&l),
+                        None => break,
+                    }
+                }
+                (all.len() == t * nv).then_some(all)
+            }
+            None => None,
         };
         #[cfg(not(feature = "cuda"))]
         let dev: Option<Vec<f32>> = None;
