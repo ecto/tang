@@ -4,6 +4,44 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 — fast MoE: grouped launches at full fan-out, 32-chunk K-quant dot (H200, branch claude/glm5-moe)
+Real model, `TANG_GLM5_MOE=fast TANG_GLM5_GPU_FFN_LAYERS=0-29 TANG_GLM5_GEMV8=1 TANG_GLM5_KDA_PF2=1`,
+-n 32 (31 decode tokens). Active weight bytes per routed layer per token: 153 MB (l4: 8 experts
+Q4_K/Q4_K/Q5_K + Q8_0 shared + F32 router; `DevMoe::active_bytes`), so the H200 floor is
+153 MB / 4.8 TB/s = 32 µs and the 1.5x target 48 µs.
+
+| | base (frog/glm5-forward 66aa4b5e) | after (this branch) |
+|---|---|---|
+| engine FFN call, T=1 mean over 30 resident layers (`TANG_GLM5_MOE_PROF`, host x/y, trace on) | 244 µs | 157 µs |
+| resident FFN per token (30 layers) | 7.3 ms | 4.7 ms |
+| bench l4 T1, device x/y (`real_layers_fast_matches_cpu`) | 210 µs (0.73 TB/s) | 107 µs (1.44 TB/s) |
+| bench l11 / l12 T1 | 227 / 211 µs | 127 / 122 µs |
+| bench l0 (dense Q8_0) T1 | 132 µs | 130 µs |
+| trace per token-layer: gu / down / router / select | 101 / 77 / 13.1 / 12.0 µs | 48.8 / 38.8+6.0 (sum) / 8.8 / 11.7 µs |
+| trace kernel BW: gu / down | 1.21 / 0.85 TB/s (after step 1) | 1.95 / 1.44 TB/s |
+| launches per routed layer | 6 (q8, router, select, gu, q8, down) | 7 (+ g5f_sum) |
+| host copies / syncs per layer | 1 H2D x + 1 D2H y (16 KB each) / 1 | same in the engine (`ffn_host`); `ffn_async` now has none |
+
+Steps (each verified: ids `785 1196 6801 264 6386 38038 911 279` = oracle, MoE shadow 240/240):
+1. `g5f_gu` grid (rows/4, S, T): one warp per (slot, row) instead of a warp walking 9 slots;
+   `g5f_down` splits slots over a block's warps (`sw`, 1 on dense — the first cut regressed l0
+   132 -> 263 µs by idling 3 of 4 warps). l4 210 -> 169.
+2. Q4_K / Q5_K `g5f_lane_dot32`: a lane owns whole 32-weight sub-blocks (scale/min decoded once
+   per 32, nibbles / high bits / int8 x as 16-byte loads) — the 8-weight decode was the bound,
+   not bytes (q8x2 vs q8 differed by ~10%). Router 4 warps a row (288 rows were 72 blocks),
+   select caches scores in smem. `__launch_bounds__(128, G5F_MINB)`, default 6 (<= 80 regs;
+   down had 139-154): l4 169 -> 126 (MINB 1) -> 110 (MINB 6; 4: 115, 8: ~109).
+3. Routed down split: `g5f_down_split` one warp per (slot, row pair) -> yp, `g5f_sum` in slot
+   order. 110 -> 107 bench; trace down 61 -> 39 + 6.
+Tried and dropped: double-buffered down staging (cp.async groups) — +regs, 169 -> 188.
+`TANG_GLM5_MOE_STAGE=0` (no smem staging) is slower (149 vs 126). ncu does not run here
+(nsight-compute 2025.1 lacks a cudarc symbol: `cuTensorMapEncodeIm2colWide`).
+Still open: 107 µs is 2.2x the 48 µs target. The remaining gap: Q8_0 shared expert and Q6_K
+down still use the 8-weight decode (Q8_0's 34-byte and Q6_K's 210-byte blocks are not 16-byte
+aligned — a repack at upload would fix both); 7 launches + the engine's per-layer host round
+trip (x up, y down, sync: ~25 µs of the 157) — `ffn_async` is the device-pointer entry for
+whoever owns engine.rs; T=8 (565 µs l4) re-decodes each row per token.
+
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
 clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree
