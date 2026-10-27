@@ -273,11 +273,14 @@ impl Model {
         // DeepSeek's repo ships its runtime config as inference/config.json (the top-level one
         // is in Hugging Face's format); the tiny fixture writes it at the top
         let inf = dir.join("inference/config.json");
-        let cfg = Config::load(&if inf.exists() {
+        let mut cfg = Config::load(&if inf.exists() {
             inf
         } else {
             dir.join("config.json")
         })?;
+        if let Some(n) = std::env::var("DS41_CTX").ok().and_then(|v| v.parse().ok()) {
+            cfg.max_seq_len = n;
+        }
         let st = St::open(dir)?;
         let engram = if cfg.engram_layer_ids.is_empty() {
             None

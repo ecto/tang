@@ -149,6 +149,22 @@ impl GpuModel {
         })
     }
 
+    /// Forget the sequence: the next forward must start at position 0. The caches need no
+    /// clearing (nothing past a sequence's own positions is ever read); the ratio-2
+    /// compressors' partial groups do.
+    pub fn reset(&mut self) -> Result<()> {
+        let hd = self.cpu.cfg.head_dim;
+        for (&l, st) in self.cst.iter_mut() {
+            let r = self.cpu.cfg.compress_ratios[l];
+            *st = (zbuf(r * hd)?, up(&vec![f32::NEG_INFINITY; r * hd])?);
+        }
+        self.sh_ckv = 0;
+        self.sh_idxk = 0;
+        self.topk.clear();
+        self.cand.clear();
+        Ok(())
+    }
+
     fn dw(&self, name: &str) -> Result<Rc<DevW>> {
         if name.contains(".ffn.experts.") {
             return self.expert_w(name);

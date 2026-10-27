@@ -378,6 +378,11 @@ fn main() -> Result<()> {
     if cmd == "glm5-ref" {
         return tang_llm::flash::glm5::forward::cli(&args[1..]);
     }
+    // DeepSeek-V4.1-Flash: deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N]
+    #[cfg(feature = "cuda")]
+    if cmd == "deepseek-serve" {
+        return deepseek_serve(&args[1..]);
+    }
     // GLM-5.3-Flash (`glm5-next`) runs on its own engine, on any build.
     if matches!(cmd, "flash-generate" | "flash-bench")
         && tang_llm::flash::glm5::engine::is_glm5(&dir)
@@ -621,6 +626,49 @@ fn serve_flash(args: &[String]) -> Result<()> {
         hardware: probe(Backend::Cuda),
     };
     tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
+}
+
+#[cfg(feature = "cuda")]
+fn deepseek_serve(args: &[String]) -> Result<()> {
+    let usage =
+        "deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N] [--expert-slots N]";
+    let dir = PathBuf::from(args.first().context(usage)?);
+    let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--host" => host = val()?.clone(),
+            "--port" => port = val()?.parse()?,
+            "--ctx" => std::env::set_var("DS41_CTX", val()?),
+            "--expert-slots" => std::env::set_var("DS_EXPERT_SLOTS", val()?),
+            "--api-key-file" => {
+                let path = val()?;
+                key =
+                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+            }
+            other => bail!("unknown option {other} ({usage})"),
+        }
+    }
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
+        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+    }
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let opts = tang_llm::server::Options {
+        addr: format!("{host}:{port}"),
+        model: Some(name),
+        key,
+        dtype: Dtype::Q4,
+        hardware: probe(Backend::Cuda),
+    };
+    tang_llm::server::serve(opts, move |_name: &str| {
+        tang_llm::flash::deepseek::serve::DsServe::load(&dir)
+    })
 }
 
 fn serve(backend: Backend, args: &[String]) -> Result<()> {

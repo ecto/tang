@@ -8,6 +8,8 @@
 //!   (`kernels.cu`), each tested against its CPU twin.
 //! - [`engine`] (cuda): the forward on the device, the CPU reference's control flow over
 //!   [`gpu`]'s kernels; selection steps (top-k, routing lists) still on the host.
+//! - [`serve`] (cuda): the OpenAI-compatible backend (`tang-llm deepseek-serve <dir>`): chat
+//!   template, tokenizer, DSML tool calls.
 //! - [`forward`]: the CPU f32 reference forward, a transcription of `scripts/deepseek_ref.py`
 //!   (itself DeepSeek's `inference/model.py` in plain torch), checked against its dumps.
 //!
@@ -19,6 +21,8 @@ pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod quant;
+#[cfg(feature = "cuda")]
+pub mod serve;
 pub mod st;
 
 use anyhow::{Context, Result};
@@ -78,6 +82,7 @@ pub struct Config {
     #[serde(default)]
     pub dspark_n_activated_experts: usize,
     /// Not in the released config (a runtime limit in DeepSeek's code); sizes the caches.
+    /// `DS41_CTX` overrides it.
     #[serde(default = "max_seq")]
     pub max_seq_len: usize,
 }

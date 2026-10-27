@@ -1,0 +1,425 @@
+//! DeepSeek-V4.1-Flash behind the OpenAI-compatible server ([`crate::server`]): the chat
+//! template, `tokenizer.json`, the device forward, and DeepSeek's DSML tool calls.
+//!
+//! Deliberately minimal, like GLM's first serve glue:
+//! - One sequence at a time. Each request prefills its whole prompt in one chunk at position
+//!   0 and then decodes one token at a time, the only two shapes DeepSeek's reference forward
+//!   (and so this port) supports; there is no prefix reuse across requests yet.
+//! - No drafts: DSpark runs only in the parity tests until speculative decoding lands (M4).
+//! - Sampling on the host from the last logits: greedy at temperature 0, else top-p.
+//!
+//! The reply streams as reasoning (inside `<think>`), text, and tool calls. DeepSeek writes a
+//! tool call as
+//! `<｜DSML｜ calls><｜DSML｜ invoke name="N"><｜DSML｜ parameter name="K" string="true">V
+//! </｜DSML｜ parameter>…</｜DSML｜ invoke></｜DSML｜ calls>`, where `｜DSML｜` is one token;
+//! [`Dsml`] turns that into [`Piece::ToolCall`]s.
+
+use super::engine::GpuModel;
+use crate::chat::{Chunk, Detok, Parser, Piece, Tags, Template};
+use crate::engine::{Finish, Request, Usage};
+use crate::server::Backend;
+use anyhow::{bail, Context, Result};
+use serde_json::Value;
+use std::path::Path;
+use std::time::Instant;
+
+const DSML: &str = "｜DSML｜";
+
+pub struct DsServe {
+    m: GpuModel,
+    tok: tokenizers::Tokenizer,
+    tpl: Template,
+    tags: Tags,
+    eos: Vec<u32>,
+    ctx: usize,
+}
+
+impl DsServe {
+    /// `dir`: the checkpoint with `tokenizer.json`, `tokenizer_config.json`,
+    /// `chat_template.jinja`, `inference/config.json` and `engram.json`.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let t = Instant::now();
+        let m = GpuModel::open(dir)?;
+        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
+        let tpl = Template::load(dir)?;
+        let tags = Tags::new(|s| tok.token_to_id(s));
+        let eos = ["<｜end▁of▁sentence｜>"]
+            .iter()
+            .filter_map(|s| tok.token_to_id(s))
+            .collect::<Vec<_>>();
+        if eos.is_empty() {
+            bail!("tokenizer has no <｜end▁of▁sentence｜>");
+        }
+        let ctx = m.cpu.cfg.max_seq_len;
+        eprintln!(
+            "tang-llm: deepseek ready in {:.1} s: ctx {ctx}, expert slots {}",
+            t.elapsed().as_secs_f64(),
+            if m.expert_slots == 0 {
+                "all".to_string()
+            } else {
+                m.expert_slots.to_string()
+            }
+        );
+        Ok(Self {
+            m,
+            tok,
+            tpl,
+            tags,
+            eos,
+            ctx,
+        })
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.tok
+            .decode(ids, false)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
+}
+
+/// Splitmix64, for seeded sampling.
+fn next_u64(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Greedy at temperature 0, else nucleus sampling at `top_p`.
+fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut u64) -> usize {
+    let argmax = || (0..logits.len()).fold(0, |b, i| if logits[i] > logits[b] { i } else { b });
+    if temp <= 0.0 {
+        return argmax();
+    }
+    let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut p: Vec<(usize, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i, (((l - mx) / temp) as f64).exp()))
+        .collect();
+    p.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    let z: f64 = p.iter().map(|x| x.1).sum();
+    let (mut keep, mut acc) = (0, 0.0);
+    for &(_, v) in &p {
+        acc += v / z;
+        keep += 1;
+        if acc >= top_p as f64 {
+            break;
+        }
+    }
+    let total: f64 = p[..keep].iter().map(|x| x.1).sum();
+    let mut r = (next_u64(rng) >> 11) as f64 / (1u64 << 53) as f64 * total;
+    for &(i, v) in &p[..keep] {
+        r -= v;
+        if r <= 0.0 {
+            return i;
+        }
+    }
+    p[keep - 1].0
+}
+
+/// Pulls DSML tool calls out of the text stream; everything else passes through. Holds back
+/// text that could still turn into `<｜DSML｜ calls>`.
+#[derive(Default)]
+pub struct Dsml {
+    buf: String,
+    in_calls: bool,
+}
+
+impl Dsml {
+    fn open() -> String {
+        format!("<{DSML} calls>")
+    }
+
+    fn close() -> String {
+        format!("</{DSML} calls>")
+    }
+
+    pub fn push(&mut self, s: &str) -> Vec<Piece> {
+        self.buf.push_str(s);
+        let mut out = Vec::new();
+        loop {
+            if self.in_calls {
+                let Some(end) = self.buf.find(&Self::close()) else {
+                    break;
+                };
+                out.extend(parse_calls(&self.buf[..end]));
+                self.buf.drain(..end + Self::close().len());
+                self.in_calls = false;
+                continue;
+            }
+            let open = Self::open();
+            if let Some(at) = self.buf.find(&open) {
+                let before = self.buf[..at].trim_end().to_string();
+                if !before.is_empty() {
+                    out.push(Piece::Text(before));
+                }
+                self.buf.drain(..at + open.len());
+                self.in_calls = true;
+                continue;
+            }
+            // flush all but a tail that may be the start of the marker
+            let keep = (1..open.len().min(self.buf.len()) + 1)
+                .rev()
+                .find(|&n| {
+                    self.buf.is_char_boundary(self.buf.len() - n)
+                        && open.starts_with(&self.buf[self.buf.len() - n..])
+                })
+                .unwrap_or(0);
+            // and the whitespace before it: the template puts "\n\n" ahead of a calls block,
+            // which a tool call drops
+            let cut = self.buf[..self.buf.len() - keep].trim_end().len();
+            if cut > 0 {
+                out.push(Piece::Text(self.buf[..cut].to_string()));
+                self.buf.drain(..cut);
+            }
+            break;
+        }
+        out
+    }
+
+    pub fn finish(&mut self) -> Vec<Piece> {
+        let rest = std::mem::take(&mut self.buf);
+        if self.in_calls {
+            // an unterminated block: parse what's there
+            return parse_calls(&rest);
+        }
+        if rest.is_empty() {
+            Vec::new()
+        } else {
+            vec![Piece::Text(rest)]
+        }
+    }
+}
+
+/// The invokes inside a `calls` block.
+fn parse_calls(body: &str) -> Vec<Piece> {
+    let inv_open = format!("<{DSML} invoke name=\"");
+    let inv_close = format!("</{DSML} invoke>");
+    let par_open = format!("<{DSML} parameter name=\"");
+    let par_close = format!("</{DSML} parameter>");
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find(&inv_open) {
+        rest = &rest[i + inv_open.len()..];
+        let Some(q) = rest.find('"') else { break };
+        let name = rest[..q].to_string();
+        let end = rest.find(&inv_close).unwrap_or(rest.len());
+        let mut inv = &rest[q..end];
+        let mut args = serde_json::Map::new();
+        while let Some(j) = inv.find(&par_open) {
+            inv = &inv[j + par_open.len()..];
+            let Some(q) = inv.find('"') else { break };
+            let key = inv[..q].to_string();
+            let Some(gt) = inv.find('>') else { break };
+            let is_string = inv[q..gt].contains("string=\"true\"");
+            let vend = inv[gt + 1..]
+                .find(&par_close)
+                .map_or(inv.len(), |e| gt + 1 + e);
+            let raw = &inv[gt + 1..vend];
+            let v = if is_string {
+                Value::String(raw.to_string())
+            } else {
+                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+            };
+            args.insert(key, v);
+            inv = &inv[vend.min(inv.len())..];
+        }
+        out.push(Piece::ToolCall {
+            name,
+            arguments: Value::Object(args),
+        });
+        rest = &rest[end.min(rest.len())..];
+    }
+    out
+}
+
+impl Backend for DsServe {
+    fn complete(
+        &mut self,
+        req: &Request,
+        on: &mut dyn FnMut(Piece) -> bool,
+    ) -> Result<(Finish, Usage)> {
+        let think = req.think.unwrap_or(true);
+        let prompt = self
+            .tpl
+            .render(&req.messages, req.tools.as_ref(), Some(think))?;
+        let enc = self
+            .tok
+            .encode(prompt.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids: Vec<usize> = enc.get_ids().iter().map(|&i| i as usize).collect();
+        let max_new = req
+            .max_tokens
+            .unwrap_or(self.ctx)
+            .min(self.ctx.saturating_sub(ids.len()));
+        if ids.is_empty() || max_new == 0 {
+            bail!(
+                "prompt of {} tokens leaves no room in a {}-token context",
+                ids.len(),
+                self.ctx
+            );
+        }
+        let mut usage = Usage {
+            prompt_tokens: ids.len(),
+            ..Default::default()
+        };
+        self.m.reset()?;
+        let t0 = Instant::now();
+        let (mut logits, _) = self.m.forward(&ids, 0, None).context("prefill")?;
+        usage.prefill_tok_s = ids.len() as f64 / t0.elapsed().as_secs_f64();
+        let mut rng = req.sampling.seed ^ 0x5eed;
+        let (temp, top_p) = (req.sampling.temperature, req.sampling.top_p);
+        let (mut detok, mut parser, mut dsml) =
+            (Detok::default(), Parser::new(think), Dsml::default());
+        let mut out: Vec<u32> = Vec::new();
+        let mut finish = Finish::Length;
+        let mut called = false;
+        let t1 = Instant::now();
+        let mut emit = |pieces: Vec<Piece>, dsml: &mut Dsml, called: &mut bool| -> bool {
+            for p in pieces {
+                let ps = match p {
+                    Piece::Text(s) => dsml.push(&s),
+                    other => vec![other],
+                };
+                for p in ps {
+                    *called |= matches!(p, Piece::ToolCall { .. });
+                    if !on(p) {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        let mut pos = ids.len();
+        'gen: for _ in 0..max_new {
+            let next = sample(&logits, temp, top_p, &mut rng) as u32;
+            if self.eos.contains(&next) {
+                finish = Finish::Stop;
+                break;
+            }
+            out.push(next);
+            usage.completion_tokens += 1;
+            for ch in detok.push(&out, &self.tags, |s| self.decode(s))? {
+                let pieces = match ch {
+                    Chunk::Text(s) => parser.push_text(&s),
+                    Chunk::Tag(t) => parser.push_tag(t),
+                };
+                if !emit(pieces, &mut dsml, &mut called) {
+                    finish = Finish::Cancelled;
+                    break 'gen;
+                }
+            }
+            if !req.stop.is_empty() {
+                let text = self.decode(&out)?;
+                if req.stop.iter().any(|s| text.ends_with(s.as_str())) {
+                    finish = Finish::Stop;
+                    break;
+                }
+            }
+            if pos + 1 >= self.ctx {
+                break;
+            }
+            logits = self.m.forward(&[next as usize], pos, None)?.0;
+            pos += 1;
+        }
+        let tail = parser.finish();
+        emit(tail, &mut dsml, &mut called);
+        for p in dsml.finish() {
+            called |= matches!(p, Piece::ToolCall { .. });
+            on(p);
+        }
+        if called && finish == Finish::Stop {
+            finish = Finish::ToolCalls;
+        }
+        usage.decode_tok_s = usage.completion_tokens as f64 / t1.elapsed().as_secs_f64().max(1e-9);
+        Ok((finish, usage))
+    }
+
+    fn context_window(&self) -> usize {
+        self.ctx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsml_tool_calls_parse_across_chunks() {
+        let text = format!(
+            "Let me look.\n\n<{DSML} calls>\n<{DSML} invoke name=\"read\">\n<{DSML} parameter name=\"path\" string=\"true\">src/main.rs</{DSML} parameter>\n<{DSML} parameter name=\"limit\" string=\"false\">40</{DSML} parameter>\n</{DSML} invoke>\n<{DSML} invoke name=\"ls\">\n</{DSML} invoke>\n</{DSML} calls>"
+        );
+        // feed it a few characters at a time, as a token stream would
+        let mut d = Dsml::default();
+        let mut got = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        for c in chars.chunks(3) {
+            got.extend(d.push(&c.iter().collect::<String>()));
+        }
+        got.extend(d.finish());
+        let text_out: String = got
+            .iter()
+            .filter_map(|p| {
+                if let Piece::Text(s) = p {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text_out, "Let me look.");
+        let calls: Vec<_> = got
+            .iter()
+            .filter(|p| matches!(p, Piece::ToolCall { .. }))
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            &Piece::ToolCall {
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "src/main.rs", "limit": 40})
+            }
+        );
+        assert_eq!(
+            calls[1],
+            &Piece::ToolCall {
+                name: "ls".into(),
+                arguments: serde_json::json!({})
+            }
+        );
+    }
+
+    #[test]
+    fn plain_text_passes_through() {
+        let mut d = Dsml::default();
+        let mut got = d.push("a < b and <｜");
+        got.extend(d.push("x"));
+        got.extend(d.finish());
+        let s: String = got
+            .iter()
+            .filter_map(|p| {
+                if let Piece::Text(s) = p {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(s, "a < b and <｜x");
+    }
+
+    #[test]
+    fn sampling_is_greedy_at_zero_and_seeded_otherwise() {
+        let l = vec![0.1, 2.0, 1.9, -1.0];
+        let mut r = 1;
+        assert_eq!(sample(&l, 0.0, 1.0, &mut r), 1);
+        let (mut a, mut b) = (7, 7);
+        let xs: Vec<usize> = (0..20).map(|_| sample(&l, 1.0, 0.95, &mut a)).collect();
+        let ys: Vec<usize> = (0..20).map(|_| sample(&l, 1.0, 0.95, &mut b)).collect();
+        assert_eq!(xs, ys);
+        assert!(xs.iter().all(|&i| i < 3), "top-p drops the tail");
+    }
+}
