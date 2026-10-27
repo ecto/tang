@@ -138,6 +138,17 @@ pub struct DevLayer {
     /// `TANG_GLM5_GEMV8=1` at construction: the q/k/v projections on k5_gemv8 (a field,
     /// not an env read per window, so a test can A/B one layer in-process).
     pub gemv8: bool,
+    /// `TANG_GLM5_KDA_G5F` at construction (default 0 = off): x's projections (q|k|v,
+    /// f_a, g_a) and o_proj on the fast row kernels instead of k5_gemv8 / k5_gemv, on
+    /// BOTH the naive and the fused path (the per-matrix rule: one kernel per matrix).
+    /// 1 = `g5f_gemv` (one launch per matrix, k5_q8's codes); 2 = `k5_qgemv` (q|k|v|f_a|
+    /// g_a in one launch, T = 1, Q8_0 only — any other window or type takes 1).
+    /// Takes precedence over `gemv8` for those six matrices.
+    pub g5f: u8,
+    /// k5_qgemv segment tables (G5F=2, built at load when every matrix is Q8_0 with
+    /// 16-byte-aligned rows): x's five matrices, o_proj.
+    segx: Option<DevBuf>,
+    sego: Option<DevBuf>,
 }
 
 /// The G5W descriptor of one `KdaLayerW` matrix, from the GGUF's raw tensor (the weights
@@ -206,7 +217,8 @@ impl DevLayer {
         let mut core = DevKda::new(g, &kers, cfg, &conv_w, conv, state, slots)?;
         if pf2 {
             core.enable_pf2(max_t)?;
-        }        Ok(Self {
+        }
+        Self {
             core,
             wq: dev_w(gguf, &t("attn_q.weight"))?,
             wk: dev_w(gguf, &t("attn_k.weight"))?,
@@ -257,7 +269,138 @@ impl DevLayer {
                 }
             },
             gemv8: std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1"),
-        })
+            g5f: std::env::var("TANG_GLM5_KDA_G5F").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            segx: None,
+            sego: None,
+        }
+        .with_seg_tables()
+    }
+
+    /// Build the k5_qgemv segment tables (only with `g5f == 2`; `None` = fall back to
+    /// g5f_gemv). Each entry: base, y, row_bytes | rows << 32 (the kernel's K5Seg).
+    fn with_seg_tables(mut self) -> Result<Self> {
+        if self.g5f < 2 {
+            return Ok(self);
+        }
+        let f = std::mem::size_of::<f32>() as u64;
+        let di = self.d_inner as u64;
+        let ok = |ws: &[&super::moe::gpu::DevW]| {
+            let rb = ws[0].w.row_bytes;
+            ws.iter().all(|w| w.w.ty == 8 && w.w.base % 16 == 0 && w.w.row_bytes == rb && rb % 16 == 0 && rb <= 17 * 32 * 16)
+        };
+        let tab = |e: &[(&super::moe::gpu::DevW, u64, usize)]| -> Result<DevBuf> {
+            let mut v: Vec<u64> = Vec::new();
+            for (w, y, rows) in e {
+                v.extend_from_slice(&[w.w.base, *y, w.w.row_bytes as u64 | ((*rows as u64) << 32)]);
+            }
+            DevBuf::from_slice(&v).map_err(|e| anyhow::anyhow!("k5_qgemv table: {e}"))
+        };
+        if ok(&[&self.wq, &self.wk, &self.wv, &self.fa, &self.ga]) {
+            let (q, hd) = (self.qkvb.ptr, self.hd);
+            self.segx = Some(tab(&[
+                (&self.wq, q, self.d_inner),
+                (&self.wk, q + di * f, self.d_inner),
+                (&self.wv, q + 2 * di * f, self.d_inner),
+                (&self.fa, self.g1b.ptr, hd),
+                (&self.ga, self.g2a.ptr, hd),
+            ])?);
+        }
+        if ok(&[&self.wo]) {
+            self.sego = Some(tab(&[(&self.wo, self.outb.ptr, self.hidden)])?);
+        }
+        Ok(self)
+    }
+
+    /// k5_qgemv over a segment table (T = 1): `nseg` matrices of `rows_total` rows of
+    /// `rb` bytes, all reading x's k5_q8 codes. Warps a block: as many staged rows as fit
+    /// 48 KB, at most 8.
+    unsafe fn qgemv_launch(&self, s: &Stream, tab: &DevBuf, nseg: usize, rb: u32, rows_total: usize,
+        bytes: u64, codes: u64, scales: u64, cols: usize) -> Result<()> {
+        let nw = (49152 / rb as usize).clamp(1, 8);
+        let f = if rb as usize <= 9 * 32 * 16 { self.gv.qgemv9 } else { self.gv.qgemv17 };
+        tang_moe::gpu::trace::bytes(bytes);
+        unsafe {
+            launch(
+                f,
+                (rows_total.div_ceil(nw) as u32, 1, 1),
+                ((32 * nw) as u32, 1, 1),
+                (nw as u32) * rb,
+                s,
+                args![tab.ptr, nseg as u32, codes, scales, cols as u32],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// TANG_GLM5_KDA_G5F: quantise x (k5_q8 into xq8), then q|k|v → qkvb, f_a → g1b,
+    /// g_a → g2a on the fast kernels. `false` (nothing launched) when the flag is off.
+    unsafe fn g5f_x(&self, s: &Stream, t: usize) -> Result<bool> {
+        if self.g5f == 0 {
+            return Ok(false);
+        }
+        let (di, hd, hidden) = (self.d_inner, self.hd, self.hidden);
+        let f = std::mem::size_of::<f32>() as u64;
+        let codes = self.xq8.ptr;
+        let scales = codes + (self.max_t * hidden) as u64;
+        unsafe {
+            launch(
+                self.gv.q8,
+                ((hidden / 32) as u32, t as u32, 1),
+                (32, 1, 1),
+                0,
+                s,
+                args![self.xb.ptr, codes, hidden as u32, self.max_t as u32],
+            )?;
+            if let (1, Some(tab)) = (t, self.segx.as_ref()) {
+                let bytes = [&self.wq, &self.wk, &self.wv, &self.fa, &self.ga].iter().map(|w| w.w.estride).sum();
+                return self
+                    .qgemv_launch(s, tab, 5, self.wq.w.row_bytes, 3 * di + 2 * hd, bytes, codes, scales, hidden)
+                    .map(|_| true);
+            }
+            let a = super::moe::gpu::Act { xf: self.xb.ptr, xq: codes, xq2: 0, xd: scales, xs: hidden };
+            let q = self.qkvb.ptr;
+            for (w, y, ys, rows) in [
+                (&self.wq, q, 3 * di, di),
+                (&self.wk, q + di as u64 * f, 3 * di, di),
+                (&self.wv, q + 2 * di as u64 * f, 3 * di, di),
+                (&self.fa, self.g1b.ptr, hd, hd),
+                (&self.ga, self.g2a.ptr, hd, hd),
+            ] {
+                tang_moe::gpu::trace::bytes(w.w.estride);
+                self.gv.fast.gemv(s, w.w, 0, a, y, ys, t, rows, hidden)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// TANG_GLM5_KDA_G5F: o_proj — quantise yb (d_inner wide) into xq8, then wo → outb.
+    /// `false` when the flag is off.
+    unsafe fn g5f_o(&self, s: &Stream, t: usize) -> Result<bool> {
+        if self.g5f == 0 {
+            return Ok(false);
+        }
+        let (di, hidden) = (self.d_inner, self.hidden);
+        let codes = self.xq8.ptr;
+        let scales = codes + (self.max_t * di) as u64;
+        unsafe {
+            launch(
+                self.gv.q8,
+                ((di / 32) as u32, t as u32, 1),
+                (32, 1, 1),
+                0,
+                s,
+                args![self.yb.ptr, codes, di as u32, self.max_t as u32],
+            )?;
+            if let (1, Some(tab)) = (t, self.sego.as_ref()) {
+                return self
+                    .qgemv_launch(s, tab, 1, self.wo.w.row_bytes, hidden, self.wo.w.estride, codes, scales, di)
+                    .map(|_| true);
+            }
+            let a = super::moe::gpu::Act { xf: self.yb.ptr, xq: codes, xq2: 0, xd: scales, xs: di };
+            tang_moe::gpu::trace::bytes(self.wo.w.estride);
+            self.gv.fast.gemv(s, self.wo.w, 0, a, self.outb.ptr, hidden, t, hidden, di)?;
+        }
+        Ok(true)
     }
 
     /// Pull the device's conv + recurrent state into the host copies (before a CPU
@@ -414,7 +557,10 @@ impl DevLayer {
         let g8 = |w: &super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
         let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv); // the x pre-pass + q/k/v
         unsafe {
-            if gemv8 {
+            let g5 = self.g5f_x(&self.s, t)?;
+            if g5 {
+                // TANG_GLM5_KDA_G5F: q|k|v, f_a, g_a all written above
+            } else if gemv8 {
                 launch(
                     self.gv.q8,
                     ((hidden / 32) as u32, t as u32, 1),
@@ -445,7 +591,9 @@ impl DevLayer {
             drop(tr);
             let tr = span("gates");
             // forget gate: f_a → g1, f_b: g1 → g (out of place), finish in place on g
-            if gemv8 && g8(&self.fa) {
+            if g5 {
+                // f_a went with q/k/v (g5f_x)
+            } else if gemv8 && g8(&self.fa) {
                 // x's int8 codes are still in xq8 from the q/k/v pre-pass
                 self.gemv8_launch(&self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, t)?;
             } else {
@@ -736,7 +884,9 @@ impl DevLayer {
         let tr = span("out_gate");
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
-            if gemv8 && g8(&self.ga) {
+            if self.g5f > 0 {
+                // g_a was written into g2a by g5f_x in window() (x's codes are gone by now)
+            } else if gemv8 && g8(&self.ga) {
                 // x's codes are still in xq8 (nothing has re-quantised since the pre-pass;
                 // the o_proj pass below is the first to overwrite them)
                 self.gemv8_launch(&self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, t)?;
@@ -773,7 +923,8 @@ impl DevLayer {
             )?;
             drop(tr);
             let _tr = span("o_proj");
-            if g8(&self.wo) {
+            if self.g5f_o(&self.s, t)? {
+            } else if g8(&self.wo) {
                 // o_proj reads yb (d_inner wide): quantise it, then the dequant-reuse GEMV
                 launch(
                     self.gv.q8,

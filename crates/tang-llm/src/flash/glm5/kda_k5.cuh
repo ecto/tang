@@ -153,4 +153,75 @@ extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
         __syncwarp();
     }
 }
+
+// ---------------------------------------------------------------------------
+// k5_qgemv: the T=1 Q8_0 GEMV pushed toward HBM bandwidth (TANG_GLM5_KDA_G5F=2). Several
+// matrices that share one input x run in ONE launch (q | k | v | f_a | g_a: 107 MB, so the
+// ramp-up/tail of a 35 MB launch is paid once, not three times). Segment table in device
+// memory (built at load: weight bases and output pointers never move, so it is
+// graph-capture safe): {base, y, row_bytes, rows}. One row a warp, K5Q warps a block
+// (blockDim.x / 32, the launcher picks it so the staged rows fit 48 KB).
+// Each lane issues ALL its 16-byte row loads first (ld.global.nc, no L1 allocate: the
+// weights are read once), then parks them in shared memory, then walks the row's Q8_0
+// blocks (block b = lane + 32 i: f16 d + 32 int8 codes, 8 dp4a against x's k5_q8 codes,
+// one fmaf per 32 elements). Requires base % 16 == 0 and row_bytes % 16 == 0 (Q8_0 rows
+// of 4096 / 8192 are 4352 / 8704 B); the launcher checks and falls back otherwise.
+struct K5Seg { unsigned long long base; unsigned long long y; unsigned row_bytes; unsigned rows; };
+__device__ __forceinline__ uint4 k5_ldnc(const uint4* p) {
+    uint4 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+}
+// MAXV = 16-byte granules a lane holds (rows up to 32 * MAXV * 16 B): k5_qgemv9 for
+// 4352 B rows (8.5 granules a lane), k5_qgemv17 for 8704 B (o_proj).
+template <int K5Q_MAXV>
+__device__ __forceinline__ void k5_qgemv_body(
+    const K5Seg* __restrict__ segs, unsigned nseg, const unsigned char* __restrict__ xq,
+    const float* __restrict__ xd, unsigned COLS) {
+    extern __shared__ uint4 dsm[];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    unsigned g = blockIdx.x * nw + warp;
+    unsigned s = 0;
+    for (; s < nseg; s++) {
+        if (g < segs[s].rows) break;
+        g -= segs[s].rows;
+    }
+    if (s >= nseg) return;
+    const unsigned rb = segs[s].row_bytes;
+    const int n16 = (int)(rb >> 4);
+    const uint4* src = (const uint4*)(segs[s].base + (unsigned long long)g * rb);
+    uint4* sm = dsm + (size_t)warp * n16;
+    uint4 v[K5Q_MAXV];
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXV; i++)
+        if (lane + 32 * i < n16) v[i] = k5_ldnc(src + lane + 32 * i);
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXV; i++)
+        if (lane + 32 * i < n16) sm[lane + 32 * i] = v[i];
+    __syncwarp();
+    const unsigned char* row = (const unsigned char*)sm;
+    float acc = 0.f;
+    const int nb = (int)(COLS >> 5);
+    for (int b = lane; b < nb; b += 32) {
+        const unsigned short* p = (const unsigned short*)(row + 34 * b); // 2-byte aligned
+        const float dw = g5_h2f(p[0]);
+        const int4* xv = (const int4*)(xq + 32 * b);
+        const int4 x0 = __ldg(xv), x1 = __ldg(xv + 1);
+        int w[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) w[j] = (int)((unsigned)p[1 + 2 * j] | ((unsigned)p[2 + 2 * j] << 16));
+        int si = __dp4a(w[0], x0.x, 0);
+        si = __dp4a(w[1], x0.y, si); si = __dp4a(w[2], x0.z, si); si = __dp4a(w[3], x0.w, si);
+        si = __dp4a(w[4], x1.x, si); si = __dp4a(w[5], x1.y, si); si = __dp4a(w[6], x1.z, si);
+        si = __dp4a(w[7], x1.w, si);
+        acc = fmaf(xd[b] * dw, k5_i2f(si), acc);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) ((float*)segs[s].y)[g] = acc;
+}
+extern "C" __global__ void __launch_bounds__(256) k5_qgemv9(const K5Seg* segs, unsigned nseg,
+    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<9>(segs, nseg, xq, xd, COLS); }
+extern "C" __global__ void __launch_bounds__(256) k5_qgemv17(const K5Seg* segs, unsigned nseg,
+    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<17>(segs, nseg, xq, xd, COLS); }
 #endif // K5_HOST_CHECK
