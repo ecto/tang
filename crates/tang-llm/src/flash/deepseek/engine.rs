@@ -2,9 +2,11 @@
 //! kernels, so every step has a CPU twin and the fixture checks the whole.
 //!
 //! Correctness first. On the device: every GEMM, norm, RoPE, quant-dequant, attention, mHC,
-//! the router, expert MLPs and Engram's gate. Still on the host, each a later fast-path step:
-//! the indexer's masks, candidate blocks and top-k (its scores are computed on the device and
-//! read back), the per-expert routing lists, Engram's hashing and row gather (the tables stay
+//! the router, expert MLPs and Engram's gate, and selection (kernels_select.cu): the indexer's
+//! masks, candidate blocks and top-k, the per-expert routing lists (CSR; experts launch for
+//! every id and exit early when empty), and the attention index rows. Still on the host, each
+//! a later fast-path step: the expert LRU's routed-expert counts (read back only when
+//! `DS_EXPERT_SLOTS` bounds it), Engram's hashing and row gather (the tables stay
 //! mapped on the host: 101 GB each for the real model), and DSpark's left-to-right Markov
 //! sampling. Weights upload lazily on first use, in their checkpoint format.
 //!
@@ -13,7 +15,7 @@
 //! still doesn't wait for queued kernels, so every helper that drops a temporary a queued
 //! kernel reads syncs first.
 
-use super::forward::{topk_stable, Model};
+use super::forward::Model;
 use super::gpu::{blocks, DevW, Kernels};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
 use anyhow::{Context, Result};
@@ -83,8 +85,10 @@ pub struct GpuModel {
     qk: RefCell<HashMap<usize, Rc<DevBuf>>>,
     sh_ckv: usize,
     sh_idxk: usize,
-    topk: Vec<Vec<i32>>,
-    cand: Vec<Vec<bool>>,
+    /// The last index source's selection on the device: [t][k] compressed positions.
+    topk: Option<(DevBuf, usize)>,
+    /// The candidate mask on the device: u8 [t][width], and its width.
+    cand: Option<(DevBuf, usize)>,
     /// Debugging: each backbone layer's input stream and pre-mix (as [`Model::force`]).
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     /// Intermediates read back by name when `DS_TAP` is set (as [`Model::taps`]).
@@ -145,8 +149,8 @@ impl GpuModel {
             qk: RefCell::new(HashMap::new()),
             sh_ckv: 0,
             sh_idxk: 0,
-            topk: Vec::new(),
-            cand: Vec::new(),
+            topk: None,
+            cand: None,
             force: None,
             taps: RefCell::new(Vec::new()),
             fast: std::env::var_os("DS_SLOW").is_none(),
@@ -164,8 +168,8 @@ impl GpuModel {
         }
         self.sh_ckv = 0;
         self.sh_idxk = 0;
-        self.topk.clear();
-        self.cand.clear();
+        self.topk = None;
+        self.cand = None;
         Ok(())
     }
 
@@ -326,13 +330,17 @@ impl GpuModel {
         self.tap(&format!("{p}.q0"), &q, t * h * hd)?;
         self.rope(&q, t, h, hd, lid, sp, 1, None, false)?;
         self.tap(&format!("{p}.q"), &q, t * h * hd)?;
-        let (kv, nkv, mut idxs) = self.window_kv(p, lid, x, t, sp)?;
+        let (kv, nkv) = self.window_kv(p, lid, x, t, sp)?;
         self.tap(&format!("{p}.wkv"), &kv, nkv * hd)?;
+        let (nw, mode) = if sp == 0 {
+            (t.min(c.window_size), 0)
+        } else {
+            (c.window_size, 1)
+        };
+        let mut kc = 0;
         let all = if c.compress_ratios[lid] > 0 {
-            let (src, clen, cidx) = self.compress_kv(p, lid, x, &qr, t, sp, nkv)?;
-            for (a, b) in idxs.iter_mut().zip(cidx) {
-                a.extend(b);
-            }
+            let (src, clen, k) = self.compress_kv(p, lid, x, &qr, t, sp, nkv)?;
+            kc = k;
             let all = fbuf((nkv + clen) * hd)?;
             self.copy(all.ptr, kv.ptr, nkv * hd)?;
             self.copy(
@@ -344,27 +352,75 @@ impl GpuModel {
         } else {
             kv
         };
-        self.attn_out(p, &q, &all, &idxs, lid, sp)
+        let idx = self.win_idx(t, nw + kc, nw, mode, sp, 0)?;
+        if kc > 0 {
+            let (src, ti, ki, st, col) = (
+                self.topk.as_ref().context("no top-k")?.0.ptr,
+                t as i32,
+                kc as i32,
+                (nw + kc) as i32,
+                nw as i32,
+            );
+            unsafe {
+                self.k.go(
+                    "ds_idx_cat",
+                    blocks(t * kc, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![idx.ptr, src, ti, ki, st, col],
+                )?
+            };
+        }
+        self.attn_out(p, &q, &all, &idx, t, nw + kc, lid, sp)
     }
 
+    /// Attention index rows [t][stride] with the window's `n` columns filled (`ds_win_idx`).
+    fn win_idx(
+        &self,
+        t: usize,
+        stride: usize,
+        n: usize,
+        mode: i32,
+        sp: usize,
+        b: usize,
+    ) -> Result<DevBuf> {
+        let idx = DevBuf::alloc(t.max(1) * stride.max(1) * 4)?;
+        let (ti, si, ni, spi, wi, bi) = (
+            t as i32,
+            stride as i32,
+            n as i32,
+            sp as i32,
+            self.cpu.cfg.window_size as i32,
+            b as i32,
+        );
+        unsafe {
+            self.k.go(
+                "ds_win_idx",
+                blocks(t * n, 256),
+                B256,
+                0,
+                &self.s,
+                args![idx.ptr, ti, si, ni, mode, spi, wi, bi],
+            )?
+        };
+        Ok(idx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn attn_out(
         &self,
         p: &str,
         q: &DevBuf,
         kv: &DevBuf,
-        idxs: &[Vec<i32>],
+        di: &DevBuf,
+        t: usize,
+        k: usize,
         lid: usize,
         pos0: usize,
     ) -> Result<DevBuf> {
         let c = &self.cpu.cfg;
         let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
-        let t = idxs.len();
-        let k = idxs.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
-        let flat: Vec<i32> = idxs
-            .iter()
-            .flat_map(|r| r.iter().copied().chain(std::iter::repeat(-1)).take(k))
-            .collect();
-        let di = up(&flat)?;
         let sink = self.dw(&format!("{p}.attn.attn_sink"))?;
         let o = fbuf(t * h * hd)?;
         self.k.sparse_attn(
@@ -421,7 +477,7 @@ impl GpuModel {
         x: &DevBuf,
         t: usize,
         sp: usize,
-    ) -> Result<(DevBuf, usize, Vec<Vec<i32>>)> {
+    ) -> Result<(DevBuf, usize)> {
         let c = self.cpu.cfg.clone();
         let (hd, win) = (c.head_dim, c.window_size);
         let kv = self.lin(x, t, &format!("{p}.attn.wkv.weight"))?;
@@ -430,33 +486,13 @@ impl GpuModel {
         self.k.fp8_qdq(&self.s, kv.ptr, t * hd)?;
         if sp == 0 {
             self.ring_seed(lid, &kv, t)?;
-            let n = t.min(win);
-            let idxs = (0..t)
-                .map(|e| {
-                    let lo = (e as i64 - win as i64 + 1).max(0);
-                    (0..n as i64)
-                        .map(|j| {
-                            if lo + j > e as i64 {
-                                -1
-                            } else {
-                                (lo + j) as i32
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            return Ok((kv, t, idxs));
+            return Ok((kv, t));
         }
         let ring = self.win[lid].ptr;
         self.copy(ring + ((sp % win) * hd * 4) as u64, kv.ptr, hd)?;
         let all = fbuf(win * hd)?;
         self.copy(all.ptr, ring, win * hd)?;
-        let oldest = sp % win + 1;
-        let idxs = (oldest..win)
-            .chain(0..oldest)
-            .map(|i| if i > sp { -1 } else { i as i32 })
-            .collect();
-        Ok((all, win, vec![idxs]))
+        Ok((all, win))
     }
 
     /// The source's new compressed latents (pre-RoPE) and how many.
@@ -548,7 +584,7 @@ impl GpuModel {
         t: usize,
         sp: usize,
         offset: usize,
-    ) -> Result<(usize, usize, Vec<Vec<i32>>)> {
+    ) -> Result<(usize, usize, usize)> {
         let c = self.cpu.cfg.clone();
         let (r, hd) = (c.compress_ratios[lid], c.head_dim);
         let clen = (sp + t) / r;
@@ -557,17 +593,14 @@ impl GpuModel {
             latent = self.compressor(p, lid, x, t, sp)?;
             self.sh_ckv = lid;
         }
-        let idxs = if c.is_index_source(lid) {
-            let idxs = if clen == 0 {
-                vec![Vec::new(); t]
+        if c.is_index_source(lid) {
+            self.topk = if clen == 0 {
+                None
             } else {
-                self.indexer(p, lid, x, qr, latent.as_ref(), t, sp, offset)?
+                Some(self.indexer(p, lid, x, qr, latent.as_ref(), t, sp, offset)?)
             };
-            self.topk = idxs.clone();
-            idxs
-        } else {
-            self.topk.clone()
-        };
+        }
+        let kc = self.topk.as_ref().map_or(0, |(_, k)| *k);
         if let Some((lat, n)) = latent {
             let (pos0, stride, fixed) = if sp == 0 {
                 (0, r, None)
@@ -583,7 +616,7 @@ impl GpuModel {
             )?;
             self.s.sync()?;
         }
-        Ok((self.sh_ckv, clen, idxs))
+        Ok((self.sh_ckv, clen, kc))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -597,7 +630,7 @@ impl GpuModel {
         t: usize,
         sp: usize,
         offset: usize,
-    ) -> Result<Vec<Vec<i32>>> {
+    ) -> Result<(DevBuf, usize)> {
         let c = self.cpu.cfg.clone();
         let (r, nh, ihd) = (c.compress_ratios[lid], c.index_n_heads, c.index_head_dim);
         let end = sp + t;
@@ -652,46 +685,45 @@ impl GpuModel {
                 args![q.ptr, ik, wts.ptr, score.ptr, ti, wi, nhi, ihdi],
             )?
         };
-        let mut score = self.read(&score, t * width)?;
-        // host: masks, candidate blocks, top-k (as forward.rs)
-        let lens: Vec<usize> = (0..t)
-            .map(|ti| if sp == 0 { (ti + 1) / r } else { end / r })
-            .collect();
-        if sp == 0 {
-            for ti in 0..t {
-                for j in lens[ti]..width {
-                    score[ti * width + j] = f32::NEG_INFINITY;
-                }
-            }
+        // masks, candidate blocks, top-k (as forward.rs), all on the device
+        let causal = sp == 0;
+        if causal {
+            self.k
+                .mask_scores(&self.s, score.ptr, 0, t, width, true, r)?;
         }
         let src = c.candidate_source_layer;
         if lid as i64 == src {
-            self.cand = self.cpu.candidates(&score, width, &lens);
+            let cand = DevBuf::alloc(t * width)?;
+            self.k.candidates(
+                &self.s,
+                score.ptr,
+                cand.ptr,
+                t,
+                width,
+                causal,
+                r,
+                c.candidate_block_size,
+                c.candidate_topk_blocks,
+            )?;
+            self.cand = Some((cand, width));
         } else if src >= 0 && (src as usize) < lid {
-            for ti in 0..t {
-                for j in 0..width {
-                    if !self.cand[ti][j] {
-                        score[ti * width + j] = f32::NEG_INFINITY;
-                    }
-                }
-            }
+            let (cand, cw) = self.cand.as_ref().context("no candidate mask")?;
+            anyhow::ensure!(*cw == width, "candidate mask width {cw} != {width}");
+            self.k
+                .mask_scores(&self.s, score.ptr, cand.ptr, t, width, false, r)?;
         }
         let k = c.index_topk.min(width);
-        Ok((0..t)
-            .map(|ti| {
-                let mut sel = topk_stable(&score[ti * width..(ti + 1) * width], k);
-                sel.sort();
-                sel.into_iter()
-                    .map(|i| {
-                        if i < lens[ti] {
-                            (i + offset) as i32
-                        } else {
-                            -1
-                        }
-                    })
-                    .collect()
-            })
-            .collect())
+        let out = DevBuf::alloc(t * k * 4)?;
+        self.k.topk(
+            &self.s, score.ptr, out.ptr, t, width, k, k, offset, causal, r,
+        )?;
+        if std::env::var_os("DS_TAP").is_some() {
+            let v = out.read::<i32>(0, t * k)?;
+            self.taps
+                .borrow_mut()
+                .push((format!("{p}.topk"), v.iter().map(|&i| i as f32).collect()));
+        }
+        Ok((out, k))
     }
 
     // moe
@@ -752,6 +784,51 @@ impl GpuModel {
         self.lin(&h, n, &format!("{p}.w2.weight"))
     }
 
+    /// `lin` over at most expert `e`'s row count (from the device CSR `off`) of `t` rows.
+    fn lin_csr(&self, x: &DevBuf, t: usize, name: &str, off: &DevBuf, e: usize) -> Result<DevBuf> {
+        let w = self.dw(name)?;
+        let (k, n) = (w.v.cols as usize, w.v.rows as usize);
+        let y = fbuf(t * n)?;
+        let xq = fbuf(t * k)?;
+        let xp = if w.v.fmt >= 2 {
+            self.copy(xq.ptr, x.ptr, t * k)?;
+            self.k.fp8_qdq(&self.s, xq.ptr, t * k)?;
+            xq.ptr
+        } else {
+            x.ptr
+        };
+        let (wv, ti, r, ei) = (w.v, t as i32, 1i32, e as i32);
+        unsafe {
+            self.k.go(
+                "ds_linear_csr",
+                blocks(t * n * 32, 256),
+                B256,
+                0,
+                &self.s,
+                args![wv, xp, y.ptr, ti, r, off.ptr, ei],
+            )?
+        };
+        // drain before `xq` (and an evictable expert weight) can drop
+        self.s.sync()?;
+        Ok(y)
+    }
+
+    fn mlp_csr(
+        &self,
+        p: &str,
+        x: &DevBuf,
+        n: usize,
+        w: &DevBuf,
+        off: &DevBuf,
+        e: usize,
+    ) -> Result<DevBuf> {
+        let g = self.lin_csr(x, n, &format!("{p}.w1.weight"), off, e)?;
+        let u = self.lin_csr(x, n, &format!("{p}.w3.weight"), off, e)?;
+        let inter = self.dw(&format!("{p}.w1.weight"))?.v.rows as usize;
+        let h = self.swiglu(&g, &u, w.ptr, n, inter)?;
+        self.lin_csr(&h, n, &format!("{p}.w2.weight"), off, e)
+    }
+
     fn moe(&self, p: &str, x: &DevBuf, t: usize, lid: usize) -> Result<DevBuf> {
         let c = &self.cpu.cfg;
         let (ne, topk) = c.moe(lid);
@@ -776,43 +853,45 @@ impl GpuModel {
                 args![raw.ptr, bias.v.w, ids.ptr, wts.ptr, ti, nei, ki, norm, rs],
             )?
         };
-        self.s.sync()?;
-        let (ids, wts) = (ids.read::<i32>(0, t * topk)?, wts.read::<f32>(0, t * topk)?);
-        let mut routes: Vec<Vec<(i32, f32)>> = vec![Vec::new(); ne];
-        for ti in 0..t {
-            for j in 0..topk {
-                routes[ids[ti * topk + j] as usize].push((ti as i32, wts[ti * topk + j]));
-            }
-        }
+        // per-expert CSR on the device
+        let (counts, off) = (DevBuf::alloc(ne * 4)?, DevBuf::alloc((ne + 1) * 4)?);
+        let (rows, rw) = (DevBuf::alloc(t * topk * 4)?, fbuf(t * topk)?);
+        self.k.route(
+            &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+        )?;
+        // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
+        // (and not upload) unrouted experts
+        let live: Vec<bool> = if self.expert_slots > 0 {
+            self.s.sync()?;
+            counts.read::<i32>(0, ne)?.iter().map(|&n| n > 0).collect()
+        } else {
+            vec![true; ne]
+        };
         let y = zbuf(t * d)?;
-        for (e, rs) in routes.iter().enumerate() {
-            if rs.is_empty() {
-                continue;
-            }
-            let n = rs.len();
-            let rows = up(&rs.iter().map(|r| r.0).collect::<Vec<i32>>())?;
-            let w = up(&rs.iter().map(|r| r.1).collect::<Vec<f32>>())?;
-            let xs = fbuf(n * d)?;
-            let (ni, di) = (n as i32, d as i32);
+        let (ei_t, di) = (t as i32, d as i32);
+        for e in (0..ne).filter(|&e| live[e]) {
+            let xs = fbuf(t * d)?;
+            let w = fbuf(t)?;
+            let ei = e as i32;
             unsafe {
                 self.k.go(
-                    "ds_gather_rows",
-                    blocks(n * d, 256),
+                    "ds_gather_csr",
+                    blocks(t * d, 256),
                     B256,
                     0,
                     &self.s,
-                    args![x.ptr, rows.ptr, xs.ptr, ni, di],
+                    args![x.ptr, off.ptr, rows.ptr, rw.ptr, xs.ptr, w.ptr, ei, ei_t, di],
                 )?
             };
-            let out = self.mlp(&format!("{p}.ffn.experts.{e}"), &xs, n, w.ptr)?;
+            let out = self.mlp_csr(&format!("{p}.ffn.experts.{e}"), &xs, t, &w, &off, e)?;
             unsafe {
                 self.k.go(
-                    "ds_scatter_add",
-                    blocks(n * d, 256),
+                    "ds_scatter_csr",
+                    blocks(t * d, 256),
                     B256,
                     0,
                     &self.s,
-                    args![y.ptr, out.ptr, rows.ptr, ni, di],
+                    args![y.ptr, out.ptr, off.ptr, rows.ptr, ei, ei_t, di],
                 )?
             };
             self.s.sync()?;
@@ -1152,16 +1231,14 @@ impl GpuModel {
         self.rms(&kv, b, &format!("{p}.attn.kv_norm.weight"))?;
         self.rope(&kv, b, 1, hd, lid, pos0, 1, None, false)?;
         self.k.fp8_qdq(&self.s, kv.ptr, b * hd)?;
-        let row: Vec<i32> = (0..win.min(sp + 1) as i32)
-            .chain((0..b as i32).map(|i| win as i32 + i))
-            .collect();
-        let idxs = vec![row; b];
+        let nk = win.min(sp + 1) + b;
+        let idx = self.win_idx(b, nk, nk, 2, sp, b)?;
         let ring = self.win[lid].ptr;
         self.copy(ring + ((sp % win) * hd * 4) as u64, mkv.ptr, hd)?;
         let all = fbuf((win + b) * hd)?;
         self.copy(all.ptr, ring, win * hd)?;
         self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, b * hd)?;
-        self.attn_out(p, &q, &all, &idxs, lid, pos0)
+        self.attn_out(p, &q, &all, &idx, b, nk, lid, pos0)
     }
 
     /// As [`Model::forward_spec`].
