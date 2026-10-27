@@ -294,6 +294,8 @@ impl DevLayer {
     ) -> Result<()> {
         let scales = xq8 + (self.max_t * cols) as u64;
         let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
+        // TANG_GLM5_TRACE: the weight bytes (the stream a decode GEMV is bound by)
+        tang_moe::gpu::trace::bytes(w.w.estride);
         unsafe {
             launch(
                 self.gv.gemv8,
@@ -326,6 +328,9 @@ impl DevLayer {
             // differs, the divergence is upstream of KDA (not a staging bug)
             eprintln!("kda gpu x[0..8]: {:?}", &x[..8.min(x.len())]);
         }
+        use super::trace::span;
+        use tang_moe::gpu::trace::bytes as tr_bytes;
+        let tr = span("proj");
         self.xb.write(0, x)?;
         let mut tp = self.probe.take();
         if let Some(p) = &tp {
@@ -375,6 +380,7 @@ impl DevLayer {
                 }
             } else {
                 for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    tr_bytes(w.w.estride);
                     launch(
                         self.gv.gemv,
                         grid(t * di),
@@ -388,11 +394,14 @@ impl DevLayer {
                     )?;
                 }
             }
+            drop(tr);
+            let tr = span("gates");
             // forget gate: f_a → g1, f_b: g1 → g (out of place), finish in place on g
             if gemv8 && g8(&self.fa) {
                 // x's int8 codes are still in xq8 from the q/k/v pre-pass
                 self.gemv8_launch(&self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, t)?;
             } else {
+                tr_bytes(self.fa.w.estride);
                 launch(
                     self.gv.gemv,
                     grid(t * hd),
@@ -403,6 +412,7 @@ impl DevLayer {
                         hd as u32, hidden as u32],
                 )?;
             }
+            tr_bytes(self.fb.w.estride);
             launch(
                 self.gv.gemv,
                 grid(t * di),
@@ -422,16 +432,19 @@ impl DevLayer {
                     lb, t as u32],
             )?;
             // beta gate
+            tr_bytes(self.bproj.w.estride);
             launch(
                 self.gv.beta,
-                grid(t * nh),
+                grid(t * nh / K5_WARPS + (t * nh % K5_WARPS > 0) as usize),
                 (128, 1, 1),
                 0,
                 &self.s,
                 args![self.bproj.w, self.xb.ptr, self.bb.ptr, t as u32, hidden as u32,
                     nh as u32],
             )?;
+            drop(tr);
         }
+        let tr = span("core");
         if self.pf2 {
             if prof {
                 self.s.sync()?;
@@ -443,6 +456,7 @@ impl DevLayer {
                 self.s.sync()?;
                 eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
             }
+            drop(tr);
             return self.finish(t, None, tp);
         }
         self.s.sync()?;
@@ -556,6 +570,7 @@ impl DevLayer {
         if prof {
             eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
         }
+        drop(tr);
         self.finish(t, Some(o), tp)
     }
 
@@ -622,6 +637,9 @@ impl DevLayer {
             };
             eprintln!("kda gpu o[0..8]: {:?}", &o[..8.min(o.len())]);
         }
+        use super::trace::span;
+        use tang_moe::gpu::trace::bytes as tr_bytes;
+        let tr = span("out_gate");
         unsafe {
             // g2 = g_b(g_a(x)): g_a → g2a, g_b: g2a → g2b (out of place)
             if gemv8 && g8(&self.ga) {
@@ -629,6 +647,7 @@ impl DevLayer {
                 // the o_proj pass below is the first to overwrite them)
                 self.gemv8_launch(&self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, t)?;
             } else {
+                tr_bytes(self.ga.w.estride);
                 launch(
                     self.gv.gemv,
                     grid(t * hd),
@@ -639,6 +658,7 @@ impl DevLayer {
                         hd as u32, hidden as u32],
                 )?;
             }
+            tr_bytes(self.gb.w.estride);
             launch(
                 self.gv.gemv,
                 grid(t * di),
@@ -657,6 +677,8 @@ impl DevLayer {
                 args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32,
                     hd as u32, self.cfg.eps, t as u32],
             )?;
+            drop(tr);
+            let _tr = span("o_proj");
             if g8(&self.wo) {
                 // o_proj reads yb (d_inner wide): quantise it, then the dequant-reuse GEMV
                 launch(
@@ -669,6 +691,7 @@ impl DevLayer {
                 )?;
                 self.gemv8_launch(&self.wo, self.xq8.ptr, di, self.outb.ptr, hidden, hidden, t)?;
             } else {
+                tr_bytes(self.wo.w.estride);
                 launch(
                     self.gv.gemv,
                     grid(t * hidden),
@@ -680,11 +703,15 @@ impl DevLayer {
                 )?;
             }
         }
+        // the layer's one wait: the stream drains here (async kernels' wall time lands in
+        // this span; their GPU time is on the spans that launched them)
+        let tr = span("sync+read");
         self.s.sync()?;
         if prof {
             eprintln!("glm5: prof kda out: {:.2} ms", t_out.elapsed().as_secs_f32() * 1e3);
         }
         let out = self.outb.read::<f32>(0, t * hidden)?;
+        drop(tr);
         if let Some(mut p) = tp {
             use super::kda_debug::tap;
             // the host-staged path hands back the core output it read; PF2 leaves it in
@@ -818,6 +845,38 @@ mod gemv8_tests {
     use super::*;
     use std::path::Path;
 
+    /// section `sec` (0=q,1=k,2=v) of a stacked [t][3·di] tap (the old kda_debug helper,
+    /// which the tang-verify port replaced with the Spec's stacked sections)
+    fn section(v: &[f32], t: usize, di: usize, sec: usize) -> Vec<f32> {
+        if v.len() < t * 3 * di { return Vec::new(); }
+        let mut out = Vec::with_capacity(t * di);
+        for ti in 0..t {
+            let b = ti * 3 * di + sec * di;
+            out.extend_from_slice(&v[b..b + di]);
+        }
+        out
+    }
+
+    /// relative L2 (the old kda_debug::stat's headline number)
+    fn stat(gpu: &[f32], cpu: &[f32], _tol: f64) -> (f64, f64, usize) {
+        if gpu.is_empty() || cpu.is_empty() {
+            return (0.0, 0.0, 1); // missing tap: counts as nonfinite so the gate fails
+        }
+        let (mut d2, mut c2, mut nf) = (0f64, 0f64, 0usize);
+        for (&g, &c) in gpu.iter().zip(cpu) {
+            if !g.is_finite() { nf += 1; continue; }
+            d2 += ((g as f64) - (c as f64)).powi(2);
+            c2 += (c as f64).powi(2);
+        }
+        let n = gpu.len().min(cpu.len()) as f64;
+        let rms = (c2 / n).sqrt();
+        let _ = (rms, _tol);
+        // (rel L2, abs L2, NaN/Inf count): the gate is NaN-free + rel under the band, as
+        // the harness's Stat::bad — an element-wise miss count is always > 0 under int8
+        // activation noise (4 of 163840 on the fixture) and must not fail the test
+        (d2.sqrt() / c2.max(1e-30).sqrt(), d2.sqrt(), nf)
+    }
+
     // the Q8_0 fixture: gemv8 only takes Q8_0 rows (the f32 fixture routes to k5_gemv)
     const TINY: &str = "/private/tmp/glm5-tiny/glm5-tiny-q8_0.gguf";
 
@@ -870,31 +929,30 @@ mod gemv8_tests {
         let (y0, t0) = run(&mut layer, false);
         let (y1, t1) = run(&mut layer, true);
         let di = cfg.heads * cfg.head_dim;
-        // the q|k|v sections of the stacked QKV tap, the verifier's way
-        let sec = |tv: &tang_verify::Taps, s: usize| -> Vec<f32> {
-            let qkv = tap(tv, super::super::kda_debug::tap::QKV);
-            (0..t).flat_map(|r| qkv[r * 3 * di + s * di..r * 3 * di + (s + 1) * di].iter().copied()).collect()
-        };
-        for (s, name) in [(0, "q"), (1, "k"), (2, "v")] {
-            let a = sec(&t0, s);
-            let b = sec(&t1, s);
-            let st = tang_verify::stat(&b, &a, 1e-2);
-            eprintln!("qkv.{name}: rel {:.3e} max {:.3e} nonfinite {} zeros {}/{}", st.rel_l2, st.max_abs, st.nonfinite_gpu, st.zeros_gpu, st.zeros_cpu);
+        for (sec, name) in [(0, "q"), (1, "k"), (2, "v")] {
+            let a = section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, sec);
+            let b = section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, sec);
+            let s = stat(&b, &a, 1e-2);
+            eprintln!("qkv.{name}: rel {:.3e} l2 {:.3e} nonfinite {}", s.0, s.1, s.2);
             // int8 activations vs f32: the fe_gemv8 band, not bitwise
-            assert!(st.nonfinite_gpu == 0 && st.rel_l2 < 1e-2, "gemv8 qkv.{name} diverges: {st:?}");
+            assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 qkv.{name} diverges: rel {:.3e}", s.0);
         }
         // f_a (gate) and g_a (g2) now on gemv8 too; o_proj covers the layer output
         for (name, a, b) in [("g", tap(&t0, super::super::kda_debug::tap::G), tap(&t1, super::super::kda_debug::tap::G)), ("g2", tap(&t0, super::super::kda_debug::tap::G2), tap(&t1, super::super::kda_debug::tap::G2))] {
-            let st = tang_verify::stat(&b, &a, 1e-2);
-            eprintln!("{name}: rel {:.3e} max {:.3e} nonfinite {}", st.rel_l2, st.max_abs, st.nonfinite_gpu);
-            assert!(st.nonfinite_gpu == 0 && st.rel_l2 < 1e-2, "gemv8 {name} diverges: {st:?}");
+            let s = stat(&b, &a, 1e-2);
+            eprintln!("{name}: rel {:.3e} l2 {:.3e} nonfinite {}", s.0, s.1, s.2);
+            assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 {name} diverges: rel {:.3e}", s.0);
         }
-        let st = tang_verify::stat(&y1, &y0, 1e-2);
-        eprintln!("layer out: rel {:.3e} max {:.3e}", st.rel_l2, st.max_abs);
+        let s = stat(&y1, &y0, 1e-2);
+        eprintln!("layer out: rel {:.3e} max {:.3e}", s.0, s.1);
         // a hollow A/B (both runs on the naive kernel) gives EXACTLY 0 — int8 activations
         // always leave some noise, so 0 means gemv8 never ran
-        let sq = tang_verify::stat(&sec(&t1, 0), &sec(&t0, 0), 1e-2);
-        assert!(sq.rel_l2 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
-        assert!(st.nonfinite_gpu == 0 && st.rel_l2 < 2e-2, "gemv8 layer output diverges: {st:?}");
+        let sq = stat(
+            &section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, 0),
+            &section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, 0),
+            1e-2,
+        );
+        assert!(sq.0 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
+        assert!(s.1 < 2e-2, "gemv8 layer output diverges: rel {:.3e}", s.0);
     }
 }

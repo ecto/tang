@@ -63,6 +63,53 @@ Ops: `cargo build` of the whole workspace fails on CUDA 12.8 (crates/tang pins c
 build `-p tang-llm` only. Don't hold the GPU flock around builds — other sessions'
 90-minute runs queue on it.
 
+## 2026-10-26 — g5f_gemv: the fast MoE row kernel as a plain GEMV (branch frog/glm5-grouped-moe)
+
+- `g5f_gemv` (moe_cuda.cuh) + `Kernels5::fast` (`FastGemv::q8` / `::gemv`, `Act`): any G5W type,
+  int8 dp4a, two rows a warp, 8-token tile. Not wired into kda_dev (the manager does that);
+  no env flag. Staging only when it fits 48 KB (o_proj's 70 KB staged was 35.8 µs vs 22.8).
+- Parity: `gpu_gemv_fast_matches_cpu` 144 cases (tiny F32 + Q8_0, T 1/3/9, staged/not,
+  q8x2/q8), NaN-filled outputs; q8x2 rel ≤ 4.2e-5, q8 ≤ 1.05e-2. The tiny q4_k_m GGUF is
+  absent on the H200, so K-quant rows are covered only by the MoE tests (same dot code).
+- H200, real l0 KDA projections (Q8_0, 35.7 MB each), CUDA events, kernel only, T=1:
+  q/k/v 8192×4096: g5f-q8 18.2 µs (1.95 TB/s), g5f-q8x2 23.6, k5_gemv8 20.5;
+  o 4096×8192: g5f-q8 15.5 (2.29 TB/s), q8x2 22.8, k5_gemv8 28.1.
+  q+k+v+o: g5f-q8 70.4 µs, q8x2 93.6, k5_gemv8 89.4. T=8: 430 / 657 / 534 µs. At T=8 the cost
+  is compute (each token re-decodes the row), not bytes.
+- Gate (fast MoE, `TANG_GLM5_GPU_FFN_LAYERS=0-29`; 186 GB doesn't fit 141 GB with all 45):
+  ids 785 1196 6801 264 6386 38038 911 279 = oracle; MoE shadow 240/240 within tol, worst rel 9.4e-5.
+- Full `flash::glm5` suite, default and `TANG_GLM5_MOE=fast`: 62 passed, 2 failed, the same
+  two in both: `engine_gpu_mla_matches_cpu` (tiny-fixture gate, top-1 167/170, logits 16.47;
+  see "not a valid gate" below) and `cuda_resident_flow_matches_upload`. After three test
+  shape fixes the latter now gets to its first numeric check and fails it: resident-flow vs
+  upload attend maxerr 1.148e-1 (bar 1e-5). Open: an MLA resident-path issue, or the test.
+
+## 2026-10-26 — tang-verify: the four ad-hoc tools are now a crate; the KDA shadow check ported onto it (branch frog/kernel-verify-harness)
+
+[`tang-verify`](../../docs/kernel-verify.md) = shadow + NaN poison + first-divergence
+attribution + skip_or_fail, as a reusable API (the same `Stat`/row format/env semantics as
+the old `kda_debug`, so old logs diff cleanly). Core is dependency-free; feature `cuda`
+adds the device side on tang-moe (`Probe::poison`/`read`, `kernel_test!` with
+`TANG_REQUIRE_CUDA`). The attribution now ranks provenance ("these values are `k`'s,
+written at offset 2048 in `qkv_pre` where 8192 was expected = an ELEMENT offset added to a
+BYTE address") over pipeline order — it names the *k* writer for cc578187, where the old
+rule blamed attn_q.
+
+Evidence:
+- Ported check, real model (mew 3090, KDA+DSA+mHC GPU / FFN CPU, `TANG_GLM5_KDA_MAXT=64`,
+  prompt "Write a haiku about the sea.", `-n 8 --temp 0`): ids
+  `785 1196 6801 264 6386 38038 911 279` = the oracle, and
+  `kdadbg SUMMARY: 272 windows checked, 0 failed`, worst rel 2.8e-6 (34 KDA layers × 8).
+- `kda_dev` kernel tests (`TANG_REQUIRE_CUDA=1`, mew 3090, 2/2): the q/k/v GEMVs vs the
+  host matmul at three shapes, plus `k5_gemv_element_offset_bug_is_named`, which plants
+  the bug in the test itself and asserts the verdict names `k`'s writer with the ×4 note.
+- The planted-bug demo on the real model (H200 pod): `scripts/kernel-verify-demo.sh`
+  reverts cc578187's byte scaling in a scratch copy, runs the model once planted and once
+  fixed, and prints the verdict. Planted run: `qkv.k` nonfinite 81920 = 20×8192/2 and
+  `qkv.v` 163840 = 20×8192 (exactly the offset arithmetic), verdict
+  "`qkv.k` wrote into `qkv.q` … → suspect: k5_gemv attn_k (device)"; fixed run 34/34
+  clean, `ids: 785 …`. The transcript is in docs/kernel-verify.md.
+
 ## 2026-10-26 (speed step 4) — fused, device-resident mHC: 170.8 → 10.5 ms per decode step (3090)
 
 `TANG_GLM5_MHC_FUSED=1` (default off), `mhc_fused.rs`. The 4 residual streams stay on
