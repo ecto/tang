@@ -4,6 +4,56 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-26 — MLA: both divergence signals were real bugs (3 of them); device-resident projections (branch frog/glm5-mla-divergence)
+
+Method: a new MLA shadow (`mla_debug.rs`, `TANG_GLM5_MLA_DEBUG=1`, on tang-verify) runs
+the CPU reference on the same inputs and the device's own rows for every DSA window. It
+checks latents, indexer rows, mirrors, valid, pool and attention (using the GPU's own
+selection), plus the shadow's own caches. It compares the selection as sets, with an f64
+tie classifier. Every finding below was A/B'd against a planted copy (bug restored).
+
+1. **`cuda_resident_flow_matches_upload` 1.148e-1 = a use-after-free, not the test.**
+   On their upload branch, `attend`/`attend_absorbed` wrote through `DevBuf { ptr, len }`,
+   which aliased the sequence's latent buffer. DevBuf frees on drop, so the next `from_slice`
+   (q, sel) reused the memory, and the kernel read those bytes as latents. Only a fresh
+   MlaCuda takes that branch: the test's "upload" reference. Planted: `resident vs CPU
+   7.451e-9, upload vs CPU 1.148e-1`. Fixed: both 7.451e-9; all 4 flow checks 0.000e0.
+2. **`engine_gpu_mla_matches_cpu` 167/170, 16.47 = the incremental pool path.**
+   `idx_pool_keys` used `p = blockIdx.x` while the launcher offset the output by
+   `pool_upto`. So every sparse window after the first stored pools `[0, n-from)` at
+   slots `[from, n)`. Shadow: `pool` BAD w3 rel 1.6e-1, w4 3.5e-1; selection 7–11
+   queries differ by f64 gaps 1.6e-2..7.7e-1 of max (real, not ties); every other tap
+   ≤ 7.6e-7. The flow test's pool check shared the code path and couldn't see it.
+   Regression `resident_pool_content_matches_a_fresh_pool`: planted 1.221e-1, fixed 0.
+3. **Mirror read-back offsets**: `kv_append`/`idx_append` read the decode rows' host
+   mirrors at element offsets (`DevBuf::read` takes bytes), so the mirrors held row pos0/2
+   or pos0/4. This was latent until a re-upload (cache realloc, LRU re-entry). The flow
+   test now asserts the decode-row mirrors (planted: false ×3).
+
+Test bug: the flow test used `Stream::new()` (NON_BLOCKING; the stream-blocking.md
+class). It is blocking now, and every MlaCuda launcher asserts `Stream::is_blocking()`.
+
+After the fixes (H200, tiny f32): shadow 5/5 windows clean, 0/158 selections differ. The
+remaining gap to the f32 CPU engine is the bf16 latent format, so the test now measures
+against `Glm5Engine::bf16_latents`. GPU vs CPU-bf16: 0 flips / 170, logits max abs
+1.982e-3. GPU vs CPU-f32: 1 flip, 15.22, which equals the CPU's own bf16-vs-f32 gap
+(1 flip, 15.22; logit scale 45). The B300 8-token match fits: that run never hit an
+incremental sparse pool (prompt < top-k = 2048, so the indexer is dense).
+
+**Device-resident projections** (`TANG_GLM5_MLA_RESIDENT=1`, default off, `mla_dev.rs`):
+q_a + `mla_rms_norm`, q_b, o_proj and the indexer's wq_b / weights_proj run on `g5f_gemv`
+(GGUF types, q8x2 activations). Activations stay on the device from x to y.
+- Tiny: 0 flips and logits 2.0e-5 vs the naive GPU path, shadow clean.
+- Real model (H200, `TANG_GLM5_GPU_FFN=0 TANG_GLM5_KDA_MAXT=64`): ids
+  `785 1196 6801 264 6386 38038 911 279` = the oracle, with and without the shadow.
+  Shadow: `88 windows checked, 0 failed`; q_resid rel ≤ 1.6e-5, q ≤ 1.3e-5, out ≤ 2.1e-5.
+  Selection was not exercised: the prompt is dense.
+- mla mixer per step (sum of 11 DSA layers, `TANG_GLM5_PROF=1`), resident: prefill
+  (20 tok) 200.6 ms, decode 84.0 → 98.9 ms. Naive baseline: see below.
+
+`test result` lines (H200): `flash::glm5::mla` 11 passed; `engine_gpu*` 4 passed;
+`engine_reset_gpu` ok.
+
 ## 2026-10-26 — g5f_gemv: the fast MoE row kernel as a plain GEMV (branch frog/glm5-grouped-moe)
 
 - `g5f_gemv` (moe_cuda.cuh) + `Kernels5::fast` (`FastGemv::q8` / `::gemv`, `Act`): any G5W type,
