@@ -3,9 +3,11 @@
 //!
 //! Deliberately minimal, like GLM's first serve glue:
 //! - One sequence at a time. Each request prefills its whole prompt in one chunk at position
-//!   0 and then decodes one token at a time, the only two shapes DeepSeek's reference forward
-//!   (and so this port) supports; there is no prefix reuse across requests yet.
-//! - No drafts: DSpark runs only in the parity tests until speculative decoding lands (M4).
+//!   0 and then decodes; there is no prefix reuse across requests yet.
+//! - Greedy requests (temperature 0) decode speculatively with DSpark (`DS_SPEC=0` turns it
+//!   off): each forward verifies the sampled token and its drafts as one window
+//!   ([`GpuModel::decode_spec`]), the same tokens as plain greedy decoding. Sampled requests
+//!   decode one token at a time.
 //! - Sampling on the host from the last logits: greedy at temperature 0, else top-p.
 //!
 //! The reply streams as reasoning (inside `<think>`), text, and tool calls. DeepSeek writes a
@@ -268,7 +270,7 @@ impl Backend for DsServe {
         };
         self.m.reset()?;
         let t0 = Instant::now();
-        let (mut logits, _) = self.m.forward(&ids, 0, None).context("prefill")?;
+        let (mut logits, mut main) = self.m.forward(&ids, 0, None).context("prefill")?;
         usage.prefill_tok_s = ids.len() as f64 / t0.elapsed().as_secs_f64();
         let mut rng = req.sampling.seed ^ 0x5eed;
         let (temp, top_p) = (req.sampling.temperature, req.sampling.top_p);
@@ -293,9 +295,22 @@ impl Backend for DsServe {
             }
             true
         };
+        let spec = temp <= 0.0 && std::env::var("DS_SPEC").map_or(true, |v| v != "0");
+        let blk = self.m.cpu.cfg.dspark_block_size;
+        if spec {
+            // seed the drafter's windows with the prompt
+            self.m.forward_spec(0, &main, 0)?;
+        }
+        // tokens a verify window produced: (token, already fed)
+        let mut queue: std::collections::VecDeque<(u32, bool)> = Default::default();
+        // the start position of `main`'s rows, once it holds a decode step's hiddens
+        let mut main_sp: Option<usize> = None;
         let mut pos = ids.len();
         'gen: for _ in 0..max_new {
-            let next = sample(&logits, temp, top_p, &mut rng) as u32;
+            let (next, fed) = match queue.pop_front() {
+                Some(q) => q,
+                None => (sample(&logits, temp, top_p, &mut rng) as u32, false),
+            };
             if self.eos.contains(&next) {
                 finish = Finish::Stop;
                 break;
@@ -322,7 +337,32 @@ impl Backend for DsServe {
             if pos + 1 >= self.ctx {
                 break;
             }
-            logits = self.m.forward(&[next as usize], pos, None)?.0;
+            if fed {
+                pos += 1;
+                continue;
+            }
+            match main_sp {
+                Some(sp) if spec && pos + blk + 1 < self.ctx => {
+                    let s = self
+                        .m
+                        .decode_spec(next as usize, &main, sp, &mut |_, _| {})?;
+                    usage.draft_tokens += s.drafted;
+                    usage.accepted_tokens += s.accepted;
+                    let n = s.tokens.len();
+                    queue.extend(
+                        s.tokens
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &t)| (t as u32, i + 1 < n)),
+                    );
+                    main = s.main;
+                    main_sp = Some(s.sp);
+                }
+                _ => {
+                    (logits, main) = self.m.forward(&[next as usize], pos, None)?;
+                    main_sp = Some(pos);
+                }
+            }
             pos += 1;
         }
         let tail = parser.finish();

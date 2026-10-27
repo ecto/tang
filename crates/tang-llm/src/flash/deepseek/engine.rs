@@ -13,7 +13,7 @@
 //! still doesn't wait for queued kernels, so every helper that drops a temporary a queued
 //! kernel reads syncs first.
 
-use super::forward::{topk_stable, Model};
+use super::forward::{argmax, topk_stable, Model, SpecStep};
 use super::gpu::{blocks, DevW, Kernels};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
 use anyhow::{Context, Result};
@@ -86,6 +86,15 @@ pub struct GpuModel {
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     /// Intermediates read back by name when `DS_TAP` is set (as [`Model::taps`]).
     pub taps: RefCell<Vec<(String, Vec<f32>)>>,
+    /// While a [`GpuSnapshot`] is open: the compressors' partial-group writes (as
+    /// [`Model::snapshot`]): lid, position, kv row, score row.
+    journal: Option<Vec<(usize, usize, DevBuf, DevBuf)>>,
+}
+
+/// As [`super::forward::Snapshot`], on the device.
+pub struct GpuSnapshot {
+    win: Vec<DevBuf>,
+    cst: HashMap<usize, (DevBuf, DevBuf)>,
 }
 
 impl GpuModel {
@@ -146,6 +155,7 @@ impl GpuModel {
             cand: Vec::new(),
             force: None,
             taps: RefCell::new(Vec::new()),
+            journal: None,
         })
     }
 
@@ -438,6 +448,26 @@ impl GpuModel {
             return Ok((kv, t, idxs));
         }
         let ring = self.win[lid].ptr;
+        if t > 1 {
+            // a verify window (as forward.rs): the pre-chunk ring then the chunk's rows
+            let all = fbuf((win + t) * hd)?;
+            self.copy(all.ptr, ring, win * hd)?;
+            self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, t * hd)?;
+            let idxs = (0..t)
+                .map(|e| {
+                    let q = sp + e;
+                    ((q + 1).saturating_sub(win)..=q)
+                        .map(|j| if j < sp { j % win } else { win + j - sp } as i32)
+                        .collect()
+                })
+                .collect();
+            for e in 0..t {
+                let s = ((sp + e) % win * hd * 4) as u64;
+                self.copy(ring + s, kv.ptr + (e * hd * 4) as u64, hd)?;
+            }
+            self.s.sync()?;
+            return Ok((all, win + t, idxs));
+        }
         self.copy(ring + ((sp % win) * hd * 4) as u64, kv.ptr, hd)?;
         let all = fbuf(win * hd)?;
         self.copy(all.ptr, ring, win * hd)?;
@@ -517,6 +547,12 @@ impl GpuModel {
             let slot = (sp % r) as u64;
             self.copy(kst + slot * row, kv.ptr, hd)?;
             self.copy(sst + slot * row, sc.ptr, hd)?;
+            if self.journal.is_some() {
+                let (jk, js) = (fbuf(hd)?, fbuf(hd)?);
+                self.copy(jk.ptr, kv.ptr, hd)?;
+                self.copy(js.ptr, sc.ptr, hd)?;
+                self.journal.as_mut().unwrap().push((lid, sp, jk, js));
+            }
             if (sp + 1) % r != 0 {
                 self.s.sync()?;
                 return Ok(None);
@@ -541,6 +577,30 @@ impl GpuModel {
     ) -> Result<(usize, usize, Vec<Vec<i32>>)> {
         let c = self.cpu.cfg.clone();
         let (r, hd) = (c.compress_ratios[lid], c.head_dim);
+        if sp > 0 && t > 1 {
+            // a verify window one position at a time (as forward.rs `compress_kv_steps`)
+            let (d, ql) = (c.dim, c.q_lora_rank);
+            let topk_in = std::mem::take(&mut self.topk);
+            let cand_in = std::mem::take(&mut self.cand);
+            let (mut idxs, mut topk, mut cand, mut last) =
+                (Vec::new(), Vec::new(), Vec::new(), (0, 0));
+            for e in 0..t {
+                self.topk = topk_in.get(e).cloned().into_iter().collect();
+                self.cand = cand_in.get(e).cloned().into_iter().collect();
+                let (xe, qe) = (fbuf(d)?, fbuf(ql)?);
+                self.copy(xe.ptr, x.ptr + (e * d * 4) as u64, d)?;
+                self.copy(qe.ptr, qr.ptr + (e * ql * 4) as u64, ql)?;
+                let (src, clen, mut ie) = self.compress_kv(p, lid, &xe, &qe, 1, sp + e, offset)?;
+                self.s.sync()?;
+                last = (src, clen);
+                idxs.push(ie.pop().unwrap_or_default());
+                topk.append(&mut self.topk);
+                cand.append(&mut self.cand);
+            }
+            self.topk = topk;
+            self.cand = cand;
+            return Ok((last.0, last.1, idxs));
+        }
         let clen = (sp + t) / r;
         let mut latent = None;
         if c.is_kv_source(lid) {
@@ -1002,7 +1062,22 @@ impl GpuModel {
         &mut self,
         ids: &[usize],
         sp: usize,
+        hook: Option<&mut dyn FnMut(&str, &[f32])>,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward_impl(ids, sp, hook, false)
+    }
+
+    /// As [`Model::forward_all`]: every position's logits [T][V] (a verify window).
+    pub fn forward_all(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward_impl(ids, sp, None, true)
+    }
+
+    fn forward_impl(
+        &mut self,
+        ids: &[usize],
+        sp: usize,
         mut hook: Option<&mut dyn FnMut(&str, &[f32])>,
+        all: bool,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let c = self.cpu.cfg.clone();
         let (hc, d, t) = (c.hc_mult, c.dim, ids.len());
@@ -1063,8 +1138,9 @@ impl GpuModel {
         }
         let x = self.hc_pre(&h, &pre_mix, t)?;
         self.rms(&x, t, "norm.weight")?;
-        let logits = self.raw(x.ptr + ((t - 1) * d * 4) as u64, 1, "head.weight")?;
-        let logits = self.read(&logits, c.vocab_size)?;
+        let rows = if all { t } else { 1 };
+        let logits = self.raw(x.ptr + ((t - rows) * d * 4) as u64, rows, "head.weight")?;
+        let logits = self.read(&logits, rows * c.vocab_size)?;
         let n = mains.len();
         let mut main = vec![0f32; t * d * n];
         for (j, m) in mains.iter().enumerate() {
@@ -1110,12 +1186,15 @@ impl GpuModel {
         self.rms(&kv, b, &format!("{p}.attn.kv_norm.weight"))?;
         self.rope(&kv, b, 1, hd, lid, pos0, 1, None, false)?;
         self.k.fp8_qdq(&self.s, kv.ptr, b * hd)?;
-        let row: Vec<i32> = (0..win.min(sp + 1) as i32)
+        let row: Vec<i32> = (0..win.min(sp + t) as i32)
             .chain((0..b as i32).map(|i| win as i32 + i))
             .collect();
         let idxs = vec![row; b];
         let ring = self.win[lid].ptr;
-        self.copy(ring + ((sp % win) * hd * 4) as u64, mkv.ptr, hd)?;
+        for i in 0..t {
+            let s = ((sp + i) % win * hd * 4) as u64;
+            self.copy(ring + s, mkv.ptr + (i * hd * 4) as u64, hd)?;
+        }
         let all = fbuf((win + b) * hd)?;
         self.copy(all.ptr, ring, win * hd)?;
         self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, b * hd)?;
@@ -1188,6 +1267,97 @@ impl GpuModel {
             logits,
             conf,
         }))
+    }
+
+    // speculative decoding
+
+    fn dup(&self, b: &DevBuf, n: usize) -> Result<DevBuf> {
+        let o = fbuf(n)?;
+        self.copy(o.ptr, b.ptr, n)?;
+        Ok(o)
+    }
+
+    /// As [`Model::snapshot`].
+    pub fn snapshot(&mut self) -> Result<GpuSnapshot> {
+        let c = self.cpu.cfg.clone();
+        let hd = c.head_dim;
+        let win = (0..c.n_layers)
+            .map(|l| self.dup(&self.win[l], c.window_size * hd))
+            .collect::<Result<_>>()?;
+        let mut cst = HashMap::new();
+        for (&l, (a, b)) in &self.cst {
+            let n = c.compress_ratios[l] * hd;
+            cst.insert(l, (self.dup(a, n)?, self.dup(b, n)?));
+        }
+        self.s.sync()?;
+        self.journal = Some(Vec::new());
+        Ok(GpuSnapshot { win, cst })
+    }
+
+    /// As [`Model::rewind`]: back to only positions `< from` fed.
+    pub fn rewind(&mut self, snap: &GpuSnapshot, from: usize, end: usize) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let (win, hd) = (c.window_size, c.head_dim);
+        for (l, old) in snap.win.iter().enumerate() {
+            for pos in from..end.min(from + win) {
+                let o = ((pos % win) * hd * 4) as u64;
+                self.copy(self.win[l].ptr + o, old.ptr + o, hd)?;
+            }
+        }
+        for (l, (a, b)) in &snap.cst {
+            let n = c.compress_ratios[*l] * hd;
+            let (ka, kb) = (self.cst[l].0.ptr, self.cst[l].1.ptr);
+            self.copy(ka, a.ptr, n)?;
+            self.copy(kb, b.ptr, n)?;
+        }
+        let journal = self.journal.take().unwrap_or_default();
+        for (lid, pos, kv, sc) in &journal {
+            if *pos < from {
+                let o = ((pos % c.compress_ratios[*lid]) * hd * 4) as u64;
+                let (ka, kb) = (self.cst[lid].0.ptr, self.cst[lid].1.ptr);
+                self.copy(ka + o, kv.ptr, hd)?;
+                self.copy(kb + o, sc.ptr, hd)?;
+            }
+        }
+        self.s.sync()?;
+        drop(journal);
+        Ok(())
+    }
+
+    /// As [`Model::decode_spec`].
+    pub fn decode_spec(
+        &mut self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        edit: &mut dyn FnMut(usize, &mut [usize]),
+    ) -> Result<SpecStep> {
+        let c = self.cpu.cfg.clone();
+        let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
+        let pos0 = sp + main.len() / w;
+        let draft = self
+            .forward_spec(token, main, sp)?
+            .context("decode_spec needs sp > 0")?;
+        let mut ids = draft.ids;
+        edit(pos0 + 1, &mut ids[1..]);
+        let snap = self.snapshot()?;
+        let (logits, mains) = self.forward_all(&ids, pos0)?;
+        let n = ids.len();
+        let mut k = 0;
+        while k + 1 < n && argmax(&logits[k * v..(k + 1) * v]) == ids[k + 1] {
+            k += 1;
+        }
+        let next = argmax(&logits[k * v..(k + 1) * v]);
+        self.rewind(&snap, pos0 + k + 1, pos0 + n)?;
+        let mut tokens = ids[1..=k].to_vec();
+        tokens.push(next);
+        Ok(SpecStep {
+            tokens,
+            drafted: n - 1,
+            accepted: k,
+            main: mains[..(k + 1) * w].to_vec(),
+            sp: pos0,
+        })
     }
 }
 
@@ -1399,5 +1569,119 @@ mod tests {
             );
         }
         assert!(top1 + 1 >= steps.len(), "top-1 {top1}/{}", steps.len());
+    }
+
+    fn prompt(meta: &serde_json::Value) -> Vec<usize> {
+        meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect()
+    }
+
+    /// As forward.rs `tiny_chunk_and_rewind_exact`, on the device.
+    #[test]
+    fn gpu_tiny_chunk_and_rewind_exact() {
+        let Some((mut a, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let (v, n) = (a.cpu.cfg.vocab_size, ids.len());
+        a.forward(&ids, 0, None).unwrap();
+        let stream: Vec<usize> = (0..14).map(|i| (37 * i + 11) % v).collect();
+        let mut want = Vec::new();
+        for (i, &t) in stream.iter().enumerate() {
+            want.push(a.forward(&[t], n + i, None).unwrap().0);
+        }
+        drop(a);
+        for keep in 1..=6 {
+            let mut b = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+            b.forward(&ids, 0, None).unwrap();
+            b.forward(&stream[..1], n, None).unwrap();
+            let snap = b.snapshot().unwrap();
+            let (lw, _) = b.forward_all(&stream[1..7], n + 1).unwrap();
+            for e in 0..6 {
+                assert_eq!(lw[e * v..(e + 1) * v], want[1 + e][..], "window row {e}");
+            }
+            b.rewind(&snap, n + 1 + keep, n + 7).unwrap();
+            for i in 1 + keep..stream.len() {
+                let (l, _) = b.forward(&[stream[i]], n + i, None).unwrap();
+                assert_eq!(l, want[i], "keep {keep} step {i}");
+            }
+        }
+    }
+
+    /// As forward.rs `tiny_spec_matches_greedy`, on the device.
+    #[test]
+    fn gpu_tiny_spec_matches_greedy() {
+        let Some((mut m, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let (v, n, len) = (m.cpu.cfg.vocab_size, ids.len(), 40);
+        let (mut l, _) = m.forward(&ids, 0, None).unwrap();
+        let mut want = Vec::new();
+        while want.len() < len {
+            want.push(argmax(&l));
+            l = m
+                .forward(&[*want.last().unwrap()], n + want.len() - 1, None)
+                .unwrap()
+                .0;
+        }
+        drop(m);
+        let (oracle, oracle2) = (want.clone(), want.clone());
+        let mut rng = 1u64;
+        type Edit = Box<dyn FnMut(usize, &mut [usize])>;
+        let runs: Vec<(&str, Edit)> = vec![
+            ("dspark", Box::new(|_, _: &mut [usize]| {})),
+            (
+                "oracle",
+                Box::new(move |pos, d: &mut [usize]| {
+                    for (i, x) in d.iter_mut().enumerate() {
+                        if let Some(&w) = oracle.get(pos + i - n) {
+                            *x = w;
+                        }
+                    }
+                }),
+            ),
+            (
+                "wrong",
+                Box::new(move |pos, d: &mut [usize]| {
+                    for (i, x) in d.iter_mut().enumerate() {
+                        if let Some(&w) = oracle2.get(pos + i - n) {
+                            *x = w;
+                        }
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        if (rng >> 33) % 5 == 0 {
+                            *x = (*x + 1 + (rng >> 40) as usize % (v - 1)) % v;
+                        }
+                    }
+                }),
+            ),
+        ];
+        for (name, mut edit) in runs {
+            let mut m = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+            let (l, main) = m.forward(&ids, 0, None).unwrap();
+            let t0 = argmax(&l);
+            m.forward_spec(t0, &main, 0).unwrap();
+            let (l, mut main) = m.forward(&[t0], n, None).unwrap();
+            let mut out = vec![t0, argmax(&l)];
+            let (mut sp, mut drafted, mut accepted) = (n, 0, 0);
+            while out.len() < len {
+                let s = m
+                    .decode_spec(*out.last().unwrap(), &main, sp, &mut *edit)
+                    .unwrap();
+                drafted += s.drafted;
+                accepted += s.accepted;
+                out.extend(s.tokens);
+                main = s.main;
+                sp = s.sp;
+            }
+            out.truncate(len);
+            eprintln!(
+                "{name}: accepted {accepted}/{drafted} ({:.1}%)",
+                100.0 * accepted as f64 / drafted.max(1) as f64
+            );
+            assert_eq!(out, want, "{name}");
+        }
     }
 }
