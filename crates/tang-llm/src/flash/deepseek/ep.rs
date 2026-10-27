@@ -133,6 +133,8 @@ impl EpGroup {
                             Backend::Nccl => {
                                 let comm = tang_moe::nccl::Comm::new(rank, world, nccl_id.unwrap())
                                     .map_err(|e| anyhow!("rank {rank}: {e}"))?;
+                                // only enqueues: captured into the step's graph
+                                m.reduce_graphable = true;
                                 Some(Box::new(move |y, n, s| {
                                     comm.all_reduce_sum_f32(y, n, s).map_err(|e| anyhow!("{e}"))
                                 }))
@@ -153,7 +155,11 @@ impl EpGroup {
                     for cmd in crx {
                         let r = match cmd {
                             Cmd::Forward(ids, sp) => {
-                                m.forward(&ids, sp, None).map(|(l, h)| Reply::Forward(l, h))
+                                // only rank 0's output is read: the others skip the read-back
+                                m.skip_readback = rank != 0;
+                                let r = m.forward(&ids, sp, None);
+                                m.skip_readback = false;
+                                r.map(|(l, h)| Reply::Forward(l, h))
                             }
                             Cmd::Spec(tok, main, sp) => {
                                 m.forward_spec(tok, &main, sp).map(Reply::Spec)
