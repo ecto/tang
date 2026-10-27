@@ -1226,6 +1226,153 @@ extern "C" __global__ void mla_rms_norm(float* __restrict__ x, const float* __re
     const float inv = rsqrtf(red[0] / n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) xt[i] = xt[i] * inv * w[i];
 }
+
+// Block-wide sum over 256 threads (all threads get it).
+__device__ __forceinline__ float mla_bsum(float v, float* red) {
+    __syncthreads();
+    red[threadIdx.x] = v;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    return red[0];
+}
+
+// mla_lat_norm_bf16: the latent append's finish on the resident path. One block (256) per
+// token: y [t][dl] f32 (kv_a . x, from g5f_gemv) -> lat [t][dl] bf16 rows (pre-offset to
+// row pos0) = bf16(y * an / sqrt(mean(y^2) + eps)). Same math and rounding as mla_kv_append.
+extern "C" __global__ void mla_lat_norm_bf16(const float* __restrict__ y, const float* __restrict__ an,
+    unsigned short* __restrict__ lat, int dl, float eps)
+{
+    __shared__ float red[256];
+    const float* yt = y + (size_t)blockIdx.x * dl;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < dl; i += blockDim.x) s += yt[i] * yt[i];
+    const float inv = rsqrtf(mla_bsum(s, red) / dl + eps);
+    for (int i = threadIdx.x; i < dl; i += blockDim.x)
+        lat[(size_t)blockIdx.x * dl + i] = f2bf(yt[i] * inv * an[i]);
+}
+
+// mla_idx_ln: the indexer key append's finish. One block (256) per token, in place on the
+// resident cache rows (pre-offset to row pos0): k = LayerNorm(k) * w + b (eps 1e-6), and
+// valid[tok] = 1. (The gate rows are written straight by g5f_gemv.)
+extern "C" __global__ void mla_idx_ln(float* __restrict__ k, const float* __restrict__ w,
+    const float* __restrict__ b, unsigned char* __restrict__ valid, int hd)
+{
+    __shared__ float red[256];
+    float* kt = k + (size_t)blockIdx.x * hd;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) s += kt[i];
+    const float mean = mla_bsum(s, red) / hd;
+    float v = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) v += (kt[i] - mean) * (kt[i] - mean);
+    const float inv = rsqrtf(mla_bsum(v, red) / hd + 1e-6f);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) kt[i] = (kt[i] - mean) * inv * w[i] + b[i];
+    if (threadIdx.x == 0) valid[blockIdx.x] = 1;
+}
+
+// ---------------- absorbed MLA, coalesced (the resident path's attend) ----------------
+// The naive kernel decompresses every selected key through W_k_h / W_v_h, re-reading the
+// full f32 decompress weights per key (~82 MB per key per layer at the real geometry, with
+// the W_v reads strided across threads): ~6 ms per decode layer at 28 keys, growing with
+// kv. Absorbed: fold q once (q' = W_k_h^T q), score q' . latent, one W_v_h per (query,
+// head). Every weight row is read by one warp, lanes along the row (coalesced).
+
+// mla_fold_q2: grid (nh, t), 256 threads. qa[t][nh][dl] = W_k_h^T q_h; wk [nh][dl][dk].
+extern "C" __global__ void mla_fold_q2(const float* __restrict__ q, const float* __restrict__ wk,
+    float* __restrict__ qa, int nh, int dk, int dl)
+{
+    const int h = blockIdx.x, qi = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const float* qh = q + ((size_t)qi * nh + h) * dk;
+    const float* wh = wk + (size_t)h * dl * dk;
+    float* out = qa + ((size_t)qi * nh + h) * dl;
+    for (int l = warp; l < dl; l += nw) {
+        const float* row = wh + (size_t)l * dk;
+        float a = 0.f;
+        for (int d = lane; d < dk; d += 32) a += row[d] * qh[d];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0) out[l] = a;
+    }
+}
+
+// mla_attn_abs2: grid (nh, t), 256 threads; dynamic smem = (2*dl + width) floats.
+// Scores: one warp per key, lanes along the latent row; softmax over the block; the
+// weighted latent sum with threads along l (coalesced over keys' rows); then W_v_h: one
+// warp per output d, lanes along l. sel/dense semantics as mla_attn_naive.
+extern "C" __global__ void mla_attn_abs2(const float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const float* __restrict__ wv, const int* __restrict__ sel, float* __restrict__ out,
+    int nkv, int pos0, int nh, int dv, int dl, int width, float scale)
+{
+    const int h = blockIdx.x, qi = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int qpos = pos0 + qi;
+    extern __shared__ float sm[];
+    float* sq = sm;              // [dl] q'
+    float* lacc = sm + dl;       // [dl] weighted latent sum
+    float* sc = sm + 2 * dl;     // [width] scores (-inf = skipped)
+    __shared__ float red[256];
+    const float* qh = qa + ((size_t)qi * nh + h) * dl;
+    for (int l = threadIdx.x; l < dl; l += blockDim.x) { sq[l] = qh[l]; lacc[l] = 0.f; }
+    __syncthreads();
+    for (int w = warp; w < width; w += nw) {
+        int k;
+        if (sel == NULL) k = w <= qpos ? w : -1;
+        else k = sel[(size_t)qi * width + w];
+        float a = G5_NEG_INF_F;
+        if (k >= 0 && k < nkv) {
+            const unsigned short* kr = lat + (size_t)k * dl;
+            a = 0.f;
+            for (int l = lane; l < dl; l += 32) a += sq[l] * bf2f(kr[l]);
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            a *= scale;
+        }
+        if (lane == 0) sc[w] = a;
+    }
+    __syncthreads();
+    float m = G5_NEG_INF_F;
+    for (int w = threadIdx.x; w < width; w += blockDim.x) m = fmaxf(m, sc[w]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float den = 0.f;
+    for (int w = threadIdx.x; w < width; w += blockDim.x) {
+        const float p = sc[w] == G5_NEG_INF_F ? 0.f : expf(sc[w] - m);
+        sc[w] = p;
+        den += p;
+    }
+    red[threadIdx.x] = den;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    den = red[0];
+    // weighted latent sum: threads along l, keys in order (sel resolved again)
+    for (int w = 0; w < width; w++) {
+        const float p = sc[w];
+        if (p == 0.f) continue;
+        const int k = sel == NULL ? w : sel[(size_t)qi * width + w];
+        const unsigned short* kr = lat + (size_t)k * dl;
+        for (int l = threadIdx.x; l < dl; l += blockDim.x) lacc[l] += p * bf2f(kr[l]);
+    }
+    __syncthreads();
+    const float* wh = wv + (size_t)h * dv * dl;
+    float* o = out + ((size_t)qi * nh + h) * dv;
+    for (int d = warp; d < dv; d += nw) {
+        const float* row = wh + (size_t)d * dl;
+        float a = 0.f;
+        for (int l = lane; l < dl; l += 32) a += row[l] * lacc[l];
+        for (int s2 = 16; s2 > 0; s2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s2);
+        if (lane == 0) o[d] = den > 0.f ? a / den : 0.f;
+    }
+}
 "#;
 
 /// The `#define` prelude for [`CUDA_SRC`] at this geometry.
@@ -1737,7 +1884,8 @@ pub mod cuda {
         let hd = self.idxd;
         let kp = self.kpool;
         assert_eq!(i_ape.len(), kp * hd);
-        assert_eq!(pool_keys.len(), n_pool * hd);
+        // empty `pool_keys`: leave the pools on the device (no sync, no host copy)
+        assert!(pool_keys.is_empty() || pool_keys.len() == n_pool * hd);
         self.ensure_pool(n_pool)?;
         // resident idk/idg are authoritative only when idx_append wrote every row of the
         // current sequence contiguously; else fall back to uploading the caller's mirrors
@@ -1833,6 +1981,9 @@ pub mod cuda {
             let mut lru = self.seqs.borrow_mut();
             let i = lru.active_idx();
             lru.entries[i].pool_upto = n_pool;
+        }
+        if pool_keys.is_empty() {
+            return Ok(());
         }
         stream.sync()?;
         // hand the engine its full host copy (256 KB at the real geometry — acceptable)
@@ -2276,14 +2427,20 @@ pub mod cuda {
                 None => 0,
             };
             let od_ptr = self.o_d.borrow().ptr;
-            let f = self.m.func("mla_attn_naive")?;
-            let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
-            let (mut nh, mut dk, mut dv, mut dl, mut wd) =
+            let qa_ptr = self.qa_d.borrow().ptr;
+            let (nh, dk, dv, dl, wd) =
                 (self.nh as i32, self.dk as i32, self.dv as i32, self.dl as i32, width as i32);
-            let mut scale = 1.0f32 / (self.dk as f32).sqrt();
-            let (mut qp, mut lp, mut wkp, mut wvp, mut sp, mut op) =
-                (q, ld_ptr, self.wk_d.ptr, self.wv_d.ptr, sel_ptr, od_ptr);
-            let smem = ((self.dk + self.dv) * 4) as u32;
+            let (nkv, p0) = (n_kv as i32, pos0 as i32);
+            let scale = 1.0f32 / (self.dk as f32).sqrt();
+            let (wkp, wvp) = (self.wk_d.ptr, self.wv_d.ptr);
+            let ff = self.m.func("mla_fold_q2")?;
+            gpu::trace::bytes((self.nh * self.dl * self.dk * 4) as u64);
+            unsafe {
+                gpu::launch(ff, (self.nh as u32, t as u32, 1), (256, 1, 1), 0, stream, tang_moe::args![q, wkp, qa_ptr, nh, dk, dl])?
+            };
+            let f = self.m.func("mla_attn_abs2")?;
+            let smem = ((2 * self.dl + width) * 4) as u32;
+            gpu::trace::bytes((self.nh * self.dl * self.dv * 4 + width * self.dl * 2) as u64);
             unsafe {
                 gpu::launch(
                     f,
@@ -2291,10 +2448,92 @@ pub mod cuda {
                     (256, 1, 1),
                     smem,
                     stream,
-                    tang_moe::args![qp, lp, wkp, wvp, sp, op, tt, nkv, p0, nh, dk, dv, dl, wd, scale],
+                    tang_moe::args![qa_ptr, ld_ptr, wvp, sel_ptr, od_ptr, nkv, p0, nh, dv, dl, wd, scale],
                 )?
             };
             Ok(od_ptr)
+        }
+
+        /// The resident path's cache append, step 1: make rows `[pos0, pos0 + t)` of the
+        /// active sequence's latent and indexer caches writable (grow; on a contiguity
+        /// break re-upload rows `[0, pos0)` from the caller's mirrors, exactly as
+        /// [`Self::kv_append`] / [`Self::idx_append`] do). Returns the device pointers of
+        /// row `pos0`: (latent bf16, idx k f32, idx gate f32, valid u8). The caller's
+        /// kernels write the rows; then [`Self::append_done`].
+        #[allow(clippy::type_complexity)]
+        pub fn append_rows(
+            &self,
+            pos0: usize,
+            t: usize,
+            lat: &[u16],
+            k: &[f32],
+            g: &[f32],
+            valid: &[u8],
+        ) -> Result<(u64, u64, u64, u64), gpu::Error> {
+            let (dl, hd) = (self.dl, self.idxd);
+            self.ensure_lat(pos0 + t)?;
+            self.ensure_idx(pos0 + t)?;
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            let e = &mut lru.entries[i];
+            if e.lat_rows != pos0 && pos0 > 0 {
+                e.lat_d.as_ref().unwrap().write(0, &lat[..pos0 * dl])?;
+            }
+            if e.idx_rows != pos0 && pos0 > 0 {
+                e.idk_d.as_ref().unwrap().write(0, &k[..pos0 * hd])?;
+                e.idg_d.as_ref().unwrap().write(0, &g[..pos0 * hd])?;
+                e.val_d.as_ref().unwrap().write(0, &valid[..pos0])?;
+            }
+            Ok((
+                e.lat_d.as_ref().unwrap().ptr + (pos0 * dl * 2) as u64,
+                e.idk_d.as_ref().unwrap().ptr + (pos0 * hd * 4) as u64,
+                e.idg_d.as_ref().unwrap().ptr + (pos0 * hd * 4) as u64,
+                e.val_d.as_ref().unwrap().ptr + pos0 as u64,
+            ))
+        }
+
+        /// Step 2 of [`Self::append_rows`]: the rows `[pos0, pos0 + t)` are written (launched
+        /// on the caller's stream): advance the watermarks.
+        pub fn append_done(&self, pos0: usize, t: usize) {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            lru.entries[i].lat_rows = pos0 + t;
+            lru.entries[i].idx_rows = pos0 + t;
+        }
+
+        /// Refresh the caller's host mirrors for rows `[pos0, pos0 + t)` (after a sync).
+        pub fn refresh_mirrors(
+            &self,
+            pos0: usize,
+            t: usize,
+            lat: &mut [u16],
+            k: &mut [f32],
+            g: &mut [f32],
+            valid: &mut [u8],
+        ) -> Result<(), gpu::Error> {
+            let (rl, rk, rg, rv) = self.debug_rows(pos0, t)?;
+            let (dl, hd) = (self.dl, self.idxd);
+            lat[pos0 * dl..(pos0 + t) * dl].copy_from_slice(&rl);
+            k[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&rk);
+            g[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&rg);
+            valid[pos0..pos0 + t].copy_from_slice(&rv);
+            Ok(())
+        }
+
+        /// Launch `mla_lat_norm_bf16` (`y` f32 [t][dl] -> bf16 rows at `lat`).
+        pub fn lat_norm_dev(&self, y: u64, an: u64, lat: u64, t: usize, stream: &Stream) -> Result<(), gpu::Error> {
+            let f = self.m.func("mla_lat_norm_bf16")?;
+            let (yp, ap, lp, dl, eps) = (y, an, lat, self.dl as i32, self.eps);
+            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![yp, ap, lp, dl, eps])? };
+            Ok(())
+        }
+
+        /// Launch `mla_idx_ln` (LayerNorm the k rows at `k` in place, mark `valid`).
+        pub fn idx_ln_dev(&self, k: u64, w: u64, b: u64, valid: u64, t: usize, stream: &Stream) -> Result<(), gpu::Error> {
+            let f = self.m.func("mla_idx_ln")?;
+            let (kp, wp, bp, vp, hd) = (k, w, b, valid, self.idxd as i32);
+            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![kp, wp, bp, vp, hd])? };
+            Ok(())
         }
 
         /// `x [t][n]` in place: `x * w / sqrt(mean(x^2) + eps)` per token (device pointers).

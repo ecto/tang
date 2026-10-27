@@ -34,6 +34,8 @@ struct Scratch {
     oq2: DevBuf,
     od: DevBuf,
     y: DevBuf,
+    /// kv_a . x before the norm, [t][kv_lora] f32
+    ylat: DevBuf,
 }
 
 /// One DSA layer's resident projections.
@@ -44,7 +46,16 @@ pub struct MlaProj {
     o: DevW,
     iq_b: DevW,
     ip: DevW,
+    /// the cache appends' projections (kv_a; the indexer's wk and pool gate)
+    kv_a: DevW,
+    i_wk: DevW,
+    i_gate: DevW,
     qan: DevBuf,
+    kvan: DevBuf,
+    iknw: DevBuf,
+    iknb: DevBuf,
+    dl: usize,
+    hd: usize,
     hid: usize,
     ql: usize,
     nhdk: usize,
@@ -73,6 +84,7 @@ impl MlaProj {
     /// Upload layer `l`'s projections from the GGUF (bound to the layer's device).
     pub fn new(g: &Gpu, gguf: &crate::gguf::Gguf, l: usize, w: &MlaWeights) -> Result<Self> {
         let t = |s: &str| super::t(l, s);
+        let up = |v: &[f32]| DevBuf::from_slice(v).map_err(|e| anyhow::anyhow!("mla_dev upload: {e}"));
         let p = MlaProj {
             k: Kernels5::new(g)?,
             q_a: dev_w(gguf, &t("attn_q_a.weight"))?,
@@ -80,7 +92,15 @@ impl MlaProj {
             o: dev_w(gguf, &t("attn_output.weight"))?,
             iq_b: dev_w(gguf, &t("indexer.attn_q_b.weight"))?,
             ip: dev_w(gguf, &t("indexer.proj.weight"))?,
-            qan: DevBuf::from_slice(&w.q_a_norm).map_err(|e| anyhow::anyhow!("q_a_norm: {e}"))?,
+            kv_a: dev_w(gguf, &t("attn_kv_a_mqa.weight"))?,
+            i_wk: dev_w(gguf, &t("indexer.attn_k.weight"))?,
+            i_gate: dev_w(gguf, &t("indexer_compressor_gate.weight"))?,
+            qan: up(&w.q_a_norm)?,
+            kvan: up(&w.kv_a_norm)?,
+            iknw: up(&w.i_k_norm_w)?,
+            iknb: up(&w.i_k_norm_b)?,
+            dl: w.kv_lora,
+            hd: w.idx_dim,
             hid: w.hidden,
             ql: w.q_lora,
             nhdk: w.n_head * w.qk_nope,
@@ -96,6 +116,9 @@ impl MlaProj {
             ("o", &p.o, p.nhdv),
             ("iq_b", &p.iq_b, p.ql),
             ("ip", &p.ip, p.hid),
+            ("kv_a", &p.kv_a, p.hid),
+            ("i_wk", &p.i_wk, p.hid),
+            ("i_gate", &p.i_gate, p.hid),
         ] {
             // g5f_gemv's activation stride must be a multiple of 32; every row length here
             // is one (real model and the tiny fixtures alike)
@@ -129,6 +152,7 @@ impl MlaProj {
                 oq2: b(cap * ov)?,
                 od: f(cap * ov / 32)?,
                 y: f(cap * self.hid)?,
+                ylat: f(cap * self.dl)?,
             });
         }
         Ok(std::cell::RefMut::map(s, |s| s.as_mut().unwrap()))
@@ -169,26 +193,43 @@ impl MlaProj {
         s: &Stream,
     ) -> Result<ProjOut> {
         let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla_dev: {e}");
+        use super::trace::span;
         let kv_len = pos0 + t;
         let sc = self.scratch(t)?;
         let (h, ql) = (self.hid, self.ql);
+        let tr = span("q_a");
         sc.x.write(0, x).map_err(gerr)?;
-        let ax = self.act(s, &[&self.q_a, &self.ip], sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, t)?;
+        let xw = [&self.q_a, &self.ip, &self.kv_a, &self.i_wk, &self.i_gate];
+        let ax = self.act(s, &xw, sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, t)?;
         // q_resid = rms_norm(q_a x) * q_a_norm
         self.k.fast.gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, t, ql, h)?;
         cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, t, self.eps, s).map_err(gerr)?;
+        drop(tr);
+        let tr = span("q_b");
         let aq = self.act(s, &[&self.q_b, &self.iq_b], sc.qr.ptr, sc.qrq.ptr, sc.qrq2.ptr, sc.qrd.ptr, ql, t)?;
         self.k.fast.gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, t, self.nhdk, ql)?;
+        drop(tr);
 
-        // caches (host x staged by the launchers; also refresh the engine's mirrors)
-        cu.kv_append(&w.kv_a, &w.kv_a_norm, x, t, pos0, c_lat, s).map_err(gerr)?;
-        cu.idx_append(&w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, x, t, pos0, c_k, c_g, c_valid, s)
-            .map_err(gerr)?;
+        // the cache appends, on the device: GEMVs straight into the resident rows (the
+        // latent through an f32 scratch + norm/bf16), no host staging, no sync
+        let tr = span("kv_append");
+        let (lp, kp, gp, vp) = cu.append_rows(pos0, t, c_lat, c_k, c_g, c_valid).map_err(gerr)?;
+        self.k.fast.gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, t, self.dl, h)?;
+        cu.lat_norm_dev(sc.ylat.ptr, self.kvan.ptr, lp, t, s).map_err(gerr)?;
+        drop(tr);
+        let tr = span("idx_append");
+        self.k.fast.gemv(s, self.i_wk.w, 0, ax, kp, self.hd, t, self.hd, h)?;
+        self.k.fast.gemv(s, self.i_gate.w, 0, ax, gp, self.hd, t, self.hd, h)?;
+        cu.idx_ln_dev(kp, self.iknw.ptr, self.iknb.ptr, vp, t, s).map_err(gerr)?;
+        cu.append_done(pos0, t);
+        drop(tr);
+        let tr = span("idx_select");
         let sel = if super::mla::indexer_is_dense(kv_len, w.topk) {
             None
         } else {
             let n_pool = kv_len / w.kpool;
-            let mut pool_keys = vec![0f32; n_pool * w.idx_dim];
+            // pools stay on the device; the host copy only for the shadow
+            let mut pool_keys = if pool_keys_out.is_some() { vec![0f32; n_pool * w.idx_dim] } else { Vec::new() };
             cu.idx_pool(c_k, c_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, s).map_err(gerr)?;
             self.k.fast.gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, t, self.iqr, ql)?;
             self.k.fast.gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, t, self.ih, h)?;
@@ -199,12 +240,20 @@ impl MlaProj {
             }
             Some(sel)
         };
+        drop(tr);
+        let tr = span("attend");
         let ov = cu.attend_dev(sc.q.ptr, kv_len, t, pos0, sel.as_deref(), s).map_err(gerr)?;
+        drop(tr);
+        let tr = span("o_proj");
         // o_proj straight off the attention output ([t][nh*dv])
         let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, t)?;
         self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
         s.sync().map_err(gerr)?;
         let y = sc.y.read::<f32>(0, t * h).map_err(gerr)?;
+        drop(tr);
+        let tr = span("mirrors");
+        cu.refresh_mirrors(pos0, t, c_lat, c_k, c_g, c_valid).map_err(gerr)?;
+        drop(tr);
         let (q_resid, q) = if debug {
             (
                 Some(sc.qr.read::<f32>(0, t * ql).map_err(gerr)?),
