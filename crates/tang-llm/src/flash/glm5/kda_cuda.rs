@@ -1353,7 +1353,7 @@ mod tests {
             for _ in 0..3 {
                 xb.write(0, xs).unwrap(); // the conv runs in place: restore the input
                 let t0 = std::time::Instant::now();
-                dev2.prefill_dev(&kers, &s, xb.ptr, ch, gb.ptr, nh * hd, bb.ptr, nh, ob.ptr, t).unwrap();
+                dev2.prefill_dev(&kers, &s, 0, xb.ptr, ch, gb.ptr, nh * hd, bb.ptr, nh, ob.ptr, t).unwrap();
                 s.sync().unwrap();
                 best = best.min(t0.elapsed().as_secs_f64() * 1e3);
             }

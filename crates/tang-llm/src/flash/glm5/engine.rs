@@ -2949,6 +2949,71 @@ mod tests {
         }
     }
 
+    /// The batcher on the GPU (tiny model): the device `[slots][...]` KDA state, the
+    /// batched rows' per-slot core (`core_rows`, needs PF2) and the per-slot MLA LRU. Two
+    /// slots with DIFFERENT prompts decoded together through `window_batch` must match a
+    /// lone single-slot GPU engine per prompt, step by step.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_slots_batch_matches_single() {
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("no CUDA device");
+            return;
+        }
+        // the batched KDA rows need the device-resident core (read at layer construction)
+        std::env::set_var("TANG_GLM5_KDA_PF2", "1");
+        let prompts = [&ids[..9], &ids[3..15]];
+        let steps = 4;
+        let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut toks: Vec<Vec<u32>> = Vec::new();
+        for p in prompts {
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            assert!(e.use_gpu().unwrap(), "GPU did not load");
+            let nv = e.m.hp.n_vocab;
+            let lg = e.window(p).unwrap();
+            let mut cur = argmax(&lg[(p.len() - 1) * nv..]);
+            let (mut w, mut tk) = (Vec::new(), vec![cur]);
+            for _ in 0..steps {
+                let lg = e.window(&[cur]).unwrap();
+                cur = argmax(&lg);
+                w.push(lg);
+                tk.push(cur);
+            }
+            want.push(w);
+            toks.push(tk);
+        }
+        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(e.use_gpu_slots(3).unwrap(), "GPU did not load");
+        std::env::remove_var("TANG_GLM5_KDA_PF2");
+        let nv = e.m.hp.n_vocab;
+        let mut cur = Vec::new();
+        for (k, p) in prompts.iter().enumerate() {
+            let lg = e.window_slot(k + 1, p).unwrap();
+            cur.push(argmax(&lg[(p.len() - 1) * nv..]));
+        }
+        assert_eq!(cur, vec![toks[0][0], toks[1][0]], "prefill next tokens");
+        for step in 0..steps {
+            let lg = e.window_batch(&[(1, cur[0]), (2, cur[1])]).unwrap();
+            for k in 0..2 {
+                let got = &lg[k * nv..(k + 1) * nv];
+                let scale = want[k][step].iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+                let worst = got
+                    .iter()
+                    .zip(&want[k][step])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                eprintln!("gpu slots: slot {k} step {step}: max abs {worst:.3e} (scale {scale:.2})");
+                assert!(worst <= 1e-3 * scale, "slot {k} step {step}: max abs {worst} vs scale {scale}");
+                cur[k] = argmax(got);
+            }
+        }
+        assert!(e.slot_tokens(0).is_empty(), "slot 0 untouched");
+    }
+
     /// reset() gives a fresh sequence.
     #[test]
     fn engine_reset() {

@@ -849,7 +849,7 @@ mod tests {
             // DevLayer reads the flag at load
             std::env::set_var("TANG_GLM5_KDA_PF2", if pf2 { "1" } else { "0" });
             let d = DevLayer::new_gguf(&g, &r.g, l, &cfg, hidden, &ConvState::zeros(&cfg, 1),
-                &KdaState::zeros(&cfg, 1), max_t).unwrap();
+                &KdaState::zeros(&cfg, 1), max_t, 1).unwrap();
             std::env::remove_var("TANG_GLM5_KDA_PF2");
             d
         };
@@ -976,7 +976,7 @@ mod gemv8_tests {
         let conv = ConvState::zeros(&cfg, 1);
         let state = KdaState::zeros(&cfg, 1);
         g.bind().unwrap();
-        let mut layer = DevLayer::new_gguf(&g, &r.g, l, &cfg, hp.n_embd, &conv, &state, 64).unwrap();
+        let mut layer = DevLayer::new_gguf(&g, &r.g, l, &cfg, hp.n_embd, &conv, &state, 64, 1).unwrap();
         let t = 20usize;
         let mut seed = 7u64;
         let x: Vec<f32> = (0..t * hp.n_embd)

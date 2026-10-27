@@ -323,7 +323,7 @@ mod tests {
         let n = hp.n_embd;
         // `a` has no fused kernels, so its window() is the naive path whatever the env says
         let mk = |fast: bool| {
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 8).unwrap();
+            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 8, 1).unwrap();
             d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
             d
         };
@@ -398,7 +398,7 @@ mod tests {
         };
         let n = hp.n_embd;
         let mk = |fast: bool| {
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64).unwrap();
+            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
             d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
             d
         };
