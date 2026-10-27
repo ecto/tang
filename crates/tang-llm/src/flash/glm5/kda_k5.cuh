@@ -41,7 +41,7 @@ extern "C" __global__ void k5_beta(const G5W bp, const float* x, float* beta,
     float a = 0.f;
     for (int e0 = lane * 8; e0 < (int)HID; e0 += 256) {
         #pragma unroll
-        for (int q = 0; q < 8; q++) a = fmaf(g5_deq(bp.ty, bp.base + (unsigned long long)h * bp.row_bytes, e0 + q), x[(size_t)t * HID + e0 + q], a);
+        for (int q = 0; q < 8; q++) a = fmaf(g5_deq(bp.ty, (const unsigned char*)(bp.base + (unsigned long long)h * bp.row_bytes), e0 + q), x[(size_t)t * HID + e0 + q], a);
     }
     for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
     if (lane == 0) beta[(unsigned long long)t * NH + h] = 1.f / (1.f + expf(-a));
