@@ -690,6 +690,9 @@ pub struct Kernels5 {
     pub norm: Func,
     /// The fast path's plain GEMV (`g5f_gemv` + `g5f_q8`), for the KDA projections.
     pub fast: FastGemv,
+    /// `k5_qgemv9` / `k5_qgemv17`: the multi-matrix T=1 Q8_0 GEMV (kda_k5.cuh).
+    pub qgemv9: Func,
+    pub qgemv17: Func,
 }
 
 impl Kernels5 {
@@ -703,6 +706,8 @@ impl Kernels5 {
             gate: m.func("k5_gate_finish")?,
             beta: m.func("k5_beta")?,
             norm: m.func("k5_gated_norm")?,
+            qgemv9: m.func("k5_qgemv9")?,
+            qgemv17: m.func("k5_qgemv17")?,
             _m: m,
         })
     }

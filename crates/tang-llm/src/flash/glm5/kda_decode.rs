@@ -141,6 +141,20 @@ impl DevLayer {
         let g8ga = gemv8 && self.ga.w.ty == 8;
         let skip = (g8f as u32) | ((g8ga as u32) << 1);
         unsafe {
+            if self.g5f > 0 {
+                // TANG_GLM5_KDA_G5F: q|k|v, f_a, g_a on the fast kernels (kda_dev g5f_x, the
+                // same launches as the naive window), beta on k5_beta as the naive path does —
+                // k5d_proj would compute only beta, one THREAD per 4096-wide row (~1.3 ms)
+                self.g5f_x(s, 1)?;
+                launch(
+                    self.gv.beta,
+                    (nh.div_ceil(super::K5_WARPS) as u32, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    args![self.bproj.w, self.xb.ptr, self.bb.ptr, 1u32, hidden as u32, nh as u32],
+                )?;
+            } else {
             let r0 = if gemv8 {
                 // the dequant-reuse GEMV for q/k/v (kda_dev's TANG_GLM5_GEMV8 path, T = 1)
                 launch(
@@ -189,6 +203,7 @@ impl DevLayer {
                     self.xb.ptr, qkv, self.g1b.ptr, self.bb.ptr, self.g2a.ptr, di as u32,
                     hd as u32, nh as u32, hidden as u32, r0 as u32, skip],
             )?;
+            }
             mark(1)?;
             launch(
                 fast.gate2,
@@ -215,7 +230,8 @@ impl DevLayer {
             // pre-pass used (nothing reads x's codes after the q/k/v GEMVs, so overwriting
             // them here is safe; kda_dev's finish() does the same)
             let g8o = gemv8 && self.wo.w.ty == 8;
-            if g8o {
+            if self.g5f_o(s, 1)? {
+            } else if g8o {
                 launch(
                     self.gv.q8,
                     ((di / 32) as u32, 1, 1),
@@ -525,5 +541,188 @@ mod tests {
             eprintln!("{name} vs naive: {diff} output values differ (bits), state {sdiff}, conv {cdiff}");
             assert_eq!((diff, sdiff, cdiff), (0, 0, 0), "{name} decode is not bit-equal to naive on real weights");
         }
+    }
+    /// REAL WEIGHTS (TANG_GLM5_REAL_GGUF = shard 1), TANG_GLM5_KDA_G5F: (a) per-matrix
+    /// kernel time (CUDA events, kernel only, T = 1, median of 50) and HBM GB/s of
+    /// k5_gemv8, g5f_gemv (q8 codes) and k5_qgemv for q/k/v/o/f_a/g_a plus the merged
+    /// q|k|v|f_a|g_a launch; (b) parity: 32 decode steps through the naive path with
+    /// G5F=0 (gemv8) vs 1 vs 2 — layer output and final state within the int8 band
+    /// (rel 1e-2); (c) fused and graph vs naive under G5F=1/2 bit-equal (per-matrix rule);
+    /// (d) fused per-stage µs per G5F mode. Skips without the env var.
+    #[test]
+    fn kda_g5f_real_bench() {
+        let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let g = Gpu::for_test().expect("GPU");
+        g.bind().unwrap();
+        let gguf = crate::gguf::Gguf::open(Path::new(&real)).unwrap();
+        let hp = super::super::super::Hparams::from_gguf(&gguf).unwrap();
+        let l = std::env::var("TANG_GLM5_BENCH_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| (0..hp.n_layer).find(|&l| hp.is_kda[l]).unwrap());
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let n = hp.n_embd;
+        let mk = |g5f: u8, fast: bool| {
+            std::env::set_var("TANG_GLM5_KDA_G5F", g5f.to_string());
+            std::env::set_var("TANG_GLM5_GEMV8", "1");
+            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64).unwrap();
+            std::env::remove_var("TANG_GLM5_KDA_G5F");
+            d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
+            d
+        };
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let xs: Vec<Vec<f32>> = (0..32).map(|_| (0..n).map(|_| rnd()).collect()).collect();
+
+        // (a) per-matrix kernel time
+        let d = mk(2, false);
+        assert!(d.segx.is_some() && d.sego.is_some(), "k5_qgemv tables not built (non-Q8_0 or unaligned weights)");
+        d.xb.write(0, &xs[0]).unwrap();
+        d.yb.write(0, &xs[0].iter().cycle().take(d.d_inner).copied().collect::<Vec<f32>>()).unwrap();
+        let (e0, e1) = (Event::new(true).unwrap(), Event::new(true).unwrap());
+        let time = |f: &dyn Fn()| -> f32 {
+            for _ in 0..5 {
+                f();
+            }
+            let mut v: Vec<f32> = (0..50)
+                .map(|_| {
+                    e0.record(&d.s).unwrap();
+                    f();
+                    e1.record(&d.s).unwrap();
+                    d.s.sync().unwrap();
+                    e1.since(&e0).unwrap() * 1e3
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[25]
+        };
+        let (di, hd, hid) = (d.d_inner, d.hd, d.hidden);
+        let mats: [(&str, &crate::flash::glm5::moe::gpu::DevW, usize, usize, u64, u64); 6] = [
+            ("q", &d.wq, di, hid, d.xb.ptr, d.qkvb.ptr),
+            ("k", &d.wk, di, hid, d.xb.ptr, d.qkvb.ptr),
+            ("v", &d.wv, di, hid, d.xb.ptr, d.qkvb.ptr),
+            ("f_a", &d.fa, hd, hid, d.xb.ptr, d.g1b.ptr),
+            ("g_a", &d.ga, hd, hid, d.xb.ptr, d.g2a.ptr),
+            ("o", &d.wo, hid, di, d.yb.ptr, d.outb.ptr),
+        ];
+        let codes = d.xq8.ptr;
+        let mut tot = [0f32; 3];
+        let mut to = 0f32;
+        let mut tabs = Vec::new();
+        for (name, w, rows, cols, x, y) in mats {
+            unsafe {
+                launch(d.gv.q8, ((cols / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![x, codes, cols as u32, d.max_t as u32]).unwrap();
+            }
+            let scales = codes + (d.max_t * cols) as u64;
+            let t8 = time(&|| unsafe { d.gemv8_launch(w, codes, cols, y, rows, rows, 1).unwrap() });
+            let a = crate::flash::glm5::moe::gpu::Act { xf: x, xq: codes, xq2: 0, xd: scales, xs: cols };
+            let tf = time(&|| d.gv.fast.gemv(&d.s, w.w, 0, a, y, rows, 1, rows, cols).unwrap());
+            let tab = tang_moe::gpu::DevBuf::from_slice(&[w.w.base, y, w.w.row_bytes as u64 | ((rows as u64) << 32)]).unwrap();
+            let tq = time(&|| unsafe { d.qgemv_launch(&d.s, &tab, 1, w.w.row_bytes, rows, 0, codes, scales, cols).unwrap() });
+            tabs.push(tab);
+            let mb = w.w.estride as f64 / 1e6;
+            eprintln!(
+                "g5f bench {name:>3} {rows}x{cols} ({mb:.1} MB): k5_gemv8 {t8:.1} us ({:.2} TB/s), g5f_gemv {tf:.1} us ({:.2} TB/s), k5_qgemv {tq:.1} us ({:.2} TB/s)",
+                mb / t8 as f64 / 1e6, mb / tf as f64 / 1e6, mb / tq as f64 / 1e6
+            );
+            if name == "o" {
+                to = tq;
+            }
+            for (i, v) in [t8, tf, tq].into_iter().enumerate() {
+                tot[i] += v;
+            }
+        }
+        unsafe {
+            launch(d.gv.q8, ((hid / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![d.xb.ptr, codes, hid as u32, d.max_t as u32]).unwrap();
+        }
+        let mb5: f64 = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga].iter().map(|w| w.w.estride as f64).sum::<f64>() / 1e6;
+        let tm = time(&|| unsafe {
+            d.qgemv_launch(&d.s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * di + 2 * hd, 0, codes, codes + (d.max_t * hid) as u64, hid).unwrap()
+        });
+        eprintln!("g5f bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)", mb5 / tm as f64 / 1e6);
+        eprintln!(
+            "g5f bench per layer (6 matrices, separate launches): k5_gemv8 {:.1} us, g5f_gemv {:.1} us, k5_qgemv {:.1} us; merged x-launch + o: {:.1} us",
+            tot[0], tot[1], tot[2], tm + to
+        );
+        drop(tabs);
+        drop(d);
+
+        // (b) naive-path parity across modes, (c) fused/graph bit-equality per mode
+        let run = |g5f: u8, mode: Mode| {
+            let mut d = mk(g5f, mode != Mode::Naive);
+            let mut conv = ConvState::zeros(&cfg, 1);
+            let mut ys = Vec::new();
+            let t0 = std::time::Instant::now();
+            for x in &xs {
+                ys.push(match mode {
+                    Mode::Naive => d.window(x, 1, &mut conv).unwrap(),
+                    m => d.decode_fast(x, &mut conv, m).unwrap(),
+                });
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / xs.len() as f64;
+            let mut st = KdaState::zeros(&cfg, 1);
+            let mut hc = conv.clone();
+            d.read_back(&mut hc, &mut st).unwrap();
+            (ys.concat(), st, us)
+        };
+        let base = run(0, Mode::Naive);
+        for g5f in [1u8, 2] {
+            let nv = run(g5f, Mode::Naive);
+            let (eo, es) = (rel64(&nv.0, &base.0), rel64(&nv.1 .0, &base.1 .0));
+            eprintln!("g5f parity G5F={g5f} naive vs gemv8 naive: out rel {eo:.3e}, state rel {es:.3e} ({:.0} vs {:.0} us/step host)", nv.2, base.2);
+            assert!(eo < 1e-2 && es < 1e-2, "G5F={g5f} diverges from the gemv8 path");
+            assert!(eo > 0.0, "G5F={g5f} bit-identical to gemv8: did it run?");
+            for m in [Mode::Fused, Mode::Graph] {
+                let fv = run(g5f, m);
+                let diff = fv.0.iter().zip(&nv.0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                let sdiff = fv.1 .0.iter().zip(&nv.1 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                eprintln!("g5f parity G5F={g5f} {m:?} vs naive: {diff} outputs, {sdiff} state values differ (bits); {:.0} us/step host", fv.2);
+                assert_eq!((diff, sdiff), (0, 0), "G5F={g5f} {m:?} not bit-equal to naive");
+            }
+        }
+        // (d) fused per-stage GPU time per mode
+        for g5f in [0u8, 1, 2] {
+            let d = mk(g5f, true);
+            let ev: Vec<Event> = (0..5).map(|_| Event::new(true).unwrap()).collect();
+            let gemv8 = d.gemv8 && [&d.wq, &d.wk, &d.wv].iter().all(|w| w.w.ty == 8);
+            let mut acc = [0f32; 4];
+            for x in &xs {
+                d.xb.write(0, x).unwrap();
+                d.enqueue_decode(&d.s, gemv8, Some(&ev)).unwrap();
+                d.s.sync().unwrap();
+                for i in 0..4 {
+                    acc[i] += ev[i + 1].since(&ev[i]).unwrap();
+                }
+            }
+            let k = xs.len() as f32;
+            eprintln!(
+                "g5f fused stages G5F={g5f} (GPU us/step): proj {:.1}, gate2 {:.1}, step {:.1}, o_proj {:.1}, total {:.1}",
+                acc[0] * 1e3 / k, acc[1] * 1e3 / k, acc[2] * 1e3 / k, acc[3] * 1e3 / k, acc.iter().sum::<f32>() * 1e3 / k
+            );
+        }
+    }
+
+    fn rel64(a: &[f32], b: &[f32]) -> f64 {
+        if a.iter().any(|x| !x.is_finite()) {
+            return f64::INFINITY;
+        }
+        let (mut d, mut n) = (0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            d += ((x - y) as f64).powi(2);
+            n += (*y as f64).powi(2);
+        }
+        (d / n.max(1e-30)).sqrt()
     }
 }
