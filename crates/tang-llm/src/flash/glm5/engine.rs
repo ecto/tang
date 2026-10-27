@@ -143,6 +143,47 @@ impl Drop for GpuFfn {
 
 #[cfg(feature = "cuda")]
 impl GpuFfn {
+    /// The device LM head (TANG_GLM5_GPU_HEAD=1) for one decode row: the last normed h row
+    /// up, one k5_q8 + one k5_gemv8, the logits row down. The host tiled path measured
+    /// 39.6 ms/token (TANG_GLM5_TRACE); the kernel is ~150 us. `None` without a head.
+    fn head_logits(&self, h: &[f32], n: usize, nv: usize) -> Result<Option<Vec<f32>>> {
+        let Some(hd) = self.head_dev.as_ref() else {
+            return Ok(None);
+        };
+        let gpu = &self.devs[0].0;
+        gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+        let row = &h[h.len() - n..];
+        // synchronous legacy-stream copy; hd.s is blocking, so it orders after
+        hd.xf.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
+        unsafe {
+            // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
+            launch(
+                hd.k5.q8,
+                ((n / 32) as u32, 1, 1),
+                (32, 1, 1),
+                0,
+                &hd.s,
+                args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32],
+            )?;
+            // k5_gemv8: grid (ceil(rows/K5_WARPS), T=1), ROWS = n_vocab, COLS = n;
+            // scales live at xq8 + 1*n bytes (the MAXT offset)
+            launch(
+                hd.k5.gemv8,
+                (nv.div_ceil(K5_WARPS) as u32, 1, 1),
+                (128, 1, 1),
+                (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                &hd.s,
+                args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
+                    nv as u32, 1u32, nv as u32, n as u32],
+            )?;
+        }
+        hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
+        hd.out
+            .read::<f32>(0, nv)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("head read: {e}"))
+    }
+
     /// The KDA layers resident (tests: the wiring regression guards).
     #[cfg(test)]
     pub(crate) fn kda_resident(&self) -> usize {
@@ -1360,56 +1401,6 @@ impl Glm5Engine {
         Ok(h)
     }
 
-    /// The device LM head for a decode row (`t == 1`, `TANG_GLM5_GPU_HEAD=1`; the head
-    /// block of frog/glm5-forward 7a18fd5d, kept in a cfg-split helper so the non-cuda
-    /// build — which has no `self.gpu` — compiles): the normed row goes up into `xf`,
-    /// `k5_q8` quantises it into `xq8` (codes, scales after them at MAXT = 1), `k5_gemv8`
-    /// writes the logits into `out`, one D2H read. `None`: not loaded or `t > 1`.
-    #[cfg(feature = "cuda")]
-    fn head_gpu(&self, h: &[f32], t: usize) -> Result<Option<Vec<f32>>> {
-        let Some(g) = self.gpu.as_ref() else { return Ok(None) };
-        let Some(hd) = g.head_dev.as_ref() else { return Ok(None) };
-        if t != 1 {
-            return Ok(None);
-        }
-        let gpu = &g.devs[0].0;
-        gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
-        let n = self.m.hp.n_embd;
-        let nv = self.m.hp.n_vocab;
-        let row = &h[(t - 1) * n..t * n];
-        // synchronous legacy-stream copy; hd.s is blocking, so it orders after
-        hd.xf.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
-        unsafe {
-            // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
-            launch(
-                hd.k5.q8,
-                ((n / 32) as u32, 1, 1),
-                (32, 1, 1),
-                0,
-                &hd.s,
-                args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32],
-            )?;
-            // k5_gemv8: grid (ceil(rows/K5_WARPS), T=1), ROWS = n_vocab, COLS = n;
-            // scales live at xq8 + 1*n bytes (the MAXT offset)
-            launch(
-                hd.k5.gemv8,
-                (nv.div_ceil(K5_WARPS) as u32, 1, 1),
-                (128, 1, 1),
-                (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
-                &hd.s,
-                args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
-                    nv as u32, 1u32, nv as u32, n as u32],
-            )?;
-        }
-        hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
-        Ok(Some(hd.out.read::<f32>(0, nv).map_err(|e| anyhow::anyhow!("head read: {e}"))?))
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    fn head_gpu(&self, _h: &[f32], _t: usize) -> Result<Option<Vec<f32>>> {
-        Ok(None)
-    }
-
     /// Run `ids` after the tokens so far (slot 0). Returns their logits `[ids.len()][n_vocab]`.
     pub fn window(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         self.window_slot(0, ids)
@@ -1539,10 +1530,17 @@ impl Glm5Engine {
         self.m.norm_all_exact(&mut h, "output_norm.weight")?;
         drop(tr);
         let tr = span("lm_head");
-        // TANG_GLM5_GPU_HEAD=1 (decode, t = 1): the device head; else the host tiled f32
-        let logits = match self.head_gpu(&h, t)? {
-            Some(lg) => lg,
-            None => {
+        // decode (t=1) on the device LM head when TANG_GLM5_GPU_HEAD=1 (GpuFfn::head_logits)
+        #[cfg(feature = "cuda")]
+        let dev = match self.gpu.as_ref() {
+            Some(g) if t == 1 => g.head_logits(&h, self.m.hp.n_embd, self.m.hp.n_vocab)?,
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let dev: Option<Vec<f32>> = None;
+        let logits = match dev {
+            Some(l) => l,
+            _ => {
                 if self.head.is_none() {
                     self.head = Some(self.m.head()?);
                 }
