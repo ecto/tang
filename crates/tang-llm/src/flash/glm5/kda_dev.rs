@@ -1029,9 +1029,8 @@ mod gemv8_tests {
             1e-2,
         );
         assert!(sq.0 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
-        // the bar is the RELATIVE L2 (s.0; d40850cf recorded 9.2e-3 for this layer) —
-        // the max abs (s.1) was compared here while the message printed rel, and an int8
-        // GEMV's worst element on a ~O(10) output is ~0.15 by construction
-        assert!(s.0 < 2e-2, "gemv8 layer output diverges: rel {:.3e} (max {:.3e})", s.0, s.1);
+        // relative, like the taps above. s.1 is an ABSOLUTE l2: it grew 1.1e-2 -> 1.5e-1 when
+        // k5_beta began computing every (t, h) (output scale, not error; rel stayed 9.2e-3)
+        assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 layer output diverges: rel {:.3e}", s.0);
     }
 }

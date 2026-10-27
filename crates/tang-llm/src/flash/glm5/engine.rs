@@ -448,7 +448,10 @@ impl GpuFfn {
         // the LM head on the GPU (TANG_GLM5_GPU_HEAD=1): t==1 decode only. The host
         // tiled Mat::apply was 39.6 ms/token (trace); one k5_q8 + k5_gemv8 is ~150 us.
         // Built here, before `devs` moves into Self.
-        let head_dev = if std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
+        let head_dev = 'head: {
+            if !std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
+                break 'head None;
+            }
             devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
             let info = match g.get("output.weight") {
                 Some(t) => t,
@@ -456,12 +459,14 @@ impl GpuFfn {
             };
             let rows = info.dims[1] as usize; // n_vocab
             let cols = info.dims[0] as usize; // hidden
-            anyhow::ensure!(
-                info.ty == crate::gguf::GgmlType::Q8_0,
-                "lm head: want Q8_0 (k5_gemv8), got {:?}",
-                info.ty
-            );
-            anyhow::ensure!(cols % 32 == 0, "lm head: hidden {cols} not a multiple of 32");
+            if info.ty != crate::gguf::GgmlType::Q8_0 || cols % 32 != 0 {
+                // k5_gemv8 reads Q8_0 rows (the tiny fixtures' head is f32): host head
+                eprintln!(
+                    "glm5: LM head stays on the host ({:?}, hidden {cols}: the device head wants Q8_0)",
+                    info.ty
+                );
+                break 'head None;
+            }
             let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, rows, cols)
                 .map_err(|e| anyhow::anyhow!("lm head upload: {e}"))?;
             let k5 = super::moe::gpu::Kernels5::new(&devs[0].0)
@@ -481,8 +486,6 @@ impl GpuFfn {
                 dw.w.row_bytes as usize * rows / 1_000_000
             );
             Some(HeadDev { dw, xf, xq8, out, k5, s: hs })
-        } else {
-            None
         };
         let mut f = Self {
             devs,
