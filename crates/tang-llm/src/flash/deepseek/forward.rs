@@ -30,7 +30,7 @@ pub struct W {
 }
 
 /// `y[t][n] = Σ_k x[t][k] w[n][k]` in f32.
-fn matmul(x: &[f32], t: usize, w: &W) -> Vec<f32> {
+pub(crate) fn matmul(x: &[f32], t: usize, w: &W) -> Vec<f32> {
     let (n, k) = (w.rows, w.cols);
     assert_eq!(x.len(), t * k, "matmul: x {} != {t} x {k}", x.len());
     let mut y = vec![0f32; t * n];
@@ -45,7 +45,7 @@ fn matmul(x: &[f32], t: usize, w: &W) -> Vec<f32> {
 }
 
 /// Indices of the `k` largest, ties to the lowest index, in score order (`topk_stable`).
-fn topk_stable(v: &[f32], k: usize) -> Vec<usize> {
+pub(crate) fn topk_stable(v: &[f32], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap().then(a.cmp(&b)));
     idx.truncate(k);
@@ -66,7 +66,13 @@ fn softplus(x: f32) -> f32 {
 }
 
 /// RoPE tables `[seqlen][dim / 2]` of (cos, sin), YaRN-corrected when `orig > 0`.
-fn yarn_freqs(c: &Config, dim: usize, seqlen: usize, orig: usize, base: f32) -> Vec<(f32, f32)> {
+pub(crate) fn yarn_freqs(
+    c: &Config,
+    dim: usize,
+    seqlen: usize,
+    orig: usize,
+    base: f32,
+) -> Vec<(f32, f32)> {
     let half = dim / 2;
     let mut freqs: Vec<f32> = (0..half)
         .map(|j| 1.0 / base.powf((2 * j) as f32 / dim as f32))
@@ -97,7 +103,7 @@ fn yarn_freqs(c: &Config, dim: usize, seqlen: usize, orig: usize, base: f32) -> 
 
 /// Rotate the last `rd` of every `d`-wide vector in `v` (rows of `per_row` vectors), row `r`
 /// at table position `pos(r)`; adjacent pairs are (re, im). Rounds to bf16.
-fn rope(
+pub(crate) fn rope(
     v: &mut [f32],
     d: usize,
     rd: usize,
@@ -123,7 +129,7 @@ fn rope(
 
 /// Gathered attention with a per-head sink in the denominator (`sparse_attn`). `q` is [T][H][d],
 /// `kv` [n][d] shared by every head, `idxs[t]` the rows query t sees (-1 = none).
-fn sparse_attn(
+pub(crate) fn sparse_attn(
     q: &[f32],
     h: usize,
     d: usize,
@@ -174,7 +180,7 @@ fn sparse_attn(
 }
 
 /// Sinkhorn-normalized mHC coefficients from one token's mixes: (pre, post, comb[j][k]).
-fn sinkhorn(
+pub(crate) fn sinkhorn(
     m: &[f32],
     scale: &[f32],
     base: &[f32],
@@ -234,9 +240,9 @@ struct Shared {
 
 pub struct Model {
     pub cfg: Config,
-    st: St,
+    pub(crate) st: St,
     wcache: RefCell<HashMap<String, Rc<W>>>,
-    freqs: Vec<Vec<(f32, f32)>>,
+    pub(crate) freqs: Vec<Vec<(f32, f32)>>,
     win: Vec<Vec<f32>>,
     ckv: HashMap<usize, Vec<f32>>,
     idxk: HashMap<usize, Vec<f32>>,
@@ -347,7 +353,7 @@ impl Model {
     }
 
     /// `linear`: fp8 / fp4 weights quantize the activation per 32 first; the output is bf16.
-    fn linear(&self, x: &[f32], t: usize, name: &str) -> Result<Vec<f32>> {
+    pub(crate) fn linear(&self, x: &[f32], t: usize, name: &str) -> Result<Vec<f32>> {
         let w = self.w(name)?;
         let mut y = if w.quant {
             let mut xq = x.to_vec();
@@ -361,7 +367,7 @@ impl Model {
     }
 
     /// RMSNorm over rows of the weight's width, rounded to bf16.
-    fn rms(&self, x: &mut [f32], name: &str) -> Result<()> {
+    pub(crate) fn rms(&self, x: &mut [f32], name: &str) -> Result<()> {
         let w = self.v(name)?;
         let n = w.cols;
         let eps = self.cfg.norm_eps;
@@ -1227,13 +1233,16 @@ impl Model {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const TINY: &str = "/private/tmp/ds41-tiny";
+    /// The fixture `scripts/deepseek_tiny.py` writes (`DS41_TINY` overrides).
+    pub(crate) fn tiny() -> String {
+        std::env::var("DS41_TINY").unwrap_or_else(|_| "/private/tmp/ds41-tiny".into())
+    }
 
     fn load_ref(name: &str) -> Option<Vec<f32>> {
-        let b = std::fs::read(format!("{TINY}/ref/{name}.bin")).ok()?;
+        let b = std::fs::read(format!("{}/ref/{name}.bin", tiny())).ok()?;
         Some(
             b.chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -1267,16 +1276,16 @@ mod tests {
     /// reference does between its own prefill and decode paths; see `tiny_free_running`).
     #[test]
     fn tiny_teacher_forced() {
-        if !Path::new(TINY).join("ref/step0_in0.bin").exists() {
-            eprintln!("skip: no {TINY} (run scripts/deepseek_tiny.py)");
+        if !Path::new(&tiny()).join("ref/step0_in0.bin").exists() {
+            eprintln!("skip: no {} (run scripts/deepseek_tiny.py)", tiny());
             return;
         }
         let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{TINY}/ref/meta.json")).unwrap(),
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
         )
         .unwrap();
         let steps = meta["steps"].as_array().unwrap();
-        let mut m = Model::open(&Path::new(TINY).join("hf")).unwrap();
+        let mut m = Model::open(&Path::new(&tiny()).join("hf")).unwrap();
         for (s, step) in steps.iter().enumerate() {
             let ids: Vec<usize> = step["ids"]
                 .as_array()
@@ -1356,13 +1365,13 @@ mod tests {
     /// Informational past top-1 (see `tiny_teacher_forced`). Skips without the fixture.
     #[test]
     fn tiny_free_running() {
-        let dir = Path::new(TINY).join("hf");
+        let dir = Path::new(&tiny()).join("hf");
         if !dir.join("model.safetensors").exists() {
-            eprintln!("skip: no {TINY} (run scripts/deepseek_tiny.py)");
+            eprintln!("skip: no {} (run scripts/deepseek_tiny.py)", tiny());
             return;
         }
         let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!("{TINY}/ref/meta.json")).unwrap(),
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
         )
         .unwrap();
         let mut m = Model::open(&dir).unwrap();

@@ -4,12 +4,16 @@
 //!   experts (the workspace's safetensors 0.4 rejects these headers).
 //! - [`quant`]: the number formats, and the fp8 / fp4 quant-dequant steps the forward applies to
 //!   activations.
+//! - [`gpu`] (cuda): weights on the device in their checkpoint format and the kernels
+//!   (`kernels.cu`), each tested against its CPU twin.
 //! - [`forward`]: the CPU f32 reference forward, a transcription of `scripts/deepseek_ref.py`
 //!   (itself DeepSeek's `inference/model.py` in plain torch), checked against its dumps.
 //!
 //! See `docs/deepseek-v41-plan.md` for the architecture and the port's milestones.
 
 pub mod forward;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod quant;
 pub mod st;
 
