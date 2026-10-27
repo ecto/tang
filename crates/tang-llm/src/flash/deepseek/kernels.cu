@@ -636,3 +636,330 @@ DS_LIN_T(2, 0)
 DS_LIN_T(3, 0)
 DS_LIN_T(2, 1)
 DS_LIN_T(3, 1)
+
+// ---- tensor-core K-split GEMV (the default fast path; DS_EXACT=1 selects lin_fast above) ----
+//
+// Not bit-exact with ds_linear (the reduction order differs); outputs agree with it to within
+// one bf16 ulp in rare elements. The activation is fp8-quantized per 32-group while it is
+// staged in shared memory (bit-identical to ds_fp8_qdq; idempotent on an already quantized
+// activation), and kept as its e4m3 value in f16 plus the group scale. Weights decode with a
+// few integer ops to f16 (e4m3 is f16 × 2^8, e2m1 is f16 × 2^14, both exact), so each 32-column
+// group of a 16-row × 8-token tile is two mma.m16n8k16 (f16 in, f32 accumulate), scaled by
+// weight scale × activation scale into f32 accumulators. A warp owns 16 weight rows (GU: rows
+// 0-7 of w1 and the same rows of w3); a block of 8 warps is RW = 8 / S row tiles × S K-slices,
+// the slices meeting in shared memory in a fixed order (deterministic). Within an mma's k step
+// columns are permuted freely (A and B agree), so each lane's weight bytes are contiguous.
+
+#define KS_UG 8  // groups in flight per warp
+
+__device__ __forceinline__ unsigned short f2h_exact(float v) {
+    unsigned int b = __float_as_uint(v);
+    unsigned int sg = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;
+    if (a == 0) return (unsigned short)sg;
+    return (unsigned short)(sg | (((a >> 23) - 112u) << 10) | ((a >> 13) & 0x3ffu));
+}
+
+// two e4m3 in bits 8-15 and 24-31 -> f16x2 of value / 2^8
+__device__ __forceinline__ unsigned int f8h(unsigned int u) { return (u & 0x80008000u) | ((u >> 1) & 0x3f803f80u); }
+// two e2m1 in bits 12-15 and 28-31 -> f16x2 of value / 2^14
+__device__ __forceinline__ unsigned int f4h(unsigned int u) { return (u & 0x80008000u) | ((u >> 3) & 0x0e000e00u); }
+
+__device__ __forceinline__ void mma16816(float* c, unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+                                         unsigned int b0, unsigned int b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
+// __CUDA_ARCH__ of the module, so the host can fall back to the exact kernels below sm_80.
+extern "C" __global__ void ds_arch(int* out) { *out = __CUDA_ARCH__; }
+
+template <int FMT, int GU>
+__device__ __forceinline__ void lin_mma(DsW w, DsW w3, const float* __restrict__ x, float* __restrict__ y, int t,
+                                        int round, const float* __restrict__ rw, float lim, int S, int KC,
+                                        float* part, int* cnt) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ float red[8][4][32];
+    const int XS = KC + 32, NG = KC / 32;
+    unsigned short* xs = (unsigned short*)smem;  // [t][XS] f16 codes
+    float* sx = (float*)(smem + t * XS * 2);     // [t][NG] scales × 2^8 or 2^14
+    const float POW = FMT == 3 ? 16384.f : 256.f;
+    int wib = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    int RW = 8 / S, rwi = wib / S, si = wib % S;
+    const int OUT = GU ? 8 : 16;
+    int n0 = (blockIdx.x * RW + rwi) * OUT;
+    int ra = n0 + g, rb = GU ? n0 + g : n0 + g + 8;
+    bool va = ra < w.rows, vb = rb < w.rows;
+    int cols = w.cols, nch = cols / 32;
+    long long rbytes = FMT == 3 ? cols / 2 : cols;
+    const unsigned char* pa = (const unsigned char*)w.w + (va ? (long long)ra * rbytes : 0) + (FMT == 3 ? 4 : 8) * tig;
+    const unsigned char* pb =
+        (const unsigned char*)(GU ? w3.w : w.w) + (vb ? (long long)rb * rbytes : 0) + (FMT == 3 ? 4 : 8) * tig;
+    const unsigned char* sa = (const unsigned char*)w.s + (FMT == 3 ? (long long)ra * nch : (long long)(ra / 32) * nch);
+    const unsigned char* sb =
+        (const unsigned char*)(GU ? w3.s : w.s) + (FMT == 3 ? (long long)rb * nch : (long long)(rb / 32) * nch);
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    // this block's share of the columns (blockIdx.y of SB = gridDim.y)
+    int SB = gridDim.y, gpb = (nch + SB - 1) / SB;
+    int clo = blockIdx.y * gpb * 32, chi = min(nch, (int)(blockIdx.y + 1) * gpb) * 32;
+    for (int c0 = clo; c0 < chi; c0 += KC) {
+        int ng = min(KC, chi - c0) / 32, G0 = c0 / 32;
+        __syncthreads();
+        for (int gb = wib; gb < ng * t; gb += 32) {
+            float xv[4];
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                int gi = gb + 8 * m;
+                xv[m] = gi < ng * t ? x[(long long)(gi / ng) * cols + c0 + (gi % ng) * 32 + lane] : 0.f;
+            }
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                int gi = gb + 8 * m;
+                if (gi >= ng * t) break;
+                int ti = gi / ng, gg = gi % ng;
+                float a = fabsf(xv[m]);
+#pragma unroll
+                for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+                float s = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
+                xs[ti * XS + gg * 32 + lane] = f2h_exact(round_e4m3(fminf(fmaxf(xv[m] / s, -448.f), 448.f)));
+                if (lane == 0) sx[ti * NG + gg] = s * POW;
+            }
+        }
+        __syncthreads();
+        for (int q0 = si; q0 < ng; q0 += KS_UG * S) {
+            uint2 la[KS_UG], lb[KS_UG];
+            unsigned char ca[KS_UG], cb[KS_UG];
+#pragma unroll
+            for (int u = 0; u < KS_UG; u++) {
+                int gq = q0 + u * S;
+                la[u] = lb[u] = make_uint2(0, 0);
+                ca[u] = cb[u] = 0;
+                if (gq < ng) {
+                    long long G = G0 + gq;
+                    if (va) {
+                        if (FMT == 3) la[u].x = __ldg((const unsigned int*)(pa + G * 16));
+                        else la[u] = __ldg((const uint2*)(pa + G * 32));
+                        ca[u] = __ldg(sa + G);
+                    }
+                    if (vb) {
+                        if (FMT == 3) lb[u].x = __ldg((const unsigned int*)(pb + G * 16));
+                        else lb[u] = __ldg((const uint2*)(pb + G * 32));
+                        cb[u] = __ldg(sb + G);
+                    }
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < KS_UG; u++) {
+                int gq = q0 + u * S;
+                if (gq >= ng) break;
+                uint4 X = g < t ? *(const uint4*)&xs[g * XS + gq * 32 + 8 * tig] : make_uint4(0, 0, 0, 0);
+                float c[4] = {0.f, 0.f, 0.f, 0.f};
+                if (FMT == 3) {
+                    unsigned int wa = la[u].x, wb = lb[u].x;
+                    mma16816(c, f4h(wa << 12), f4h(wb << 12), f4h(wa << 8), f4h(wb << 8), __byte_perm(X.x, X.z, 0x5410),
+                             __byte_perm(X.x, X.z, 0x7632));
+                    mma16816(c, f4h(wa << 4), f4h(wb << 4), f4h(wa), f4h(wb), __byte_perm(X.y, X.w, 0x5410),
+                             __byte_perm(X.y, X.w, 0x7632));
+                } else {
+                    mma16816(c, f8h(la[u].x << 8), f8h(lb[u].x << 8), f8h(la[u].x), f8h(lb[u].x),
+                             __byte_perm(X.x, X.y, 0x5410), __byte_perm(X.x, X.y, 0x7632));
+                    mma16816(c, f8h(la[u].y << 8), f8h(lb[u].y << 8), f8h(la[u].y), f8h(lb[u].y),
+                             __byte_perm(X.z, X.w, 0x5410), __byte_perm(X.z, X.w, 0x7632));
+                }
+                float x0 = 2 * tig < t ? sx[2 * tig * NG + gq] : 0.f;
+                float x1 = 2 * tig + 1 < t ? sx[(2 * tig + 1) * NG + gq] : 0.f;
+                float swa = e8m0(ca[u]), swb = e8m0(cb[u]);
+                acc[0] = fmaf(c[0], swa * x0, acc[0]);
+                acc[1] = fmaf(c[1], swa * x1, acc[1]);
+                acc[2] = fmaf(c[2], swb * x0, acc[2]);
+                acc[3] = fmaf(c[3], swb * x1, acc[3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) red[wib][i][lane] = acc[i];
+    __syncthreads();
+    // (row tile rg, output o, token j) -> the slices' sum in fixed order; GU: gate and up
+    const int R2 = GU ? 2 * w.rows : w.rows;
+    __shared__ int last;
+    if (SB > 1) {
+        // partials to part[sb][j][r2]; the last block of this row group sums them in order
+        for (int e = threadIdx.x; e < RW * OUT * t; e += blockDim.x) {
+            int j = e % t, o = (e / t) % OUT, rg = e / (t * OUT);
+            int n = (blockIdx.x * RW + rg) * OUT + o;
+            if (n >= w.rows) continue;
+            int ln = (o & 7) * 4 + j / 2, i = j & 1;
+            float a = 0.f, b = 0.f;
+            for (int s = 0; s < S; s++) {
+                a += red[rg * S + s][GU || o < 8 ? i : 2 + i][ln];
+                if (GU) b += red[rg * S + s][2 + i][ln];
+            }
+            float* pp = part + ((long long)blockIdx.y * t + j) * R2;
+            pp[n] = a;
+            if (GU) pp[w.rows + n] = b;
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            last = atomicAdd(&cnt[blockIdx.x], 1) == SB - 1;
+            if (last) cnt[blockIdx.x] = 0;
+        }
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+    }
+    for (int e = threadIdx.x; e < RW * OUT * t; e += blockDim.x) {
+        int j = e % t, o = (e / t) % OUT, rg = e / (t * OUT);
+        int n = (blockIdx.x * RW + rg) * OUT + o;
+        if (n >= w.rows) continue;
+        // C fragment: (row g, token 2tig + i) in acc[i], (row g + 8, ...) in acc[2 + i]
+        int ln = (o & 7) * 4 + j / 2, i = j & 1;
+        float a = 0.f, b = 0.f;
+        if (SB > 1) {
+            for (int sb = 0; sb < SB; sb++) {
+                const float* pp = part + ((long long)sb * t + j) * R2;
+                a += __ldcg(pp + n);
+                if (GU) b += __ldcg(pp + w.rows + n);
+            }
+        } else {
+            for (int s = 0; s < S; s++) {
+                a += red[rg * S + s][GU || o < 8 ? i : 2 + i][ln];
+                if (GU) b += red[rg * S + s][2 + i][ln];
+            }
+        }
+        if (GU) y[(long long)j * w.rows + n] = swiglu1(bf(a), bf(b), rw ? rw + j : 0, lim);
+        else y[(long long)j * w.rows + n] = round ? bf(a) : a;
+    }
+}
+
+#define DS_KS(F, G)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(256) ds_ks_f##F##_g##G(DsW w, DsW w3, const float* x, float* y,  \
+                                                                        int t, int round, const float* rw,         \
+                                                                        float lim, int S, int KC, float* part,     \
+                                                                        int* cnt) {                                \
+        lin_mma<F, G>(w, w3, x, y, t, round, rw, lim, S, KC, part, cnt);                                                   \
+    }
+DS_KS(2, 0)
+DS_KS(3, 0)
+DS_KS(2, 1)
+DS_KS(3, 1)
+
+// ---- tiled sparse attention (default; DS_EXACT=1 selects ds_sparse_attn) ---------------------
+//
+// Three launches over a scratch buffer, same numerics as ds_sparse_attn up to summation order:
+// 1. ds_attn_qk: block per (t, 64-head chunk, 32-key tile, 64-wide d slice): the key tile and
+//    the heads' q slice in shared memory, every head scores every key of the tile (4 heads ×
+//    2 keys a thread); partial dot products to part[t][d/64][h][k].
+// 2. ds_attn_soft: warp per (t, h): score = Σ partials × scale (-inf for idx -1), softmax with
+//    the sink in the denominator; P = bf(p) to pr[t][h][k], den to den[t][h].
+// 3. ds_attn_pv: block per (t, 8 heads, 64-wide d slice), 4 key slices × 64 dims: each kv
+//    value is read once for 8 heads; o = bf(Σ P kv / den).
+
+extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, const float* kv, const int* idxs,
+                                                             float* part, int h, int d, int k) {
+    __shared__ float Qs[64][65];
+    __shared__ float Ks[32][65];
+    int nkt = (k + 31) / 32, nds = d / 64, nhc = h / 64;
+    int b = blockIdx.x;
+    int ds = b % nds;
+    int kt = (b / nds) % nkt;
+    int hc = (b / (nds * nkt)) % nhc;
+    int ti = b / (nds * nkt * nhc);
+    int tid = threadIdx.x;
+    const int* ix = idxs + (long long)ti * k;
+    for (int e = tid; e < 64 * 64; e += 256) {
+        int hh = e / 64, i = e % 64;
+        Qs[hh][i] = q[((long long)ti * h + hc * 64 + hh) * d + ds * 64 + i];
+    }
+    for (int e = tid; e < 32 * 64; e += 256) {
+        int kk = e / 64, i = e % 64;
+        int j = kt * 32 + kk;
+        int r = j < k ? ix[j] : -1;
+        Ks[kk][i] = r >= 0 ? kv[(long long)r * d + ds * 64 + i] : 0.f;
+    }
+    __syncthreads();
+    int kq = tid & 15, hq = tid >> 4;
+    float a[4][2] = {{0.f, 0.f}, {0.f, 0.f}, {0.f, 0.f}, {0.f, 0.f}};
+#pragma unroll 8
+    for (int i = 0; i < 64; i++) {
+        float k0 = Ks[kq * 2][i], k1 = Ks[kq * 2 + 1][i];
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            float qv = Qs[hq * 4 + m][i];
+            a[m][0] = fmaf(qv, k0, a[m][0]);
+            a[m][1] = fmaf(qv, k1, a[m][1]);
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < 4; m++)
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            int j = kt * 32 + kq * 2 + c;
+            if (j < k) part[(((long long)ti * nds + ds) * h + hc * 64 + hq * 4 + m) * k + j] = a[m][c];
+        }
+}
+
+extern "C" __global__ void ds_attn_soft(const float* part, const float* sink, const int* idxs, float* pr,
+                                        float* den, int t, int h, int d, int k, float scale) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (warp >= t * h) return;
+    int ti = warp / h, hi = warp % h, nds = d / 64;
+    const int* ix = idxs + (long long)ti * k;
+    float* p = pr + (long long)warp * k;
+    float mx = -DS_INF;
+    for (int j = lane; j < k; j += 32) {
+        float s = 0.f;
+        for (int c = 0; c < nds; c++) s += part[(((long long)ti * nds + c) * h + hi) * k + j];
+        s = ix[j] >= 0 ? s * scale : -DS_INF;
+        p[j] = s;
+        mx = fmaxf(mx, s);
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    mx = fmaxf(mx, -1e30f);
+    float sum = 0.f;
+    for (int j = lane; j < k; j += 32) {
+        float e = expf(p[j] - mx);
+        sum += e;
+        p[j] = bf(e);
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (lane == 0) den[warp] = sum + expf(sink[hi] - mx);
+}
+
+extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, const float* den, const float* kv,
+                                                             const int* idxs, float* o, int h, int d, int k) {
+    extern __shared__ float P[];  // [8][k]
+    __shared__ float red[4][8][64];
+    int nds = d / 64, hg = h / 8;
+    int b = blockIdx.x;
+    int ds = b % nds, g = (b / nds) % hg, ti = b / (nds * hg);
+    int tid = threadIdx.x;
+    for (int e = tid; e < 8 * k; e += 256) P[e] = pr[((long long)ti * h + g * 8) * k + e];
+    __syncthreads();
+    int ks = tid >> 6, di = tid & 63;
+    const int* ix = idxs + (long long)ti * k;
+    const float* kc = kv + ds * 64 + di;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int j = ks; j < k; j += 4) {
+        int r = ix[j];
+        if (r < 0) continue;
+        float v = kc[(long long)r * d];
+#pragma unroll
+        for (int m = 0; m < 8; m++) acc[m] = fmaf(P[m * k + j], v, acc[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < 8; m++) red[ks][m][di] = acc[m];
+    __syncthreads();
+    for (int e = tid; e < 8 * 64; e += 256) {
+        int m = e / 64, c = e % 64;
+        float s = red[0][m][c] + red[1][m][c] + red[2][m][c] + red[3][m][c];
+        int hi = g * 8 + m;
+        o[((long long)ti * h + hi) * d + ds * 64 + c] = bf(s / den[ti * h + hi]);
+    }
+}

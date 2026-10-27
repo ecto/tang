@@ -98,6 +98,20 @@ pub struct Kernels {
     sinkhorn: Func,
     /// `ds_lin_f{fmt}_t{tm}_g{gu}`, by (fmt - 2, log2 tm, gu).
     fast: [[[Func; 2]; 4]; 2],
+    /// `ds_ks_f{fmt}_g{gu}`, the tensor-core K-split GEMV, by (fmt - 2, gu).
+    ks: [[Func; 2]; 2],
+    attn_qk: Func,
+    attn_soft: Func,
+    attn_pv: Func,
+    /// Scratch for the tiled attention (partial scores, probabilities, denominators).
+    scratch: DevBuf,
+    /// K-split partials across blocks [SB][t][rows (× 2 for GU)] and per-row-group arrival
+    /// counters (left at zero by the last block). One launch at a time per `Kernels`.
+    ks_part: DevBuf,
+    ks_cnt: DevBuf,
+    /// `DS_EXACT=1`: the bit-exact kernels (`ds_lin_*`, `ds_sparse_attn`) instead of the
+    /// K-split GEMV and the tiled attention.
+    pub exact: bool,
     /// Every other kernel, by name, for [`Kernels::go`].
     more: std::collections::HashMap<&'static str, Func>,
 }
@@ -134,6 +148,59 @@ const MORE: &[&str] = &[
     "ds_copy_u8",
 ];
 
+/// Floats of attention scratch: partial scores [t][d/64][h][k], then P [t][h][k] and den
+/// [t][h]. Larger problems fall back to `ds_sparse_attn`.
+const ATTN_SCRATCH: usize = 6 << 20;
+
+/// Dynamic shared memory per K-split block: f16 activation codes and group scales.
+const KS_SMEM: usize = 40960;
+
+/// Floats of cross-block K-split partials, and row-group counters.
+const KS_PART: usize = 1 << 21;
+const KS_CNT: usize = 1 << 13;
+
+/// `__CUDA_ARCH__` the module was built for.
+fn arch(m: &Module) -> Result<i32> {
+    let f = m.func("ds_arch")?;
+    let out = DevBuf::alloc(4)?;
+    let s = Stream::blocking()?;
+    unsafe { gpu::launch(f, (1, 1, 1), (1, 1, 1), 0, &s, tang_moe::args![out.ptr])? };
+    s.sync()?;
+    Ok(out.read::<i32>(0, 1)?[0])
+}
+
+/// SMs to fill when choosing the K split (82 on the 3090; more is harmless).
+const KS_SMS: usize = 82;
+
+fn lin_table(m: &Module, pre: &str) -> Result<[[[Func; 2]; 4]; 2]> {
+    let mut a = [[[std::ptr::null_mut(); 2]; 4]; 2];
+    for (fi, af) in a.iter_mut().enumerate() {
+        for (ti, at) in af.iter_mut().enumerate() {
+            for (gi, ag) in at.iter_mut().enumerate() {
+                *ag = m.func(&format!("{pre}_f{}_t{}_g{gi}", fi + 2, 1 << ti))?;
+            }
+        }
+    }
+    Ok(a)
+}
+
+/// The K split for `tiles` 16-row warp tiles with `groups` 32-column groups: S slices within a
+/// block of 8 warps (RW = 8 / S tiles a block) and SB blocks along K, aiming at ≥ 2 blocks of 8
+/// warps per SM while keeping ≥ 4 groups a warp. Returns (S, row-group blocks, SB).
+fn ks_split(tiles: usize, groups: usize) -> (usize, usize, usize) {
+    let target = 2 * KS_SMS;
+    let mut sp = 1;
+    while sp < 8 && tiles.div_ceil(8 / sp) < target && groups >= sp * 2 * 4 {
+        sp *= 2;
+    }
+    let br = tiles.div_ceil(8 / sp).max(1);
+    let mut sb = 1;
+    while br * sb < target && groups >= (sb + 1) * sp * 4 && sb < 16 {
+        sb += 1;
+    }
+    (sp, br, sb)
+}
+
 pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
     // at least one block: every kernel bounds-checks, and a zero grid is a launch error
     (n.div_ceil(per).max(1) as u32, 1, 1)
@@ -150,20 +217,19 @@ impl Kernels {
             rope: m.func("ds_rope")?,
             sparse_attn: m.func("ds_sparse_attn")?,
             sinkhorn: m.func("ds_sinkhorn")?,
-            fast: {
-                let f = |fmt: usize, tm: usize, gu: usize| {
-                    m.func(&format!("ds_lin_f{}_t{}_g{gu}", fmt + 2, 1 << tm))
-                };
-                let mut a = [[[std::ptr::null_mut(); 2]; 4]; 2];
-                for (fi, af) in a.iter_mut().enumerate() {
-                    for (ti, at) in af.iter_mut().enumerate() {
-                        for (gi, ag) in at.iter_mut().enumerate() {
-                            *ag = f(fi, ti, gi)?;
-                        }
-                    }
-                }
-                a
-            },
+            fast: lin_table(&m, "ds_lin")?,
+            ks: [
+                [m.func("ds_ks_f2_g0")?, m.func("ds_ks_f2_g1")?],
+                [m.func("ds_ks_f3_g0")?, m.func("ds_ks_f3_g1")?],
+            ],
+            attn_qk: m.func("ds_attn_qk")?,
+            attn_soft: m.func("ds_attn_soft")?,
+            attn_pv: m.func("ds_attn_pv")?,
+            scratch: DevBuf::alloc(ATTN_SCRATCH * 4)?,
+            ks_part: DevBuf::alloc(KS_PART * 4)?,
+            ks_cnt: DevBuf::from_slice(&vec![0i32; KS_CNT])?,
+            // the mma path needs sm_80 (an arch-less NVRTC build may target less)
+            exact: std::env::var("DS_EXACT").is_ok_and(|v| v == "1") || arch(&m)? < 800,
             more: MORE
                 .iter()
                 .map(|&n| Ok((n, m.func(n)?)))
@@ -374,6 +440,9 @@ impl Kernels {
                 bail!("linear_fast: w1/w3 mismatch");
             }
         }
+        if !self.exact {
+            return self.linear_ks(s, w, w3, x, y, t, round, qdq, rw, lim);
+        }
         let (rows, cols) = (w.rows as usize, w.cols as usize);
         let gu = w3.is_some() as usize;
         let per_warp = if gu == 1 { 2 } else { 4 };
@@ -404,6 +473,70 @@ impl Kernels {
                     0,
                     s,
                     tang_moe::args![wv, w3v, xo, yo, ni, r, q, rwo, lim],
+                )?
+            }
+            t0 += n;
+        }
+        Ok(())
+    }
+
+    /// The K-split GEMV behind [`Kernels::linear_fast`] (unless `DS_EXACT=1`): same contract,
+    /// outputs within one bf16 ulp of the exact kernels in rare elements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_ks(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        w3: Option<&DsW>,
+        x: u64,
+        y: u64,
+        t: usize,
+        round: bool,
+        qdq: bool,
+        rw: u64,
+        lim: f32,
+    ) -> Result<()> {
+        if !Self::fast_ok(w) {
+            bail!("linear_ks: fmt {} cols {}", w.fmt, w.cols);
+        }
+        if let Some(w3) = w3 {
+            if (w3.fmt, w3.rows, w3.cols) != (w.fmt, w.rows, w.cols) {
+                bail!("linear_ks: w1/w3 mismatch");
+            }
+        }
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        let gu = w3.is_some() as usize;
+        let out = if gu == 1 { 8 } else { 16 };
+        let r = round as i32;
+        let _ = qdq; // the staging quantizes either way (idempotent on a quantized activation)
+        let f = self.ks[w.fmt as usize - 2][gu];
+        let mut t0 = 0;
+        while t0 < t {
+            let n = (t - t0).min(8);
+            // f16 codes [n][kc + 32] + scales [n][kc / 32], kc a multiple of 64
+            let kc = ((KS_SMEM / n - 64) * 8 / 17 / 64 * 64).min(cols.div_ceil(64) * 64);
+            let smem = n * (kc + 32) * 2 + n * (kc / 32) * 4;
+            let (sp, br, mut sb) = ks_split(rows.div_ceil(out), cols / 32);
+            if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
+                sb = 1;
+            }
+            let (wv, w3v) = (*w, *w3.unwrap_or(w));
+            let (xo, yo, ni) = (
+                x + (t0 * cols * 4) as u64,
+                y + (t0 * rows * 4) as u64,
+                n as i32,
+            );
+            let rwo = if rw == 0 { 0 } else { rw + (t0 * 4) as u64 };
+            let (si, kci) = (sp as i32, kc as i32);
+            let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
+            unsafe {
+                gpu::launch(
+                    f,
+                    (br as u32, sb as u32, 1),
+                    (256, 1, 1),
+                    smem as u32,
+                    s,
+                    tang_moe::args![wv, w3v, xo, yo, ni, r, rwo, lim, si, kci, part, cnt],
                 )?
             }
             t0 += n;
@@ -520,6 +653,40 @@ impl Kernels {
         scale: f32,
     ) -> Result<()> {
         let (hi, di, ki) = (h as i32, d as i32, k as i32);
+        let need = t * h * k * (d / 64 + 1) + t * h;
+        if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 1024 && need <= ATTN_SCRATCH {
+            let part = self.scratch.ptr;
+            let pr = part + (t * h * k * (d / 64) * 4) as u64;
+            let den = pr + (t * h * k * 4) as u64;
+            let ti = t as i32;
+            unsafe {
+                gpu::launch(
+                    self.attn_qk,
+                    ((t * (h / 64) * k.div_ceil(32) * (d / 64)) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![q, kv, idxs, part, hi, di, ki],
+                )?;
+                gpu::launch(
+                    self.attn_soft,
+                    blocks(t * h * 32, 256),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![part, sink, idxs, pr, den, ti, hi, di, ki, scale],
+                )?;
+                gpu::launch(
+                    self.attn_pv,
+                    ((t * (h / 8) * (d / 64)) as u32, 1, 1),
+                    (256, 1, 1),
+                    (8 * k * 4) as u32,
+                    s,
+                    tang_moe::args![pr, den, kv, idxs, o, hi, di, ki],
+                )?;
+            }
+            return Ok(());
+        }
         let threads = d.clamp(32, 1024) as u32;
         unsafe {
             gpu::launch(
@@ -818,11 +985,36 @@ mod tests {
         dy.read::<f32>(0, t * w.rows as usize).unwrap()
     }
 
+    /// The fast-path bar against the exact kernels: bit for bit under `DS_EXACT=1`; otherwise
+    /// ≥ 99.5% of elements equal and every other one a neighbouring bf16 value.
+    fn check(k: &Kernels, got: &[f32], want: &[f32], what: &str) {
+        if k.exact {
+            assert_eq!(got, want, "{what}");
+            return;
+        }
+        assert_eq!(got.len(), want.len());
+        let mut diff = 0;
+        for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+            if a.to_bits() == b.to_bits() {
+                continue;
+            }
+            diff += 1;
+            let (ua, ub) = ((a.to_bits() >> 16) as i32, (b.to_bits() >> 16) as i32);
+            let near = (a.signum() == b.signum() && (ua - ub).abs() == 1) || (a == 0.0 && b == 0.0);
+            assert!(near, "{what}: [{i}] {a} vs {b} is not a bf16 neighbour");
+        }
+        assert!(
+            diff as f64 <= 0.005 * got.len() as f64,
+            "{what}: {diff} of {} differ",
+            got.len()
+        );
+    }
+
     /// The fast GEMV against the slow path, bit for bit, for every fp8/fp4 weight shape in
     /// the fixture, with the activation quant fused and not, over decode and verify widths
     /// (and t > 8, which runs in launches of 8).
     #[test]
-    fn fast_linear_is_bit_exact() {
+    fn fast_linear_matches_slow() {
         let Some((_g, k, s, m)) = setup() else { return };
         let mut seen = std::collections::HashSet::new();
         let mut names: Vec<&str> = m.st.names().filter(|n| n.ends_with("weight")).collect();
@@ -851,17 +1043,34 @@ mod tests {
                 k.linear_fast(&s, &w.v, None, dx.ptr, dy.ptr, t, true, true, 0, 0.0)
                     .unwrap();
                 s.sync().unwrap();
-                assert_eq!(
-                    dy.read::<f32>(0, t * rows).unwrap(),
-                    want,
-                    "{name} t {t} fused"
+                check(
+                    &k,
+                    &dy.read::<f32>(0, t * rows).unwrap(),
+                    &want,
+                    &format!("{name} t {t} fused"),
                 );
                 // pre-quantized
                 k.fp8_qdq(&s, dx.ptr, x.len()).unwrap();
                 k.linear_fast(&s, &w.v, None, dx.ptr, dy.ptr, t, true, false, 0, 0.0)
                     .unwrap();
                 s.sync().unwrap();
-                assert_eq!(dy.read::<f32>(0, t * rows).unwrap(), want, "{name} t {t}");
+                check(
+                    &k,
+                    &dy.read::<f32>(0, t * rows).unwrap(),
+                    &want,
+                    &format!("{name} t {t}"),
+                );
+                // unrounded f32 against unrounded ds_linear
+                let dq = DevBuf::from_slice(&x).unwrap();
+                k.fp8_qdq(&s, dq.ptr, x.len()).unwrap();
+                k.linear(&s, &w.v, dq.ptr, dy.ptr, t, false).unwrap();
+                s.sync().unwrap();
+                let wf = dy.read::<f32>(0, t * rows).unwrap();
+                k.linear_fast(&s, &w.v, None, dq.ptr, dy.ptr, t, false, false, 0, 0.0)
+                    .unwrap();
+                s.sync().unwrap();
+                let r = rel(&dy.read::<f32>(0, t * rows).unwrap(), &wf);
+                assert!(r < 1e-5, "{name} t {t}: f32 rel {r:e}");
             }
             eprintln!("{name} fmt {} [{rows}, {cols}]: exact", w.v.fmt);
             checked += 1;
@@ -871,7 +1080,7 @@ mod tests {
 
     /// The fused w1/w3 GEMV + SwiGLU against two slow GEMVs and ds_swiglu, bit for bit.
     #[test]
-    fn fast_swiglu_is_bit_exact() {
+    fn fast_swiglu_matches_slow() {
         let Some((_g, k, s, m)) = setup() else { return };
         let lim = m.cfg.swiglu_limit;
         for p in ["layers.0.ffn.experts.0", "layers.0.ffn.shared_experts"] {
@@ -915,10 +1124,11 @@ mod tests {
                     )
                     .unwrap();
                     s.sync().unwrap();
-                    assert_eq!(
-                        h.read::<f32>(0, t * inter).unwrap(),
-                        want,
-                        "{p} t {t} routed {routed}"
+                    check(
+                        &k,
+                        &h.read::<f32>(0, t * inter).unwrap(),
+                        &want,
+                        &format!("{p} t {t} routed {routed}"),
                     );
                 }
             }
@@ -933,7 +1143,7 @@ mod tests {
     fn fast_linear_bench() {
         let Some(_g) = Gpu::for_test() else { return };
         _g.bind().unwrap();
-        let k = Kernels::new(&_g).unwrap();
+        let mut k = Kernels::new(&_g).unwrap();
         let s = Stream::blocking().unwrap();
         let peak: f64 = std::env::var("DS_PEAK_GBS")
             .ok()
@@ -1000,57 +1210,282 @@ mod tests {
             s.sync().unwrap();
             t0.elapsed().as_secs_f64() / n as f64
         };
-        let fq = std::env::var_os("DS_BENCH_NOQDQ").is_none();
-        let shapes: &[(&str, i32, usize, usize)] = &[
-            ("expert w1", 3, 2304, 5120),
-            ("expert w2", 3, 5120, 2304),
-            ("wq_b", 2, 32768, 1280),
-            ("wo_a", 2, 8192, 4096),
-            ("wo_b", 2, 5120, 8192),
-            ("wkv", 2, 512, 5120),
+        // Weights cycle through copies totalling > 4× L2 (6 MB on the 3090), so every launch
+        // reads DRAM. Bytes = weights + scales.
+        let copies = |bytes: usize| (24usize << 20).div_ceil(bytes).max(1);
+        let kinds: &[(&str, i32, usize, usize, bool)] = &[
+            ("wq_a", 2, 1280, 5120, false),
+            ("wq_b", 2, 32768, 1280, false),
+            ("wkv", 2, 512, 5120, false),
+            ("wo_a", 2, 8192, 4096, false),
+            ("wo_b", 2, 5120, 8192, false),
+            ("expert w1", 3, 2304, 5120, false),
+            ("expert w2", 3, 5120, 2304, false),
+            ("expert w1+w3", 3, 2304, 5120, true),
         ];
-        for &(label, fmt, rows, cols) in shapes {
-            let (_w, _s, w, bytes) = mk(fmt, rows, cols, rows as u64 + cols as u64);
-            for t in [1, 6, 8] {
+        eprintln!(
+            "\n| weight | fmt | [rows, cols] | t | exact µs | exact GB/s | K-split µs | K-split GB/s | % of {peak} |"
+        );
+        eprintln!("|---|---|---|---|---|---|---|---|---|");
+        // t = 1 K-split µs per kind, for the per-token estimate
+        let mut t1 = std::collections::HashMap::new();
+        for &(label, fmt, rows, cols, gu) in kinds {
+            let one = mk(fmt, rows, cols, 1).3 * if gu { 2 } else { 1 };
+            let nc = copies(one);
+            let ws: Vec<_> = (0..nc * if gu { 2 } else { 1 })
+                .map(|i| mk(fmt, rows, cols, rows as u64 + cols as u64 + i as u64))
+                .collect();
+            for t in [1, 2, 6, 8] {
                 let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
                 let y = DevBuf::alloc(t * rows * 4).unwrap();
-                let tf = time(&|| {
-                    k.linear_fast(&s, &w, None, x.ptr, y.ptr, t, true, fq, 0, 0.0)
-                        .unwrap()
-                });
-                let ts = if t == 1 {
-                    time(&|| {
-                        k.fp8_qdq(&s, x.ptr, t * cols).unwrap();
-                        k.linear(&s, &w, x.ptr, y.ptr, t, true).unwrap()
-                    })
-                } else {
-                    f64::NAN
+                let i = std::cell::Cell::new(0usize);
+                let mut run = |exact: bool| {
+                    k.exact = exact;
+                    let f = || {
+                        let c = i.get() % nc;
+                        i.set(i.get() + 1);
+                        let (w, w3) = if gu {
+                            (&ws[2 * c].2, Some(&ws[2 * c + 1].2))
+                        } else {
+                            (&ws[c].2, None)
+                        };
+                        k.linear_fast(&s, w, w3, x.ptr, y.ptr, t, true, true, 0, 10.0)
+                            .unwrap()
+                    };
+                    time(&f)
                 };
-                let gbs = bytes as f64 / tf / 1e9;
+                let (te, tk) = (run(true), run(false));
+                k.exact = false;
+                let (ge, gk) = (one as f64 / te / 1e9, one as f64 / tk / 1e9);
                 eprintln!(
-                    "{label:10} fmt {fmt} [{rows:5}, {cols:5}] t {t}: fast {:7.1} us {gbs:6.1} GB/s ({:4.1}% of {peak}) | slow {:8.1} us ({:5.1}x)",
-                    tf * 1e6,
-                    100.0 * gbs / peak,
-                    ts * 1e6,
-                    ts / tf
+                    "| {label} | {} | [{}{rows}, {cols}] | {t} | {:.1} | {ge:.0} | {:.1} | {gk:.0} | {:.0}% |",
+                    if fmt == 2 { "fp8" } else { "fp4" },
+                    if gu { "2×" } else { "" },
+                    te * 1e6,
+                    tk * 1e6,
+                    100.0 * gk / peak
                 );
+                if t == 1 {
+                    t1.insert(label, (tk, one));
+                }
             }
         }
-        // fused w1/w3 + SwiGLU
-        let (_a, _b, w1, b1) = mk(3, 2304, 5120, 1);
-        let (_c, _d, w3, b3) = mk(3, 2304, 5120, 2);
-        for t in [1, 6, 8] {
-            let x = DevBuf::from_slice(&data(t * 5120, 3, 2.0)).unwrap();
-            let h = DevBuf::alloc(t * 2304 * 4).unwrap();
-            let tf = time(&|| {
-                k.linear_fast(&s, &w1, Some(&w3), x.ptr, h.ptr, t, true, fq, 0, 10.0)
-                    .unwrap()
-            });
-            let gbs = (b1 + b3) as f64 / tf / 1e9;
+
+        // The small ops at d = 5120, hc = 4, 64 heads × 512 (t = 1, and 6).
+        eprintln!("\n| op | t | µs |\n|---|---|---|");
+        let d = 5120;
+        let nw = DevBuf::from_slice(&vec![0x3f80u16; d]).unwrap();
+        let nv = DsW {
+            w: nw.ptr,
+            s: 0,
+            rows: 1,
+            cols: d as i32,
+            fmt: 1,
+            _pad: 0,
+        };
+        let tab: Vec<f32> = (0..4096 * 32)
+            .flat_map(|i| [(i as f32).cos(), (i as f32).sin()])
+            .collect();
+        let dtab = DevBuf::from_slice(&tab).unwrap();
+        let mut small = 0.0;
+        for t in [1, 6] {
+            let xb = DevBuf::from_slice(&data(t * 4 * d, 3, 2.0)).unwrap();
+            let pre = DevBuf::from_slice(&data(t * 4, 4, 1.0)).unwrap();
+            let comb = DevBuf::from_slice(&data(t * 16, 5, 1.0)).unwrap();
+            let hb = DevBuf::from_slice(&data(t * d, 6, 1.0)).unwrap();
+            let out = DevBuf::alloc(t * 4 * d * 4).unwrap();
+            let qb = DevBuf::from_slice(&data(t * 64 * 512, 7, 1.0)).unwrap();
+            let (ti, hc, di) = (t as i32, 4i32, d as i32);
+            let ops: Vec<(&str, Box<dyn Fn()>)> = vec![
+                (
+                    "rms [t, 5120]",
+                    Box::new(|| k.rms(&s, xb.ptr, &nv, t, 1e-6).unwrap()),
+                ),
+                (
+                    "fp8_qdq [t, 5120]",
+                    Box::new(|| k.fp8_qdq(&s, xb.ptr, t * d).unwrap()),
+                ),
+                (
+                    "rope q [t, 64, 512] rd 64",
+                    Box::new(|| {
+                        k.rope(&s, qb.ptr, dtab.ptr, t, 64, 512, 64, 9, 1, None, false)
+                            .unwrap()
+                    }),
+                ),
+                (
+                    "hc_pre [t, 4, 5120]",
+                    Box::new(|| unsafe {
+                        k.go(
+                            "ds_hc_pre",
+                            blocks(t * d, 256),
+                            (256, 1, 1),
+                            0,
+                            &s,
+                            tang_moe::args![xb.ptr, pre.ptr, out.ptr, ti, hc, di],
+                        )
+                        .unwrap()
+                    }),
+                ),
+                (
+                    "hc_post [t, 4, 5120]",
+                    Box::new(|| unsafe {
+                        k.go(
+                            "ds_hc_post",
+                            blocks(t * 4 * d, 256),
+                            (256, 1, 1),
+                            0,
+                            &s,
+                            tang_moe::args![hb.ptr, xb.ptr, pre.ptr, comb.ptr, out.ptr, ti, hc, di],
+                        )
+                        .unwrap()
+                    }),
+                ),
+            ];
+            for (name, f) in &ops {
+                let us = time(f.as_ref()) * 1e6;
+                if t == 1 {
+                    small += us;
+                }
+                eprintln!("| {name} | {t} | {us:.1} |");
+            }
+        }
+
+        // Per-token estimate at the real shapes, t = 1: 40 layers × (dense attention
+        // projections + 6 routed + 1 shared expert), the GEMVs at their measured K-split time.
+        let l = 40.0;
+        let dense = ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"];
+        let (mut us, mut bytes) = (0.0, 0.0);
+        for n in dense {
+            let (tk, b) = t1[n];
+            us += tk * 1e6;
+            bytes += b as f64;
+        }
+        for n in ["expert w1+w3", "expert w2"] {
+            let (tk, b) = t1[n];
+            us += 7.0 * tk * 1e6;
+            bytes += 7.0 * b as f64;
+        }
+        // the bf16 router [384, 5120] isn't on the fast path; count its bytes at peak
+        let router = 384.0 * 5120.0 * 2.0;
+        let (us_l, by_l) = (us + router / peak / 1e3, bytes + router);
+        let gb = l * by_l / 1e9;
+        eprintln!(
+            "\nper layer: {:.1} MB, {:.1} µs GEMV (+ {small:.1} µs of small ops, launched ~4× a layer)",
+            by_l / 1e6,
+            us_l
+        );
+        eprintln!(
+            "per token (40 layers, no head/embed/MTP): {gb:.2} GB; GEMV-only measured {:.0} tok/s",
+            1e6 / (l * us_l)
+        );
+        for (hw, bw) in [("3090", peak), ("H200", 4800.0), ("B300", 8000.0)] {
             eprintln!(
-                "expert gu  fmt 3 [2x2304, 5120] t {t}: fast {:7.1} us {gbs:6.1} GB/s ({:4.1}% of {peak})",
-                tf * 1e6,
-                100.0 * gbs / peak
+                "{hw}: memory-bound ceiling {:.0} tok/s at 100% of {bw} GB/s; {:.0} tok/s at the measured {:.0}%",
+                bw / gb,
+                bw / gb * (by_l / us_l / 1e3) / peak,
+                100.0 * (by_l / us_l / 1e3) / peak
+            );
+        }
+
+        // attention at the real head shapes
+        eprintln!("\n| attention h 64 d 512 | t | k | exact µs | tiled µs | tiled kv GB/s |\n|---|---|---|---|---|---|");
+        for (t, kk) in [(1, 640), (6, 640), (5, 640)] {
+            let [q, kv, sink, ix] = attn_case(t, kk);
+            let o = DevBuf::alloc(t * 64 * 512 * 4).unwrap();
+            let mut run = |exact: bool| {
+                k.exact = exact;
+                time(&|| {
+                    k.sparse_attn(
+                        &s, q.ptr, kv.ptr, sink.ptr, ix.ptr, o.ptr, t, 64, 512, kk, 0.04,
+                    )
+                    .unwrap()
+                })
+            };
+            let (te, tt) = (run(true), run(false));
+            k.exact = false;
+            eprintln!(
+                "| | {t} | {kk} | {:.1} | {:.1} | {:.0} |",
+                te * 1e6,
+                tt * 1e6,
+                (t * kk * 512 * 4) as f64 / tt / 1e9
+            );
+        }
+    }
+
+    /// Real-model attention shapes (64 heads × 512, 1 kv head) with `k` gathered keys, -1
+    /// holes and a sink; returns (q, kv, sink, idxs) on the device.
+    fn attn_case(t: usize, k: usize) -> [DevBuf; 4] {
+        let (h, d, n) = (64, 512, 4096);
+        let idxs: Vec<i32> = (0..t * k)
+            .map(|i| {
+                if i % 37 == 5 {
+                    -1
+                } else {
+                    ((i * 7919 + 13) % n) as i32
+                }
+            })
+            .collect();
+        [
+            DevBuf::from_slice(&data(t * h * d, 31, 2.0)).unwrap(),
+            DevBuf::from_slice(&data(n * d, 32, 1.0)).unwrap(),
+            DevBuf::from_slice(&data(h, 33, 1.0)).unwrap(),
+            DevBuf::from_slice(&idxs).unwrap(),
+        ]
+    }
+
+    /// The tiled attention against `ds_sparse_attn` (DS_EXACT=1) at the real head shapes.
+    #[test]
+    fn tiled_attn_matches_exact() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let mut k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (h, d) = (64, 512);
+        for (t, kk) in [(1, 640), (6, 640), (5, 100), (2, 1024)] {
+            let [q, kv, sink, ix] = attn_case(t, kk);
+            let o = DevBuf::alloc(t * h * d * 4).unwrap();
+            let run = |k: &Kernels| {
+                k.sparse_attn(
+                    &s,
+                    q.ptr,
+                    kv.ptr,
+                    sink.ptr,
+                    ix.ptr,
+                    o.ptr,
+                    t,
+                    h,
+                    d,
+                    kk,
+                    (d as f32).powf(-0.5),
+                )
+                .unwrap();
+                s.sync().unwrap();
+                o.read::<f32>(0, t * h * d).unwrap()
+            };
+            k.exact = true;
+            let want = run(&k);
+            k.exact = false;
+            let got = run(&k);
+            k.exact = false;
+            // Reordered sums flip bf(p) of a few keys by an ulp, and outputs that cancel to
+            // near zero then miss by more than an ulp of themselves: ≥ 99% equal, normwise within
+            // two ulps of the largest output.
+            let (mut eq, mut ulp1) = (0, 0);
+            for (a, b) in got.iter().zip(&want) {
+                let du = ((a.to_bits() >> 16) as i32 - (b.to_bits() >> 16) as i32).abs();
+                eq += (du == 0) as usize;
+                ulp1 += (du == 1) as usize;
+            }
+            let r = rel(&got, &want);
+            eprintln!(
+                "attn t {t} k {kk}: {:.2}% equal, {:.2}% 1-ulp, normwise rel {r:.2e}",
+                100.0 * eq as f64 / got.len() as f64,
+                100.0 * ulp1 as f64 / got.len() as f64
+            );
+            assert!(r < 8e-3, "attn t {t} k {kk}: rel {r}");
+            assert!(
+                eq as f64 >= 0.9 * got.len() as f64,
+                "attn t {t} k {kk}: {eq} equal"
             );
         }
     }
