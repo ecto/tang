@@ -240,6 +240,10 @@ extern "C" __global__ void g5_combine(const float* yp, const float* wts, const f
 // smem = 4 warps * 2 * row16 * 16 B); row16 = 0 disables staging (rows read from global).
 // =============================================================================================
 #if defined(__CUDACC_RTC__) || defined(__CUDACC__)
+// min resident blocks per SM for g5f_gu / g5f_down (caps registers: 4 -> 128, 8 -> 64)
+#ifndef G5F_MINB
+#define G5F_MINB 1
+#endif
 
 __device__ __forceinline__ float g5f_i2f(int q) { return __int_as_float(0x4B400000 + q) - 12582912.0f; }
 __device__ __forceinline__ float g5f_h2f(unsigned short h) {
@@ -372,6 +376,68 @@ __device__ __forceinline__ float g5f_lane_dot(const unsigned char* w, const unsi
     return acc;
 }
 
+// Q4_K / Q5_K at 32-weight granularity: lane L takes whole 32-chunks c = L + 32 i (one
+// sub-block each), so the 6-bit scale / min decode happens once per 32 weights instead of once
+// per 8, and the chunk's nibbles, high bits and int8 activations arrive as 16-byte loads (both
+// block sizes, 144 and 176, are multiples of 16; the caller checks w is 16-aligned and
+// k % 256 == 0). Same arithmetic as g5f_lane_dot (dot = dx * (dw * sum(q x) - mw * sum(x))),
+// summed in a different order.
+#ifndef G5F_DOT32
+#define G5F_DOT32 1
+#endif
+template <int TY>
+__device__ __forceinline__ float g5f_lane_dot32(const unsigned char* w, const unsigned char* xq, const unsigned char* xq2,
+                                               const float* xd, int k) {
+    const int lane = threadIdx.x & 31;
+    const int bb = TY == 12 ? 144 : 176;
+    float acc = 0.f;
+    for (int c = lane; c < k / 32; c += 32) {
+        const unsigned char* b = w + (c >> 3) * bb;
+        const int j = c & 7, up = j & 1;
+        int s, m;
+        g5f_smk4(j, b + 4, s, m);
+        const float dw = g5f_h2f(g5f_rd16(b)) * (float)s;
+        const float mw = g5f_h2f(g5f_rd16(b + 2)) * (float)m;
+        const uint4* qp = (const uint4*)(b + (TY == 12 ? 16 : 48) + (j >> 1) * 32);
+        const uint4 q0 = qp[0], q1 = qp[1];
+        unsigned n[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        #pragma unroll
+        for (int i = 0; i < 8; i++) n[i] = (n[i] >> (4 * up)) & 0x0F0F0F0Fu;
+        if (TY == 13) {
+            const uint4* hp = (const uint4*)(b + 16);
+            const uint4 h0 = hp[0], h1 = hp[1];
+            const unsigned hw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            #pragma unroll
+            for (int i = 0; i < 8; i++) n[i] |= ((hw[i] >> j) & 0x01010101u) << 4;
+        }
+        const uint4* xp = (const uint4*)(xq + (size_t)c * 32);
+        const uint4 x0 = xp[0], x1 = xp[1];
+        const unsigned xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        int sf = 0, sx = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            sf = __dp4a((int)n[i], (int)xw[i], sf);
+            sx = __dp4a(0x01010101, (int)xw[i], sx);
+        }
+        float fsf = (float)sf, fsx = (float)sx;
+        if (xq2) {
+            const uint4* x2p = (const uint4*)(xq2 + (size_t)c * 32);
+            const uint4 y0 = x2p[0], y1 = x2p[1];
+            const unsigned yw[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
+            int sf2 = 0, sx2 = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                sf2 = __dp4a((int)n[i], (int)yw[i], sf2);
+                sx2 = __dp4a(0x01010101, (int)yw[i], sx2);
+            }
+            fsf = fmaf((float)sf2, 1.0f / 254.0f, fsf);
+            fsx = fmaf((float)sx2, 1.0f / 254.0f, fsx);
+        }
+        acc = fmaf(xd[c], fmaf(dw, fsf, -mw * fsx), acc);
+    }
+    return acc;
+}
+
 __device__ __forceinline__ float g5f_dot_any(unsigned ty, const unsigned char* w, const unsigned char* xq,
                                             const unsigned char* xq2, const float* xd, const float* xf, int k) {
     switch (ty) {
@@ -379,8 +445,12 @@ __device__ __forceinline__ float g5f_dot_any(unsigned ty, const unsigned char* w
         case 1: return g5f_lane_dot<1>(w, xq, xq2, xd, xf, k);
         case 6: return g5f_lane_dot<6>(w, xq, xq2, xd, xf, k);
         case 8: return g5f_lane_dot<8>(w, xq, xq2, xd, xf, k);
-        case 12: return g5f_lane_dot<12>(w, xq, xq2, xd, xf, k);
-        case 13: return g5f_lane_dot<13>(w, xq, xq2, xd, xf, k);
+        case 12:
+            if (G5F_DOT32 && ((unsigned long long)w & 15) == 0 && (k & 255) == 0) return g5f_lane_dot32<12>(w, xq, xq2, xd, k);
+            return g5f_lane_dot<12>(w, xq, xq2, xd, xf, k);
+        case 13:
+            if (G5F_DOT32 && ((unsigned long long)w & 15) == 0 && (k & 255) == 0) return g5f_lane_dot32<13>(w, xq, xq2, xd, k);
+            return g5f_lane_dot<13>(w, xq, xq2, xd, xf, k);
         case 14: return g5f_lane_dot<14>(w, xq, xq2, xd, xf, k);
         default: return __uint_as_float(0x7fc00000u);
     }
@@ -442,22 +512,36 @@ extern "C" __global__ void g5f_q8(const float* x, unsigned char* q, unsigned cha
     if (lane == 0) d[(size_t)blockIdx.y * (k / 32) + c] = dd;
 }
 
-// s[t][e] = sigmoid(router_e . x[t]) for an F32 router: one warp per expert row, f32 throughout.
-// grid (ceil(ne/4), T), block 128.
+// s[t][e] = sigmoid(router_e . x[t]) for an F32 router, f32 throughout. grid (ne, T), block 128:
+// the block's 4 warps each take a quarter of the row (8-aligned), summed in a fixed order —
+// 4x the warps of a warp-per-row router (288 rows were 72 blocks on a 132-SM part).
 extern "C" __global__ void __launch_bounds__(128) g5f_router(const G5W w, const float* x, float* s, int ne, int hid) {
-    const int e = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31, t = blockIdx.y;
-    if (e >= ne) return;
+    __shared__ float red[4];
+    const int e = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = blockIdx.y;
+    const int chunk = ((hid / 8 + 3) / 4) * 8, q0 = warp * chunk, q1 = min(hid, q0 + chunk);
     const unsigned char* row = (const unsigned char*)(w.base + (unsigned long long)e * w.row_bytes);
-    const float a = g5f_warp_sum(g5f_lane_dot<0>(row, 0, 0, 0, x + (size_t)t * hid, hid));
-    if (lane == 0) s[(size_t)t * ne + e] = 1.0f / (1.0f + expf(-a));
+    const float a = q1 > q0 ? g5f_warp_sum(g5f_lane_dot<0>(row + 4 * (size_t)q0, 0, 0, 0, x + (size_t)t * hid + q0, q1 - q0)) : 0.f;
+    if (lane == 0) red[warp] = a;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const float v = (red[0] + red[1]) + (red[2] + red[3]);
+        s[(size_t)t * ne + e] = 1.0f / (1.0f + expf(-v));
+    }
 }
 
 // g5_router_select for n_group == 1, one WARP per token (grid T, block 32): k passes of a warp
 // argmax over choice = s + bias, lower index on ties; weights as g5_router_select.
 extern "C" __global__ void g5f_select(const float* s, const float* bias, unsigned* ids, float* wts, int ne, int k,
                                       int norm, float scale) {
+    __shared__ float sv[1024], sc[1024];  // score, choice = score + bias (ne <= 1024)
     const int t = blockIdx.x, lane = threadIdx.x & 31;
-    const float* st = s + (size_t)t * ne;
+    for (int e = lane; e < ne; e += 32) {
+        const float v = s[(size_t)t * ne + e];
+        sv[e] = v;
+        sc[e] = v + (bias ? bias[e] : 0.f);
+    }
+    __syncwarp();
+    const float* st = sv;
     unsigned* id = ids + (size_t)t * k;
     float* wt = wts + (size_t)t * k;
     unsigned taken = 0u;  // bit i: expert lane + 32 i is chosen (ne <= 1024)
@@ -468,7 +552,7 @@ extern "C" __global__ void g5f_select(const float* s, const float* bias, unsigne
         for (int i = 0; lane + 32 * i < ne; i++) {
             if ((taken >> i) & 1u) continue;
             const int e = lane + 32 * i;
-            const float v = st[e] + (bias ? bias[e] : 0.f);
+            const float v = sc[e];
             if (bi < 0 || v > best) { best = v; bi = e; }
         }
         for (int o = 16; o > 0; o >>= 1) {
@@ -499,7 +583,7 @@ extern "C" __global__ void g5f_select(const float* s, const float* bias, unsigne
 // sgate/sup when sgate.base != 0, limit lims). grid (ceil(max(ff, ffs)/4), S, T), block 128,
 // one (slot, row r) per warp (gate and up rows staged together): every active expert's rows
 // are in flight at once instead of a warp walking the slots in turn.
-extern "C" __global__ void __launch_bounds__(128) g5f_gu(
+extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_gu(
     const G5W gate, const G5W up, const G5W sgate, const G5W sup, const unsigned* ids, int k, int ne,
     const float* x, const unsigned char* xq, const unsigned char* xq2, const float* xd, float* h, int hs, int ff,
     int ffs, int hid,
@@ -541,7 +625,7 @@ extern "C" __global__ void __launch_bounds__(128) g5f_gu(
 // share a row pair c0, c0+1: warp sub-index i takes slots i, i+sw, ... (two rows each, staged),
 // then the group's first warp sums the sw partials in a fixed order (deterministic). sw = 4
 // for the routed layers (9 slots: every expert's rows in flight at once), 1 for dense.
-extern "C" __global__ void __launch_bounds__(128) g5f_down(
+extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down(
     const G5W down, const G5W sdown, const unsigned* ids, const float* wts, int k, int ne,
     const float* h, const unsigned char* hq, const unsigned char* hq2, const float* hd, int hs, float* y, int ff,
     int ffs, int hid,

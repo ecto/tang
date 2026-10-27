@@ -622,6 +622,7 @@ mod cuda {
                 .collect()
         };
         let mut worst_fast = 0f64;
+        eprintln!("moebench regs g5f_gu/g5f_down {:?}", k.regs());
         for l in list("TANG_GLM5_MOE_BENCH_LAYERS", "0,4,11,12") {
             let p = MoeParams::from_gguf(&gg, l).unwrap();
             let t_up = Instant::now();

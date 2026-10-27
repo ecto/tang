@@ -118,11 +118,17 @@ impl Drop for Kernels {
 
 impl Kernels {
     pub fn new(g: &Gpu) -> Result<Self> {
-        let m = g.module(super::SRC)?;
         let env_on = |k: &str, d: bool| match std::env::var(k) {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => d,
         };
+        // TANG_GLM5_MOE_MINB: __launch_bounds__ min blocks for g5f_gu / g5f_down. 6 (<= 80 regs)
+        // measured best on the H200 l4 T1: 1 -> 126 us (86 / 139 regs), 4 -> 115, 6 -> 110
+        let minb = std::env::var("TANG_GLM5_MOE_MINB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(6);
+        // TANG_GLM5_MOE_DOT32=0: the 8-weight Q4_K / Q5_K row decode instead of the 32-chunk one
+        let dot32 = i32::from(env_on("TANG_GLM5_MOE_DOT32", true));
+        let src = format!("#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n{}", super::SRC);
+        let m = g.module(&src)?;
         let debug = std::env::var("TANG_GLM5_MOE_DEBUG").is_ok_and(|v| v == "1");
         let smem_optin = g
             .attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
@@ -151,6 +157,18 @@ impl Kernels {
             pool: RefCell::new(Pool::default()),
             _m: m,
         })
+    }
+
+    /// Registers per thread of (g5f_gu, g5f_down) — bench diagnostics.
+    pub fn regs(&self) -> (i32, i32) {
+        let r = |f: Func| {
+            let mut v = 0i32;
+            unsafe {
+                cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+            }
+            v
+        };
+        (r(self.f_gu), r(self.f_down))
     }
 
     /// The fast path's routing from the last MoE call (`[t][k]` ids, weights): the debug
@@ -500,11 +518,11 @@ fn row16(ws: &[G5W]) -> usize {
 
 /// Dynamic smem for a 4-warp block staging two rows a warp, or `(0, 0)` (no staging) when it
 /// exceeds the device's opt-in; sets the function's opt-in once when it passes 48 KB.
-fn smem_for(k: &Kernels, pool: &mut Pool, which: usize, f: Func, r16: usize) -> Result<(i32, u32)> {
+fn smem_for(k: &Kernels, pool: &mut Pool, which: usize, f: Func, r16: usize, pairs: usize) -> Result<(i32, u32)> {
     if !k.stage || r16 == 0 {
         return Ok((0, 0));
     }
-    let bytes = (8 * r16 * 16) as u32;
+    let bytes = (8 * pairs * r16 * 16) as u32;
     if bytes + 512 > k.smem_optin {
         return Ok((0, 0));
     }
@@ -592,7 +610,7 @@ fn ffn_fast(
             if rw.ty == 0 && hid % 8 == 0 {
                 gpu::launch(
                     k.f_router,
-                    (ne.div_ceil(4) as u32, t as u32, 1),
+                    (ne as u32, t as u32, 1),
                     blk,
                     0,
                     s,
@@ -644,8 +662,8 @@ fn ffn_fast(
         nan_fill(h, nh, s)?;
         nan_fill(y, t * hid, s)?;
     }
-    let (r16g, smg) = smem_for(k, pool, 0, k.f_gu, row16(&[gate, up, sg, su]))?;
-    let (r16d, smd) = smem_for(k, pool, 1, k.f_down, row16(&[down, sd]))?;
+    let (r16g, smg) = smem_for(k, pool, 0, k.f_gu, row16(&[gate, up, sg, su]), 1)?;
+    let (r16d, smd) = smem_for(k, pool, 1, k.f_down, row16(&[down, sd]), 1)?;
     let lims = p.limit_shexp;
     // warps sharing a down row pair: the routed layers' 9 slots spread over a block's 4 warps
     // (TANG_GLM5_MOE_DOWN_SW overrides: 1, 2 or 4); dense has one slot, so one warp a pair
