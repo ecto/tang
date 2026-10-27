@@ -258,6 +258,13 @@ impl DevLayer {
     pub(super) fn decode_fast(&mut self, x: &[f32], conv: &mut ConvState, mode: Mode) -> Result<Vec<f32>> {
         ensure!(x.len() == self.hidden, "k5 decode input");
         ensure!(mode != Mode::Naive, "decode_fast: naive mode");
+        let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
+        let t_win = std::time::Instant::now();
+        let mut prof_at = |ms: f32, what: &str| {
+            if prof {
+                eprintln!("glm5: prof kda fused {what}: {ms:.2} ms");
+            }
+        };
         let (nh, di, hidden) = (self.nh, self.d_inner, self.hidden);
         // kda_dev's per-matrix rule (the x pre-pass): gemv8 only when q/k/v are all Q8_0
         // (the kernel reads 34-byte Q8_0 blocks; the f32 tiny fixture must take k5_gemv)
@@ -266,9 +273,12 @@ impl DevLayer {
         // the core's prefill path uses its own stream: make sure it has drained (it syncs
         // at the end of every call, so this is free; it keeps the ordering explicit)
         self.core.s.sync()?;
+        prof_at(t_win.elapsed().as_secs_f32() * 1e3, "pre sync");
+        let t_q = std::time::Instant::now();
         // synchronous HtoD on the legacy stream; self.s is BLOCKING, so the launches (or
         // the graph) below are ordered after it
         self.xb.write(0, x)?;
+        prof_at(t_q.elapsed().as_secs_f32() * 1e3, "x h2d");
         let mut tp = self.probe.take();
         if let Some(p) = &tp {
             // NaN-fill every output scratch this window writes (whole buffers): a region
@@ -279,6 +289,7 @@ impl DevLayer {
                 &self.outb, &self.ob,
             ])?;
         }
+        let t_g = std::time::Instant::now();
         match mode {
             Mode::Graph if self.fast.as_ref().and_then(|f| f.graph.as_ref()).is_some_and(|g| g.1 == gemv8) => {
                 let f = self.fast.as_ref().unwrap();
@@ -306,8 +317,14 @@ impl DevLayer {
                 log_once(&LOG_EAGER, || format!("glm5 kda: decode mode fused engaged (first eager step, gemv8={gemv8})"));
             }
         }
+        prof_at(t_g.elapsed().as_secs_f32() * 1e3, "enqueue");
+        let t_w = std::time::Instant::now();
         self.s.sync()?;
+        prof_at(t_w.elapsed().as_secs_f32() * 1e3, "step wait");
+        let t_r = std::time::Instant::now();
         let out = self.outb.read::<f32>(0, hidden)?;
+        prof_at(t_r.elapsed().as_secs_f32() * 1e3, "out read");
+        prof_at(t_win.elapsed().as_secs_f32() * 1e3, "total");
         let Some(mut p) = tp else {
             // no probe: keep the pre-probe behavior — the host conv copy is NOT shifted
             // (that would cost a qkv read-back per token per layer; nothing reads it while
