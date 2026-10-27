@@ -23,9 +23,10 @@
 //! and bounded on the device, and short top-k rows are padded with -1 holes, which the
 //! attention skips exactly. So the step is captured once per t (after a warm-up run that
 //! uploads the weights and sizes the arena) and replayed per token. Not captured: prefill,
-//! DSpark's `forward_spec`, and steps with the expert LRU (`DS_EXPERT_SLOTS`), an expert
-//! parallel `moe_reduce` (a host callback: NCCL would have to be captured with it), a hook,
-//! `force` or `DS_TAP`; they run the same code directly.
+//! DSpark's `forward_spec`, and steps with the expert LRU (`DS_EXPERT_SLOTS`), a host-side
+//! expert-parallel `moe_reduce` (one that syncs: `reduce_graphable` unset), a hook,
+//! `force` or `DS_TAP`; they run the same code directly. An NCCL `moe_reduce` only enqueues
+//! (`reduce_graphable`), so it is captured as a graph node with the step.
 
 use super::forward::{argmax, Model, SpecPick, SpecStep};
 use super::gpu::{blocks, DevW, Kernels};
@@ -172,6 +173,13 @@ pub struct GpuModel {
     /// callback enqueueing on the stream: a step that has one is not captured (to capture
     /// it, the callback's NCCL all-reduce would have to be captured with the step).
     pub moe_reduce: Option<MoeReduce>,
+    /// `moe_reduce` only enqueues on the stream (no host sync, no allocation), so a step
+    /// that has one can be captured with it (NCCL's all-reduce becomes a graph node). Every
+    /// rank then captures and replays its collectives in the same order.
+    pub reduce_graphable: bool,
+    /// Skip the logits/hiddens read-back (and its sync): `forward` returns empty vectors.
+    /// For expert-parallel ranks whose output nobody reads.
+    pub skip_readback: bool,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -285,6 +293,8 @@ impl GpuModel {
             snap: None,
             owns_expert: Box::new(|_| true),
             moe_reduce: None,
+            reduce_graphable: false,
+            skip_readback: false,
         })
     }
 
@@ -1665,7 +1675,7 @@ impl GpuModel {
             && !hook
             && self.force.is_none()
             && self.expert_slots == 0
-            && self.moe_reduce.is_none()
+            && (self.moe_reduce.is_none() || self.reduce_graphable)
             && std::env::var_os("DS_TAP").is_none()
     }
 
@@ -1758,6 +1768,9 @@ impl GpuModel {
                 .iter()
                 .map(|&(l, e, kv, sc)| (l, sp + e, kv, sc))
                 .collect();
+        }
+        if self.skip_readback {
+            return Ok((Vec::new(), Vec::new()));
         }
         self.s.sync()?;
         let logits = out.logits.dev().read::<f32>(0, out.rows * v)?;
