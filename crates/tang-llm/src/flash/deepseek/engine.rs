@@ -361,6 +361,8 @@ impl GpuModel {
         self.tap(&format!("{p}.wkv"), &kv, nkv * hd)?;
         let (nw, mode) = if sp == 0 {
             (t.min(c.window_size), 0)
+        } else if t > 1 {
+            (c.window_size, 3)
         } else {
             (c.window_size, 1)
         };
@@ -521,20 +523,12 @@ impl GpuModel {
             let all = fbuf((win + t) * hd)?;
             self.copy(all.ptr, ring, win * hd)?;
             self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, t * hd)?;
-            let idxs = (0..t)
-                .map(|e| {
-                    let q = sp + e;
-                    ((q + 1).saturating_sub(win)..=q)
-                        .map(|j| if j < sp { j % win } else { win + j - sp } as i32)
-                        .collect()
-                })
-                .collect();
             for e in 0..t {
                 let s = ((sp + e) % win * hd * 4) as u64;
                 self.copy(ring + s, kv.ptr + (e * hd * 4) as u64, hd)?;
             }
             self.s.sync()?;
-            return Ok((all, win + t, idxs));
+            return Ok((all, win + t));
         }
         self.copy(ring + ((sp % win) * hd * 4) as u64, kv.ptr, hd)?;
         let all = fbuf(win * hd)?;
@@ -641,28 +635,127 @@ impl GpuModel {
         let c = self.cpu.cfg.clone();
         let (r, hd) = (c.compress_ratios[lid], c.head_dim);
         if sp > 0 && t > 1 {
-            // a verify window one position at a time (as forward.rs `compress_kv_steps`)
+            // a verify window one position at a time (as forward.rs `compress_kv_steps`). The
+            // selection stays on the device: a layer that is not an index source passes the
+            // window's [t][k] top-k through untouched; an index source writes each position's
+            // row (k grows with the position; short rows padded with -1) into a fresh [t][k],
+            // reading row e of the incoming candidate mask when it consumes one.
             let (d, ql) = (c.dim, c.q_lora_rank);
+            let is_idx = c.is_index_source(lid);
+            let src_l = c.candidate_source_layer;
+            let makes_cand = lid as i64 == src_l;
+            let eats_cand = is_idx && src_l >= 0 && (src_l as usize) < lid;
             let topk_in = std::mem::take(&mut self.topk);
             let cand_in = std::mem::take(&mut self.cand);
-            let (mut idxs, mut topk, mut cand, mut last) =
-                (Vec::new(), Vec::new(), Vec::new(), (0, 0));
+            let (mut rows, mut crows, mut last) = (Vec::new(), Vec::new(), (0, 0));
             for e in 0..t {
-                self.topk = topk_in.get(e).cloned().into_iter().collect();
-                self.cand = cand_in.get(e).cloned().into_iter().collect();
+                if eats_cand {
+                    let (cb, cw) = cand_in.as_ref().context("no candidate mask")?;
+                    let we = (sp + e + 1) / r;
+                    let row = DevBuf::alloc(we.max(1))?;
+                    if we > 0 {
+                        let (dp, sp_, n) = (row.ptr, cb.ptr + (e * cw) as u64, we as i64);
+                        unsafe {
+                            self.k.go(
+                                "ds_copy_u8",
+                                blocks(we, 256),
+                                B256,
+                                0,
+                                &self.s,
+                                args![dp, sp_, n],
+                            )?
+                        };
+                    }
+                    self.cand = Some((row, we));
+                }
                 let (xe, qe) = (fbuf(d)?, fbuf(ql)?);
                 self.copy(xe.ptr, x.ptr + (e * d * 4) as u64, d)?;
                 self.copy(qe.ptr, qr.ptr + (e * ql * 4) as u64, ql)?;
-                let (src, clen, mut ie) = self.compress_kv(p, lid, &xe, &qe, 1, sp + e, offset)?;
+                let (src, clen, _) = self.compress_kv(p, lid, &xe, &qe, 1, sp + e, offset)?;
                 self.s.sync()?;
                 last = (src, clen);
-                idxs.push(ie.pop().unwrap_or_default());
-                topk.append(&mut self.topk);
-                cand.append(&mut self.cand);
+                rows.push(self.topk.take());
+                crows.push(if makes_cand { self.cand.take() } else { None });
+                self.cand = None;
             }
-            self.topk = topk;
-            self.cand = cand;
-            return Ok((last.0, last.1, idxs));
+            self.topk = if !is_idx {
+                topk_in
+            } else {
+                let kk = rows.iter().flatten().map(|(_, k)| *k).max().unwrap_or(0);
+                if kk == 0 {
+                    None
+                } else {
+                    let all = DevBuf::alloc(t * kk * 4)?;
+                    let (ap, m1, n) = (all.ptr, -1i32, (t * kk) as i64);
+                    unsafe {
+                        self.k.go(
+                            "ds_fill_i32",
+                            blocks(t * kk, 256),
+                            B256,
+                            0,
+                            &self.s,
+                            args![ap, m1, n],
+                        )?
+                    };
+                    for (e, (rb, k)) in rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(e, r)| Some((e, r.as_ref()?)))
+                    {
+                        let (dp, s_, one, ki, st, col) = (
+                            ap + (e * kk * 4) as u64,
+                            rb.ptr,
+                            1i32,
+                            *k as i32,
+                            kk as i32,
+                            0i32,
+                        );
+                        unsafe {
+                            self.k.go(
+                                "ds_idx_cat",
+                                blocks(*k, 256),
+                                B256,
+                                0,
+                                &self.s,
+                                args![dp, s_, one, ki, st, col],
+                            )?
+                        };
+                    }
+                    Some((all, kk))
+                }
+            };
+            self.cand = if !makes_cand {
+                cand_in
+            } else {
+                let w = crows.iter().flatten().map(|(_, w)| *w).max().unwrap_or(0);
+                if w == 0 {
+                    cand_in
+                } else {
+                    let all = DevBuf::from_slice(&vec![0u8; t * w])?;
+                    for (e, (cb, we)) in crows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(e, r)| Some((e, r.as_ref()?)))
+                    {
+                        let (dp, s_, n) = (all.ptr + (e * w) as u64, cb.ptr, *we as i64);
+                        unsafe {
+                            self.k.go(
+                                "ds_copy_u8",
+                                blocks(*we, 256),
+                                B256,
+                                0,
+                                &self.s,
+                                args![dp, s_, n],
+                            )?
+                        };
+                    }
+                    Some((all, w))
+                }
+            };
+            // drain before the per-position rows drop
+            self.s.sync()?;
+            let kc = self.topk.as_ref().map_or(0, |(_, k)| *k);
+            return Ok((last.0, last.1, kc));
         }
         let clen = (sp + t) / r;
         let mut latent = None;

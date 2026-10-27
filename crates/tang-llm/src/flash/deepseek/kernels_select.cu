@@ -157,6 +157,8 @@ extern "C" __global__ void ds_topk(const float* score, int* scratch, int* out, i
 //   mode 0, prefill: row e sees positions max(e - win + 1, 0) .. e (n = min(t, win) columns,
 //     -1 past e);
 //   mode 1, decode at sp: the ring oldest first, -1 for slots not yet written;
+//   mode 3, verify window at sp (kv = the pre-chunk ring then the chunk's t rows): row e sees
+//     positions max(sp + e - win + 1, 0) .. sp + e ascending, -1 past them;
 //   mode 2, DSpark at sp: ring slots 0 .. min(win, sp + 1), then win .. win + b (the block).
 extern "C" __global__ void ds_win_idx(int* out, int t, int stride, int n, int mode, int sp, int win, int b) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -168,6 +170,9 @@ extern "C" __global__ void ds_win_idx(int* out, int t, int stride, int n, int mo
     } else if (mode == 1) {
         int i = (sp % win + 1 + j) % win;
         v = i > sp ? -1 : i;
+    } else if (mode == 3) {
+        int q = sp + row, cnt = min(win, q + 1), pos = q + 1 - cnt + j;
+        v = j >= cnt ? -1 : (pos < sp ? pos % win : win + pos - sp);
     } else {
         int n1 = min(win, sp + 1);
         v = j < n1 ? j : win + (j - n1);
@@ -245,4 +250,16 @@ extern "C" __global__ void ds_linear_csr(DsW w, const float* x, float* y, int t,
     for (int k = lane; k < w.cols; k += 32) s += xr[k] * wget(w, n, k);
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
     if (lane == 0) y[(long long)ti * w.rows + n] = round ? bf(s) : s;
+}
+
+// n ints set to v (a verify window's [t][k] selection, -1 = no entry).
+extern "C" __global__ void ds_fill_i32(int* p, int v, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = v;
+}
+
+// n bytes (candidate mask rows).
+extern "C" __global__ void ds_copy_u8(unsigned char* dst, const unsigned char* src, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
 }

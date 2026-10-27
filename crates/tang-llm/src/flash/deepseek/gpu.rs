@@ -130,6 +130,8 @@ const MORE: &[&str] = &[
     "ds_candidates",
     "ds_topk",
     "ds_route",
+    "ds_fill_i32",
+    "ds_copy_u8",
 ];
 
 pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
@@ -1050,6 +1052,8 @@ mod tests {
                 tf * 1e6,
                 100.0 * gbs / peak
             );
+        }
+    }
 
     /// Scores with heavy ties (few levels, ±0, -inf) so tie-breaking is exercised.
     fn tied(n: usize, seed: u64) -> Vec<f32> {
