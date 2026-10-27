@@ -87,6 +87,10 @@ pub struct GpuFfn {
     /// layer on the first layer's weights and let the next window's first DSA layer
     /// attend over the last layer's latents (the watermark matched, so no re-upload).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
+    /// The device-resident MLA projections per DSA layer ([`super::mla_dev::MlaProj`]:
+    /// q_a + norm, q_b, o_proj, the indexer's wq_b / weights_proj on g5f_gemv), built
+    /// when `TANG_GLM5_MLA_RESIDENT=1` (default off). `None`: the host GEMVs.
+    pub(crate) mla_p: Vec<Option<super::mla_dev::MlaProj>>,
     /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
     /// scratch pool on the device; `TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
     mhc_g: Vec<Option<super::mhc::MhcGpu>>,
@@ -94,9 +98,13 @@ pub struct GpuFfn {
     /// `TANG_GLM5_MHC_FUSED=1`, single device, every layer's `MhcGpu` resident. `None`:
     /// the per-call [`Self::mhc_g`] path.
     pub(crate) mhc_f: Option<super::mhc_fused::MhcFused>,
-    layers: Vec<super::moe::gpu::DevMoe>,
+    /// Per layer: its FFN resident on the GPU (`None`: not resident, the CPU runs it —
+    /// `TANG_GLM5_GPU_FFN=0` for all, or `TANG_GLM5_GPU_FFN_LAYERS` to pick a subset).
+    layers: Vec<Option<super::moe::gpu::DevMoe>>,
     dev_of: Vec<usize>,
     pub split: usize,
+    /// `TANG_GLM5_MOE_PROF=1`: per layer, (calls, total µs) for T = 1 / T > 1 FFN calls.
+    prof: Option<Vec<[(u64, f64); 2]>>,
 }
 
 /// Everything device-owned goes before the contexts it lives in. Fields drop in
@@ -107,10 +115,12 @@ pub struct GpuFfn {
 #[cfg(feature = "cuda")]
 impl Drop for GpuFfn {
     fn drop(&mut self) {
+        self.print_prof();
         if let Some((g, _)) = self.devs.first() {
             let _ = g.bind();
         }
         self.kda_l.clear();
+        self.mla_p.clear();
         self.mla_k.clear();
         self.mhc_f = None;
         self.mhc_g.clear();
@@ -158,7 +168,9 @@ impl GpuFfn {
         let kda_on = !std::env::var("TANG_GLM5_GPU_KDA").is_ok_and(|v| v == "0");
         let mut kda_kernels = Vec::new();
         let mla_on = !std::env::var("TANG_GLM5_GPU_MLA").is_ok_and(|v| v == "0");
+        let mla_res = std::env::var("TANG_GLM5_MLA_RESIDENT").is_ok_and(|v| v == "1");
         let mut mla_k = Vec::new();
+        let mut mla_p = Vec::new();
         let mhc_on = hp.hc == 4
             && hp.n_embd % 32 == 0
             && !std::env::var("TANG_GLM5_GPU_MHC").is_ok_and(|v| v == "0");
@@ -248,8 +260,17 @@ impl GpuFfn {
                         super::mla::cuda::MlaCuda::new_at(&w, d)
                             .map_err(|e| anyhow::anyhow!("MLA layer {l} on GPU {d}: {e}"))?,
                     ));
+                    mla_p.push(if mla_res {
+                        Some(
+                            super::mla_dev::MlaProj::new(&devs[d].0, g, l, &w)
+                                .with_context(|| format!("MLA projections layer {l} on GPU {d}"))?,
+                        )
+                    } else {
+                        None
+                    });
                 } else {
                     mla_k.push(None);
+                    mla_p.push(None);
                 }
                 if !hp.is_kda[l] || !kda_on {
                     kda_l.push(None);
@@ -296,25 +317,50 @@ impl GpuFfn {
 
         let t0 = Instant::now();
         let ffn_on = !std::env::var("TANG_GLM5_GPU_FFN").is_ok_and(|v| v == "0");
-        let mut layers = Vec::with_capacity(if ffn_on { n_layer } else { 0 });
+        // TANG_GLM5_GPU_FFN_LAYERS=0-6,11: only these layers' FFNs resident (the rest on the
+        // CPU) — lets a 24 GB card run the real model with some MoE layers on the GPU
+        let pick = std::env::var("TANG_GLM5_GPU_FFN_LAYERS").ok().map(|s| {
+            let mut v = Vec::new();
+            for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                match part.split_once('-') {
+                    Some((a, b)) => {
+                        if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                            v.extend(a..=b);
+                        }
+                    }
+                    None => v.extend(part.parse::<usize>().ok()),
+                }
+            }
+            v
+        });
+        let mut layers = Vec::with_capacity(n_layer);
         let mut dev_of = vec![0usize; n_layer];
-        for l in 0..(if ffn_on { n_layer } else { 0 }) {
+        for l in 0..n_layer {
             let d = usize::from(l >= split);
+            dev_of[l] = d;
+            if !ffn_on || pick.as_ref().is_some_and(|v| !v.contains(&l)) {
+                layers.push(None);
+                continue;
+            }
             devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
             let p = super::moe::MoeParams::from_gguf(g, l)?;
-            layers.push(
+            layers.push(Some(
                 super::moe::gpu::DevMoe::new(&p)
                     .with_context(|| format!("uploading layer {l}'s FFN to GPU {d}"))?,
-            );
-            dev_of.push(d);
+            ));
             if l % 8 == 7 || l + 1 == n_layer {
                 eprintln!(
                     "glm5: {} of {n_layer} FFNs on the GPU ({:.0} s)",
-                    l + 1,
+                    layers.iter().filter(|x| x.is_some()).count(),
                     t0.elapsed().as_secs_f64()
                 );
             }
         }
+        eprintln!(
+            "glm5: {} of {n_layer} FFNs resident on the GPU, MoE kernels: {}",
+            layers.iter().filter(|x| x.is_some()).count(),
+            if devs.first().is_some_and(|d| d.1.fast) { "fast (TANG_GLM5_MOE=fast)" } else { "naive" }
+        );
         eprintln!(
             "glm5: FFNs on {} GPU(s), layers [0, {split}) on GPU 0{}",
             devs.len(),
@@ -332,11 +378,15 @@ impl GpuFfn {
             head_dev,
             max_t,
             mla_k,
+            mla_p,
             mhc_g,
             mhc_f: None,
             layers,
             dev_of,
             split,
+            prof: std::env::var("TANG_GLM5_MOE_PROF")
+                .is_ok_and(|v| v == "1")
+                .then(|| vec![[(0u64, 0f64); 2]; n_layer]),
         };
         if mhc_fused {
             f.enable_mhc_fused(g, hp)?;
@@ -379,6 +429,25 @@ impl GpuFfn {
         Ok(Some(f))
     }
 
+    /// Build the device-resident MLA projections for every DSA layer that has an
+    /// `MlaCuda` (`load` does when `TANG_GLM5_MLA_RESIDENT=1`). Returns how many.
+    pub(crate) fn enable_mla_resident(
+        &mut self,
+        g: &crate::gguf::Gguf,
+        mla_w: &dyn Fn(usize) -> Result<MlaWeights>,
+    ) -> Result<usize> {
+        for l in 0..self.mla_k.len() {
+            if self.mla_k[l].is_none() || self.mla_p[l].is_some() {
+                continue;
+            }
+            let d = self.dev_of[l];
+            self.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            let w = mla_w(l)?;
+            self.mla_p[l] = Some(super::mla_dev::MlaProj::new(&self.devs[d].0, g, l, &w)?);
+        }
+        Ok(self.mla_p.iter().filter(|p| p.is_some()).count())
+    }
+
     /// Build the fused mHC ([`Self::mhc_f`]; `load` does when `TANG_GLM5_MHC_FUSED=1`).
     /// Single device only; the windows it serves need every layer's `MhcGpu` resident.
     pub(crate) fn enable_mhc_fused(&mut self, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
@@ -403,11 +472,64 @@ impl GpuFfn {
         Ok(())
     }
 
+    /// Whether layer `l`'s FFN is resident.
+    fn has_ffn(&self, l: usize) -> bool {
+        self.layers.get(l).is_some_and(|m| m.is_some())
+    }
+
     /// Layer `l`'s FFN on its GPU: host `x` `[t][hidden]` in, host `y` out.
-    fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+    fn ffn(&mut self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
         let (gpu, k) = &self.devs[self.dev_of[l]];
         gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-        super::moe::gpu::ffn_host(k, &self.layers[l], x, t)
+        let m = self.layers[l].as_ref().context("FFN not resident")?;
+        let t0 = Instant::now();
+        let y = super::moe::gpu::ffn_host(k, m, x, t)?;
+        if let Some(p) = self.prof.as_mut() {
+            let e = &mut p[l][usize::from(t > 1)];
+            e.0 += 1;
+            e.1 += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        Ok(y)
+    }
+
+    /// The fast path's routing of the last call on layer `l`'s device (`MoE debug tap`).
+    fn last_routing(&self, l: usize, t: usize, k: usize) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        let (gpu, kern) = &self.devs[self.dev_of[l]];
+        if !kern.fast {
+            return Ok(None);
+        }
+        gpu.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        kern.last_routing(t, k)
+    }
+
+    /// `TANG_GLM5_MOE_PROF=1` summary: mean µs per FFN call, per layer and kind.
+    fn print_prof(&self) {
+        let Some(p) = &self.prof else { return };
+        let mut tot = [(0u64, 0f64); 2];
+        for (l, e) in p.iter().enumerate() {
+            for (i, (n, us)) in e.iter().enumerate() {
+                if *n == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "moeprof l{l} {} calls {n} mean {:.0} us",
+                    if i == 0 { "T=1" } else { "T>1" },
+                    us / *n as f64
+                );
+                tot[i].0 += n;
+                tot[i].1 += us;
+            }
+        }
+        for (i, (n, us)) in tot.iter().enumerate() {
+            if *n > 0 {
+                eprintln!(
+                    "moeprof ALL {} calls {n} total {:.1} ms mean {:.0} us/call",
+                    if i == 0 { "T=1" } else { "T>1" },
+                    us / 1e3,
+                    us / *n as f64
+                );
+            }
+        }
     }
 }
 
@@ -424,6 +546,9 @@ pub struct Glm5Engine {
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
+    /// CPU DSA path: round the latent cache to bf16 (the GPU cache's format), so a CPU
+    /// engine is the like-for-like oracle of the GPU MLA path (tests).
+    pub(crate) bf16_latents: bool,
     /// W0's R3 bisector: per-layer dump sink, no-op without TANG_DUMP_DIR (dump.rs).
     pub dump: Option<super::dump::DumpSink>,
     /// The FFNs on the GPU, when a CUDA build finds one ([`Glm5Engine::use_gpu`]).
@@ -433,6 +558,12 @@ pub struct Glm5Engine {
     /// intermediate-by-intermediate after each window ([`super::kda_debug`]).
     #[cfg(feature = "cuda")]
     kda_dbg: Option<super::kda_debug::Shadow>,
+    /// `TANG_GLM5_MOE_DEBUG=1`: the CPU shadow of every GPU FFN call ([`super::moe_debug`]).
+    #[cfg(feature = "cuda")]
+    moe_dbg: Option<super::moe_debug::Shadow>,
+    /// `TANG_GLM5_MLA_DEBUG=1`: the CPU shadow of every GPU DSA window ([`super::mla_debug`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) mla_dbg: Option<super::mla_debug::Shadow>,
 }
 
 impl Glm5Engine {
@@ -449,11 +580,16 @@ impl Glm5Engine {
             mla_w: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
+            bf16_latents: false,
             dump: super::dump::DumpSink::open(),
             #[cfg(feature = "cuda")]
             gpu: None,
             #[cfg(feature = "cuda")]
             kda_dbg: super::kda_debug::Shadow::from_env(nl),
+            #[cfg(feature = "cuda")]
+            moe_dbg: super::moe_debug::Shadow::from_env(nl),
+            #[cfg(feature = "cuda")]
+            mla_dbg: super::mla_debug::Shadow::from_env(),
         })
     }
 
@@ -467,13 +603,20 @@ impl Glm5Engine {
     }
 
     /// Layer `l`'s FFN: on its GPU when loaded, else W1's dense FFN / W5's CPU MoE.
-    fn ffn(&self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+    fn ffn(&mut self, l: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
-        if let Some(g) = &self.gpu {
-            if l < g.layers.len() {
-                return g.ffn(l, x, t);
+        if let Some(g) = self.gpu.as_mut() {
+            if g.has_ffn(l) {
+                let y = g.ffn(l, x, t)?;
+                if let Some(d) = self.moe_dbg.as_mut().filter(|d| d.wants(l)) {
+                    let p = super::moe::MoeParams::from_gguf(&self.m.g, l)?;
+                    let route = if p.is_dense() { None } else { g.last_routing(l, t, p.top_k)? };
+                    let m = &self.m;
+                    d.check(l, &p, x, t, &y, route, &|| m.dense_ffn(l, x, t))?;
+                }
+                return Ok(y);
             }
-            // TANG_GLM5_GPU_FFN=0: no FFNs resident; fall through to the CPU MoE path.
+            // not resident (TANG_GLM5_GPU_FFN=0 / _LAYERS): fall through to the CPU path.
         }
         if self.m.hp.is_dense(l) {
             let _tr = super::trace::span("dense.cpu");
@@ -624,7 +767,11 @@ impl Glm5Engine {
             let d = g.dev_of[l];
             if let Some(cu) = &g.mla_k[l] {
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[l]);
+                let dbg = self.mla_dbg.as_mut().filter(|d| d.wants(l));
+                if let Some(p) = &g.mla_p[l] {
+                    return dsa_gpu_resident(l, w, cu, p, x, t, pos0, &mut self.dsa[l], dbg);
+                }
+                return dsa_gpu(l, w, cu, x, t, pos0, &mut self.dsa[l], dbg);
             }
         }
         let _tr = super::trace::span("cpu");
@@ -647,7 +794,11 @@ impl Glm5Engine {
                 let latent = w.gemv_kv_a(x, t);
                 let idx_dim = hp.idx_dim;
                 let cache = &mut self.dsa[l];
-                cache.latent.extend_from_slice(&latent);
+                if self.bf16_latents {
+                    cache.latent.extend(latent.iter().map(|&v| super::mla::bf16_round(v)));
+                } else {
+                    cache.latent.extend_from_slice(&latent);
+                }
                 for i in 0..t {
                     let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
                     super::mla::indexer_key(w, &x[i * n..(i + 1) * n], &mut k, &mut g);
@@ -1217,13 +1368,16 @@ fn kda_gpu(
 /// Order follows W3's parity test: kv_append → idx_append → (sparse) idx_pool + idx_run →
 /// attend.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn dsa_gpu(
+    l: usize,
     w: &MlaWeights,
     cu: &super::mla::cuda::MlaCuda,
     x: &[f32],
     t: usize,
     pos0: usize,
     c: &mut DsaCache,
+    dbg: Option<&mut super::mla_debug::Shadow>,
 ) -> Result<Vec<f32>> {
     let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla cuda: {e}");
     let s = tang_moe::gpu::Stream::blocking().map_err(gerr)?;
@@ -1235,6 +1389,9 @@ fn dsa_gpu(
     let tr = span("q_a.host");
     let q_resid = w.gemv_q_a(x, t);
     drop(tr);
+    if dbg.as_ref().is_some_and(|d| d.poison()) {
+        cu.debug_poison(pos0, t).map_err(gerr)?;
+    }
     // caches grow by t rows; the launchers write rows [pos0, kv_len)
     let tr = span("kv_append");
     c.lat16.resize(kv_len * dl, 0);
@@ -1261,6 +1418,7 @@ fn dsa_gpu(
     .map_err(gerr)?;
     drop(tr);
     let tr = span("idx_select");
+    let mut pool_dbg = None;
     let sel = if super::mla::indexer_is_dense(kv_len, w.topk) {
         None
     } else {
@@ -1268,6 +1426,9 @@ fn dsa_gpu(
         let mut pool_keys = vec![0f32; n_pool * idd];
         cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, &s)
             .map_err(gerr)?;
+        if dbg.is_some() {
+            pool_dbg = Some(pool_keys.clone());
+        }
         let mut sel = vec![-1i32; t * w.select_width()];
         cu.idx_run(
             &w.i_wq_b,
@@ -1312,7 +1473,96 @@ fn dsa_gpu(
             );
         }
     }
+    if let Some(d) = dbg {
+        let (lat_dev, idk_dev, idg_dev, val_dev) = cu.debug_rows(0, kv_len).map_err(gerr)?;
+        d.check(
+            l,
+            w,
+            &super::mla_debug::GpuWindow {
+                x,
+                q_resid: &q_resid,
+                t,
+                pos0,
+                lat_dev,
+                idk_dev,
+                idg_dev,
+                val_dev,
+                lat_mirror: &c.lat16,
+                idk_mirror: &c.idx_k,
+                idg_mirror: &c.idx_g,
+                val_mirror: &c.valid,
+                pool: pool_dbg,
+                sel: sel.clone(),
+                out: &out,
+                q_resid_dev: false,
+                q_dev: None,
+            },
+        );
+    }
     Ok(out)
+}
+
+/// [`dsa_gpu`] with the projections on the device ([`super::mla_dev::MlaProj::window`]):
+/// `x` up, `y` down, nothing else crosses per layer except the cache mirrors' new rows.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn dsa_gpu_resident(
+    l: usize,
+    w: &MlaWeights,
+    cu: &super::mla::cuda::MlaCuda,
+    p: &super::mla_dev::MlaProj,
+    x: &[f32],
+    t: usize,
+    pos0: usize,
+    c: &mut DsaCache,
+    dbg: Option<&mut super::mla_debug::Shadow>,
+) -> Result<Vec<f32>> {
+    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla cuda: {e}");
+    let s = tang_moe::gpu::Stream::blocking().map_err(gerr)?;
+    let (n, dl, idd) = (w.hidden, w.kv_lora, w.idx_dim);
+    let kv_len = pos0 + t;
+    ensure!(x.len() == t * n, "layer input");
+    ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
+    if dbg.as_ref().is_some_and(|d| d.poison()) {
+        cu.debug_poison(pos0, t).map_err(gerr)?;
+    }
+    c.lat16.resize(kv_len * dl, 0);
+    c.idx_k.resize(kv_len * idd, 0.0);
+    c.idx_g.resize(kv_len * idd, 0.0);
+    c.valid.resize(kv_len, 0);
+    let mut pool = Vec::new();
+    let o = p.window(
+        cu, w, x, t, pos0, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid,
+        dbg.is_some().then_some(&mut pool), dbg.is_some(), &s,
+    )?;
+    if let Some(d) = dbg {
+        let (lat_dev, idk_dev, idg_dev, val_dev) = cu.debug_rows(0, kv_len).map_err(gerr)?;
+        let q_resid = o.q_resid.clone().unwrap_or_default();
+        d.check(
+            l,
+            w,
+            &super::mla_debug::GpuWindow {
+                x,
+                q_resid: &q_resid,
+                t,
+                pos0,
+                lat_dev,
+                idk_dev,
+                idg_dev,
+                val_dev,
+                lat_mirror: &c.lat16,
+                idk_mirror: &c.idx_k,
+                idg_mirror: &c.idx_g,
+                val_mirror: &c.valid,
+                pool: o.sel.is_some().then_some(pool),
+                sel: o.sel.clone(),
+                out: &o.y,
+                q_resid_dev: true,
+                q_dev: o.q.as_deref(),
+            },
+        );
+    }
+    Ok(o.y)
 }
 
 pub(crate) fn argmax(v: &[f32]) -> u32 {
@@ -1881,27 +2131,104 @@ mod tests {
                 .all(|(k, &kda)| k.is_some() != kda),
             "MLA kernels: one per DSA layer, none on KDA layers"
         );
+        // the in-process shadow on every DSA window: device rows, pools, selection and
+        // attention vs the CPU reference on the SAME inputs. This is the layer-local
+        // statement (bf16 latents included); the end-to-end bars below are the sum.
+        gpu.mla_dbg = Some(super::super::mla_debug::Shadow::always());
+        // the like-for-like oracle: the CPU engine with the GPU cache's bf16 latents. The
+        // f32 CPU engine differs from BOTH by the latent format alone (bf16 is W3's cache
+        // design, ~4e-3 relative per latent), and on this random-weight fixture that moves
+        // the logits by O(10) — measured below as cpu-bf16 vs cpu-f32, not a GPU error.
+        let mut cpu16 = Glm5Engine::open(Path::new(TINY)).unwrap();
+        cpu16.bf16_latents = true;
         let nv = cpu.m.hp.n_vocab;
-        let (mut worst, mut agree, mut total) = (0f32, 0usize, 0usize);
+        let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let flips = |a: &[f32], b: &[f32], n: usize| {
+            (0..n).filter(|&p| argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])).count()
+        };
+        let (mut w_gpu16, mut w_gpu32, mut w_fmt, mut scale) = (0f32, 0f32, 0f32, 0f32);
+        let (mut f_gpu16, mut f_gpu32, mut f_fmt, mut total) = (0usize, 0usize, 0usize, 0usize);
         // dense (≤ top-k) then sparse windows, then decode steps
         for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
             let a = cpu.window(w).unwrap();
+            let a16 = cpu16.window(w).unwrap();
             let b = gpu.window(w).unwrap();
-            for p in 0..w.len() {
-                total += 1;
-                if argmax(&a[p * nv..(p + 1) * nv]) == argmax(&b[p * nv..(p + 1) * nv]) {
-                    agree += 1;
-                }
-            }
-            for (x, y) in a.iter().zip(&b) {
-                worst = worst.max((x - y).abs());
-            }
+            total += w.len();
+            (f_gpu16, f_gpu32, f_fmt) = (
+                f_gpu16 + flips(&a16, &b, w.len()),
+                f_gpu32 + flips(&a, &b, w.len()),
+                f_fmt + flips(&a, &a16, w.len()),
+            );
+            w_gpu16 = w_gpu16.max(maxd(&a16, &b));
+            w_gpu32 = w_gpu32.max(maxd(&a, &b));
+            w_fmt = w_fmt.max(maxd(&a, &a16));
+            scale = a.iter().fold(scale, |m, x| m.max(x.abs()));
         }
         eprintln!(
-            "GPU (FFN + KDA + mHC + MLA bf16) vs CPU: top-1 {agree}/{total}, logits max abs {worst:.3e}"
+            "GPU (FFN + KDA + mHC + MLA bf16) vs CPU-bf16-latents: {f_gpu16} top-1 flips / {total}, logits max abs {w_gpu16:.3e}"
         );
-        assert!(agree as f32 >= 0.98 * total as f32, "top-1 {agree}/{total}");
-        assert!(worst <= 0.25, "logits max abs {worst}");
+        eprintln!(
+            "  vs CPU-f32: {f_gpu32} flips, max abs {w_gpu32:.3e}; the format alone (CPU-bf16 vs CPU-f32): \
+             {f_fmt} flips, max abs {w_fmt:.3e}; logit scale max |logit| {scale:.3e}"
+        );
+        let (checked, failed, sel) = gpu.mla_dbg.as_ref().unwrap().totals();
+        eprintln!(
+            "MLA shadow: {checked} windows, {failed} failed; selection {}/{} queries differ ({} near ties, {} real)",
+            sel.differ, sel.queries, sel.ties, sel.real
+        );
+        assert!(checked == 5 && failed == 0, "MLA shadow: {failed}/{checked} windows failed");
+        // the GPU path IS the bf16-latent model: tight against its CPU twin
+        assert_eq!(f_gpu16, 0, "top-1 flips vs the CPU-bf16 engine");
+        assert!(w_gpu16 <= 1e-2, "logits max abs vs the CPU-bf16 engine {w_gpu16}");
+        // and the f32 gap is the format's: no larger than the CPU's own bf16-vs-f32 gap
+        // (+ the f32-path noise of engine_gpu_matches_cpu, 1e-3)
+        assert!(w_gpu32 <= 1.25 * w_fmt + 1e-3, "GPU vs CPU-f32 {w_gpu32} exceeds the format gap {w_fmt}");
+        assert!(f_gpu32 as f32 <= 0.02 * total as f32, "top-1 vs CPU-f32 {f_gpu32}/{total}");
+    }
+
+    /// The device-resident projections (`TANG_GLM5_MLA_RESIDENT=1`: q_a + norm, q_b,
+    /// o_proj and the indexer GEMVs on g5f_gemv) against the naive GPU path on the same
+    /// windows, with the shadow on every DSA window (its `q_resid` / `q` taps check the
+    /// new GEMVs against the CPU). f32 fixture: f32 rows, no activation quantisation, so
+    /// the two GPU engines differ only by accumulation order.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_mla_resident_matches_naive() {
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("fixture/GPU");
+            return;
+        }
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let mut naive = Glm5Engine::open(Path::new(TINY)).unwrap();
+        let mut res = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(naive.use_gpu().unwrap() && res.use_gpu().unwrap(), "GPU did not load");
+        let n = {
+            let m = &res.m;
+            res.gpu.as_mut().unwrap().enable_mla_resident(&m.g, &|l| m.mla_weights(l)).unwrap()
+        };
+        assert_eq!(n, res.m.hp.is_kda.iter().filter(|&&k| !k).count(), "one MlaProj per DSA layer");
+        res.mla_dbg = Some(super::super::mla_debug::Shadow::always());
+        let nv = res.m.hp.n_vocab;
+        let (mut worst, mut flips) = (0f32, 0usize);
+        for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
+            let a = naive.window(w).unwrap();
+            let b = res.window(w).unwrap();
+            for p in 0..w.len() {
+                flips += (argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])) as usize;
+            }
+            worst = a.iter().zip(&b).fold(worst, |m, (x, y)| m.max((x - y).abs()));
+        }
+        let (checked, failed, sel) = res.mla_dbg.as_ref().unwrap().totals();
+        eprintln!(
+            "MLA resident vs naive GPU: {flips} top-1 flips / 170, logits max abs {worst:.3e}; \
+             shadow {checked} windows, {failed} failed, selection {}/{} differ",
+            sel.differ, sel.queries
+        );
+        assert!(checked == 5 && failed == 0, "MLA shadow (resident): {failed}/{checked} windows failed");
+        assert_eq!(flips, 0, "resident vs naive top-1 flips");
+        assert!(worst <= 1e-2, "resident vs naive logits max abs {worst}");
     }
 
     /// reset() gives a fresh sequence.
