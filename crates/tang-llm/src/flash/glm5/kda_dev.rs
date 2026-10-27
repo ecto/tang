@@ -43,6 +43,10 @@ use tang_moe::{args, gpu::launch};
 
 use super::kda_cuda::cuda::{DevKda, Kernels};
 
+/// The fused + graph-captured decode step (TANG_GLM5_KDA_FUSED / TANG_GLM5_KDA_GRAPH).
+#[path = "kda_decode.rs"]
+pub mod decode;
+
 /// The KDA projection kernels, appended to [`super::moe::SRC`] (the G5W dequant table is
 /// defined there). NAIVE ON PURPOSE (GATES.md): one thread per output value, plain loops,
 /// f32 accumulate. All layouts match the host 1:1 so parity is a value compare:
@@ -128,6 +132,9 @@ pub struct DevLayer {
     /// leaves every intermediate in the probe's taps for the shadow check
     /// ([`super::kda_debug`], names in [`super::kda_debug::tap`]). `None`: zero cost.
     pub probe: Option<tang_verify::Probe>,
+    /// The fused decode kernels + captured graph ([`decode`]); built at load when the env
+    /// selects a fused mode, else `None` (the naive path).
+    fast: Option<decode::Fast>,
     /// `TANG_GLM5_GEMV8=1` at construction: the q/k/v projections on k5_gemv8 (a field,
     /// not an env read per window, so a test can A/B one layer in-process).
     pub gemv8: bool,
@@ -241,6 +248,14 @@ impl DevLayer {
             max_t,
             pf2,
             probe: None,
+            fast: {
+                let mode = decode::Mode::from_env();
+                decode::log_load(mode);
+                match mode {
+                    decode::Mode::Naive => None,
+                    _ => Some(decode::Fast::new(g, cfg)?),
+                }
+            },
             gemv8: std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1"),
         })
     }
@@ -301,6 +316,12 @@ impl DevLayer {
     pub fn window(&mut self, x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
         ensure!(x.len() == t * self.hidden, "k5 layer input");
         ensure!(t <= self.max_t, "k5 window {t} > {max}", max = self.max_t);
+        if t == 1 && self.fast.is_some() {
+            let mode = decode::Mode::from_env();
+            if mode != decode::Mode::Naive {
+                return self.decode_fast(x, conv, mode);
+            }
+        }
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let lb = match self.cfg.gate_lower_bound {
             Some(v) => v,
