@@ -28,7 +28,7 @@
 //! `force` or `DS_TAP`; they run the same code directly.
 
 use super::forward::{argmax, Model, SpecPick, SpecStep};
-use super::gpu::{blocks, DevW, Kernels};
+use super::gpu::{blocks, DevW, DsW, Kernels};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
 use anyhow::{bail, Context, Result};
@@ -55,6 +55,19 @@ struct ExpertCache {
     map: HashMap<String, (Rc<DevW>, u64)>,
     tick: u64,
     misses: usize,
+}
+
+/// A layer's routed experts for the grouped MoE kernels: device arrays of [`DsW`] (w1, w3,
+/// w2) and the ownership mask, indexed by expert; non-local experts are zeroed and masked off.
+struct MoeTab {
+    w1: DevBuf,
+    w3: DevBuf,
+    w2: DevBuf,
+    mask: DevBuf,
+    fmt: i32,
+    inter: usize,
+    local: usize,
+    _keep: Vec<Rc<DevW>>,
 }
 
 /// Which attention a block runs.
@@ -172,6 +185,11 @@ pub struct GpuModel {
     /// callback enqueueing on the stream: a step that has one is not captured (to capture
     /// it, the callback's NCCL all-reduce would have to be captured with the step).
     pub moe_reduce: Option<MoeReduce>,
+    /// Grouped MoE (a fixed handful of launches per layer, whatever the expert count) for
+    /// steps of <= 8 tokens with every expert resident; `DS_MOE_LOOP=1` keeps the per-expert
+    /// loop. Bit-identical either way.
+    pub moe_grouped: bool,
+    moe_tabs: RefCell<HashMap<usize, Option<Rc<MoeTab>>>>,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -285,6 +303,8 @@ impl GpuModel {
             snap: None,
             owns_expert: Box::new(|_| true),
             moe_reduce: None,
+            moe_grouped: std::env::var("DS_MOE_LOOP").map_or(true, |v| v != "1"),
+            moe_tabs: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1334,6 +1354,15 @@ impl GpuModel {
         self.k.route(
             &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
         )?;
+        let tab = if self.moe_grouped && self.expert_slots == 0 && t <= 8 {
+            self.moe_tab(p, lid, ne)?
+        } else {
+            None
+        };
+        if let Some(tab) = tab {
+            let y = self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?;
+            return self.moe_finish(p, x, t, y);
+        }
         // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
         // (and not upload) unrouted experts
         let live: Vec<bool> = if self.expert_slots > 0 {
@@ -1396,6 +1425,131 @@ impl GpuModel {
                 )?
             };
         }
+        self.moe_finish(p, x, t, y)
+    }
+
+    /// The routed experts' partial sum y [t][d] by the grouped kernels: plan (live local
+    /// experts), gate/up + SwiGLU, quantize, down to per-slot partials, ordered reduce.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_routed(
+        &self,
+        tab: &MoeTab,
+        x: Buf,
+        t: usize,
+        topk: usize,
+        ne: usize,
+        ids: Buf,
+        counts: Buf,
+        off: Buf,
+        rows: Buf,
+        rw: Buf,
+    ) -> Result<Buf> {
+        let d = self.cpu.cfg.dim;
+        let (n, inter) = (t * topk, tab.inter);
+        let slots = n.min(tab.local);
+        let elist = self.fbuf(slots)?;
+        let (nei, ci) = (ne as i32, slots as i32);
+        unsafe {
+            self.k.go(
+                "ds_moe_plan",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                &self.s,
+                args![counts.ptr, tab.mask.ptr, elist.ptr, nei, ci],
+            )?
+        };
+        let xq = self.qdq(x, t * d)?;
+        let h = self.fbuf(n * inter)?;
+        let lim = self.cpu.cfg.swiglu_limit;
+        self.k.moe_gu(
+            &self.s, tab.fmt, tab.w1.ptr, tab.w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, xq.ptr,
+            h.ptr, t, slots, inter, lim,
+        )?;
+        self.k.fp8_qdq(&self.s, h.ptr, n * inter)?;
+        let part = self.fbuf(n * d)?;
+        self.k.moe_down(
+            &self.s, tab.fmt, tab.w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d,
+        )?;
+        let y = self.fbuf(t * d)?;
+        let (ti, ki, di) = (t as i32, topk as i32, d as i32);
+        unsafe {
+            self.k.go(
+                "ds_moe_reduce",
+                blocks(t * d, 256),
+                B256,
+                0,
+                &self.s,
+                args![
+                    y.ptr,
+                    part.ptr,
+                    ids.ptr,
+                    off.ptr,
+                    rows.ptr,
+                    tab.mask.ptr,
+                    ti,
+                    ki,
+                    di
+                ],
+            )?
+        };
+        Ok(y)
+    }
+
+    /// Layer `lid`'s grouped-MoE table, built (uploading every local expert) on first use;
+    /// None when the experts are not one `linear_fast` format (the loop then runs).
+    fn moe_tab(&self, p: &str, lid: usize, ne: usize) -> Result<Option<Rc<MoeTab>>> {
+        if let Some(t) = self.moe_tabs.borrow().get(&lid) {
+            return Ok(t.clone());
+        }
+        let zero = DsW::default();
+        let (mut w1, mut w3, mut w2, mut mask) = (
+            vec![zero; ne],
+            vec![zero; ne],
+            vec![zero; ne],
+            vec![0i32; ne],
+        );
+        let mut keep = Vec::new();
+        let mut ok = true;
+        let mut shape: Option<(i32, i32, i32)> = None;
+        for e in (0..ne).filter(|&e| (self.owns_expert)(e)) {
+            let pe = format!("{p}.ffn.experts.{e}");
+            let ws = [
+                self.dw(&format!("{pe}.w1.weight"))?,
+                self.dw(&format!("{pe}.w3.weight"))?,
+                self.dw(&format!("{pe}.w2.weight"))?,
+            ];
+            let (a, b, c) = (ws[0].v, ws[1].v, ws[2].v);
+            let sh = (a.fmt, a.rows, a.cols);
+            ok &= Kernels::fast_ok(&a)
+                && Kernels::fast_ok(&c)
+                && (b.fmt, b.rows, b.cols) == sh
+                && (c.fmt, c.rows, c.cols) == (a.fmt, a.cols, a.rows)
+                && *shape.get_or_insert(sh) == sh;
+            (w1[e], w3[e], w2[e], mask[e]) = (a, b, c, 1);
+            keep.extend(ws);
+        }
+        let tab = match shape {
+            Some((fmt, inter, _)) if ok => Some(Rc::new(MoeTab {
+                w1: DevBuf::from_slice(&w1)?,
+                w3: DevBuf::from_slice(&w3)?,
+                w2: DevBuf::from_slice(&w2)?,
+                mask: DevBuf::from_slice(&mask)?,
+                fmt,
+                inter: inter as usize,
+                local: mask.iter().filter(|&&m| m != 0).count(),
+                _keep: keep,
+            })),
+            _ => None,
+        };
+        self.moe_tabs.borrow_mut().insert(lid, tab.clone());
+        Ok(tab)
+    }
+
+    /// The routed sum `y` [t][d] -> the MoE output: the EP reduce hook, then the shared
+    /// expert added and the sum bf16-rounded once.
+    fn moe_finish(&self, p: &str, x: Buf, t: usize, y: Buf) -> Result<Buf> {
+        let d = self.cpu.cfg.dim;
         if let Some(reduce) = &self.moe_reduce {
             reduce(&y.dev(), t * d, &self.s)?;
         }
@@ -2270,6 +2424,45 @@ mod tests {
             b.expert_misses()
         );
         assert!(b.expert_misses() > a.expert_misses());
+    }
+
+    /// The grouped MoE kernels give the per-expert loop's logits and hiddens bit for bit, on
+    /// decode steps and 6-token verify windows (prefill takes the loop in both).
+    #[test]
+    fn gpu_tiny_moe_grouped_matches_loop() {
+        let Some((_, meta)) = open() else { return };
+        let dir = Path::new(&tiny()).join("hf");
+        let ids = prompt(&meta);
+        let (mut a, mut b) = (GpuModel::open(&dir).unwrap(), GpuModel::open(&dir).unwrap());
+        a.moe_grouped = true;
+        b.moe_grouped = false;
+        let (v, n) = (a.cpu.cfg.vocab_size, ids.len());
+        let (la, _) = a.forward(&ids, 0, None).unwrap();
+        let (lb, _) = b.forward(&ids, 0, None).unwrap();
+        assert_eq!(la, lb, "prefill");
+        let mut tok = argmax(&la);
+        let mut pos = n;
+        for i in 0..6 {
+            let (la, ma) = a.forward(&[tok], pos, None).unwrap();
+            let (lb, mb) = b.forward(&[tok], pos, None).unwrap();
+            assert_eq!(la, lb, "decode step {i}");
+            assert_eq!(ma, mb, "decode step {i} hiddens");
+            tok = argmax(&la);
+            pos += 1;
+        }
+        for round in 0..3 {
+            let win: Vec<usize> = (0..6).map(|i| (tok + 31 * i + round) % v).collect();
+            let (la, ma) = a.forward_all(&win, pos).unwrap();
+            let (lb, mb) = b.forward_all(&win, pos).unwrap();
+            assert_eq!(la, lb, "verify window {round}");
+            assert_eq!(ma, mb, "verify window {round} hiddens");
+            pos += 6;
+            tok = argmax(&la[5 * v..]);
+        }
+        assert!(
+            a.moe_tabs.borrow().values().any(|t| t.is_some()),
+            "grouped path never taken"
+        );
     }
 
     /// Free-running on the device, prefill then greedy decode; informational past top-1.

@@ -24,7 +24,7 @@ type Func = cudarc::driver::sys::CUfunction;
 
 /// `struct DsW` in kernels.cu (8 + 8 + 4 + 4 + 4, padded to 32 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DsW {
     pub w: u64,
     pub s: u64,
@@ -100,6 +100,9 @@ pub struct Kernels {
     fast: [[[Func; 2]; 4]; 2],
     /// `ds_ks_f{fmt}_g{gu}`, the tensor-core K-split GEMV, by (fmt - 2, gu).
     ks: [[Func; 2]; 2],
+    /// `ds_moe_{gu,down}_f{fmt}_t{tm}`, the grouped MoE projections, by (fmt - 2, log2 tm,
+    /// down).
+    moe: [[[Func; 2]; 4]; 2],
     attn_qk: Func,
     attn_soft: Func,
     attn_pv: Func,
@@ -152,6 +155,8 @@ const MORE: &[&str] = &[
     "ds_route",
     "ds_fill_i32",
     "ds_copy_u8",
+    "ds_moe_plan",
+    "ds_moe_reduce",
 ];
 
 /// Floats of attention scratch: partial scores [t][d/64][h][k], then P [t][h][k] and den
@@ -186,6 +191,19 @@ fn lin_table(m: &Module, pre: &str) -> Result<[[[Func; 2]; 4]; 2]> {
     Ok(a)
 }
 
+fn moe_table(m: &Module) -> Result<[[[Func; 2]; 4]; 2]> {
+    let mut a = [[[std::ptr::null_mut(); 2]; 4]; 2];
+    for (fi, af) in a.iter_mut().enumerate() {
+        for (ti, at) in af.iter_mut().enumerate() {
+            for (di, ad) in at.iter_mut().enumerate() {
+                let kind = ["gu", "down"][di];
+                *ad = m.func(&format!("ds_moe_{kind}_f{}_t{}", fi + 2, 1 << ti))?;
+            }
+        }
+    }
+    Ok(a)
+}
+
 /// The K split for `tiles` 16-row warp tiles with `groups` 32-column groups: S slices within a
 /// block of 8 warps (RW = 8 / S tiles a block) and SB blocks along K, aiming at ≥ 2 blocks of 8
 /// warps per SM while keeping ≥ 4 groups a warp. Returns (S, row-group blocks, SB).
@@ -201,6 +219,17 @@ fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
         sb += 1;
     }
     (sp, br, sb)
+}
+
+/// The `ds_lin_*` / `ds_moe_*` row-tile template index for `t` <= 8 rows.
+fn tm_index(t: usize) -> Result<usize> {
+    Ok(match t {
+        1 => 0,
+        2 => 1,
+        3 | 4 => 2,
+        5..=8 => 3,
+        _ => bail!("tm_index: {t} rows"),
+    })
 }
 
 pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
@@ -220,6 +249,7 @@ impl Kernels {
             sparse_attn: m.func("ds_sparse_attn")?,
             sinkhorn: m.func("ds_sinkhorn")?,
             fast: lin_table(&m, "ds_lin")?,
+            moe: moe_table(&m)?,
             ks: [
                 [m.func("ds_ks_f2_g0")?, m.func("ds_ks_f2_g1")?],
                 [m.func("ds_ks_f3_g0")?, m.func("ds_ks_f3_g1")?],
@@ -609,6 +639,75 @@ impl Kernels {
                 )?
             }
             t0 += n;
+        }
+        Ok(())
+    }
+
+    /// Grouped MoE gate/up + SwiGLU for every routed expert of a layer in one launch (see
+    /// `DS_MOE` in kernels.cu): `w1s`/`w3s` device arrays of [`DsW`] per expert (format
+    /// `fmt`, `inter` rows), `elist` [slots] from `ds_moe_plan`, the CSR of [`Kernels::route`],
+    /// `xq` the fp8-quantized activation [t][d], into `h` [t * k][inter] at CSR positions.
+    /// Bit-identical to the per-expert `ds_linear_csr` + `ds_swiglu` loop. `t` <= 8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gu(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        w1s: u64,
+        w3s: u64,
+        elist: u64,
+        off: u64,
+        rows: u64,
+        rw: u64,
+        xq: u64,
+        h: u64,
+        t: usize,
+        slots: usize,
+        inter: usize,
+        lim: f32,
+    ) -> Result<()> {
+        let f = self.moe[fmt as usize - 2][tm_index(t)?][0];
+        let grid = (inter.div_ceil(2).div_ceil(4) as u32, slots.max(1) as u32, 1);
+        unsafe {
+            gpu::launch(
+                f,
+                grid,
+                (128, 1, 1),
+                0,
+                s,
+                tang_moe::args![w1s, w3s, elist, off, rows, rw, xq, h, lim],
+            )?
+        }
+        Ok(())
+    }
+
+    /// Grouped MoE down projection: `hq` [t * k][inter] (quantized `h`) to per-slot partials
+    /// `part` [t * k][d], bf16-rounded, for `ds_moe_reduce`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        w2s: u64,
+        elist: u64,
+        off: u64,
+        hq: u64,
+        part: u64,
+        t: usize,
+        slots: usize,
+        d: usize,
+    ) -> Result<()> {
+        let f = self.moe[fmt as usize - 2][tm_index(t)?][1];
+        let grid = (d.div_ceil(4).div_ceil(4) as u32, slots.max(1) as u32, 1);
+        unsafe {
+            gpu::launch(
+                f,
+                grid,
+                (128, 1, 1),
+                0,
+                s,
+                tang_moe::args![w2s, elist, off, hq, part],
+            )?
         }
         Ok(())
     }
@@ -1202,6 +1301,167 @@ mod tests {
                 }
             }
             eprintln!("{p} fmt {}: swiglu exact", w1.v.fmt);
+        }
+    }
+
+    /// One layer's routed MoE by the grouped kernels at the real shapes (384 experts, top-6,
+    /// d = 5120, inter = 2304, fp4) with random weights: plan, GU, h quant, down, reduce
+    /// (manual: `--ignored --nocapture moe_grouped_bench`). Bytes = the live experts' weights
+    /// and scales.
+    #[test]
+    #[ignore]
+    fn moe_grouped_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let peak: f64 = std::env::var("DS_PEAK_GBS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(936.0);
+        let (ne, topk, d, inter) = (384usize, 6usize, 5120usize, 2304usize);
+        let rand_bytes = |n: usize, seed: u64| -> Vec<u8> {
+            let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let mut keep = Vec::new();
+        let mut mk = |rows: usize, cols: usize, seed: u64| -> (DsW, usize) {
+            let wb = rand_bytes(rows * cols / 2, seed);
+            let sb: Vec<u8> = rand_bytes(rows * cols / 32, seed + 1)
+                .iter()
+                .map(|b| 118 + b % 8)
+                .collect();
+            let (w, sc) = (
+                DevBuf::from_slice(&wb).unwrap(),
+                DevBuf::from_slice(&sb).unwrap(),
+            );
+            let v = DsW {
+                w: w.ptr,
+                s: sc.ptr,
+                rows: rows as i32,
+                cols: cols as i32,
+                fmt: 3,
+                _pad: 0,
+            };
+            keep.push((w, sc));
+            (v, wb.len() + sb.len())
+        };
+        // 36 distinct experts with weights (every t = 6 slot distinct: the worst case)
+        let used: Vec<usize> = (0..36).map(|i| (i * 67 + 5) % ne).collect();
+        let (mut w1, mut w3, mut w2) = (
+            vec![DsW::default(); ne],
+            vec![DsW::default(); ne],
+            vec![DsW::default(); ne],
+        );
+        let mut per = 0;
+        for (i, &e) in used.iter().enumerate() {
+            let a = mk(inter, d, 10 * i as u64 + 1);
+            let b = mk(inter, d, 10 * i as u64 + 2);
+            let c = mk(d, inter, 10 * i as u64 + 3);
+            (w1[e], w3[e], w2[e]) = (a.0, b.0, c.0);
+            per = a.1 + b.1 + c.1;
+        }
+        let (w1, w3, w2) = (
+            DevBuf::from_slice(&w1).unwrap(),
+            DevBuf::from_slice(&w3).unwrap(),
+            DevBuf::from_slice(&w2).unwrap(),
+        );
+        let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
+        eprintln!(
+            "\n| t | routing | live experts | µs | GB/s | % of {peak} |\n|---|---|---|---|---|---|"
+        );
+        for (t, label) in [(1, "6 experts"), (6, "36 distinct"), (6, "6 shared")] {
+            let n = t * topk;
+            let ids: Vec<i32> = (0..n)
+                .map(|i| {
+                    if label == "6 shared" {
+                        used[i % topk] as i32
+                    } else {
+                        used[i] as i32
+                    }
+                })
+                .collect();
+            let live = if label == "36 distinct" { n } else { topk };
+            let wts = DevBuf::from_slice(&vec![0.2f32; n]).unwrap();
+            let ids = DevBuf::from_slice(&ids).unwrap();
+            let (counts, off) = (
+                DevBuf::alloc(ne * 4).unwrap(),
+                DevBuf::alloc((ne + 1) * 4).unwrap(),
+            );
+            let (rows, rw) = (DevBuf::alloc(n * 4).unwrap(), DevBuf::alloc(n * 4).unwrap());
+            k.route(
+                &s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+            )
+            .unwrap();
+            let x = DevBuf::from_slice(&data(t * d, 3, 2.0)).unwrap();
+            k.fp8_qdq(&s, x.ptr, t * d).unwrap();
+            let (elist, h, part, y) = (
+                DevBuf::alloc(n * 4).unwrap(),
+                DevBuf::alloc(n * inter * 4).unwrap(),
+                DevBuf::alloc(n * d * 4).unwrap(),
+                DevBuf::alloc(t * d * 4).unwrap(),
+            );
+            let slots = n;
+            let run = || {
+                let (nei, ci) = (ne as i32, slots as i32);
+                let (ti, ki, di) = (t as i32, topk as i32, d as i32);
+                unsafe {
+                    k.go(
+                        "ds_moe_plan",
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+                    )
+                    .unwrap();
+                }
+                k.moe_gu(
+                    &s, 3, w1.ptr, w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, x.ptr, h.ptr, t,
+                    slots, inter, 10.0,
+                )
+                .unwrap();
+                k.fp8_qdq(&s, h.ptr, n * inter).unwrap();
+                k.moe_down(
+                    &s, 3, w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d,
+                )
+                .unwrap();
+                unsafe {
+                    k.go(
+                        "ds_moe_reduce",
+                        blocks(t * d, 256),
+                        (256, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![
+                            y.ptr, part.ptr, ids.ptr, off.ptr, rows.ptr, mask.ptr, ti, ki, di
+                        ],
+                    )
+                    .unwrap();
+                }
+            };
+            run();
+            s.sync().unwrap();
+            let iters = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            s.sync().unwrap();
+            let sec = t0.elapsed().as_secs_f64() / iters as f64;
+            let gbs = (live * per) as f64 / sec / 1e9;
+            eprintln!(
+                "| {t} | {label} | {live} | {:.0} | {gbs:.0} | {:.0}% |",
+                sec * 1e6,
+                100.0 * gbs / peak
+            );
         }
     }
 

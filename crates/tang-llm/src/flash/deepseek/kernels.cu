@@ -522,7 +522,8 @@ __device__ __forceinline__ float e4m3v(unsigned int v) {
 
 template <int FMT, int TM, int GU>
 __device__ __forceinline__ void lin_fast(DsW w, DsW w3, const float* __restrict__ x, float* __restrict__ y, int t,
-                                         int round, int qdq, const float* __restrict__ rw, float lim) {
+                                         int round, int qdq, const float* __restrict__ rw, float lim,
+                                         const int* __restrict__ xi) {
     // chunks (32 columns) per tile per row: 8 lanes x 16 bytes
     const int CT = FMT == 3 ? 8 : 4;
     __shared__ float sh[4][LR][8][33];
@@ -539,6 +540,10 @@ __device__ __forceinline__ void lin_fast(DsW w, DsW w3, const float* __restrict_
     long long rbytes = FMT == 3 ? cols / 2 : cols;
     const unsigned char* wp = (const unsigned char*)wr.w + (rv ? (long long)nr * rbytes : 0);
     const unsigned char* sp = (const unsigned char*)wr.s;
+    // x row of token ti: xi[ti] when gathering (grouped MoE), else ti
+    const float* xr[TM];
+#pragma unroll
+    for (int ti = 0; ti < TM; ti++) xr[ti] = x + (long long)(xi && ti < t ? xi[ti] : ti) * cols;
     float acc[LR][TM];
 #pragma unroll
     for (int i = 0; i < LR; i++)
@@ -587,7 +592,7 @@ __device__ __forceinline__ void lin_fast(DsW w, DsW w3, const float* __restrict_
 #pragma unroll
                 for (int ti = 0; ti < TM; ti++) {
                     if (ti < t) {
-                        float xv = x[(long long)ti * cols + k];
+                        float xv = xr[ti][k];
                         if (qdq) {
                             float a = fabsf(xv);
 #pragma unroll
@@ -630,13 +635,43 @@ __device__ __forceinline__ void lin_fast(DsW w, DsW w3, const float* __restrict_
 #define DS_LIN(F, T, G)                                                                                       \
     extern "C" __global__ void __launch_bounds__(128) ds_lin_f##F##_t##T##_g##G(                             \
         DsW w, DsW w3, const float* x, float* y, int t, int round, int qdq, const float* rw, float lim) {     \
-        lin_fast<F, T, G>(w, w3, x, y, t, round, qdq, rw, lim);                                               \
+        lin_fast<F, T, G>(w, w3, x, y, t, round, qdq, rw, lim, 0);                                            \
     }
 #define DS_LIN_T(F, G) DS_LIN(F, 1, G) DS_LIN(F, 2, G) DS_LIN(F, 4, G) DS_LIN(F, 8, G)
 DS_LIN_T(2, 0)
 DS_LIN_T(3, 0)
 DS_LIN_T(2, 1)
 DS_LIN_T(3, 1)
+
+// ---- grouped MoE: one launch per projection for every routed expert of a layer ----
+//
+// blockIdx.y is a slot of `elist` (ds_moe_plan: the live local experts ascending, -1 past
+// them); blockIdx.x tiles the weight rows exactly as ds_lin_*. Expert e's rows are its CSR
+// segment off[e]..off[e+1] (ds_route), at most T of them. Both are lin_fast, bit-identical to
+// the per-expert ds_linear_csr loop: GU gathers its x rows through `rows` (xq: x already
+// fp8-quantized) into h [t*k][inter] at the CSR positions, with SwiGLU and the route weights;
+// down maps hq (h quantized) to per-slot partials part [t*k][d], summed by ds_moe_reduce.
+#define DS_MOE(F, T)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) ds_moe_gu_f##F##_t##T(                                 \
+        const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,  \
+        const float* xq, float* h, float lim) {                                                               \
+        int e = elist[blockIdx.y];                                                                            \
+        if (e < 0) return;                                                                                    \
+        int o = off[e], n = off[e + 1] - o;                                                                   \
+        DsW w = w1s[e];                                                                                       \
+        lin_fast<F, T, 1>(w, w3s[e], xq, h + (long long)o * w.rows, n, 1, 0, rw + o, lim, rows + o);          \
+    }                                                                                                         \
+    extern "C" __global__ void __launch_bounds__(128) ds_moe_down_f##F##_t##T(                               \
+        const DsW* w2s, const int* elist, const int* off, const float* hq, float* part) {                    \
+        int e = elist[blockIdx.y];                                                                            \
+        if (e < 0) return;                                                                                    \
+        int o = off[e], n = off[e + 1] - o;                                                                   \
+        DsW w = w2s[e];                                                                                       \
+        lin_fast<F, T, 0>(w, w, hq + (long long)o * w.cols, part + (long long)o * w.rows, n, 1, 0, 0, 0.f, 0); \
+    }
+#define DS_MOE_T(F) DS_MOE(F, 1) DS_MOE(F, 2) DS_MOE(F, 4) DS_MOE(F, 8)
+DS_MOE_T(2)
+DS_MOE_T(3)
 
 // ---- tensor-core K-split GEMV (the default fast path; DS_EXACT=1 selects lin_fast above) ----
 //
