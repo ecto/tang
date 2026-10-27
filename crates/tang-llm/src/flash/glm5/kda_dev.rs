@@ -435,7 +435,11 @@ impl DevLayer {
             tr_bytes(self.bproj.w.estride);
             launch(
                 self.gv.beta,
-                grid(t * nh / K5_WARPS + (t * nh % K5_WARPS > 0) as usize),
+                // one WARP per (t, h), K5_WARPS warps a 128-thread block: ceil(t·nh / 4)
+                // BLOCKS. (`grid(n)` makes ceil(n/128) blocks — handed the block count it
+                // launched 1/128 of them, so beta was computed for 4 (t,h) per 128 and the
+                // rest of `bb` kept stale values: 158 top-1 flips GPU vs CPU on tiny.)
+                ((t * nh).div_ceil(K5_WARPS) as u32, 1, 1),
                 (128, 1, 1),
                 0,
                 &self.s,
