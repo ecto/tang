@@ -50,30 +50,33 @@ Correctness (prompt "Write a haiku about the sea.", greedy):
   (GPU, every FFN resident, naive and fast MoE). glm5 GPU suite on mew (TANG_REQUIRE_CUDA=1):
   **76 passed, 0 failed** (56a774fc).
 
-Decode scaling, GPU_FFN=0 KDA_MAXT=64, diverse prompts, per-step wall (one step = one
-token for every slot), parallel CPU MoE:
+Decode scaling, FINAL tree (every fast flag: GEMV8 KDA_PF2 MHC_FUSED GPU_HEAD
+MLA_RESIDENT; GPU_FFN=0 KDA_MAXT=64; diverse prompts; H200 bin 0862c49c, 3090 bin
+56a774fc; both build logs show `Compiling tang-llm`). Per-step wall = one token for every
+slot; N=1 is the plain decode (`decode: 7 tokens in …`):
 
-| box | N | per-step wall | ms/token/slot | aggregate tok/s |
-|---|---|---|---|---|
-| H200 | 1 | 11.3 s | 11 300 | 0.09 |
-| H200 | 8 | 41.0 s | 5 126 | 0.23 |
-| H200 | 32 | 41.9 s | 1 311 | 0.70 |
-| 3090 | 1 | 5.8 s | 5 810 | 0.17 |
-| 3090 | 8 | 15.1 s | 1 884 | 0.60 |
-| 3090 | 8, round-robin | 43.7 s | 5 459 | 0.18 |
-| 3090 | 32 | 30.1 s | 941 | 0.96 |
+| box | N | per-step wall | ms/token/slot | aggregate tok/s | slot 0 ids |
+|---|---|---|---|---|---|
+| H200 | 1 | 11.4 s | 11 440 | 0.09 | oracle, 8/8 |
+| H200 | 8 | 20.5 s | 2 563 | 0.41 | oracle prefix |
+| H200 | 32 | 39.9 s | 1 248 | 0.74 | oracle prefix |
+| 3090 | 1 | 5.5 s | 5 520 | 0.18 | oracle, 8/8 |
+| 3090 | 8 | 14.3 s | 1 787 | 0.63 | oracle prefix |
+| 3090 | 32 | 27.4 s | 855 | 1.04 | oracle prefix |
 
-(H200 rows: bin b7002a28 = the pre-merge tree; same engine code path as the final tree
-minus GPU_HEAD / MLA_RESIDENT. Serial-MoE baseline for the record: H200 N=8 same-prompt
-86.0 s/step, 3090 N=8 diverse 75.5 s/step.)
+Window split at 32 rows (TANG_GLM5_TRACE, wall): H200 ffn (CPU MoE) 93.1%, DSA 4.7%, KDA
+1.4%, head 0.6%; 3090 ffn 89.4%, DSA 7.6%, KDA 2.1%, head 0.8%. MLA_RESIDENT took the DSA
+share from 9–15% (host q/o GEMVs) to 3–8%.
 
-Where a 32-row window goes (TANG_GLM5_TRACE, wall): H200 — ffn (CPU MoE) 88.4%, DSA 9.3%,
-KDA 1.4%, head 0.7%; 3090 — ffn 82.1%, DSA 14.9% (per-row host o_proj 5.1%, attend 4.3%,
-q_b 2.1%), KDA 2.1%, head 0.7%. The GPU-batched stages barely grow with N; in this config
-the step is the CPU MoE (the experts don't fit the H200's 141 GB). The number that matters
-needs every FFN on the GPU (B300 / 2×H200, `TANG_GLM5_MOE=fast`): `window_batch` already
-hands it T = N rows. The trace's GPU-ms column is unreliable here (negative / inflated
-event spans): wall only.
+Earlier points, same engine path without GPU_HEAD / MLA_RESIDENT (H200 b7002a28, 3090
+3641b874): H200 N=8 41.0 s, N=32 41.9 s (0.70 tok/s); 3090 N=8 15.1 s, N=32 30.1 s (0.96
+tok/s), N=8 round-robin (one window per slot) 43.7 s — the batched window is 2.9× it.
+Serial-MoE baseline: H200 N=8 same-prompt 86.0 s/step, 3090 N=8 diverse 75.5 s/step.
+
+The GPU-batched stages barely grow with N; in this config the step is the CPU MoE (the
+experts don't fit the H200's 141 GB). The number that matters needs every FFN on the GPU
+(B300 / 2×H200, `TANG_GLM5_MOE=fast`): `window_batch` already hands it T = N rows. The
+trace's GPU-ms column is unreliable here (negative / inflated event spans): wall only.
 
 What breaks at high N:
 - `TANG_GLM5_KDA_MAXT` (64 here) caps the rows of one window (KDA scratch, fused mHC):
