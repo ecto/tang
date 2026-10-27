@@ -4,6 +4,102 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 — GLM-5.3 server batcher: N sequence slots, one batched decode window (branch frog/glm5-batcher)
+
+What was built:
+- **Per-slot engine state.** `Glm5Engine` holds `n_slots` sequences: KDA conv + recurrent
+  state `[slots][...]` on the device (`DevKda` h0/st, one allocation, slot = pointer
+  offset; `decode_dev`/`prefill_dev`/`seed_at`/`read_back_at` take the slot) and per-slot
+  host copies; the DSA caches per slot (host mirrors `dsa[slot][layer]`, the device
+  caches as `MlaCuda` LRU entries keyed by slot, `set_slots` pre-creates them, `reset_seq`
+  drops one); per-slot tokens (slot 0 = `tokens`, the single-sequence path, unchanged);
+  `kda_dev_fresh[slot][layer]`. The residual streams and logits are per window (no state).
+  `use_gpu_slots(N)` sizes it (4 MiB + 288 KiB per KDA layer per slot: 32 slots = 4.5 GiB).
+- **`window_batch(rows)`**: ONE window over N decode rows, row i = one token of slot i.
+  Embedding, mHC (fused), norms, the KDA projections / gates / o_proj (`window_rows`), the
+  FFN (CPU MoE or the GPU `ffn_host` with T = N, naive or `TANG_GLM5_MOE=fast`) and the head
+  run once for all rows; only the KDA core (`core_rows`: the decode step on each row's slot
+  state, two launches per row) and the DSA attention (one row at a time on its slot's
+  caches) split. Needs `TANG_GLM5_KDA_PF2=1`. `TANG_GLM5_KDA_GRAPH` captures slot 0 only.
+- **Serve glue**: `max_slots()` = `TANG_GLM5_SLOTS` (default 8, or `--batch`), `decode_batch`
+  = `window_batch` (`TANG_GLM5_BATCH_RR=1`: one window per row), `save/restore_running_at`
+  carry the real KDA state (68 parts, read off the device) so a restore no longer replays
+  the prefix; the DSA caches (positional) rebuild on the suffix prefill. Fixed on the way:
+  the old glue's `verify`/`window` appended each token twice (the engine appends itself)
+  — the DSA `pos0` check would have failed on the first real request.
+- **CLI bench**: `flash-generate ... --slots N [--diverse] [--rr]`; `--diverse` changes one
+  prompt token in slots 1.. (distinct states and expert routing; slot 0 keeps the oracle
+  prompt, so its ids are the bleed check).
+
+The cost that hid the batcher: with `TANG_GLM5_GPU_FFN=0` the CPU MoE's `matvec` was the
+single-threaded scalar f64 reference — ~10 GMAC per token on one core, paid PER ROW, so
+per-step wall grew linearly with N whatever the GPU side did. Now parallel over output rows
+and over experts, with the weighted sums in the serial order: bit-exact (oracle unchanged).
+Same for the DSA host GEMVs (`gemv` was parallel over tokens = 1 thread per decode row),
+the host o_proj, and the attend wk/wv (2 × 25 MB copied per DSA row; now once per layer).
+N=1 decode: H200 22.0 → 11.3 s/token, mew 18.1 → 5.8.
+
+Correctness (prompt "Write a haiku about the sea.", greedy):
+- single slot, GEMV8 PF2 MHC_FUSED (+ GPU_HEAD MLA_RESIDENT on the final tree):
+  `785 1196 6801 264 6386 38038 911 279` = the CPU oracle, on the H200 (bins b7002a28,
+  c93795d3) and mew (3641b874; final tree 56a774fc with every flag).
+- batched, diverse: slot 0's ids = the oracle prefix in every run (8 and 32 slots; 2 of 7
+  and 16 of 31 other slots decode differently, so the states really differ).
+- tests: `engine_slots_batch_matches_separate` (CPU, two slots with different prompts:
+  batched = round-robin = lone engines ≤ 1e-4), `engine_gpu_slots_batch_matches_single`
+  (GPU, every FFN resident, naive and fast MoE). glm5 GPU suite on mew (TANG_REQUIRE_CUDA=1):
+  **76 passed, 0 failed** (56a774fc).
+
+Decode scaling, GPU_FFN=0 KDA_MAXT=64, diverse prompts, per-step wall (one step = one
+token for every slot), parallel CPU MoE:
+
+| box | N | per-step wall | ms/token/slot | aggregate tok/s |
+|---|---|---|---|---|
+| H200 | 1 | 11.3 s | 11 300 | 0.09 |
+| H200 | 8 | 41.0 s | 5 126 | 0.23 |
+| H200 | 32 | 41.9 s | 1 311 | 0.70 |
+| 3090 | 1 | 5.8 s | 5 810 | 0.17 |
+| 3090 | 8 | 15.1 s | 1 884 | 0.60 |
+| 3090 | 8, round-robin | 43.7 s | 5 459 | 0.18 |
+| 3090 | 32 | 30.1 s | 941 | 0.96 |
+
+(H200 rows: bin b7002a28 = the pre-merge tree; same engine code path as the final tree
+minus GPU_HEAD / MLA_RESIDENT. Serial-MoE baseline for the record: H200 N=8 same-prompt
+86.0 s/step, 3090 N=8 diverse 75.5 s/step.)
+
+Where a 32-row window goes (TANG_GLM5_TRACE, wall): H200 — ffn (CPU MoE) 88.4%, DSA 9.3%,
+KDA 1.4%, head 0.7%; 3090 — ffn 82.1%, DSA 14.9% (per-row host o_proj 5.1%, attend 4.3%,
+q_b 2.1%), KDA 2.1%, head 0.7%. The GPU-batched stages barely grow with N; in this config
+the step is the CPU MoE (the experts don't fit the H200's 141 GB). The number that matters
+needs every FFN on the GPU (B300 / 2×H200, `TANG_GLM5_MOE=fast`): `window_batch` already
+hands it T = N rows. The trace's GPU-ms column is unreliable here (negative / inflated
+event spans): wall only.
+
+What breaks at high N:
+- `TANG_GLM5_KDA_MAXT` (64 here) caps the rows of one window (KDA scratch, fused mHC):
+  N > max_t falls back to per-row KDA / no fused mHC. Raise it for 64+ slots.
+- The KDA core is two launches per row (`core_rows`): ~2·N·34 launches per step; a
+  slot-indexed single-launch step is the next step. DSA is fully per row (host q_a/q_b/
+  o_proj + one attend per row) — the largest non-FFN cost at 32 rows; a batched attend over
+  rows with different caches is the fix.
+- Memory: 145 MiB of KDA state per slot (4.5 GiB at 32) + the DSA caches (27.5 KiB/token
+  per slot with the indexer); the CPU MoE holds one dequantised expert (~100 MB) per
+  worker thread.
+- `TANG_GLM5_KDA_GRAPH=1` (captured decode step) serves slot 0 only — other slots refuse.
+
+Bugs found in frog/glm5-forward on the way (fixed here):
+- `k5_beta`'s warp kernel (368714ff) passed a u64 to `g5_deq(const unsigned char*)`:
+  NVRTC rejected the K5 source, so NO resident KDA layer could load (39d4100c).
+- its launch used `grid(t*nh/4)` — `grid` divides by 128 again — so 1/128 of beta was
+  computed and the rest of `bb` stayed stale: 158 top-1 flips GPU vs CPU (5a0baa26).
+- the gemv8 A/B test asserted the max abs against the rel bound it printed (6c254855).
+- non-cuda build: `GpuFfn` / `HeadDev` had lost their cuda cfg (merge fd0404c2).
+
+Ops: two copies of a run script once interleaved on one status file and target dir (the
+second launch while the first was mid-queue) — run scripts now take an instance lock
+(`flock -n` on a run lock). `pkill -f <pattern>` over ssh matches the ssh's own shell and
+other workers' jobs: kill by cwd/pid only.
+
 ## 2026-10-26 — g5f_gemv: the fast MoE row kernel as a plain GEMV (branch frog/glm5-grouped-moe)
 
 - `g5f_gemv` (moe_cuda.cuh) + `Kernels5::fast` (`FastGemv::q8` / `::gemv`, `Act`): any G5W type,
