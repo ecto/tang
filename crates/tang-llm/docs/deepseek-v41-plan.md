@@ -11,6 +11,42 @@ Shapes below are from the real `config.json` (`deepseek_v41_text`), not the esti
 a Coder-Next GPU engine (`flash/coder.rs`) and most of GLM-5.3-Flash on the CPU reference
 (`flash/glm5/`). Both cut the DeepSeek bill.
 
+## Speed work landed (2026-10-27, waves 1–2)
+
+Eight parallel lanes, merged; all 30 `flash::deepseek` tests pass on mew (3090) with every
+switch at its default. Parity bar unchanged (teacher-forced KL ~1e-15 with `DS_EXACT=1`,
+~5e-15 with the fast kernels).
+
+- **Selection on the device** (`kernels_select.cu`): indexer masks, candidate blocks, radix
+  top-k (ties to the lowest index), per-expert routing CSR, window index rows. A decode step
+  reads nothing back but the logits.
+- **Fast kernels** (`kernels.cu`, `DS_EXACT=1` restores the bit-exact ones): tensor-core
+  K-split fp8/fp4 GEMVs (61–75% of 3090 bandwidth on the big dense shapes, 26–49% on the
+  small ones: launch-floor bound), fused w1/w3 + SwiGLU, tiled 64-head sparse attention
+  (10× the exact kernel). Relaxed bar: ≥99.5% bf16-identical, the rest 1 ulp.
+- **CUDA graphs** (`graph.rs`, `kernels_graph.cu`, `DS_GRAPH=0` disables): the whole decode
+  step and the 6-token verify window captured once per shape; positions come from a device
+  params buffer; persistent arena + pinned staging, no lifetime syncs. Prefill, DSpark's
+  Markov sampling, the expert LRU and the EP reduce stay outside.
+- **Speculative decoding with DSpark** (`decode_spec`, `forward_all`, `snapshot`/`rewind`):
+  verify windows at any position, exact rewind (incl. the ratio-2 compressors' partial
+  groups, via a journal), greedy and rejection sampling (`SpecPick`: same temperature/top-p
+  transform on target and draft; output distribution = plain sampling, checked by TV).
+  `serve` uses it at every temperature (`DS_SPEC=0` disables); `Usage` reports drafts,
+  accepted, decode steps.
+- **Expert parallelism** (`ep.rs`, `tang-moe/src/nccl.rs`, feature `ep`): experts sharded
+  by id across GPUs, NCCL all-reduce of the routed partial sum, one thread per device.
+  world=1 bit-exact; 2 ranks on one device KL 0.00. **NCCL itself has never run** (needs a
+  ≥2-GPU box).
+
+Measured ceiling (kernel lane, real shapes, 10.5 GB/token): at the measured ~52% bandwidth
+efficiency ≈ 240 forwards/s on H200, ≈ 400 on B300; with DSpark's 3–4 tokens a forward that
+is the 1000 tok/s class, once the launch floor and the all-reduce are hidden.
+
+Not yet: a real-weights run of any of this (only the naive engine has run on the H200);
+Engram rows still decode on the host; the max-width indexer launches at long context; the
+EP reduce inside the graph.
+
 ## M0 findings (2026-10-27)
 
 Read from the checkpoint's `config.json`, `model.safetensors.index.json`, shard headers (range

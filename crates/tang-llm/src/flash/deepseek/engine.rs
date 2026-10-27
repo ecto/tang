@@ -27,7 +27,7 @@
 //! parallel `moe_reduce` (a host callback: NCCL would have to be captured with it), a hook,
 //! `force` or `DS_TAP`; they run the same code directly.
 
-use super::forward::{argmax, Model, SpecStep};
+use super::forward::{argmax, Model, SpecPick, SpecStep};
 use super::gpu::{blocks, DevW, Kernels};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
@@ -1906,12 +1906,24 @@ impl GpuModel {
         self.attn_out(p, q, (all, win + bl, 0), idx, bl, nk, lid, at(pos0))
     }
 
-    /// As [`Model::forward_spec`]. Not captured: it runs directly, then samples on the host.
+    /// As [`Model::forward_spec`]: greedy drafts.
     pub fn forward_spec(
         &mut self,
         token: usize,
         main_hidden: &[f32],
         sp: usize,
+    ) -> Result<Option<super::forward::Draft>> {
+        self.forward_spec_with(token, main_hidden, sp, &mut argmax)
+    }
+
+    /// As [`Model::forward_spec_with`]: each draft is `draw(logits)` (Markov bias included).
+    /// Not captured: it runs directly, then samples on the host.
+    pub fn forward_spec_with(
+        &mut self,
+        token: usize,
+        main_hidden: &[f32],
+        sp: usize,
+        draw: &mut dyn FnMut(&[f32]) -> usize,
     ) -> Result<Option<super::forward::Draft>> {
         let c = self.cpu.cfg.clone();
         let (hc, d, blk, n_mtp, v) = (
@@ -1964,8 +1976,7 @@ impl GpuModel {
             for (a, bb) in li.iter_mut().zip(&bias) {
                 *a += bb;
             }
-            let best = (0..v).fold(0, |bb, j| if li[j] > li[bb] { j } else { bb });
-            out.push(best);
+            out.push(draw(li));
             let feat: Vec<f32> = xh[i * d..(i + 1) * d].iter().chain(memb).copied().collect();
             conf.push(super::forward::matmul(&feat, 1, &proj)[0]);
         }
@@ -2053,26 +2064,21 @@ impl GpuModel {
         main: &[f32],
         sp: usize,
         edit: &mut dyn FnMut(usize, &mut [usize]),
+        pick: &mut dyn SpecPick,
     ) -> Result<SpecStep> {
         let c = self.cpu.cfg.clone();
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
         let draft = self
-            .forward_spec(token, main, sp)?
+            .forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q))?
             .context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
         edit(pos0 + 1, &mut ids[1..]);
         let snap = self.snapshot()?;
         let (logits, mains) = self.forward_all(&ids, pos0)?;
         let n = ids.len();
-        let mut k = 0;
-        while k + 1 < n && argmax(&logits[k * v..(k + 1) * v]) == ids[k + 1] {
-            k += 1;
-        }
-        let next = argmax(&logits[k * v..(k + 1) * v]);
+        let (k, tokens) = super::forward::verify_rows(&logits, &draft.logits, &ids, v, pick);
         self.rewind(&snap, pos0 + k + 1, pos0 + n)?;
-        let mut tokens = ids[1..=k].to_vec();
-        tokens.push(next);
         Ok(SpecStep {
             tokens,
             drafted: n - 1,
@@ -2466,7 +2472,13 @@ mod tests {
             let (mut sp, mut drafted, mut accepted) = (n, 0, 0);
             while out.len() < len {
                 let s = m
-                    .decode_spec(*out.last().unwrap(), &main, sp, &mut *edit)
+                    .decode_spec(
+                        *out.last().unwrap(),
+                        &main,
+                        sp,
+                        &mut *edit,
+                        &mut super::super::forward::Greedy,
+                    )
                     .unwrap();
                 drafted += s.drafted;
                 accepted += s.accepted;

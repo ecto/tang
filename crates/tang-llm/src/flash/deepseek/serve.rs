@@ -84,7 +84,7 @@ impl DsServe {
 /// (as `Model::forward_spec_with`), and `GpuModel::decode_spec` a trailing
 /// `pick: &mut dyn SpecPick` used as `Model::decode_spec` does (`forward::verify_rows`); then
 /// flip this and call it below.
-const SPEC_SAMPLING: bool = false;
+const SPEC_SAMPLING: bool = true;
 
 impl Decoder for GpuModel {
     fn config(&self) -> &Config {
@@ -104,10 +104,9 @@ impl Decoder for GpuModel {
         token: usize,
         main: &[f32],
         sp: usize,
-        _pick: &mut dyn SpecPick,
+        pick: &mut dyn SpecPick,
     ) -> Result<SpecStep> {
-        // greedy only until ported: `self.decode_spec(token, main, sp, &mut |_, _| {}, pick)`
-        self.decode_spec(token, main, sp, &mut |_, _| {})
+        self.decode_spec(token, main, sp, &mut |_, _| {}, pick)
     }
 }
 
