@@ -4,6 +4,123 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 (late) — batched KDA decode: conv-slot offset fix, real-weights gate (H200, branch frog/glm5-batcher)
+
+Bug: a slot's conv history is `[chan][d_conv−1]` = conv_dim·(d_conv−1) floats (kda.rs
+`ConvState`, `DevKda::read_conv_at/seed_at`, `kda_step`'s `bi*KDA_CONV*(KDA_KC−1)`), but
+`kda_conv_commit_rows` offset by `SLOT[bi]*KDA_CONV` — slot s>0 committed into slot s/3's
+region. Same missing factor in the b>1 offsets of the prefill `kda_conv`/`kda_conv_commit`
+(single-row callers never saw it). All four kernels now agree.
+
+Verified: mew glm5 suite (TANG_REQUIRE_CUDA=1) 76 passed / 0 failed. H200 (bin md5 835cb84e,
+src md5 matched both sides), GEMV8 KDA_PF2 GPU_FFN=0:
+- `-n 8 --temp 0`: `785 1196 6801 264 6386 38038 911 279` = oracle.
+- TRACE `-n 32`: decode kda 12.76 ms/token wall (34 layers; forward baseline 13.05).
+  Single-slot decode does not take the batched path, so this is a no-regression number.
+- `--slots 8 --diverse -n 8` (KDA_MAXT=64): slot 0 = oracle 8/8, 7/7 other slots differ;
+  trace shows `kda_step` and `kda_conv_commit_rows` once per window (27 calls each),
+  i.e. the batched path ran. Per-step wall 21.9 s median (FFN on CPU dominates; was 20.5 s
+  with per-row KDA, within noise).
+
+## 2026-10-27 — GLM-5.3 server batcher: N sequence slots, one batched decode window (branch frog/glm5-batcher)
+
+What was built:
+- **Per-slot engine state.** `Glm5Engine` holds `n_slots` sequences: KDA conv + recurrent
+  state `[slots][...]` on the device (`DevKda` h0/st, one allocation, slot = pointer
+  offset; `decode_dev`/`prefill_dev`/`seed_at`/`read_back_at` take the slot) and per-slot
+  host copies; the DSA caches per slot (host mirrors `dsa[slot][layer]`, the device
+  caches as `MlaCuda` LRU entries keyed by slot, `set_slots` pre-creates them, `reset_seq`
+  drops one); per-slot tokens (slot 0 = `tokens`, the single-sequence path, unchanged);
+  `kda_dev_fresh[slot][layer]`. The residual streams and logits are per window (no state).
+  `use_gpu_slots(N)` sizes it (4 MiB + 288 KiB per KDA layer per slot: 32 slots = 4.5 GiB).
+- **`window_batch(rows)`**: ONE window over N decode rows, row i = one token of slot i.
+  Embedding, mHC (fused), norms, the KDA projections / gates / o_proj (`window_rows`), the
+  FFN (CPU MoE or the GPU `ffn_host` with T = N, naive or `TANG_GLM5_MOE=fast`) and the head
+  run once for all rows; only the KDA core (`core_rows`: the decode step on each row's slot
+  state, two launches per row) and the DSA attention (one row at a time on its slot's
+  caches) split. Needs `TANG_GLM5_KDA_PF2=1`. `TANG_GLM5_KDA_GRAPH` captures slot 0 only.
+- **Serve glue**: `max_slots()` = `TANG_GLM5_SLOTS` (default 8, or `--batch`), `decode_batch`
+  = `window_batch` (`TANG_GLM5_BATCH_RR=1`: one window per row), `save/restore_running_at`
+  carry the real KDA state (68 parts, read off the device) so a restore no longer replays
+  the prefix; the DSA caches (positional) rebuild on the suffix prefill. Fixed on the way:
+  the old glue's `verify`/`window` appended each token twice (the engine appends itself)
+  — the DSA `pos0` check would have failed on the first real request.
+- **CLI bench**: `flash-generate ... --slots N [--diverse] [--rr]`; `--diverse` changes one
+  prompt token in slots 1.. (distinct states and expert routing; slot 0 keeps the oracle
+  prompt, so its ids are the bleed check).
+
+The cost that hid the batcher: with `TANG_GLM5_GPU_FFN=0` the CPU MoE's `matvec` was the
+single-threaded scalar f64 reference — ~10 GMAC per token on one core, paid PER ROW, so
+per-step wall grew linearly with N whatever the GPU side did. Now parallel over output rows
+and over experts, with the weighted sums in the serial order: bit-exact (oracle unchanged).
+Same for the DSA host GEMVs (`gemv` was parallel over tokens = 1 thread per decode row),
+the host o_proj, and the attend wk/wv (2 × 25 MB copied per DSA row; now once per layer).
+N=1 decode: H200 22.0 → 11.3 s/token, mew 18.1 → 5.8.
+
+Correctness (prompt "Write a haiku about the sea.", greedy):
+- single slot, GEMV8 PF2 MHC_FUSED (+ GPU_HEAD MLA_RESIDENT on the final tree):
+  `785 1196 6801 264 6386 38038 911 279` = the CPU oracle, on the H200 (bins b7002a28,
+  c93795d3) and mew (3641b874; final tree 56a774fc with every flag).
+- batched, diverse: slot 0's ids = the oracle prefix in every run (8 and 32 slots; 2 of 7
+  and 16 of 31 other slots decode differently, so the states really differ).
+- tests: `engine_slots_batch_matches_separate` (CPU, two slots with different prompts:
+  batched = round-robin = lone engines ≤ 1e-4), `engine_gpu_slots_batch_matches_single`
+  (GPU, every FFN resident, naive and fast MoE). glm5 GPU suite on mew (TANG_REQUIRE_CUDA=1):
+  **76 passed, 0 failed** (56a774fc).
+
+Decode scaling, FINAL tree (every fast flag: GEMV8 KDA_PF2 MHC_FUSED GPU_HEAD
+MLA_RESIDENT; GPU_FFN=0 KDA_MAXT=64; diverse prompts; H200 bin 0862c49c, 3090 bin
+56a774fc; both build logs show `Compiling tang-llm`). Per-step wall = one token for every
+slot; N=1 is the plain decode (`decode: 7 tokens in …`):
+
+| box | N | per-step wall | ms/token/slot | aggregate tok/s | slot 0 ids |
+|---|---|---|---|---|---|
+| H200 | 1 | 11.4 s | 11 440 | 0.09 | oracle, 8/8 |
+| H200 | 8 | 20.5 s | 2 563 | 0.41 | oracle prefix |
+| H200 | 32 | 39.9 s | 1 248 | 0.74 | oracle prefix |
+| 3090 | 1 | 5.5 s | 5 520 | 0.18 | oracle, 8/8 |
+| 3090 | 8 | 14.3 s | 1 787 | 0.63 | oracle prefix |
+| 3090 | 32 | 27.4 s | 855 | 1.04 | oracle prefix |
+
+Window split at 32 rows (TANG_GLM5_TRACE, wall): H200 ffn (CPU MoE) 93.1%, DSA 4.7%, KDA
+1.4%, head 0.6%; 3090 ffn 89.4%, DSA 7.6%, KDA 2.1%, head 0.8%. MLA_RESIDENT took the DSA
+share from 9–15% (host q/o GEMVs) to 3–8%.
+
+Earlier points, same engine path without GPU_HEAD / MLA_RESIDENT (H200 b7002a28, 3090
+3641b874): H200 N=8 41.0 s, N=32 41.9 s (0.70 tok/s); 3090 N=8 15.1 s, N=32 30.1 s (0.96
+tok/s), N=8 round-robin (one window per slot) 43.7 s — the batched window is 2.9× it.
+Serial-MoE baseline: H200 N=8 same-prompt 86.0 s/step, 3090 N=8 diverse 75.5 s/step.
+
+The GPU-batched stages barely grow with N; in this config the step is the CPU MoE (the
+experts don't fit the H200's 141 GB). The number that matters needs every FFN on the GPU
+(B300 / 2×H200, `TANG_GLM5_MOE=fast`): `window_batch` already hands it T = N rows. The
+trace's GPU-ms column is unreliable here (negative / inflated event spans): wall only.
+
+What breaks at high N:
+- `TANG_GLM5_KDA_MAXT` (64 here) caps the rows of one window (KDA scratch, fused mHC):
+  N > max_t falls back to per-row KDA / no fused mHC. Raise it for 64+ slots.
+- The KDA core is two launches per row (`core_rows`): ~2·N·34 launches per step; a
+  slot-indexed single-launch step is the next step. DSA is fully per row (host q_a/q_b/
+  o_proj + one attend per row) — the largest non-FFN cost at 32 rows; a batched attend over
+  rows with different caches is the fix.
+- Memory: 145 MiB of KDA state per slot (4.5 GiB at 32) + the DSA caches (27.5 KiB/token
+  per slot with the indexer); the CPU MoE holds one dequantised expert (~100 MB) per
+  worker thread.
+- `TANG_GLM5_KDA_GRAPH=1` (captured decode step) serves slot 0 only — other slots refuse.
+
+Bugs found in frog/glm5-forward on the way (fixed here):
+- `k5_beta`'s warp kernel (368714ff) passed a u64 to `g5_deq(const unsigned char*)`:
+  NVRTC rejected the K5 source, so NO resident KDA layer could load (39d4100c).
+- its launch used `grid(t*nh/4)` — `grid` divides by 128 again — so 1/128 of beta was
+  computed and the rest of `bb` stayed stale: 158 top-1 flips GPU vs CPU (5a0baa26).
+- the gemv8 A/B test asserted the max abs against the rel bound it printed (6c254855).
+- non-cuda build: `GpuFfn` / `HeadDev` had lost their cuda cfg (merge fd0404c2).
+
+Ops: two copies of a run script once interleaved on one status file and target dir (the
+second launch while the first was mid-queue) — run scripts now take an instance lock
+(`flock -n` on a run lock). `pkill -f <pattern>` over ssh matches the ssh's own shell and
+other workers' jobs: kill by cwd/pid only.
+
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
 clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree

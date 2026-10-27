@@ -39,6 +39,17 @@ use tang_verify::{Layout, Probe, Spec, Tap, Taps, Verifier};
 /// The adapter's legacy switch (and knob prefix).
 pub const LEGACY: &str = "TANG_GLM5_KDA_DEBUG";
 
+/// Whether device code should poison/tap: `TANG_GLM5_KDA_DEBUG=1` and poison not
+/// explicitly off (the fused decode path's cheap per-call check; the harness's config
+/// reads the same knob).
+pub fn poison_on() -> bool {
+    let flag = |k: &str, default: bool| match std::env::var(k) {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => default,
+    };
+    std::env::var(LEGACY).is_ok_and(|v| v == "1") && flag("TANG_GLM5_KDA_DEBUG_POISON", true)
+}
+
 /// Tap names both paths fill (host layouts, shared): `qkv_pre`/`conv_out` `[t][3·di]`
 /// (q|k|v stacked per token), `g`/`o`/`g2`/`y_norm` `[t][di]`, `beta` `[t][nh]`, `out`
 /// `[t][hidden]`. A tap a path can't observe (the decode step fuses the conv) is left out
