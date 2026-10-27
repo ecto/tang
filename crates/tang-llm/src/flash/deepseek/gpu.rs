@@ -109,6 +109,12 @@ pub struct Kernels {
     /// counters (left at zero by the last block). One launch at a time per `Kernels`.
     ks_part: DevBuf,
     ks_cnt: DevBuf,
+    /// The quantized activation for the K-split GEMV: e4m3 codes [t][K], then scales.
+    ks_x: DevBuf,
+    ks_quant: Func,
+    /// SM count and the opt-in dynamic shared memory limit per block.
+    sms: usize,
+    smem_max: usize,
     /// `DS_EXACT=1`: the bit-exact kernels (`ds_lin_*`, `ds_sparse_attn`) instead of the
     /// K-split GEMV and the tiled attention.
     pub exact: bool,
@@ -152,12 +158,11 @@ const MORE: &[&str] = &[
 /// [t][h]. Larger problems fall back to `ds_sparse_attn`.
 const ATTN_SCRATCH: usize = 6 << 20;
 
-/// Dynamic shared memory per K-split block: f16 activation codes and group scales.
-const KS_SMEM: usize = 40960;
-
 /// Floats of cross-block K-split partials, and row-group counters.
 const KS_PART: usize = 1 << 21;
 const KS_CNT: usize = 1 << 13;
+/// Bytes for the quantized activation: 8 tokens × 16384 columns, codes and scales.
+const KS_X: usize = 8 * 16384 * 2;
 
 /// `__CUDA_ARCH__` the module was built for.
 fn arch(m: &Module) -> Result<i32> {
@@ -168,9 +173,6 @@ fn arch(m: &Module) -> Result<i32> {
     s.sync()?;
     Ok(out.read::<i32>(0, 1)?[0])
 }
-
-/// SMs to fill when choosing the K split (82 on the 3090; more is harmless).
-const KS_SMS: usize = 82;
 
 fn lin_table(m: &Module, pre: &str) -> Result<[[[Func; 2]; 4]; 2]> {
     let mut a = [[[std::ptr::null_mut(); 2]; 4]; 2];
@@ -187,8 +189,8 @@ fn lin_table(m: &Module, pre: &str) -> Result<[[[Func; 2]; 4]; 2]> {
 /// The K split for `tiles` 16-row warp tiles with `groups` 32-column groups: S slices within a
 /// block of 8 warps (RW = 8 / S tiles a block) and SB blocks along K, aiming at ≥ 2 blocks of 8
 /// warps per SM while keeping ≥ 4 groups a warp. Returns (S, row-group blocks, SB).
-fn ks_split(tiles: usize, groups: usize) -> (usize, usize, usize) {
-    let target = 2 * KS_SMS;
+fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
+    let target = 6 * sms;
     let mut sp = 1;
     while sp < 8 && tiles.div_ceil(8 / sp) < target && groups >= sp * 2 * 4 {
         sp *= 2;
@@ -228,6 +230,27 @@ impl Kernels {
             scratch: DevBuf::alloc(ATTN_SCRATCH * 4)?,
             ks_part: DevBuf::alloc(KS_PART * 4)?,
             ks_cnt: DevBuf::from_slice(&vec![0i32; KS_CNT])?,
+            ks_x: DevBuf::alloc(KS_X)?,
+            ks_quant: m.func("ds_ks_quant")?,
+            sms: g.attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )? as usize,
+            smem_max: {
+                let mx = g.attribute(
+                    cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                )?;
+                for n in ["ds_ks_f2_g0", "ds_ks_f2_g1", "ds_ks_f3_g0", "ds_ks_f3_g1"] {
+                    let r = unsafe {
+                        cudarc::driver::sys::cuFuncSetAttribute(
+                            m.func(n)?,
+                            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            mx - 4352, // static: red + last
+                        )
+                    };
+                    gpu::check(r, "cuFuncSetAttribute")?;
+                }
+                (mx - 4352) as usize
+            },
             // the mma path needs sm_80 (an arch-less NVRTC build may target less)
             exact: std::env::var("DS_EXACT").is_ok_and(|v| v == "1") || arch(&m)? < 800,
             more: MORE
@@ -443,6 +466,24 @@ impl Kernels {
         if !self.exact {
             return self.linear_ks(s, w, w3, x, y, t, round, qdq, rw, lim);
         }
+        self.linear_exact(s, w, w3, x, y, t, round, qdq, rw, lim)
+    }
+
+    /// The bit-exact `ds_lin_*` kernels behind [`Kernels::linear_fast`] under `DS_EXACT=1`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_exact(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        w3: Option<&DsW>,
+        x: u64,
+        y: u64,
+        t: usize,
+        round: bool,
+        qdq: bool,
+        rw: u64,
+        lim: f32,
+    ) -> Result<()> {
         let (rows, cols) = (w.rows as usize, w.cols as usize);
         let gu = w3.is_some() as usize;
         let per_warp = if gu == 1 { 2 } else { 4 };
@@ -507,36 +548,64 @@ impl Kernels {
         let (rows, cols) = (w.rows as usize, w.cols as usize);
         let gu = w3.is_some() as usize;
         let out = if gu == 1 { 8 } else { 16 };
+        let pitch = cols.div_ceil(128) * 128 + 32;
+        let nch = cols / 32;
+        if 8 * pitch + 8 * nch * 4 > self.smem_max || cols > 16384 {
+            // too wide to stage: the exact kernels
+            return self.linear_exact(s, w, w3, x, y, t, round, qdq, rw, lim);
+        }
         let r = round as i32;
-        let _ = qdq; // the staging quantizes either way (idempotent on a quantized activation)
+        let _ = qdq; // quantized either way (idempotent on a quantized activation)
         let f = self.ks[w.fmt as usize - 2][gu];
+        let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
         let mut t0 = 0;
         while t0 < t {
             let n = (t - t0).min(8);
-            // f16 codes [n][kc + 32] + scales [n][kc / 32], kc a multiple of 64
-            let kc = ((KS_SMEM / n - 64) * 8 / 17 / 64 * 64).min(cols.div_ceil(64) * 64);
-            let smem = n * (kc + 32) * 2 + n * (kc / 32) * 4;
-            let (sp, br, mut sb) = ks_split(rows.div_ceil(out), cols / 32);
+            let ng = (n * nch) as i32;
+            let xo = x + (t0 * cols * 4) as u64;
+            unsafe {
+                gpu::launch(
+                    self.ks_quant,
+                    blocks(n * nch * 32, 256),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![xo, codes, scales, ng],
+                )?
+            }
+            let smem = n * pitch + n * nch * 4;
+            let (sp, br, mut sb) = ks_split(rows.div_ceil(out), nch, self.sms);
             if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
                 sb = 1;
             }
+            let mut per_sm = 0i32;
+            unsafe {
+                gpu::check(
+                    cudarc::driver::sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                        &mut per_sm,
+                        f,
+                        256,
+                        smem,
+                    ),
+                    "occupancy",
+                )?
+            };
+            let grid = (br * sb).min(self.sms * per_sm.max(1) as usize);
             let (wv, w3v) = (*w, *w3.unwrap_or(w));
-            let (xo, yo, ni) = (
-                x + (t0 * cols * 4) as u64,
-                y + (t0 * rows * 4) as u64,
-                n as i32,
-            );
+            let (yo, ni) = (y + (t0 * rows * 4) as u64, n as i32);
             let rwo = if rw == 0 { 0 } else { rw + (t0 * 4) as u64 };
-            let (si, kci) = (sp as i32, kc as i32);
+            let (si, sbi, bri) = (sp as i32, sb as i32, br as i32);
             let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
             unsafe {
                 gpu::launch(
                     f,
-                    (br as u32, sb as u32, 1),
+                    (grid as u32, 1, 1),
                     (256, 1, 1),
                     smem as u32,
                     s,
-                    tang_moe::args![wv, w3v, xo, yo, ni, r, rwo, lim, si, kci, part, cnt],
+                    tang_moe::args![
+                        wv, w3v, codes, scales, yo, ni, r, rwo, lim, si, sbi, bri, part, cnt
+                    ],
                 )?
             }
             t0 += n;
@@ -549,8 +618,8 @@ impl Kernels {
         unsafe {
             gpu::launch(
                 self.fp8_qdq,
-                blocks(n / 32, 128),
-                (128, 1, 1),
+                blocks(n, 256),
+                (256, 1, 1),
                 0,
                 s,
                 tang_moe::args![v, g],
@@ -587,7 +656,7 @@ impl Kernels {
             gpu::launch(
                 self.rms,
                 (rows as u32, 1, 1),
-                (256, 1, 1),
+                (1024, 1, 1),
                 0,
                 s,
                 tang_moe::args![x, wv, n, eps],
@@ -654,7 +723,7 @@ impl Kernels {
     ) -> Result<()> {
         let (hi, di, ki) = (h as i32, d as i32, k as i32);
         let need = t * h * k * (d / 64 + 1) + t * h;
-        if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 1024 && need <= ATTN_SCRATCH {
+        if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 960 && need <= ATTN_SCRATCH {
             let part = self.scratch.ptr;
             let pr = part + (t * h * k * (d / 64) * 4) as u64;
             let den = pr + (t * h * k * 4) as u64;
@@ -680,7 +749,7 @@ impl Kernels {
                     self.attn_pv,
                     ((t * (h / 8) * (d / 64)) as u32, 1, 1),
                     (256, 1, 1),
-                    (8 * k * 4) as u32,
+                    (9 * k * 4) as u32,
                     s,
                     tang_moe::args![pr, den, kv, idxs, o, hi, di, ki],
                 )?;
@@ -1199,6 +1268,8 @@ mod tests {
             };
             (w, sc, v, wb.len() + sb.len())
         };
+        // Host-timed loop of 50 calls: includes launch overhead (~2 µs a launch here, see the
+        // rope row), which a CUDA graph mostly removes.
         let time = |f: &dyn Fn()| -> f64 {
             f();
             s.sync().unwrap();
@@ -1213,6 +1284,27 @@ mod tests {
         // Weights cycle through copies totalling > 4× L2 (6 MB on the 3090), so every launch
         // reads DRAM. Bytes = weights + scales.
         let copies = |bytes: usize| (24usize << 20).div_ceil(bytes).max(1);
+        {
+            // calibration: what a plain copy reaches here (read + write bytes)
+            let n = 32usize << 20;
+            let (a, b) = (DevBuf::alloc(n * 4).unwrap(), DevBuf::alloc(n * 4).unwrap());
+            let nn = n as i64;
+            let tc = time(&|| unsafe {
+                k.go(
+                    "ds_copy",
+                    blocks(n, 256),
+                    (256, 1, 1),
+                    0,
+                    &s,
+                    tang_moe::args![b.ptr, a.ptr, nn],
+                )
+                .unwrap()
+            });
+            eprintln!(
+                "calibration: ds_copy 128 MB -> {:.0} GB/s",
+                2.0 * (n * 4) as f64 / tc / 1e9
+            );
+        }
         let kinds: &[(&str, i32, usize, usize, bool)] = &[
             ("wq_a", 2, 1280, 5120, false),
             ("wq_b", 2, 32768, 1280, false),
@@ -1441,7 +1533,7 @@ mod tests {
         let mut k = Kernels::new(&g).unwrap();
         let s = Stream::blocking().unwrap();
         let (h, d) = (64, 512);
-        for (t, kk) in [(1, 640), (6, 640), (5, 100), (2, 1024)] {
+        for (t, kk) in [(1, 640), (6, 640), (5, 100), (2, 960)] {
             let [q, kv, sink, ix] = attn_case(t, kk);
             let o = DevBuf::alloc(t * h * d * 4).unwrap();
             let run = |k: &Kernels| {
