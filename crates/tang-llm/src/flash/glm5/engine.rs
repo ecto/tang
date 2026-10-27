@@ -455,6 +455,9 @@ pub struct Glm5Engine {
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
+    /// CPU DSA path: round the latent cache to bf16 (the GPU cache's format), so a CPU
+    /// engine is the like-for-like oracle of the GPU MLA path (tests).
+    pub(crate) bf16_latents: bool,
     /// W0's R3 bisector: per-layer dump sink, no-op without TANG_DUMP_DIR (dump.rs).
     pub dump: Option<super::dump::DumpSink>,
     /// The FFNs on the GPU, when a CUDA build finds one ([`Glm5Engine::use_gpu`]).
@@ -467,6 +470,9 @@ pub struct Glm5Engine {
     /// `TANG_GLM5_MOE_DEBUG=1`: the CPU shadow of every GPU FFN call ([`super::moe_debug`]).
     #[cfg(feature = "cuda")]
     moe_dbg: Option<super::moe_debug::Shadow>,
+    /// `TANG_GLM5_MLA_DEBUG=1`: the CPU shadow of every GPU DSA window ([`super::mla_debug`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) mla_dbg: Option<super::mla_debug::Shadow>,
 }
 
 impl Glm5Engine {
@@ -483,6 +489,7 @@ impl Glm5Engine {
             mla_w: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
+            bf16_latents: false,
             dump: super::dump::DumpSink::open(),
             #[cfg(feature = "cuda")]
             gpu: None,
@@ -490,6 +497,8 @@ impl Glm5Engine {
             kda_dbg: super::kda_debug::Shadow::from_env(nl),
             #[cfg(feature = "cuda")]
             moe_dbg: super::moe_debug::Shadow::from_env(nl),
+            #[cfg(feature = "cuda")]
+            mla_dbg: super::mla_debug::Shadow::from_env(),
         })
     }
 
@@ -661,7 +670,8 @@ impl Glm5Engine {
             let d = g.dev_of[l];
             if let Some(cu) = &g.mla_k[l] {
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[l]);
+                let dbg = self.mla_dbg.as_mut().filter(|d| d.wants(l));
+                return dsa_gpu(l, w, cu, x, t, pos0, &mut self.dsa[l], dbg);
             }
         }
         self.dsa_cpu(l, w, x, t, pos0)
@@ -683,7 +693,11 @@ impl Glm5Engine {
                 let latent = w.gemv_kv_a(x, t);
                 let idx_dim = hp.idx_dim;
                 let cache = &mut self.dsa[l];
-                cache.latent.extend_from_slice(&latent);
+                if self.bf16_latents {
+                    cache.latent.extend(latent.iter().map(|&v| super::mla::bf16_round(v)));
+                } else {
+                    cache.latent.extend_from_slice(&latent);
+                }
                 for i in 0..t {
                     let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
                     super::mla::indexer_key(w, &x[i * n..(i + 1) * n], &mut k, &mut g);
@@ -1173,13 +1187,16 @@ fn kda_gpu(
 /// Order follows W3's parity test: kv_append → idx_append → (sparse) idx_pool + idx_run →
 /// attend.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn dsa_gpu(
+    l: usize,
     w: &MlaWeights,
     cu: &super::mla::cuda::MlaCuda,
     x: &[f32],
     t: usize,
     pos0: usize,
     c: &mut DsaCache,
+    dbg: Option<&mut super::mla_debug::Shadow>,
 ) -> Result<Vec<f32>> {
     let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla cuda: {e}");
     let s = tang_moe::gpu::Stream::blocking().map_err(gerr)?;
@@ -1188,6 +1205,9 @@ fn dsa_gpu(
     ensure!(x.len() == t * n, "layer input");
     ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
     let q_resid = w.gemv_q_a(x, t);
+    if dbg.as_ref().is_some_and(|d| d.poison()) {
+        cu.debug_poison(pos0, t).map_err(gerr)?;
+    }
     // caches grow by t rows; the launchers write rows [pos0, kv_len)
     c.lat16.resize(kv_len * dl, 0);
     cu.kv_append(&w.kv_a, &w.kv_a_norm, x, t, pos0, &mut c.lat16, &s)
@@ -1209,6 +1229,7 @@ fn dsa_gpu(
         &s,
     )
     .map_err(gerr)?;
+    let mut pool_dbg = None;
     let sel = if super::mla::indexer_is_dense(kv_len, w.topk) {
         None
     } else {
@@ -1216,6 +1237,9 @@ fn dsa_gpu(
         let mut pool_keys = vec![0f32; n_pool * idd];
         cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, &s)
             .map_err(gerr)?;
+        if dbg.is_some() {
+            pool_dbg = Some(pool_keys.clone());
+        }
         let mut sel = vec![-1i32; t * w.select_width()];
         cu.idx_run(
             &w.i_wq_b,
@@ -1251,6 +1275,32 @@ fn dsa_gpu(
                 &out_v[i * hv..(i + 1) * hv],
             );
         }
+    }
+    if let Some(d) = dbg {
+        let (lat_dev, idk_dev, idg_dev, val_dev) = cu.debug_rows(0, kv_len).map_err(gerr)?;
+        d.check(
+            l,
+            w,
+            &super::mla_debug::GpuWindow {
+                x,
+                q_resid: &q_resid,
+                t,
+                pos0,
+                lat_dev,
+                idk_dev,
+                idg_dev,
+                val_dev,
+                lat_mirror: &c.lat16,
+                idk_mirror: &c.idx_k,
+                idg_mirror: &c.idx_g,
+                val_mirror: &c.valid,
+                pool: pool_dbg,
+                sel: sel.clone(),
+                out: &out,
+                q_resid_dev: false,
+                q_dev: None,
+            },
+        );
     }
     Ok(out)
 }
@@ -1778,28 +1828,61 @@ mod tests {
                 .all(|(k, &kda)| k.is_some() != kda),
             "MLA kernels: one per DSA layer, none on KDA layers"
         );
+        // the in-process shadow on every DSA window: device rows, pools, selection and
+        // attention vs the CPU reference on the SAME inputs. This is the layer-local
+        // statement (bf16 latents included); the end-to-end bars below are the sum.
+        gpu.mla_dbg = Some(super::super::mla_debug::Shadow::always());
+        // the like-for-like oracle: the CPU engine with the GPU cache's bf16 latents. The
+        // f32 CPU engine differs from BOTH by the latent format alone (bf16 is W3's cache
+        // design, ~4e-3 relative per latent), and on this random-weight fixture that moves
+        // the logits by O(10) — measured below as cpu-bf16 vs cpu-f32, not a GPU error.
+        let mut cpu16 = Glm5Engine::open(Path::new(TINY)).unwrap();
+        cpu16.bf16_latents = true;
         let nv = cpu.m.hp.n_vocab;
-        let (mut worst, mut agree, mut total) = (0f32, 0usize, 0usize);
+        let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let flips = |a: &[f32], b: &[f32], n: usize| {
+            (0..n).filter(|&p| argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])).count()
+        };
+        let (mut w_gpu16, mut w_gpu32, mut w_fmt, mut scale) = (0f32, 0f32, 0f32, 0f32);
+        let (mut f_gpu16, mut f_gpu32, mut f_fmt, mut total) = (0usize, 0usize, 0usize, 0usize);
         // dense (≤ top-k) then sparse windows, then decode steps
         for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
             let a = cpu.window(w).unwrap();
+            let a16 = cpu16.window(w).unwrap();
             let b = gpu.window(w).unwrap();
-            for p in 0..w.len() {
-                total += 1;
-                if argmax(&a[p * nv..(p + 1) * nv]) == argmax(&b[p * nv..(p + 1) * nv]) {
-                    agree += 1;
-                }
-            }
-            for (x, y) in a.iter().zip(&b) {
-                worst = worst.max((x - y).abs());
-            }
+            total += w.len();
+            (f_gpu16, f_gpu32, f_fmt) = (
+                f_gpu16 + flips(&a16, &b, w.len()),
+                f_gpu32 + flips(&a, &b, w.len()),
+                f_fmt + flips(&a, &a16, w.len()),
+            );
+            w_gpu16 = w_gpu16.max(maxd(&a16, &b));
+            w_gpu32 = w_gpu32.max(maxd(&a, &b));
+            w_fmt = w_fmt.max(maxd(&a, &a16));
+            scale = a.iter().fold(scale, |m, x| m.max(x.abs()));
         }
         eprintln!(
-            "GPU (FFN + KDA + mHC + MLA bf16) vs CPU: top-1 {agree}/{total}, logits max abs {worst:.3e}"
+            "GPU (FFN + KDA + mHC + MLA bf16) vs CPU-bf16-latents: {f_gpu16} top-1 flips / {total}, logits max abs {w_gpu16:.3e}"
         );
-        assert!(agree as f32 >= 0.98 * total as f32, "top-1 {agree}/{total}");
-        assert!(worst <= 0.25, "logits max abs {worst}");
+        eprintln!(
+            "  vs CPU-f32: {f_gpu32} flips, max abs {w_gpu32:.3e}; the format alone (CPU-bf16 vs CPU-f32): \
+             {f_fmt} flips, max abs {w_fmt:.3e}; logit scale max |logit| {scale:.3e}"
+        );
+        let (checked, failed, sel) = gpu.mla_dbg.as_ref().unwrap().totals();
+        eprintln!(
+            "MLA shadow: {checked} windows, {failed} failed; selection {}/{} queries differ ({} near ties, {} real)",
+            sel.differ, sel.queries, sel.ties, sel.real
+        );
+        assert!(checked == 5 && failed == 0, "MLA shadow: {failed}/{checked} windows failed");
+        // the GPU path IS the bf16-latent model: tight against its CPU twin
+        assert_eq!(f_gpu16, 0, "top-1 flips vs the CPU-bf16 engine");
+        assert!(w_gpu16 <= 1e-2, "logits max abs vs the CPU-bf16 engine {w_gpu16}");
+        // and the f32 gap is the format's: no larger than the CPU's own bf16-vs-f32 gap
+        // (+ the f32-path noise of engine_gpu_matches_cpu, 1e-3)
+        assert!(w_gpu32 <= 1.25 * w_fmt + 1e-3, "GPU vs CPU-f32 {w_gpu32} exceeds the format gap {w_fmt}");
+        assert!(f_gpu32 as f32 <= 0.02 * total as f32, "top-1 vs CPU-f32 {f_gpu32}/{total}");
     }
+
 
     /// reset() gives a fresh sequence.
     #[test]

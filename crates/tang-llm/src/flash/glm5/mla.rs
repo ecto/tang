@@ -152,6 +152,13 @@ pub struct MlaWeights {
     pub i_ape: Vec<f32>,
 }
 
+/// `x` rounded to bf16 (round-to-nearest-even, the CUDA `f2bf`) and back: the GPU latent
+/// cache's precision, for CPU references that should match it.
+pub fn bf16_round(x: f32) -> f32 {
+    let b = x.to_bits();
+    f32::from_bits((b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) << 16)
+}
+
 /// Max output width of [`indexer_select`].
 pub const SELECT_MAX_EXTRA: usize = 3;
 
@@ -1085,9 +1092,15 @@ extern "C" __global__ void idx_pool_keys(
     const float* __restrict__ cache_k, const float* __restrict__ cache_gate,
     const float* __restrict__ ape, const unsigned char* __restrict__ valid,
     float* __restrict__ pk_out,
-    int kvlen, int first_key, int npool, int hd, int kp)
+    int kvlen, int first_key, int npool, int hd, int kp, int from)
 {
-    const int p = blockIdx.x;
+    // p is the GLOBAL pool id: the incremental launch (pools [from, npool)) starts the
+    // grid at `from`; the cache rows it reads (first_key + p*kp) and the slot it writes
+    // (pk_out + p*hd, pk_out = the pool buffer's BASE) both use it. (Was
+    // `p = blockIdx.x` with pk_out pre-offset by `from`: every incremental launch
+    // computed pools [0, n-from)'s content and stored it at slots [from, n) — the
+    // engine shadow's w3/w4 `pool` BAD at slot 37+, wrong selection, attention off.)
+    const int p = blockIdx.x + from;
     if (p >= npool) return;
     const int base = first_key + p * kp;
     // each thread owns a dim; softmax over kp slots per dim
@@ -1194,6 +1207,7 @@ extern "C" __global__ void idx_select(
     }
     for (; wi < width; wi++) out[wi] = -1;
 }
+
 "#;
 
 /// The `#define` prelude for [`CUDA_SRC`] at this geometry.
@@ -1225,6 +1239,14 @@ pub fn cuda_prelude(hidden: usize, q_lora: usize, kv_lora: usize, n_head: usize)
 pub mod cuda {
     use super::*;
     use tang_moe::gpu::{self, DevBuf, Gpu, Module, Stream};
+
+    /// Every launcher stages its inputs with the synchronous `DevBuf::write`/`from_slice`
+    /// (legacy default stream), so the stream it launches on must order against that:
+    /// on a `NON_BLOCKING` stream ([`Stream::new`]) a kernel can read a buffer before its
+    /// upload lands (the stream-blocking.md race). The resident-flow test was the last
+    /// MlaCuda caller on `Stream::new()`; every launcher now asserts it.
+    const NON_BLOCKING_STREAM: &str =
+        "MlaCuda needs a stream that orders against the legacy default stream: use Stream::blocking(), not Stream::new()";
 
     /// Loaded kernels for one geometry (feature "cuda"; NVRTC at construction).
     pub struct MlaCuda {
@@ -1559,6 +1581,7 @@ pub mod cuda {
             cache: &mut [u16], // [cap][dl] (host mirror; rows [0..pos0) may be stale here)
             stream: &Stream,
         ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
             assert_eq!(x.len(), t * self.hid);
             assert_eq!(kv_a.len(), self.dl * self.hid);
             self.ensure_lat(pos0 + t)?;
@@ -1616,7 +1639,11 @@ pub mod cuda {
             let rows: Vec<u16> = {
                 let lru = self.seqs.borrow();
                 let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-                lru.entries[i].lat_d.as_ref().unwrap().read(pos0 * self.dl, t * self.dl)?
+                // DevBuf offsets are BYTES: row pos0 of a bf16 cache is at pos0 * dl * 2.
+                // (Was `pos0 * dl`, an element count: every decode / later-window row's
+                // mirror held row pos0/2's bytes, and any re-upload from the mirror — a
+                // cache realloc, a sequence switch-back after eviction — served them.)
+                lru.entries[i].lat_d.as_ref().unwrap().read(pos0 * self.dl * 2, t * self.dl)?
             };
             cache[pos0 * self.dl..(pos0 + t) * self.dl].copy_from_slice(&rows);
             {
@@ -1641,6 +1668,7 @@ pub mod cuda {
         pool_keys: &mut [f32],
         stream: &Stream,
     ) -> Result<(), gpu::Error> {
+        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
         let hd = self.idxd;
         let kp = self.kpool;
         assert_eq!(i_ape.len(), kp * hd);
@@ -1719,12 +1747,14 @@ pub mod cuda {
             let pd_ptr = {
                 let lru = self.seqs.borrow();
                 let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-                lru.entries[i].pool_d.as_ref().unwrap().ptr + (from * hd * 4) as u64
+                // the BASE: the kernel indexes slots by the global pool id
+                lru.entries[i].pool_d.as_ref().unwrap().ptr
             };
             let f = self.m.func("idx_pool_keys")?;
             let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
             let mut hd_ = hd as i32;
             let mut kp_ = kp as i32;
+            let mut from_ = from as i32;
             unsafe {
                 gpu::launch(
                     f,
@@ -1732,7 +1762,7 @@ pub mod cuda {
                     (256, 1, 1),
                     0,
                     stream,
-                    tang_moe::args![ck_ptr, cg_ptr, apd, vd_ptr, pd_ptr, kvlen, fk, npl, hd_, kp_],
+                    tang_moe::args![ck_ptr, cg_ptr, apd, vd_ptr, pd_ptr, kvlen, fk, npl, hd_, kp_, from_],
                 )?
             };
             let mut lru = self.seqs.borrow_mut();
@@ -1767,6 +1797,7 @@ pub mod cuda {
         valid: &mut [u8],
         stream: &Stream,
     ) -> Result<(), gpu::Error> {
+        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
         let hd = self.idxd;
         assert_eq!(x.len(), t * self.hid);
         assert_eq!(i_wk.len(), hd * self.hid);
@@ -1853,8 +1884,9 @@ pub mod cuda {
             let lru = self.seqs.borrow();
             let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
             (
-                lru.entries[i].idk_d.as_ref().unwrap().read(pos0 * hd, t * hd)?,
-                lru.entries[i].idg_d.as_ref().unwrap().read(pos0 * hd, t * hd)?,
+                // byte offsets (f32 rows): was `pos0 * hd`, row pos0/4's bytes
+                lru.entries[i].idk_d.as_ref().unwrap().read(pos0 * hd * 4, t * hd)?,
+                lru.entries[i].idg_d.as_ref().unwrap().read(pos0 * hd * 4, t * hd)?,
                 lru.entries[i].val_d.as_ref().unwrap().read(pos0, t)?,
             )
         };
@@ -1890,6 +1922,7 @@ pub mod cuda {
         sel: &mut [i32],
         stream: &Stream,
     ) -> Result<(), gpu::Error> {
+        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
         let (nh, hd) = (self.idxh, self.idxd);
         assert_eq!(pool_keys.len(), n_pool * hd);
         // iq = wq_b · q_resid, hw = proj · x (host GEMVs — small, [t][nh*hd])
@@ -1917,15 +1950,16 @@ pub mod cuda {
         self.ensure_scratch(t)?;
         // persistent scratch: iq/hw staged (t rows, small); sel out reused
         {
-            let mut q = self.iq_d.borrow_mut();
+            let q = self.iq_d.borrow_mut();
             q.write(0, &iq)?;
         }
         {
-            let mut h = self.hw_d.borrow_mut();
+            let h = self.hw_d.borrow_mut();
             h.write(0, &hw)?;
         }
         let iqd_ptr = self.iq_d.borrow().ptr;
         let hwd_ptr = self.hw_d.borrow().ptr;
+
         // pool keys: always the RESIDENT pool_d. Every caller builds its slice from the
         // immediately preceding idx_pool host copy (engine and tests both do), so pool_d
         // holds exactly these values — reading it skips the 256 KB re-upload per window.
@@ -2022,6 +2056,7 @@ pub mod cuda {
             out_v: &mut [f32], // [t][nh*dv]
             stream: &Stream,
         ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
             assert_eq!(wk.len(), self.nh * self.dl * self.dk);
             assert_eq!(wv.len(), self.nh * self.dv * self.dl);
             assert_eq!(out_v.len(), t * self.nh * self.dv);
@@ -2052,19 +2087,15 @@ pub mod cuda {
                     self.ensure_lat(n_kv)?;
                     let mut lru = self.seqs.borrow_mut();
                     let i = lru.active_idx();
-                    let (ptr, n) = {
-                        let e = lru.entries[i].lat_d.as_ref().unwrap();
-                        (e.ptr, e.len)
-                    };
-                    {
-                        let e = lru.entries[i].lat_d.as_ref().unwrap();
-                        // write through a raw pointer: `e` borrows `lru` immutably and
-                        // `lat_rows` needs a mutable borrow of the same entry, so the
-                        // DevBuf::write goes through the ptr (the buffer is exclusive
-                        // to this sequence's entry by construction).
-                        let db = DevBuf { ptr, len: n };
-                        db.write(0, lat)?;
-                    }
+                    // write through the entry's own buffer. (Was a second `DevBuf { ptr,
+                    // len }` aliasing it "for the borrow checker": DevBuf frees on drop, so
+                    // every upload FREED the sequence's latent cache, the very next
+                    // from_slice (q, sel) was handed the same memory and the kernel read
+                    // q/sel bytes as latents — the resident-flow test's 1.148e-1 — then
+                    // kv_append wrote into freed memory and teardown double-freed it.)
+                    let e = lru.entries[i].lat_d.as_ref().unwrap();
+                    e.write(0, lat)?;
+                    let ptr = e.ptr;
                     lru.entries[i].lat_rows = n_kv;
                     ptr
                 }
@@ -2117,6 +2148,7 @@ pub mod cuda {
             out_v: &mut [f32], // [t][nh*dv]
             stream: &Stream,
         ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
             assert_eq!(wk.len(), self.nh * self.dl * self.dk);
             assert_eq!(wv.len(), self.nh * self.dv * self.dl);
             assert_eq!(out_v.len(), t * self.nh * self.dv);
@@ -2139,19 +2171,15 @@ pub mod cuda {
                     self.ensure_lat(n_kv)?;
                     let mut lru = self.seqs.borrow_mut();
                     let i = lru.active_idx();
-                    let (ptr, n) = {
-                        let e = lru.entries[i].lat_d.as_ref().unwrap();
-                        (e.ptr, e.len)
-                    };
-                    {
-                        let e = lru.entries[i].lat_d.as_ref().unwrap();
-                        // write through a raw pointer: `e` borrows `lru` immutably and
-                        // `lat_rows` needs a mutable borrow of the same entry, so the
-                        // DevBuf::write goes through the ptr (the buffer is exclusive
-                        // to this sequence's entry by construction).
-                        let db = DevBuf { ptr, len: n };
-                        db.write(0, lat)?;
-                    }
+                    // write through the entry's own buffer. (Was a second `DevBuf { ptr,
+                    // len }` aliasing it "for the borrow checker": DevBuf frees on drop, so
+                    // every upload FREED the sequence's latent cache, the very next
+                    // from_slice (q, sel) was handed the same memory and the kernel read
+                    // q/sel bytes as latents — the resident-flow test's 1.148e-1 — then
+                    // kv_append wrote into freed memory and teardown double-freed it.)
+                    let e = lru.entries[i].lat_d.as_ref().unwrap();
+                    e.write(0, lat)?;
+                    let ptr = e.ptr;
                     lru.entries[i].lat_rows = n_kv;
                     ptr
                 }
@@ -2205,7 +2233,56 @@ pub mod cuda {
             Ok(())
         }
 
+        /// Shadow-check access (`mla_debug`): the ACTIVE sequence's resident rows
+        /// `[from, from + n)` read straight off the device — latent (bf16 bits), indexer
+        /// k and gate, valid. Not the host mirrors: comparing the two is how a wrong
+        /// read-back offset shows up.
+        #[allow(clippy::type_complexity)]
+        pub fn debug_rows(
+            &self,
+            from: usize,
+            n: usize,
+        ) -> Result<(Vec<u16>, Vec<f32>, Vec<f32>, Vec<u8>), gpu::Error> {
+            let lru = self.seqs.borrow();
+            let e = lru.entries.iter().find(|e| e.id == lru.active).unwrap();
+            let (dl, hd) = (self.dl, self.idxd);
+            fn get(b: &Option<DevBuf>) -> Result<&DevBuf, gpu::Error> {
+                b.as_ref().ok_or_else(|| gpu::Error("debug_rows: not allocated".into()))
+            }
+            Ok((
+                get(&e.lat_d)?.read::<u16>(from * dl * 2, n * dl)?,
+                get(&e.idk_d)?.read::<f32>(from * hd * 4, n * hd)?,
+                get(&e.idg_d)?.read::<f32>(from * hd * 4, n * hd)?,
+                get(&e.val_d)?.read::<u8>(from, n)?,
+            ))
+        }
 
+        /// Shadow-check poison: NaN into the resident rows `[pos0, pos0 + t)` this window's
+        /// appends must write (when the buffers already hold them; a realloc'd buffer is
+        /// fresh anyway) and into the attend / select output scratch, so a row or slot no
+        /// kernel writes reads NaN (the select scratch gets the NaN bit pattern as an i32,
+        /// 2143289344 — an index no cache has).
+        pub fn debug_poison(&self, pos0: usize, t: usize) -> Result<(), gpu::Error> {
+            let lru = self.seqs.borrow();
+            let e = lru.entries.iter().find(|e| e.id == lru.active).unwrap();
+            let (dl, hd) = (self.dl, self.idxd);
+            if let Some(b) = e.lat_d.as_ref().filter(|b| b.len >= (pos0 + t) * dl * 2) {
+                b.write(pos0 * dl * 2, &vec![0x7fc0u16; t * dl])?;
+            }
+            for b in [&e.idk_d, &e.idg_d] {
+                if let Some(b) = b.as_ref().filter(|b| b.len >= (pos0 + t) * hd * 4) {
+                    b.write(pos0 * hd * 4, &vec![f32::NAN; t * hd])?;
+                }
+            }
+            if let Some(b) = e.val_d.as_ref().filter(|b| b.len >= pos0 + t) {
+                b.write(pos0, &vec![0xffu8; t])?;
+            }
+            for c in [&self.o_d, &self.s_d, &self.sd_out] {
+                let b = c.borrow();
+                b.write(0, &vec![f32::NAN; b.len / 4])?;
+            }
+            Ok(())
+        }
     }
 
     /// GPU parity on the main fixture: the full DSA layer's CUDA path (kv_append
@@ -2524,7 +2601,9 @@ pub mod cuda {
         let q_resid = super::tests::load("ref_q_resid", &[t, w.q_lora]);
         let k_lat = super::tests::load("ref_k_pass", &[t, w.kv_lora]);
         g.bind().unwrap();
-        let stream = Stream::new().unwrap();
+        // blocking, like the engine: every launcher stages with legacy-stream copies and
+        // now asserts the stream orders against them (this test was on Stream::new())
+        let stream = Stream::blocking().unwrap();
         let cu = MlaCuda::new(&w).unwrap();
 
         let width = w.select_width();
@@ -2552,6 +2631,19 @@ pub mod cuda {
         )
         .unwrap();
         let kv2 = t + 1;
+        // the decode token IS row 0's x, so every host mirror's row t must equal its row 0
+        // bit for bit (same kernel, same input). The mirrors are what the engine re-uploads
+        // after a cache realloc / contiguity break, so a wrong read-back offset here is a
+        // wrong cache later.
+        let row_eq = |v: &[u16], d: usize| v[t * d..(t + 1) * d] == v[..d];
+        let row_eq_f = |v: &[f32], d: usize| v[t * d..(t + 1) * d] == v[..d];
+        eprintln!(
+            "glm5 mla cuda: decode-row mirrors == row 0: lat {} idx_k {} idx_g {} valid {}",
+            row_eq(&lat_mirror, w.kv_lora),
+            row_eq_f(&idx_k, w.idx_dim),
+            row_eq_f(&idx_g, w.idx_dim),
+            valid[t] == 1
+        );
 
         // attend over the resident cache at kv2 (decode row)
         let sel: Vec<i32> = std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
@@ -2559,6 +2651,7 @@ pub mod cuda {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        eprintln!("glm5 mla cuda: resident-flow sel row 0 = {:?} (t = {t})", &sel[..width]);
         let q = w.gemv_q_b(&q_resid[..w.q_lora], 1); // q for token 0 as a stand-in decode query
         let wk: Vec<f32> = (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect();
         let wv: Vec<f32> = (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect();
@@ -2577,6 +2670,52 @@ pub mod cuda {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         eprintln!("glm5 mla cuda: resident-flow vs upload attend maxerr {e:.3e}");
+        // which side is wrong? the CPU attention (per-head W_v·latent, softmax over the
+        // selected keys) on the mirror, and the resident rows vs the mirror bit for bit
+        {
+            let (lat_dev, ..) = cu.debug_rows(0, kv2).unwrap();
+            let bad_rows: Vec<usize> = (0..kv2)
+                .filter(|&r| lat_dev[r * w.kv_lora..(r + 1) * w.kv_lora] != lat_mirror[r * w.kv_lora..(r + 1) * w.kv_lora])
+                .collect();
+            let latf: Vec<f32> = lat_mirror.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+            let (nh, dk, dv, dl) = (w.n_head, w.qk_nope, w.v_head, w.kv_lora);
+            let keys: Vec<usize> = sel[..width].iter().filter(|&&i| i >= 0).map(|&i| i as usize).collect();
+            let mut cpu = vec![0f32; nh * dv];
+            for h in 0..nh {
+                let (wkh, wvh) = (w.k_nope(h), w.v_b_head(h));
+                let qh = &q[h * dk..(h + 1) * dk];
+                let sc: Vec<f32> = keys
+                    .iter()
+                    .map(|&k| {
+                        let kl = &latf[k * dl..(k + 1) * dl];
+                        (0..dk).map(|d| qh[d] * (0..dl).map(|l| kl[l] * wkh[l * dk + d]).sum::<f32>()).sum::<f32>()
+                            / (dk as f32).sqrt()
+                    })
+                    .collect();
+                let mx = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let p: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                let den: f32 = p.iter().sum();
+                for d in 0..dv {
+                    cpu[h * dv + d] = keys
+                        .iter()
+                        .zip(&p)
+                        .map(|(&k, &pi)| pi * (0..dl).map(|l| wvh[d * dl + l] * latf[k * dl + l]).sum::<f32>())
+                        .sum::<f32>()
+                        / den;
+                }
+            }
+            let mx = |a: &[f32]| a.iter().zip(&cpu).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            eprintln!(
+                "glm5 mla cuda: resident-flow diag: keys {keys:?}; resident rows != mirror: {bad_rows:?}; \
+                 resident vs CPU {:.3e}, upload vs CPU {:.3e}",
+                mx(&out_resident),
+                mx(&out_upload)
+            );
+        }
+        assert!(row_eq(&lat_mirror, w.kv_lora), "lat mirror row t != device row (read-back offset)");
+        assert!(row_eq_f(&idx_k, w.idx_dim), "idx_k mirror row t != device row (read-back offset)");
+        assert!(row_eq_f(&idx_g, w.idx_dim), "idx_g mirror row t != device row (read-back offset)");
+        assert_eq!(valid[t], 1);
         assert!(e < 1e-5, "resident attend flow maxerr {e}");
 
         // indexer: resident pools vs upload pools
@@ -2676,6 +2815,78 @@ pub mod cuda {
             .fold(0f32, f32::max);
         eprintln!("glm5 mla cuda: interleave back-to-A attend maxerr {e4:.3e}");
         assert!(e4 < 1e-5, "interleave A attend maxerr {e4}");
+    }
+
+    /// A regression lesson from this chase, kept as a test: the flow check's pool step
+    /// compared `cu`'s resident pools against `cu2`'s for the same mirrors and PASSED
+    /// while `idx_pool_keys` computed the wrong CONTENT for every incremental window
+    /// (`p = blockIdx.x`, the launcher wrote content of pools [0..n) at slots [from..n)):
+    /// both sides shared the bug, `from` was equal on both, the difference cancelled.
+    /// The pool tap is checked against the CPU in the engine shadow (`mla_debug`,
+    /// `TANG_GLM5_MLA_DEBUG=1`), where only one side computes. This unit pins the same
+    /// property: after incremental appends (from > 0) the pooled keys must equal a fresh
+    /// MlaCuda's pools over the same rows — the mirrors differ by construction, the
+    /// CONTENT must not.
+    #[test]
+    fn resident_pool_content_matches_a_fresh_pool() {
+        let Some(g) = Gpu::for_test() else { return };
+        let w = super::tests::weights_from_fixtures();
+        let m = super::tests::load_meta();
+        let t = m["B"].as_u64().unwrap() as usize * m["S"].as_u64().unwrap() as usize;
+        let x = super::tests::load("input_x", &[t, w.hidden]);
+        g.bind().unwrap();
+        let stream = Stream::blocking().unwrap();
+        let cu = MlaCuda::new(&w).unwrap();
+        let cu2 = MlaCuda::new(&w).unwrap();
+
+        // fixture geometry (kpool 4): t = 130 rows -> 32 complete pools resident, then
+        // 4 single-row appends: n_pool = 33, from = 32, exactly ONE pool on the
+        // incremental path — the case the bug got wrong (content of pool 0 at slot 32).
+        let mut lat = vec![0u16; (t + 8) * w.kv_lora];
+        let mut idx_k = vec![0f32; (t + 8) * w.idx_dim];
+        let mut idx_g = vec![0f32; (t + 8) * w.idx_dim];
+        let mut valid = vec![0u8; t + 8];
+        cu.kv_append(&w.kv_a, &w.kv_a_norm, &x, t, 0, &mut lat, &stream).unwrap();
+        cu.idx_append(
+            &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, &x, t, 0,
+            &mut idx_k, &mut idx_g, &mut valid, &stream,
+        )
+        .unwrap();
+        // pools [0, t/kpool) resident first, so the call below is INCREMENTAL (from > 0).
+        // (The first version of this test skipped this and passed with the bug half-fixed:
+        // a single idx_pool call always has from = 0.)
+        let mut pk0 = vec![0f32; (t / w.kpool) * w.idx_dim];
+        cu.idx_pool(&idx_k, &idx_g, &w.i_ape, t, 0, t / w.kpool, &mut pk0, &stream).unwrap();
+        let upto0 = {
+            let lru = cu.seqs.borrow();
+            lru.entries.iter().find(|e| e.id == lru.active).map(|e| e.pool_upto).unwrap()
+        };
+        assert_eq!(upto0, t / w.kpool);
+        for i in 0..4 {
+            let r = &x[i * w.hidden..(i + 1) * w.hidden];
+            cu.kv_append(&w.kv_a, &w.kv_a_norm, r, 1, t + i, &mut lat, &stream).unwrap();
+            cu.idx_append(
+                &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, r, 1, t + i,
+                &mut idx_k, &mut idx_g, &mut valid, &stream,
+            )
+            .unwrap();
+        }
+        let kv = t + 4;
+        let n_pool = kv / w.kpool;
+        assert_eq!(n_pool, t / w.kpool + 1, "the incremental case: from = n_pool - 1");
+        let mut pk = vec![0f32; n_pool * w.idx_dim];
+        cu.idx_pool(&idx_k, &idx_g, &w.i_ape, kv, 0, n_pool, &mut pk, &stream).unwrap();
+
+        // reference: a FRESH MlaCuda, the mirrors uploaded whole (its own from == 0)
+        let mut pk2 = vec![0f32; n_pool * w.idx_dim];
+        cu2.idx_pool(&idx_k, &idx_g, &w.i_ape, kv, 0, n_pool, &mut pk2, &stream).unwrap();
+        let e: f32 = pk.iter().zip(&pk2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let from = {
+            let lru = cu.seqs.borrow();
+            lru.entries.iter().find(|e| e.id == lru.active).map(|e| e.pool_upto)
+        };
+        eprintln!("glm5 mla cuda: incremental (pool_upto {from:?}) pool vs fresh maxerr {e:.3e}");
+        assert!(e < 1e-5, "incremental pool content {e}");
     }
 }
 

@@ -175,6 +175,16 @@ impl Stream {
         Ok(Stream(s))
     }
 
+    /// Whether this stream orders against the legacy default stream (created by
+    /// [`Stream::blocking`], not [`Stream::new`]'s `NON_BLOCKING`). Wrappers that stage
+    /// inputs with the synchronous `DevBuf::write`/`from_slice` assert it.
+    pub fn is_blocking(&self) -> bool {
+        let mut f: std::ffi::c_uint = 0;
+        let r = unsafe { sys::cuStreamGetFlags(self.0, &mut f) };
+        r == sys::CUresult::CUDA_SUCCESS
+            && f & sys::CUstream_flags::CU_STREAM_NON_BLOCKING as std::ffi::c_uint == 0
+    }
+
     pub fn sync(&self) -> Result<()> {
         ck!(sys::cuStreamSynchronize(self.0))
     }
