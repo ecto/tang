@@ -24,6 +24,8 @@ pub mod ep;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "cuda")]
+pub mod graph;
 pub mod quant;
 #[cfg(feature = "cuda")]
 pub mod serve;
