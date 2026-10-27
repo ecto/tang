@@ -201,7 +201,7 @@ impl DevLayer {
             let neg: Vec<f32> = r.iter().map(|&a| -a).collect();
             DevBuf::from_slice(&neg).map_err(gerr)
         };
-        let slots = 1;
+        let slots = conv.0.len() / (cfg.conv_dim() * (cfg.d_conv - 1));
         let pf2 = std::env::var("TANG_GLM5_KDA_PF2").is_ok_and(|v| v == "1");
         let mut core = DevKda::new(g, &kers, cfg, &conv_w, conv, state, slots)?;
         if pf2 {
