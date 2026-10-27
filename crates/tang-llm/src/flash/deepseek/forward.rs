@@ -270,7 +270,14 @@ pub struct Draft {
 impl Model {
     /// `dir` holds the safetensors shards, `config.json` and (with Engram) `engram.json`.
     pub fn open(dir: &Path) -> Result<Self> {
-        let cfg = Config::load(&dir.join("config.json"))?;
+        // DeepSeek's repo ships its runtime config as inference/config.json (the top-level one
+        // is in Hugging Face's format); the tiny fixture writes it at the top
+        let inf = dir.join("inference/config.json");
+        let cfg = Config::load(&if inf.exists() {
+            inf
+        } else {
+            dir.join("config.json")
+        })?;
         let st = St::open(dir)?;
         let engram = if cfg.engram_layer_ids.is_empty() {
             None

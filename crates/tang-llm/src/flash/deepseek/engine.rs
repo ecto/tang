@@ -42,6 +42,13 @@ fn up<T: Copy>(v: &[T]) -> Result<DevBuf> {
     Ok(DevBuf::from_slice(v)?)
 }
 
+#[derive(Default)]
+struct ExpertCache {
+    map: HashMap<String, (Rc<DevW>, u64)>,
+    tick: u64,
+    misses: usize,
+}
+
 /// Which attention a block runs.
 enum Attn<'a> {
     Main,
@@ -62,6 +69,9 @@ pub struct GpuModel {
     s: Stream,
     _g: Gpu,
     w: RefCell<HashMap<String, Rc<DevW>>>,
+    experts: RefCell<ExpertCache>,
+    /// Routed-expert tensors kept on the device (`DS_EXPERT_SLOTS`; 0 = all).
+    pub expert_slots: usize,
     tabs: Vec<DevBuf>,
     win: Vec<DevBuf>,
     ckv: HashMap<usize, DevBuf>,
@@ -115,6 +125,15 @@ impl GpuModel {
             s,
             _g: g,
             w: RefCell::new(HashMap::new()),
+            experts: RefCell::new(ExpertCache::default()),
+            // an expert MLP holds three tensors at once
+            expert_slots: match std::env::var("DS_EXPERT_SLOTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                Some(0) | None => 0,
+                Some(n) => n.max(3),
+            },
             tabs,
             win,
             ckv,
@@ -131,12 +150,46 @@ impl GpuModel {
     }
 
     fn dw(&self, name: &str) -> Result<Rc<DevW>> {
+        if name.contains(".ffn.experts.") {
+            return self.expert_w(name);
+        }
         if let Some(w) = self.w.borrow().get(name) {
             return Ok(w.clone());
         }
         let w = Rc::new(DevW::upload(&self.cpu.st, name)?);
         self.w.borrow_mut().insert(name.to_string(), w.clone());
         Ok(w)
+    }
+
+    /// A routed expert's weight through the LRU of `expert_slots` tensors (unbounded when 0),
+    /// uploaded from the mapped checkpoint on a miss. Evicting frees device memory, which is
+    /// safe here: every expert GEMM syncs before returning (`lin` on a quantized weight).
+    fn expert_w(&self, name: &str) -> Result<Rc<DevW>> {
+        let mut ex = self.experts.borrow_mut();
+        ex.tick += 1;
+        let tick = ex.tick;
+        if let Some((w, t)) = ex.map.get_mut(name) {
+            *t = tick;
+            return Ok(w.clone());
+        }
+        if self.expert_slots > 0 && ex.map.len() >= self.expert_slots {
+            let oldest = ex
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            ex.map.remove(&oldest);
+        }
+        ex.misses += 1;
+        let w = Rc::new(DevW::upload(&self.cpu.st, name)?);
+        ex.map.insert(name.to_string(), (w.clone(), tick));
+        Ok(w)
+    }
+
+    /// Routed-expert tensors uploaded so far (cache misses).
+    pub fn expert_misses(&self) -> usize {
+        self.experts.borrow().misses
     }
 
     fn tap(&self, name: &str, b: &DevBuf, n: usize) -> Result<()> {
@@ -1276,6 +1329,33 @@ mod tests {
                 assert!(*r < 5e-2, "step {s} layer {i}: rel {r}");
             }
         }
+    }
+
+    /// The expert LRU changes where weights live, never the math: a 3-slot cache gives the
+    /// unbounded run's logits bit for bit.
+    #[test]
+    fn gpu_tiny_expert_cache_is_exact() {
+        let Some((mut a, meta)) = open() else { return };
+        let mut b = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+        b.expert_slots = 3;
+        for step in meta["steps"].as_array().unwrap().iter().take(4) {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            let (la, _) = a.forward(&ids, sp, None).unwrap();
+            let (lb, _) = b.forward(&ids, sp, None).unwrap();
+            assert_eq!(la, lb, "step at {sp}");
+        }
+        eprintln!(
+            "misses: unbounded {} vs 3 slots {}",
+            a.expert_misses(),
+            b.expert_misses()
+        );
+        assert!(b.expert_misses() > a.expert_misses());
     }
 
     /// Free-running on the device, prefill then greedy decode; informational past top-1.
