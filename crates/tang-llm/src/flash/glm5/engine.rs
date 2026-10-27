@@ -55,8 +55,10 @@ const K5_WARPS: usize = 4;
 #[cfg(feature = "cuda")]
 struct HeadDev {
     dw: super::moe::gpu::DevW,
-    xq8: super::moe::gpu::DevBuf,
-    out: super::moe::gpu::DevBuf,
+    /// the normed h row, f32 (k5_q8 reads device memory, not the host row)
+    xf: tang_moe::gpu::DevBuf,
+    xq8: tang_moe::gpu::DevBuf,
+    out: tang_moe::gpu::DevBuf,
     k5: super::moe::gpu::Kernels5,
     s: tang_moe::gpu::Stream,
 }
@@ -404,6 +406,7 @@ impl GpuFfn {
         );
         // the LM head on the GPU (TANG_GLM5_GPU_HEAD=1): t==1 decode only. The host
         // tiled Mat::apply was 39.6 ms/token (trace); one k5_q8 + k5_gemv8 is ~150 us.
+        // Built here, before `devs` moves into Self.
         let head_dev = if std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
             devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
             let info = match g.get("output.weight") {
@@ -417,13 +420,16 @@ impl GpuFfn {
                 "lm head: want Q8_0 (k5_gemv8), got {:?}",
                 info.ty
             );
+            anyhow::ensure!(cols % 32 == 0, "lm head: hidden {cols} not a multiple of 32");
             let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, rows, cols)
                 .map_err(|e| anyhow::anyhow!("lm head upload: {e}"))?;
             let k5 = super::moe::gpu::Kernels5::new(&devs[0].0)
                 .map_err(|e| anyhow::anyhow!("k5 (head): {e}"))?;
-            // scratch: k5_q8 codes [MAXT][cols] + scales after them (the gemv8 kernel
-            // reads scales at xq8 + MAXT*cols); here MAXT = 1
-            let xq8 = tang_moe::gpu::DevBuf::zeroed_elems::<u8>(cols + cols.div_ceil(32) * 4)
+            let xf = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(cols)
+                .map_err(|e| anyhow::anyhow!("head xf: {e}"))?;
+            // scratch: k5_q8 codes [MAXT][cols] + f32 scales after them (the gemv8
+            // kernel reads scales at xq8 + MAXT*cols); here MAXT = 1
+            let xq8 = tang_moe::gpu::DevBuf::zeroed_elems::<u8>(cols + cols / 32 * 4)
                 .map_err(|e| anyhow::anyhow!("head xq8: {e}"))?;
             let out = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(rows)
                 .map_err(|e| anyhow::anyhow!("head out: {e}"))?;
@@ -431,9 +437,9 @@ impl GpuFfn {
                 .map_err(|e| anyhow::anyhow!("head stream: {e}"))?;
             eprintln!(
                 "glm5: LM head resident on the GPU ({} MB)",
-                dw.w.row_bytes * rows / 1_000_000
+                dw.w.row_bytes as usize * rows / 1_000_000
             );
-            Some(HeadDev { dw, xq8, out, k5, s: hs })
+            Some(HeadDev { dw, xf, xq8, out, k5, s: hs })
         } else {
             None
         };
@@ -1354,11 +1360,11 @@ impl Glm5Engine {
         Ok(h)
     }
 
-    /// The device LM head for a decode row (`t == 1`, `TANG_GLM5_GPU_HEAD=1`): the normed
-    /// `h` row goes up into the `out` buffer (n ≤ n_vocab floats), `k5_q8` quantises it
-    /// into `xq8` (codes, scales after them at MAXT = 1), `k5_gemv8` writes the logits over
-    /// `out` (same stream: the quantiser has read `out` before the GEMV writes it), one D2H
-    /// read. `None`: not loaded or `t > 1` (the host head runs).
+    /// The device LM head for a decode row (`t == 1`, `TANG_GLM5_GPU_HEAD=1`; the head
+    /// block of frog/glm5-forward 7a18fd5d, kept in a cfg-split helper so the non-cuda
+    /// build — which has no `self.gpu` — compiles): the normed row goes up into `xf`,
+    /// `k5_q8` quantises it into `xq8` (codes, scales after them at MAXT = 1), `k5_gemv8`
+    /// writes the logits into `out`, one D2H read. `None`: not loaded or `t > 1`.
     #[cfg(feature = "cuda")]
     fn head_gpu(&self, h: &[f32], t: usize) -> Result<Option<Vec<f32>>> {
         let Some(g) = self.gpu.as_ref() else { return Ok(None) };
@@ -1366,29 +1372,34 @@ impl Glm5Engine {
         if t != 1 {
             return Ok(None);
         }
-        let (n, nv) = (self.m.hp.n_embd, self.m.hp.n_vocab);
-        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
-        hd.out.write(0, &h[..n]).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
+        let gpu = &g.devs[0].0;
+        gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+        let n = self.m.hp.n_embd;
+        let nv = self.m.hp.n_vocab;
+        let row = &h[(t - 1) * n..t * n];
+        // synchronous legacy-stream copy; hd.s is blocking, so it orders after
+        hd.xf.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
         unsafe {
-            tang_moe::gpu::launch(
+            // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
+            launch(
                 hd.k5.q8,
                 ((n / 32) as u32, 1, 1),
                 (32, 1, 1),
                 0,
                 &hd.s,
-                tang_moe::args![hd.out.ptr, hd.xq8.ptr, n as u32, 1u32],
-            )
-            .map_err(|e| anyhow::anyhow!("head q8: {e}"))?;
-            tang_moe::gpu::launch(
+                args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32],
+            )?;
+            // k5_gemv8: grid (ceil(rows/K5_WARPS), T=1), ROWS = n_vocab, COLS = n;
+            // scales live at xq8 + 1*n bytes (the MAXT offset)
+            launch(
                 hd.k5.gemv8,
                 (nv.div_ceil(K5_WARPS) as u32, 1, 1),
                 (128, 1, 1),
                 (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                 &hd.s,
-                tang_moe::args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
-                    1u32, 1u32, nv as u32, n as u32],
-            )
-            .map_err(|e| anyhow::anyhow!("head gemv8: {e}"))?;
+                args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
+                    nv as u32, 1u32, nv as u32, n as u32],
+            )?;
         }
         hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
         Ok(Some(hd.out.read::<f32>(0, nv).map_err(|e| anyhow::anyhow!("head read: {e}"))?))
@@ -2964,15 +2975,37 @@ mod tests {
             skip_or_fail("no CUDA device");
             return;
         }
-        // the batched KDA rows need the device-resident core (read at layer construction)
-        std::env::set_var("TANG_GLM5_KDA_PF2", "1");
+        // both MoE kernel paths: window_batch hands the FFN all N rows at once (T = N),
+        // which is the batched FFN the B300 measures (TANG_GLM5_MOE=fast) — and the naive
+        // kernels as the control
+        for moe in ["naive", "fast"] {
+            gpu_slots_case(&ids, moe);
+        }
+    }
+
+    /// One MoE mode of [`engine_gpu_slots_batch_matches_single`]. The env knobs are read
+    /// at engine load (layer construction), so they are set around the loads only.
+    #[cfg(feature = "cuda")]
+    fn gpu_slots_case(ids: &[u32], moe: &str) {
+        let load = |slots: usize| {
+            std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // the batched KDA rows need it
+            std::env::set_var("TANG_GLM5_MOE", moe);
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            let ok = if slots > 1 { e.use_gpu_slots(slots) } else { e.use_gpu() }.unwrap();
+            std::env::remove_var("TANG_GLM5_KDA_PF2");
+            std::env::remove_var("TANG_GLM5_MOE");
+            assert!(ok, "GPU did not load");
+            let g = e.gpu.as_ref().unwrap();
+            assert!((0..e.m.hp.n_layer).all(|l| g.has_ffn(l)), "{moe}: every FFN on the GPU");
+            assert_eq!(g.devs[0].1.fast, moe == "fast", "{moe}: MoE kernel path");
+            e
+        };
         let prompts = [&ids[..9], &ids[3..15]];
         let steps = 4;
         let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
         let mut toks: Vec<Vec<u32>> = Vec::new();
         for p in prompts {
-            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
-            assert!(e.use_gpu().unwrap(), "GPU did not load");
+            let mut e = load(1);
             let nv = e.m.hp.n_vocab;
             let lg = e.window(p).unwrap();
             let mut cur = argmax(&lg[(p.len() - 1) * nv..]);
@@ -2986,16 +3019,14 @@ mod tests {
             want.push(w);
             toks.push(tk);
         }
-        let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
-        assert!(e.use_gpu_slots(3).unwrap(), "GPU did not load");
-        std::env::remove_var("TANG_GLM5_KDA_PF2");
+        let mut e = load(3);
         let nv = e.m.hp.n_vocab;
         let mut cur = Vec::new();
         for (k, p) in prompts.iter().enumerate() {
             let lg = e.window_slot(k + 1, p).unwrap();
             cur.push(argmax(&lg[(p.len() - 1) * nv..]));
         }
-        assert_eq!(cur, vec![toks[0][0], toks[1][0]], "prefill next tokens");
+        assert_eq!(cur, vec![toks[0][0], toks[1][0]], "{moe}: prefill next tokens");
         for step in 0..steps {
             let lg = e.window_batch(&[(1, cur[0]), (2, cur[1])]).unwrap();
             for k in 0..2 {
@@ -3006,8 +3037,8 @@ mod tests {
                     .zip(&want[k][step])
                     .map(|(a, b)| (a - b).abs())
                     .fold(0f32, f32::max);
-                eprintln!("gpu slots: slot {k} step {step}: max abs {worst:.3e} (scale {scale:.2})");
-                assert!(worst <= 1e-3 * scale, "slot {k} step {step}: max abs {worst} vs scale {scale}");
+                eprintln!("gpu slots ({moe}): slot {k} step {step}: max abs {worst:.3e} (scale {scale:.2})");
+                assert!(worst <= 1e-3 * scale, "{moe}: slot {k} step {step}: max abs {worst} vs scale {scale}");
                 cur[k] = argmax(got);
             }
         }
