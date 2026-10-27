@@ -2003,6 +2003,10 @@ fn slots_bench(
     if let Some(o) = out {
         std::fs::write(o, format!("{}\n", line(&gen[0])))?;
     }
+    // TANG_GLM5_TRACE=1: the span table (ffn vs the GPU stages per batched window)
+    if let Some(r) = super::trace::report() {
+        eprint!("{r}");
+    }
     ensure!(same, "slot ids differ");
     Ok(())
 }
