@@ -47,6 +47,25 @@ Not yet: a real-weights run of any of this (only the naive engine has run on the
 Engram rows still decode on the host; the max-width indexer launches at long context; the
 EP reduce inside the graph.
 
+## Real weights, 4× H200 (2026-10-27, RunPod CA-MTL-3, NVLink, NCCL 2.25)
+
+`tang-llm deepseek-serve /workspace/ds41 --devices 0,1,2,3`, experts sharded across the four
+GPUs (89 GB each resident), 35-token code prompt, thinking off:
+
+| mode | tok/s | forwards | tokens/forward | drafts accepted |
+|---|---|---|---|---|
+| greedy, DSpark spec (200 tokens) | 3.8 | 46 | 4.3 | 154 / 225 (68%) |
+| sampled T=0.6 top-p 0.95 (120 tokens) | 3.4 | 31 | 3.9 | 88 / 150 (59%) |
+
+Output is correct (a working CSV parser with tests). NCCL expert parallelism matched the
+single-GPU engine at KL 0.00 on the tiny fixture at 2 and 4 ranks before this run.
+
+So tokens/forward is where it needs to be; the forward is ~1.1 s against a ~4 ms bandwidth
+floor. Two causes, both being fixed: (1) `graphable()` is false under EP (the NCCL reduce is
+a host callback), so EP steps run the direct path with its syncs; (2) the MoE loop launches
+~5 kernels for each of the 384 experts per layer (~80k launches a forward) instead of one
+grouped launch over the routing CSR.
+
 ## M0 findings (2026-10-27)
 
 Read from the checkpoint's `config.json`, `model.safetensors.index.json`, shard headers (range
