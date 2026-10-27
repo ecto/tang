@@ -670,6 +670,8 @@ pub mod cuda {
         chunk: usize,
         /// `d_conv − 1` (the conv history's per-channel depth; slot pointer math).
         d_conv_m1: usize,
+        /// the state buffers' slot count (the rows cap of [`Self::decode_dev_rows`]).
+        slots: usize,
     }
 
     impl DevKda {
@@ -725,6 +727,7 @@ pub mod cuda {
                 hd,
                 chunk,
                 d_conv_m1: cfg.d_conv.saturating_sub(1),
+                slots,
             })
         }
 
@@ -1001,7 +1004,7 @@ pub mod cuda {
             o: u64,
         ) -> Result<()> {
             let n = slots.len();
-            ensure!(n > 0 && n <= self.slots_dev.len() / 4, "k5 rows: {n} rows");
+            ensure!(n > 0 && n <= self.slots, "k5 rows: {n} rows");
             let ids: Vec<u32> = slots.iter().map(|&s| s as u32).collect();
             self.slots_dev.write(0, &ids)?;
             let f = std::mem::size_of::<f32>() as u64;
