@@ -2236,27 +2236,40 @@ impl GpuModel {
         let x = self.hc_pre(h, pre_mix, blk)?;
         let xh = self.read(x, blk * d)?;
         self.rms(x, blk, &format!("{last}.norm.weight"))?;
-        let logits = self.raw(x.ptr, blk, "head.weight")?;
-        self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
-        let mut logits = self.read(logits, blk * v)?;
-        // host: the Markov head samples left to right, then the confidence head
+        let dlogits = self.raw(x.ptr, blk, "head.weight")?;
+        // the Markov head samples left to right: each position's bias (its predecessor's
+        // Markov embedding through the head, a rank x V GEMV) on the device, the row read back
+        // for the draw; the confidence head (a dot product) on the host
         let rank = c.dspark_markov_rank;
         let memb_w = self.cpu.w(&format!("{last}.markov_head.embed.weight"))?;
-        let mhead = self.cpu.w(&format!("{last}.markov_head.head.weight"))?;
+        let mhead = format!("{last}.markov_head.head.weight");
         let proj = self.cpu.w(&format!("{last}.confidence_head.proj.weight"))?;
+        let mut logits = vec![0f32; blk * v];
         let mut out = vec![token];
         let mut conf = Vec::with_capacity(blk);
         for i in 0..blk {
             let memb = &memb_w.data[out[i] * rank..(out[i] + 1) * rank];
-            let bias = super::forward::matmul(memb, 1, &mhead);
+            let mx = self.up(memb)?;
+            let bias = self.raw(mx.ptr, 1, &mhead)?;
+            let row = dlogits.at(i * v * 4);
+            let vn = v as i64;
+            unsafe {
+                self.k.go(
+                    "ds_add",
+                    blocks(v, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![row.ptr, bias.ptr, vn],
+                )?
+            };
             let li = &mut logits[i * v..(i + 1) * v];
-            for (a, bb) in li.iter_mut().zip(&bias) {
-                *a += bb;
-            }
+            li.copy_from_slice(&self.read(row, v)?);
             out.push(draw(li));
             let feat: Vec<f32> = xh[i * d..(i + 1) * d].iter().chain(memb).copied().collect();
             conf.push(super::forward::matmul(&feat, 1, &proj)[0]);
         }
+        self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
         self.obs.finish();
         Ok(Some(super::forward::Draft {
             ids: out,

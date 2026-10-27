@@ -389,6 +389,12 @@ extern "C" __global__ void ds_scatter_add(float* y, const float* v, const int* r
     y[(long long)rows[e / d] * d + e % d] += v[e];
 }
 
+// y[i] += v[i].
+extern "C" __global__ void ds_add(float* y, const float* v, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += v[i];
+}
+
 // y[i] = bf(y[i] + v[i]).
 extern "C" __global__ void ds_add_round(float* y, const float* v, long long n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;

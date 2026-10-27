@@ -137,6 +137,7 @@ const MORE: &[&str] = &[
     "ds_router",
     "ds_gather_rows",
     "ds_scatter_add",
+    "ds_add",
     "ds_add_round",
     "ds_scale_round",
     "ds_round",
