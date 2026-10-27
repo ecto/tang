@@ -77,12 +77,6 @@ impl DsServe {
             ctx,
         })
     }
-
-    fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.tok
-            .decode(ids, false)
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))
-    }
 }
 
 /// Whether the GPU `decode_spec` takes a [`SpecPick`] (speculative sampling). The port: give
