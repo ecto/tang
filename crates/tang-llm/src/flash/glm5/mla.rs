@@ -332,10 +332,11 @@ fn gemv(w: &[f32], rows: usize, cols: usize, x: &[f32], t: usize) -> Vec<f32> {
     assert_eq!(x.len(), t * cols, "input shape");
     let mut y = vec![0f32; t * rows];
     use rayon::prelude::*;
-    y.par_chunks_mut(rows).zip(x.par_chunks(cols)).for_each(|(yo, xi)| {
-        for (r, o) in yo.iter_mut().enumerate() {
-            *o = dot(&w[r * cols..(r + 1) * cols], xi);
-        }
+    // parallel over every (token, row) output — a decode row (t = 1) used to run on one
+    // thread; each element's dot is unchanged, so the result is bit-identical
+    y.par_iter_mut().enumerate().for_each(|(k, o)| {
+        let (ti, r) = (k / rows, k % rows);
+        *o = dot(&w[r * cols..(r + 1) * cols], &x[ti * cols..(ti + 1) * cols]);
     });
     y
 }

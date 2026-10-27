@@ -477,6 +477,9 @@ pub struct Glm5Engine {
     kda_w: Vec<Option<std::sync::Arc<(KdaLayerW, KdaConfig)>>>,
     hc_w: Vec<Option<std::sync::Arc<super::mhc::MhcWeights>>>,
     mla_w: Vec<Option<std::sync::Arc<MlaWeights>>>,
+    /// Per DSA layer: `mla_w`'s per-head `k_nope` / `v_b` concatenated (the
+    /// `MlaCuda::attend` host arguments), built once with the weights.
+    mla_wkv: Vec<Option<std::sync::Arc<(Vec<f32>, Vec<f32>)>>>,
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
@@ -505,6 +508,7 @@ impl Glm5Engine {
             kda_w: (0..nl).map(|_| None).collect(),
             hc_w: (0..nl * 2).map(|_| None).collect(),
             mla_w: (0..nl).map(|_| None).collect(),
+            mla_wkv: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
             dump: super::dump::DumpSink::open(),
@@ -905,7 +909,15 @@ impl Glm5Engine {
             if let Some(cu) = &g.mla_k[l] {
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 cu.set_seq(slot as u64);
-                return dsa_gpu(w, cu, x, t, pos0, &mut self.dsa[slot][l]);
+                let wkv = self.mla_wkv[l]
+                    .get_or_insert_with(|| {
+                        std::sync::Arc::new((
+                            (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect(),
+                            (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect(),
+                        ))
+                    })
+                    .clone();
+                return dsa_gpu(w, &wkv, cu, x, t, pos0, &mut self.dsa[slot][l]);
             }
         }
         let _tr = super::trace::span("cpu");
@@ -1620,6 +1632,7 @@ fn kda_gpu(
 #[cfg(feature = "cuda")]
 fn dsa_gpu(
     w: &MlaWeights,
+    wkv: &(Vec<f32>, Vec<f32>),
     cu: &super::mla::cuda::MlaCuda,
     x: &[f32],
     t: usize,
@@ -1693,28 +1706,29 @@ fn dsa_gpu(
     let q = w.gemv_q_b(&q_resid, t);
     drop(tr);
     let tr = span("attend.gather");
-    let wk: Vec<f32> = (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect();
-    let wv: Vec<f32> = (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect();
+    // the concatenated per-head decompress matrices (the resident MlaCuda reads its own
+    // device copies; these are its host-side contract) — built once per layer by the
+    // engine (`mla_wkv`), not per call: 2 × 25 MB of copying per DSA row otherwise
+    let (wk, wv) = wkv;
     drop(tr);
     let tr = span("attend");
     let hv = w.n_head * w.v_head;
     let mut out_v = vec![0f32; t * hv];
-    cu.attend(&wk, &wv, &q, &c.lat16, kv_len, t, pos0, sel.as_deref(), &mut out_v, &s)
+    cu.attend(wk, wv, &q, &c.lat16, kv_len, t, pos0, sel.as_deref(), &mut out_v, &s)
         .map_err(gerr)?;
     drop(tr);
     // o_proj on the host
     let _tr = span("o_proj.host");
+    use rayon::prelude::*;
     let mut out = vec![0f32; t * n];
-    for i in 0..t {
-        for r in 0..n {
-            out[i * n + r] = crate::flash::reference::dot(
-                &w.o[r * hv..(r + 1) * hv],
-                &out_v[i * hv..(i + 1) * hv],
-            );
-        }
-    }
+    // parallel over (token, row); each element's dot is the serial loop's
+    out.par_iter_mut().enumerate().for_each(|(k, o)| {
+        let (i, r) = (k / n, k % n);
+        *o = crate::flash::reference::dot(&w.o[r * hv..(r + 1) * hv], &out_v[i * hv..(i + 1) * hv]);
+    });
     Ok(out)
 }
+
 
 pub(crate) fn argmax(v: &[f32]) -> u32 {
     let mut best = 0;
