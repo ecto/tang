@@ -58,6 +58,32 @@ GPUs (89 GB each resident), 35-token code prompt, thinking off:
 | sampled T=0.6 top-p 0.95 (120 tokens) | 3.4 | 31 | 3.9 | 88 / 150 (59%) |
 | greedy, no drafts (`DS_SPEC=0`, 100 tokens) | 1.0 | 99 | 1.0 | — |
 
+Same prompt after the wave-3 merge (graphs under EP, grouped MoE) plus the two host-side fixes
+below, same 46 forwards and 154/225 drafts, so the math is unchanged:
+
+| build | greedy 200 | sampled T=0.6 200 |
+|---|---|---|
+| wave 3 merged, as measured first | 1.1 | 0.9 |
+| + Engram tables pre-faulted at open | 17.0 | 12.3 |
+| + DSpark Markov head on the device | 24.1 | 18.1 |
+
+The 1.1 was not the graphs or the grouped MoE (the A/B sweep of `DS_GRAPH=0` × `DS_MOE_LOOP=1`
+disagreed with itself run to run). `deepseek-profile --direct` showed verify steps of 1050 ms
+decaying to 133 ms over a dozen steps with 70% of each step outside every op span, and the
+decode step's gap sat before `embed`: the step's Engram rows. They are read per step from the
+two 100 GB memory maps, ~300 rows of 256 bytes for a 6-token window, and on the pod's MooseFS
+mount a cold row is a ~2 ms round trip (measured: 300 random rows 650 ms cold, 5 ms warm). The
+first steps of every fresh prompt were the slow ones, which is also why the bench numbers
+drifted with page-cache warmth. `Model::open` now touches every page of both tables (1.5 s
+warm, ~5 min cold once per boot; `DS_ENGRAM_PREFAULT=0` skips it). The draft step was then
+host-bound (120 ms host, 12 ms GPU): the Markov head added each position's bias with a
+256 × 129k GEMV on the CPU; it runs on the device now with one row read back per draw.
+
+Steady state after both: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a ~4 ms
+floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
+path (`moe.router` 28 ms and `moe.reduce` 10 ms per step are the next two line items), then
+the launch count (3.3k per verify step).
+
 Output is correct (a working CSV parser with tests). NCCL expert parallelism matched the
 single-GPU engine at KL 0.00 on the tiny fixture at 2 and 4 ranks before this run.
 
