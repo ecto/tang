@@ -36,7 +36,8 @@ summary() {
     echo "- tree \`$TREE\`, binary md5 \`${BIN_MD5:-none}\`"
     echo "- gpu: ${GPU_NAME:-?}"
     echo "- model: \`$G5\`"
-    echo "- prompt: ${PROMPT_IDS:+ids \`$PROMPT_IDS\`}${PROMPT_IDS:-\"$PROMPT\"}; oracle (first 8): \`${ORACLE_IDS:-$ORACLE}\`"
+    if [ -n "$PROMPT_IDS" ]; then echo "- prompt ids: \`$PROMPT_IDS\`"; else echo "- prompt: \"$PROMPT\""; fi
+    echo "- oracle (first 8): \`${ORACLE_IDS:-$ORACLE}\`"
     echo "- env: \`$FAST${XENV:+ $XENV}\`"
     case " $XENV " in *" TANG_GLM5_GPU_FFN=0 "*)
       echo "- **NOTE: GLM5_ENV sets TANG_GLM5_GPU_FFN=0 — the FFNs run on the CPU. This is NOT the all-GPU number.**" ;;
@@ -154,7 +155,7 @@ export $FAST
 exec 8> "$HOME/.cache/tang-gpu.lock"
 st "waiting for $HOME/.cache/tang-gpu.lock"
 flock 8
-st "gpu lock held; $(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader | paste -sd';' -) used"
+st "gpu lock held; gpu memory used, total: $(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader | paste -sd';' -)"
 
 st "single: -n $N_SINGLE, TANG_GLM5_TRACE=1 (logs/single.log)"
 env "${XE[@]+"${XE[@]}"}" TANG_GLM5_TRACE=1 timeout 5400 "$BIN" flash-generate "$G5" "${PARGS[@]}" -n "$N_SINGLE" --temp 0 \
