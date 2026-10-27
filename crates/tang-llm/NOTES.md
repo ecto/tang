@@ -4,7 +4,24 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
-<<<<<<< HEAD
+## 2026-10-27 (late) — batched KDA decode: conv-slot offset fix, real-weights gate (H200, branch frog/glm5-batcher)
+
+Bug: a slot's conv history is `[chan][d_conv−1]` = conv_dim·(d_conv−1) floats (kda.rs
+`ConvState`, `DevKda::read_conv_at/seed_at`, `kda_step`'s `bi*KDA_CONV*(KDA_KC−1)`), but
+`kda_conv_commit_rows` offset by `SLOT[bi]*KDA_CONV` — slot s>0 committed into slot s/3's
+region. Same missing factor in the b>1 offsets of the prefill `kda_conv`/`kda_conv_commit`
+(single-row callers never saw it). All four kernels now agree.
+
+Verified: mew glm5 suite (TANG_REQUIRE_CUDA=1) 76 passed / 0 failed. H200 (bin md5 835cb84e,
+src md5 matched both sides), GEMV8 KDA_PF2 GPU_FFN=0:
+- `-n 8 --temp 0`: `785 1196 6801 264 6386 38038 911 279` = oracle.
+- TRACE `-n 32`: decode kda 12.76 ms/token wall (34 layers; forward baseline 13.05).
+  Single-slot decode does not take the batched path, so this is a no-regression number.
+- `--slots 8 --diverse -n 8` (KDA_MAXT=64): slot 0 = oracle 8/8, 7/7 other slots differ;
+  trace shows `kda_step` and `kda_conv_commit_rows` once per window (27 calls each),
+  i.e. the batched path ran. Per-step wall 21.9 s median (FFN on CPU dominates; was 20.5 s
+  with per-row KDA, within noise).
+
 ## 2026-10-27 — GLM-5.3 server batcher: N sequence slots, one batched decode window (branch frog/glm5-batcher)
 
 What was built:
@@ -103,7 +120,7 @@ Ops: two copies of a run script once interleaved on one status file and target d
 second launch while the first was mid-queue) — run scripts now take an instance lock
 (`flock -n` on a run lock). `pkill -f <pattern>` over ssh matches the ssh's own shell and
 other workers' jobs: kill by cwd/pid only.
-=======
+
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
 clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree
@@ -238,7 +255,6 @@ FUSED/GRAPH stay default-off.
 Ops: `cargo build` of the whole workspace fails on CUDA 12.8 (crates/tang pins cudarc 0.12);
 build `-p tang-llm` only. Don't hold the GPU flock around builds — other sessions'
 90-minute runs queue on it.
->>>>>>> origin/frog/glm5-forward
 
 ## 2026-10-26 — g5f_gemv: the fast MoE row kernel as a plain GEMV (branch frog/glm5-grouped-moe)
 
