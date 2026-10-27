@@ -10,7 +10,15 @@ use super::st::{Dtype, St};
 use anyhow::{bail, Context, Result};
 use tang_moe::gpu::{self, DevBuf, Gpu, Module, Stream};
 
-pub const SRC: &str = include_str!("kernels.cu");
+/// kernels.cu, then the device-side selection (one module, so the latter can use the former's
+/// helpers).
+pub const SRC: &str = concat!(
+    include_str!("kernels.cu"),
+    include_str!("kernels_select.cu")
+);
+
+/// Threads per block of the selection kernels (`DS_SEL_THREADS` in kernels_select.cu).
+const SEL: (u32, u32, u32) = (512, 1, 1);
 
 type Func = cudarc::driver::sys::CUfunction;
 
@@ -111,6 +119,15 @@ const MORE: &[&str] = &[
     "ds_index_score",
     "ds_wo_a",
     "ds_engram_gate",
+    "ds_win_idx",
+    "ds_idx_cat",
+    "ds_gather_csr",
+    "ds_scatter_csr",
+    "ds_linear_csr",
+    "ds_mask_scores",
+    "ds_candidates",
+    "ds_topk",
+    "ds_route",
 ];
 
 pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
@@ -155,6 +172,141 @@ impl Kernels {
             .get(name)
             .with_context(|| format!("no kernel {name}"))?;
         Ok(gpu::launch(f, grid, block, smem, s, args)?)
+    }
+
+    /// In place: -inf past each row's causal prefix (`causal`, ratio `r`) and where the u8
+    /// candidate mask `cand` (0 for none) is 0. As forward.rs `indexer`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mask_scores(
+        &self,
+        s: &Stream,
+        score: u64,
+        cand: u64,
+        t: usize,
+        width: usize,
+        causal: bool,
+        r: usize,
+    ) -> Result<()> {
+        let (ti, wi, ci, ri) = (t as i32, width as i32, causal as i32, r as i32);
+        unsafe {
+            self.go(
+                "ds_mask_scores",
+                blocks(t * width, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![score, cand, ti, wi, ci, ri],
+            )
+        }
+    }
+
+    /// Candidate blocks into the u8 mask `cand` [t][width]. As [`super::forward::Model::candidates`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn candidates(
+        &self,
+        s: &Stream,
+        score: u64,
+        cand: u64,
+        t: usize,
+        width: usize,
+        causal: bool,
+        r: usize,
+        bs: usize,
+        kb: usize,
+    ) -> Result<()> {
+        let nb = width.div_ceil(bs);
+        let sc = DevBuf::alloc(t.max(1) * nb.max(1) * 4)?;
+        let sel = DevBuf::alloc(t.max(1) * nb.max(1) * 4)?;
+        let (ti, wi, ci, ri, bsi, kbi) = (
+            t as i32,
+            width as i32,
+            causal as i32,
+            r as i32,
+            bs as i32,
+            kb as i32,
+        );
+        unsafe {
+            self.go(
+                "ds_candidates",
+                (t.max(1) as u32, 1, 1),
+                SEL,
+                0,
+                s,
+                tang_moe::args![score, sc.ptr, sel.ptr, cand, ti, wi, ci, ri, bsi, kbi],
+            )?
+        };
+        // scratch drops here: drain first
+        s.sync()?;
+        Ok(())
+    }
+
+    /// Top-`k` per row of `score` [t][width] (ties to the lowest index), ascending, into
+    /// `out[ti * stride ..]` as `idx + offset`, or -1 past the row's prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk(
+        &self,
+        s: &Stream,
+        score: u64,
+        out: u64,
+        t: usize,
+        width: usize,
+        k: usize,
+        stride: usize,
+        offset: usize,
+        causal: bool,
+        r: usize,
+    ) -> Result<()> {
+        let scratch = DevBuf::alloc(t.max(1) * k.max(1) * 4)?;
+        let (ti, wi, ki, si, oi, ci, ri) = (
+            t as i32,
+            width as i32,
+            k as i32,
+            stride as i32,
+            offset as i32,
+            causal as i32,
+            r as i32,
+        );
+        unsafe {
+            self.go(
+                "ds_topk",
+                (t.max(1) as u32, 1, 1),
+                SEL,
+                0,
+                s,
+                tang_moe::args![score, scratch.ptr, out, ti, wi, ki, si, oi, ci, ri],
+            )?
+        };
+        s.sync()?;
+        Ok(())
+    }
+
+    /// Router ids/weights [t][k] to per-expert CSR: counts [ne], off [ne + 1], rows and
+    /// route weights [t * k], rows ascending within an expert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route(
+        &self,
+        s: &Stream,
+        ids: u64,
+        wts: u64,
+        counts: u64,
+        off: u64,
+        rows: u64,
+        rw: u64,
+        t: usize,
+        k: usize,
+        ne: usize,
+    ) -> Result<()> {
+        let (ti, ki, nei) = (t as i32, k as i32, ne as i32);
+        unsafe {
+            self.go(
+                "ds_route",
+                (1, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![ids, wts, counts, off, rows, rw, ti, ki, nei],
+            )
+        }
     }
 
     /// `y = x · wᵀ` for `t` rows (`x` already activation-quantized when the weight is).
@@ -554,6 +706,161 @@ mod tests {
                 rel(&gc[ti * hc * hc..(ti + 1) * hc * hc], &wc) < 1e-5,
                 "sinkhorn comb"
             );
+        }
+    }
+
+    /// Scores with heavy ties (few levels, ±0, -inf) so tie-breaking is exercised.
+    fn tied(n: usize, seed: u64) -> Vec<f32> {
+        data(n, seed, 1.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| match i % 11 {
+                0 => f32::NEG_INFINITY,
+                1 => -0.0,
+                2 => 0.0,
+                _ => (x * 4.0).round() / 4.0,
+            })
+            .collect()
+    }
+
+    fn lens(t: usize, width: usize, causal: bool, r: usize) -> Vec<usize> {
+        (0..t)
+            .map(|ti| if causal { (ti + 1) / r } else { width })
+            .collect()
+    }
+
+    #[test]
+    fn select_kernels_match_cpu() {
+        let Some((_g, k, s, m)) = setup() else { return };
+        // mask + top-k
+        for (t, width, kk, causal, r, off) in [
+            (1, 1, 1, false, 1, 0),
+            (3, 7, 6, false, 1, 8),
+            (16, 8, 6, true, 2, 16),
+            (5, 600, 64, true, 1, 3),
+            (2, 5000, 512, false, 4, 128),
+            (1, 16384, 512, false, 1, 128),
+        ] {
+            let x = tied(t * width, (width + kk) as u64);
+            let ls = lens(t, width, causal, r);
+            let mut want_sc = x.clone();
+            if causal {
+                for ti in 0..t {
+                    for j in ls[ti]..width {
+                        want_sc[ti * width + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let dx = DevBuf::from_slice(&x).unwrap();
+            k.mask_scores(&s, dx.ptr, 0, t, width, causal, r).unwrap();
+            let out = DevBuf::alloc(t * kk * 4).unwrap();
+            k.topk(&s, dx.ptr, out.ptr, t, width, kk, kk, off, causal, r)
+                .unwrap();
+            s.sync().unwrap();
+            let got_sc = dx.read::<f32>(0, t * width).unwrap();
+            assert!(
+                got_sc
+                    .iter()
+                    .zip(&want_sc)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "mask t{t} w{width}"
+            );
+            let got = out.read::<i32>(0, t * kk).unwrap();
+            for ti in 0..t {
+                let mut sel = forward::topk_stable(&want_sc[ti * width..(ti + 1) * width], kk);
+                sel.sort();
+                let want: Vec<i32> = sel
+                    .into_iter()
+                    .map(|i| if i < ls[ti] { (i + off) as i32 } else { -1 })
+                    .collect();
+                assert_eq!(
+                    &got[ti * kk..(ti + 1) * kk],
+                    &want[..],
+                    "topk t{t} w{width} row {ti}"
+                );
+            }
+        }
+        // candidate blocks, then the candidate mask
+        let (bs, kb) = (m.cfg.candidate_block_size, m.cfg.candidate_topk_blocks);
+        for (t, width, causal, r) in [
+            (16, 16, true, 1),
+            (1, 17, false, 1),
+            (12, 6, true, 2),
+            (1, 3000, false, 1),
+        ] {
+            let ls = lens(t, width, causal, r);
+            let mut x = tied(t * width, width as u64);
+            if causal {
+                for ti in 0..t {
+                    for j in ls[ti]..width {
+                        x[ti * width + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let want = m.candidates(&x, width, &ls);
+            let dx = DevBuf::from_slice(&x).unwrap();
+            let cand = DevBuf::alloc(t * width).unwrap();
+            k.candidates(&s, dx.ptr, cand.ptr, t, width, causal, r, bs, kb)
+                .unwrap();
+            let got = cand.read::<u8>(0, t * width).unwrap();
+            let flat: Vec<u8> = want.iter().flatten().map(|&b| b as u8).collect();
+            assert_eq!(got, flat, "candidates t{t} w{width}");
+            let y = tied(t * width, 99);
+            let dy = DevBuf::from_slice(&y).unwrap();
+            k.mask_scores(&s, dy.ptr, cand.ptr, t, width, false, r)
+                .unwrap();
+            s.sync().unwrap();
+            let got = dy.read::<f32>(0, t * width).unwrap();
+            for (i, (&g, &v)) in got.iter().zip(&y).enumerate() {
+                let w = if flat[i] == 1 { v } else { f32::NEG_INFINITY };
+                assert_eq!(g.to_bits(), w.to_bits(), "cand mask {i}");
+            }
+        }
+        // routing lists
+        for (t, kk, ne) in [(1, 2, 8), (37, 6, 64), (300, 8, 256)] {
+            let mut ids = Vec::new();
+            let mut wts = Vec::new();
+            for ti in 0..t {
+                // distinct per token: 3 is coprime to every ne here
+                let used: Vec<usize> = (0..kk).map(|j| (ti * 7 + j * 3) % ne).collect();
+                for (j, &e) in used.iter().enumerate() {
+                    ids.push(e as i32);
+                    wts.push((ti * 10 + j) as f32);
+                }
+            }
+            let (di, dw) = (
+                DevBuf::from_slice(&ids).unwrap(),
+                DevBuf::from_slice(&wts).unwrap(),
+            );
+            let counts = DevBuf::alloc(ne * 4).unwrap();
+            let off = DevBuf::alloc((ne + 1) * 4).unwrap();
+            let rows = DevBuf::alloc(t * kk * 4).unwrap();
+            let rw = DevBuf::alloc(t * kk * 4).unwrap();
+            k.route(
+                &s, di.ptr, dw.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, kk, ne,
+            )
+            .unwrap();
+            s.sync().unwrap();
+            let mut routes: Vec<Vec<(i32, f32)>> = vec![Vec::new(); ne];
+            for ti in 0..t {
+                for j in 0..kk {
+                    routes[ids[ti * kk + j] as usize].push((ti as i32, wts[ti * kk + j]));
+                }
+            }
+            let (gc, go, gr, gw) = (
+                counts.read::<i32>(0, ne).unwrap(),
+                off.read::<i32>(0, ne + 1).unwrap(),
+                rows.read::<i32>(0, t * kk).unwrap(),
+                rw.read::<f32>(0, t * kk).unwrap(),
+            );
+            for e in 0..ne {
+                assert_eq!(gc[e] as usize, routes[e].len());
+                let o = go[e] as usize;
+                assert_eq!(go[e + 1] as usize, o + routes[e].len());
+                for (q, &(r, w)) in routes[e].iter().enumerate() {
+                    assert_eq!((gr[o + q], gw[o + q]), (r, w), "route e{e}");
+                }
+            }
         }
     }
 }
