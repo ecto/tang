@@ -846,6 +846,7 @@ mod tests {
             s.sync().unwrap();
             t0.elapsed().as_secs_f64() / n as f64
         };
+        let fq = std::env::var_os("DS_BENCH_NOQDQ").is_none();
         let shapes: &[(&str, i32, usize, usize)] = &[
             ("expert w1", 3, 2304, 5120),
             ("expert w2", 3, 5120, 2304),
@@ -860,7 +861,7 @@ mod tests {
                 let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
                 let y = DevBuf::alloc(t * rows * 4).unwrap();
                 let tf = time(&|| {
-                    k.linear_fast(&s, &w, None, x.ptr, y.ptr, t, true, true, 0, 0.0)
+                    k.linear_fast(&s, &w, None, x.ptr, y.ptr, t, true, fq, 0, 0.0)
                         .unwrap()
                 });
                 let ts = if t == 1 {
@@ -888,7 +889,7 @@ mod tests {
             let x = DevBuf::from_slice(&data(t * 5120, 3, 2.0)).unwrap();
             let h = DevBuf::alloc(t * 2304 * 4).unwrap();
             let tf = time(&|| {
-                k.linear_fast(&s, &w1, Some(&w3), x.ptr, h.ptr, t, true, true, 0, 10.0)
+                k.linear_fast(&s, &w1, Some(&w3), x.ptr, h.ptr, t, true, fq, 0, 10.0)
                     .unwrap()
             });
             let gbs = (b1 + b3) as f64 / tf / 1e9;

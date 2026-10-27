@@ -245,9 +245,11 @@ impl GpuModel {
         let (k, n) = (w.v.cols as usize, w.v.rows as usize);
         let y = fbuf(t * n)?;
         if self.fast && Kernels::fast_ok(&w.v) {
+            let xq = self.qdq(x, t * k)?;
             self.k
-                .linear_fast(&self.s, &w.v, None, x.ptr, y.ptr, t, true, true, 0, 0.0)?;
-            self.expert_fence(name)?;
+                .linear_fast(&self.s, &w.v, None, xq.ptr, y.ptr, t, true, false, 0, 0.0)?;
+            // drain before `xq` (and an evicted expert) drops
+            self.s.sync()?;
         } else if w.v.fmt >= 2 {
             let xq = fbuf(t * k)?;
             self.copy(xq.ptr, x.ptr, t * k)?;
@@ -710,12 +712,14 @@ impl GpuModel {
         Ok(h)
     }
 
-    /// An evicted expert's memory is freed at once: drain kernels reading it first.
-    fn expert_fence(&self, name: &str) -> Result<()> {
-        if self.expert_slots > 0 && name.contains(".ffn.experts.") {
-            self.s.sync()?;
-        }
-        Ok(())
+    /// An fp8 quant-dequantized copy of `x` (n values). Kept out of the GEMV: fused into its
+    /// column loop (`qdq` in `ds_lin_*`, bit-identical) it costs 2-8x the GEMV at t = 1..8,
+    /// since every warp redoes it.
+    fn qdq(&self, x: &DevBuf, n: usize) -> Result<DevBuf> {
+        let xq = fbuf(n)?;
+        self.copy(xq.ptr, x.ptr, n)?;
+        self.k.fp8_qdq(&self.s, xq.ptr, n)?;
+        Ok(xq)
     }
 
     fn mlp(&self, p: &str, x: &DevBuf, n: usize, w: u64) -> Result<DevBuf> {
@@ -724,19 +728,20 @@ impl GpuModel {
             let (w1, w3) = (self.dw(&n1)?, self.dw(&n3)?);
             if Kernels::fast_ok(&w1.v) && Kernels::fast_ok(&w3.v) {
                 let h = fbuf(n * w1.v.rows as usize)?;
+                let xq = self.qdq(x, n * w1.v.cols as usize)?;
                 self.k.linear_fast(
                     &self.s,
                     &w1.v,
                     Some(&w3.v),
-                    x.ptr,
+                    xq.ptr,
                     h.ptr,
                     n,
                     true,
-                    true,
+                    false,
                     w,
                     self.cpu.cfg.swiglu_limit,
                 )?;
-                self.expert_fence(&n1)?;
+                self.s.sync()?;
                 return self.lin(&h, n, &format!("{p}.w2.weight"));
             }
         }
