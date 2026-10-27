@@ -21,6 +21,7 @@
 //! (`hidden ≤ 1024`, i.e. the tiny fixture), or with `TANG_GLM5_CACHE=1`, they are cached.
 
 use super::forward::Glm5Ref;
+#[cfg(feature = "cuda")]
 use tang_moe::{args, gpu::launch};
 use super::kda::{ConvState, KdaConfig, KdaLayerW, KdaState};
 use super::mla::MlaWeights;

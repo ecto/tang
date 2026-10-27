@@ -418,7 +418,7 @@ impl DevLayer {
             tr_bytes(self.bproj.w.estride);
             launch(
                 self.gv.beta,
-                grid(t * nh),
+                grid(t * nh / K5_WARPS + (t * nh % K5_WARPS > 0) as usize),
                 (128, 1, 1),
                 0,
                 &self.s,
