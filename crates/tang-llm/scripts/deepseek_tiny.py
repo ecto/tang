@@ -16,6 +16,8 @@ Outputs under --out:
   hf/config.json         the inference/config.json keys for this model
   ref/                   little-endian f32 .bin + sidecar .json {"shape": [...]}:
     step{s}_hash           [T, n_engram_layers, n_hash_cols] engram hash ids
+    step{s}_in{i}          [T, hc, D] stream into layer i (before its Engram)
+    step{s}_pm{i}          [T, hc] the pre-mix layer i's attention collapses with
     step{s}_layer{i}       [T, hc, D] stream after block i
     step{s}_logits         [V] last-position logits
     step{s}_main_hidden    [T, D * n_targets] DSpark target hiddens
@@ -184,13 +186,36 @@ def main():
     with open(os.path.join(hf, "engram_token_map.json"), "w") as f:
         json.dump(token_map, f)
     model = R.Model(c, W, token_map, C)
+    # the hash constants tang reads instead of recomputing (numpy's PCG64, the tokenizer fold)
+    eh = model.hash
+    with open(os.path.join(hf, "engram.json"), "w") as f:
+        json.dump({"token_map": token_map, "pad": eh.pad, "multipliers": eh.mult.tolist(),
+                   "primes": eh.primes.tolist(), "offsets": eh.offsets.tolist()}, f)
     dump = Dumper(os.path.join(args.out, "ref"))
+
+    # each backbone layer's input stream (before Engram) and pre-mix, for teacher forcing
+    step_of = {"s": 0}
+    block, engram, pending = model.block, model.engram, {}
+
+    def engram_tap(p, lid, x, hs):
+        pending[lid] = x[0].clone()
+        return engram(p, lid, x, hs)
+
+    def block_tap(p, lid, x, sp, pre_mix, fn):
+        if lid < c["n_layers"]:
+            s = step_of["s"]
+            dump(f"step{s}_in{lid}", pending.pop(lid, x[0]))
+            dump(f"step{s}_pm{lid}", pre_mix[0])
+        return block(p, lid, x, sp, pre_mix, fn)
+
+    model.block, model.engram = block_tap, engram_tap
 
     g = torch.Generator().manual_seed(7)
     ids = torch.randint(3, c["vocab_size"], (args.prefill,), generator=g)
     meta, pos = {"steps": []}, 0
     with torch.inference_mode():
         for step in range(args.decode + 1):
+            step_of["s"] = step
             logits, main_hidden = model.forward(ids, pos, lambda n, t: dump(f"step{step}_{n}", t))
             dump(f"step{step}_logits", logits)
             dump(f"step{step}_main_hidden", main_hidden[0])

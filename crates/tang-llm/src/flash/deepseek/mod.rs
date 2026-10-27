@@ -1,0 +1,139 @@
+//! DeepSeek-V4.1-Flash (`deepseek_v41`): one file per owner.
+//!
+//! - [`st`]: a safetensors reader that knows `F8_E4M3`, `F8_E8M0` and the `I8`-packed fp4
+//!   experts (the workspace's safetensors 0.4 rejects these headers).
+//! - [`quant`]: the number formats, and the fp8 / fp4 quant-dequant steps the forward applies to
+//!   activations.
+//! - [`forward`]: the CPU f32 reference forward, a transcription of `scripts/deepseek_ref.py`
+//!   (itself DeepSeek's `inference/model.py` in plain torch), checked against its dumps.
+//!
+//! See `docs/deepseek-v41-plan.md` for the architecture and the port's milestones.
+
+pub mod forward;
+pub mod quant;
+pub mod st;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::path::Path;
+
+/// `inference/config.json`, field for field (the keys DeepSeek's `ModelArgs` takes).
+#[derive(Clone, Debug, Deserialize)]
+pub struct Config {
+    pub vocab_size: usize,
+    pub dim: usize,
+    pub moe_inter_dim: usize,
+    pub n_layers: usize,
+    pub n_mtp_layers: usize,
+    pub n_heads: usize,
+    pub n_routed_experts: usize,
+    pub n_activated_experts: usize,
+    #[serde(default = "yes")]
+    pub norm_topk_prob: bool,
+    pub route_scale: f32,
+    pub swiglu_limit: f32,
+    pub q_lora_rank: usize,
+    pub head_dim: usize,
+    pub rope_head_dim: usize,
+    pub norm_eps: f32,
+    pub o_groups: usize,
+    pub o_lora_rank: usize,
+    pub window_size: usize,
+    pub compress_ratios: Vec<usize>,
+    pub kv_source_layers: Vec<usize>,
+    pub index_source_layers: Vec<usize>,
+    pub original_seq_len: usize,
+    pub rope_theta: f32,
+    pub rope_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub compress_rope_theta: f32,
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    pub candidate_source_layer: i64,
+    pub candidate_topk_blocks: usize,
+    pub candidate_block_size: usize,
+    pub hc_mult: usize,
+    pub hc_sinkhorn_iters: usize,
+    pub hc_eps: f32,
+    pub engram_layer_ids: Vec<usize>,
+    pub engram_max_ngram_size: usize,
+    pub engram_n_heads: usize,
+    pub engram_head_dim: usize,
+    pub dspark_block_size: usize,
+    pub dspark_noise_token_id: usize,
+    pub dspark_target_layer_ids: Vec<usize>,
+    pub dspark_markov_rank: usize,
+    #[serde(default)]
+    pub dspark_n_routed_experts: usize,
+    #[serde(default)]
+    pub dspark_n_activated_experts: usize,
+    /// Not in the released config (a runtime limit in DeepSeek's code); sizes the caches.
+    #[serde(default = "max_seq")]
+    pub max_seq_len: usize,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn max_seq() -> usize {
+    4096
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(serde_json::from_str(&s)?)
+    }
+
+    /// Routed experts and how many a token picks, for layer `lid` (DSpark stages have their own).
+    pub fn moe(&self, lid: usize) -> (usize, usize) {
+        if lid < self.n_layers {
+            return (self.n_routed_experts, self.n_activated_experts);
+        }
+        let n = if self.dspark_n_routed_experts > 0 {
+            self.dspark_n_routed_experts
+        } else {
+            self.n_routed_experts
+        };
+        let k = if self.dspark_n_activated_experts > 0 {
+            self.dspark_n_activated_experts
+        } else {
+            self.n_activated_experts
+        };
+        (n, k)
+    }
+
+    pub fn is_kv_source(&self, lid: usize) -> bool {
+        lid < self.n_layers && self.kv_source_layers.contains(&lid)
+    }
+
+    pub fn is_index_source(&self, lid: usize) -> bool {
+        lid < self.n_layers && self.index_source_layers.contains(&lid)
+    }
+}
+
+/// Engram's hash constants: the compressed token map (from the tokenizer) and numpy-drawn
+/// multipliers, precomputed in Python (`scripts/deepseek_tiny.py` writes `engram.json`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct EngramMeta {
+    pub token_map: Vec<i64>,
+    pub pad: i64,
+    /// [engram layer][n-gram position]
+    pub multipliers: Vec<Vec<i64>>,
+    /// [engram layer][n-gram size - 2][head]
+    pub primes: Vec<Vec<Vec<i64>>>,
+    /// [engram layer][hash column]
+    pub offsets: Vec<Vec<i64>>,
+}
+
+impl EngramMeta {
+    pub fn load(path: &Path) -> Result<Self> {
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(serde_json::from_str(&s)?)
+    }
+}
