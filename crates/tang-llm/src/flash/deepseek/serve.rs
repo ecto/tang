@@ -4,10 +4,13 @@
 //! Deliberately minimal, like GLM's first serve glue:
 //! - One sequence at a time. Each request prefills its whole prompt in one chunk at position
 //!   0 and then decodes; there is no prefix reuse across requests yet.
-//! - Greedy requests (temperature 0) decode speculatively with DSpark (`DS_SPEC=0` turns it
-//!   off): each forward verifies the sampled token and its drafts as one window
-//!   ([`GpuModel::decode_spec`]), the same tokens as plain greedy decoding. Sampled requests
-//!   decode one token at a time.
+//! - Requests decode speculatively with DSpark (`DS_SPEC=0` turns it off): each forward
+//!   verifies the sampled token and its drafts as one window ([`forward::generate`]). Greedy
+//!   gives the same tokens as plain greedy decoding; sampled requests use speculative
+//!   (rejection) sampling, the same distribution as plain temperature/top-p sampling
+//!   ([`SpecSampler`]). Sampled spec needs the engine's `decode_spec` to take a
+//!   [`forward::SpecPick`] ([`SPEC_SAMPLING`]); until then sampled requests decode one token
+//!   at a time.
 //! - Sampling on the host from the last logits: greedy at temperature 0, else top-p.
 //!
 //! The reply streams as reasoning (inside `<think>`), text, and tool calls. DeepSeek writes a
@@ -17,6 +20,8 @@
 //! [`Dsml`] turns that into [`Piece::ToolCall`]s.
 
 use super::engine::GpuModel;
+use super::forward::{self, Decoder, SpecPick, SpecSampler, SpecStep};
+use super::Config;
 use crate::chat::{Chunk, Detok, Parser, Piece, Tags, Template};
 use crate::engine::{Finish, Request, Usage};
 use crate::server::Backend;
@@ -72,54 +77,38 @@ impl DsServe {
             ctx,
         })
     }
-
-    fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.tok
-            .decode(ids, false)
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))
-    }
 }
 
-/// Splitmix64, for seeded sampling.
-fn next_u64(s: &mut u64) -> u64 {
-    *s = s.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *s;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
+/// Whether the GPU `decode_spec` takes a [`SpecPick`] (speculative sampling). The port: give
+/// `GpuModel::forward_spec` a `draw: &mut dyn FnMut(&[f32]) -> usize` for the Markov loop
+/// (as `Model::forward_spec_with`), and `GpuModel::decode_spec` a trailing
+/// `pick: &mut dyn SpecPick` used as `Model::decode_spec` does (`forward::verify_rows`); then
+/// flip this and call it below.
+const SPEC_SAMPLING: bool = false;
 
-/// Greedy at temperature 0, else nucleus sampling at `top_p`.
-fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut u64) -> usize {
-    let argmax = || (0..logits.len()).fold(0, |b, i| if logits[i] > logits[b] { i } else { b });
-    if temp <= 0.0 {
-        return argmax();
+impl Decoder for GpuModel {
+    fn config(&self) -> &Config {
+        &self.cpu.cfg
     }
-    let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let mut p: Vec<(usize, f64)> = logits
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| (i, (((l - mx) / temp) as f64).exp()))
-        .collect();
-    p.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-    let z: f64 = p.iter().map(|x| x.1).sum();
-    let (mut keep, mut acc) = (0, 0.0);
-    for &(_, v) in &p {
-        acc += v / z;
-        keep += 1;
-        if acc >= top_p as f64 {
-            break;
-        }
+    fn feed(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward(ids, sp, None)
     }
-    let total: f64 = p[..keep].iter().map(|x| x.1).sum();
-    let mut r = (next_u64(rng) >> 11) as f64 / (1u64 << 53) as f64 * total;
-    for &(i, v) in &p[..keep] {
-        r -= v;
-        if r <= 0.0 {
-            return i;
-        }
+    fn seed_drafter(&mut self, main: &[f32]) -> Result<()> {
+        self.forward_spec(0, main, 0).map(|_| ())
     }
-    p[keep - 1].0
+    fn spec_ok(&self, greedy: bool) -> bool {
+        greedy || SPEC_SAMPLING
+    }
+    fn spec_step(
+        &mut self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        _pick: &mut dyn SpecPick,
+    ) -> Result<SpecStep> {
+        // greedy only until ported: `self.decode_spec(token, main, sp, &mut |_, _| {}, pick)`
+        self.decode_spec(token, main, sp, &mut |_, _| {})
+    }
 }
 
 /// Pulls DSML tool calls out of the text stream; everything else passes through. Holds back
@@ -264,22 +253,17 @@ impl Backend for DsServe {
                 self.ctx
             );
         }
-        let mut usage = Usage {
-            prompt_tokens: ids.len(),
-            ..Default::default()
-        };
+        let mut usage = Usage::default();
         self.m.reset()?;
-        let t0 = Instant::now();
-        let (mut logits, mut main) = self.m.forward(&ids, 0, None).context("prefill")?;
-        usage.prefill_tok_s = ids.len() as f64 / t0.elapsed().as_secs_f64();
-        let mut rng = req.sampling.seed ^ 0x5eed;
-        let (temp, top_p) = (req.sampling.temperature, req.sampling.top_p);
+        let mut pick = SpecSampler::new(
+            req.sampling.temperature,
+            req.sampling.top_p,
+            req.sampling.seed ^ 0x5eed,
+        );
         let (mut detok, mut parser, mut dsml) =
             (Detok::default(), Parser::new(think), Dsml::default());
         let mut out: Vec<u32> = Vec::new();
-        let mut finish = Finish::Length;
         let mut called = false;
-        let t1 = Instant::now();
         let mut emit = |pieces: Vec<Piece>, dsml: &mut Dsml, called: &mut bool| -> bool {
             for p in pieces {
                 let ps = match p {
@@ -295,75 +279,58 @@ impl Backend for DsServe {
             }
             true
         };
-        let spec = temp <= 0.0 && std::env::var("DS_SPEC").map_or(true, |v| v != "0");
-        let blk = self.m.cpu.cfg.dspark_block_size;
-        if spec {
-            // seed the drafter's windows with the prompt
-            self.m.forward_spec(0, &main, 0)?;
-        }
-        // tokens a verify window produced: (token, already fed)
-        let mut queue: std::collections::VecDeque<(u32, bool)> = Default::default();
-        // the start position of `main`'s rows, once it holds a decode step's hiddens
-        let mut main_sp: Option<usize> = None;
-        let mut pos = ids.len();
-        'gen: for _ in 0..max_new {
-            let (next, fed) = match queue.pop_front() {
-                Some(q) => q,
-                None => (sample(&logits, temp, top_p, &mut rng) as u32, false),
-            };
-            if self.eos.contains(&next) {
-                finish = Finish::Stop;
-                break;
-            }
-            out.push(next);
-            usage.completion_tokens += 1;
-            for ch in detok.push(&out, &self.tags, |s| self.decode(s))? {
-                let pieces = match ch {
-                    Chunk::Text(s) => parser.push_text(&s),
-                    Chunk::Tag(t) => parser.push_tag(t),
+        let spec = std::env::var("DS_SPEC").map_or(true, |v| v != "0");
+        let eos: Vec<usize> = self.eos.iter().map(|&e| e as usize).collect();
+        let (tok, tags, stop) = (&self.tok, &self.tags, &req.stop);
+        let decode = |ids: &[u32]| -> Result<String> {
+            tok.decode(ids, false)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))
+        };
+        let mut err = None;
+        let mut finish = forward::generate(
+            &mut self.m,
+            &ids,
+            max_new,
+            &mut pick,
+            spec,
+            &eos,
+            &mut usage,
+            &mut |next| {
+                out.push(next as u32);
+                let chunks = match detok.push(&out, tags, decode) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        err = Some(e);
+                        return Some(Finish::Cancelled);
+                    }
                 };
-                if !emit(pieces, &mut dsml, &mut called) {
-                    finish = Finish::Cancelled;
-                    break 'gen;
+                for ch in chunks {
+                    let pieces = match ch {
+                        Chunk::Text(s) => parser.push_text(&s),
+                        Chunk::Tag(t) => parser.push_tag(t),
+                    };
+                    if !emit(pieces, &mut dsml, &mut called) {
+                        return Some(Finish::Cancelled);
+                    }
                 }
-            }
-            if !req.stop.is_empty() {
-                let text = self.decode(&out)?;
-                if req.stop.iter().any(|s| text.ends_with(s.as_str())) {
-                    finish = Finish::Stop;
-                    break;
+                if !stop.is_empty() {
+                    match decode(&out) {
+                        Ok(text) if stop.iter().any(|s| text.ends_with(s.as_str())) => {
+                            return Some(Finish::Stop)
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            err = Some(e);
+                            return Some(Finish::Cancelled);
+                        }
+                    }
                 }
-            }
-            if pos + 1 >= self.ctx {
-                break;
-            }
-            if fed {
-                pos += 1;
-                continue;
-            }
-            match main_sp {
-                Some(sp) if spec && pos + blk + 1 < self.ctx => {
-                    let s = self
-                        .m
-                        .decode_spec(next as usize, &main, sp, &mut |_, _| {})?;
-                    usage.draft_tokens += s.drafted;
-                    usage.accepted_tokens += s.accepted;
-                    let n = s.tokens.len();
-                    queue.extend(
-                        s.tokens
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &t)| (t as u32, i + 1 < n)),
-                    );
-                    main = s.main;
-                    main_sp = Some(s.sp);
-                }
-                _ => {
-                    (logits, main) = self.m.forward(&[next as usize], pos, None)?;
-                    main_sp = Some(pos);
-                }
-            }
-            pos += 1;
+                None
+            },
+        )
+        .context("decode")?;
+        if let Some(e) = err {
+            return Err(e);
         }
         let tail = parser.finish();
         emit(tail, &mut dsml, &mut called);
@@ -374,7 +341,6 @@ impl Backend for DsServe {
         if called && finish == Finish::Stop {
             finish = Finish::ToolCalls;
         }
-        usage.decode_tok_s = usage.completion_tokens as f64 / t1.elapsed().as_secs_f64().max(1e-9);
         Ok((finish, usage))
     }
 
@@ -454,11 +420,13 @@ mod tests {
     #[test]
     fn sampling_is_greedy_at_zero_and_seeded_otherwise() {
         let l = vec![0.1, 2.0, 1.9, -1.0];
-        let mut r = 1;
-        assert_eq!(sample(&l, 0.0, 1.0, &mut r), 1);
-        let (mut a, mut b) = (7, 7);
-        let xs: Vec<usize> = (0..20).map(|_| sample(&l, 1.0, 0.95, &mut a)).collect();
-        let ys: Vec<usize> = (0..20).map(|_| sample(&l, 1.0, 0.95, &mut b)).collect();
+        assert_eq!(SpecSampler::new(0.0, 1.0, 1).sample(&l), 1);
+        let (mut a, mut b) = (
+            SpecSampler::new(1.0, 0.95, 7),
+            SpecSampler::new(1.0, 0.95, 7),
+        );
+        let xs: Vec<usize> = (0..20).map(|_| a.sample(&l)).collect();
+        let ys: Vec<usize> = (0..20).map(|_| b.sample(&l)).collect();
         assert_eq!(xs, ys);
         assert!(xs.iter().all(|&i| i < 3), "top-p drops the tail");
     }
