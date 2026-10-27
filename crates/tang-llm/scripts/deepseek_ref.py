@@ -402,6 +402,18 @@ class Model:
             idxs = (end - win + 1).clamp(min=0) + torch.arange(min(T, win))
             idxs = torch.where(idxs > end, -1, idxs)
             return kv, idxs.int().unsqueeze(0)
+        if T > 1:
+            # a chunk at sp > 0 (a speculative verify window) is the same math as T decode
+            # steps: query sp+e sees its window in time order, older rows from the ring as it
+            # was before the chunk (rows [0, win)), the chunk's own rows after it
+            old = ring.clone()
+            q = torch.arange(sp, sp + T).unsqueeze(1)
+            j = (q - win + 1).clamp(min=0) + torch.arange(win)
+            rows = torch.where(j < sp, j % win, win + j - sp)
+            idxs = torch.where(j > q, -1, rows)
+            for e in range(T):
+                ring[(sp + e) % win] = kv[0, e]
+            return torch.cat([old.unsqueeze(0), kv], 1), idxs.int().unsqueeze(0)
         ring[sp % win] = kv[0, 0]
         oldest = sp % win + 1
         idxs = torch.cat([torch.arange(oldest, win), torch.arange(oldest)])
@@ -436,6 +448,23 @@ class Model:
 
     def compress_kv(self, p, lid, x, qr, sp, offset):
         c, T = self.c, x.size(1)
+        if sp > 0 and T > 1:
+            # one position at a time: groups complete where a decode step completes them and
+            # each query's top-k sees only the groups complete at its own position
+            topk_in, cand_in = self.shared.get("topk"), self.shared.get("cand")
+            rows, cands = [], []
+            for e in range(T):
+                if topk_in is not None:
+                    self.shared["topk"] = topk_in[:, e : e + 1]
+                if isinstance(cand_in, list):
+                    self.shared["cand"] = cand_in[e]
+                ckv, idx = self.compress_kv(p, lid, x[:, e : e + 1], qr[:, e : e + 1], sp + e, offset)
+                rows.append(idx[0, 0])
+                cands.append(self.shared.get("cand"))
+            w = max(r.numel() for r in rows)
+            idxs = torch.stack([F.pad(r, (0, w - r.numel()), value=-1) for r in rows]).unsqueeze(0)
+            self.shared["topk"], self.shared["cand"] = idxs, cands
+            return ckv, idxs
         r, rd = c["compress_ratios"][lid], c["rope_head_dim"]
         clen = (sp + T) // r
         latent = None
@@ -633,8 +662,9 @@ class Model:
         q = torch.cat([q[..., :-rd], rope(q[..., -rd:], fr)], -1)
         kv = rms(self.linear(x, f"{p}.attn.wkv.weight"), self.W[f"{p}.attn.kv_norm.weight"], self.eps)
         kv = fp8_qdq(torch.cat([kv[..., :-rd], rope(kv[..., -rd:], fr)], -1))
-        idxs = torch.cat([torch.arange(min(win, sp + 1)), win + torch.arange(B)]).int().view(1, 1, -1).expand(1, B, -1)
-        ring[sp % win] = mkv[0, 0]
+        idxs = torch.cat([torch.arange(min(win, sp + T)), win + torch.arange(B)]).int().view(1, 1, -1).expand(1, B, -1)
+        for i in range(T):  # positions sp..sp+T (one at decode, the accepted ones after a verify)
+            ring[(sp + i) % win] = mkv[0, i]
         kv = torch.cat([ring.unsqueeze(0), kv], 1)
         return self.attn_out(p, q, kv, idxs, fr)
 

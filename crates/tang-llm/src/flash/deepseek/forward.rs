@@ -255,6 +255,9 @@ pub struct Model {
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     engram: Option<EngramMeta>,
     hash_cache: Vec<i64>,
+    /// While a [`Snapshot`] is open: every compressor partial-group write (lid, pos, kv, score),
+    /// so a rewind can replay the kept positions' writes over the snapshot.
+    journal: Option<Vec<(usize, usize, Vec<f32>, Vec<f32>)>>,
 }
 
 /// The DSpark draft of one decode step.
@@ -329,6 +332,7 @@ impl Model {
             taps: RefCell::new(Vec::new()),
             force: None,
             engram,
+            journal: None,
         })
     }
 
@@ -507,6 +511,26 @@ impl Model {
                 .collect();
             return Ok((kv, idxs));
         }
+        if t > 1 {
+            // a chunk at sp > 0 (a verify window): query sp+e sees the positions of its own
+            // window in time order, the older ones from the ring as it was before the chunk,
+            // exactly the rows (and order) T single decode steps would see
+            let mut all = ring.clone();
+            all.extend_from_slice(&kv);
+            let idxs = (0..t)
+                .map(|e| {
+                    let q = sp + e;
+                    ((q + 1).saturating_sub(win)..=q)
+                        .map(|j| if j < sp { j % win } else { win + j - sp } as i32)
+                        .collect()
+                })
+                .collect();
+            for e in 0..t {
+                let s = (sp + e) % win;
+                ring[s * hd..(s + 1) * hd].copy_from_slice(&kv[e * hd..(e + 1) * hd]);
+            }
+            return Ok((all, idxs));
+        }
         ring[(sp % win) * hd..(sp % win + 1) * hd].copy_from_slice(&kv);
         let oldest = sp % win + 1;
         let idxs = (oldest..win)
@@ -578,6 +602,9 @@ impl Model {
             let slot = sp % r;
             kst[slot * hd..(slot + 1) * hd].copy_from_slice(&kv);
             sst[slot * hd..(slot + 1) * hd].copy_from_slice(&sc);
+            if let Some(j) = &mut self.journal {
+                j.push((lid, sp, kv.clone(), sc.clone()));
+            }
             if (sp + 1) % r != 0 {
                 return Ok(None);
             }
@@ -603,6 +630,9 @@ impl Model {
             self.cfg.head_dim,
         );
         let t = x.len() / self.cfg.dim;
+        if sp > 0 && t > 1 {
+            return self.compress_kv_steps(p, lid, x, qr, sp, offset);
+        }
         let clen = (sp + t) / r;
         let mut latent = None;
         if self.cfg.is_kv_source(lid) {
@@ -629,6 +659,46 @@ impl Model {
             dst.copy_from_slice(&lat);
         }
         Ok((self.ckv[&self.shared.ckv][..clen * hd].to_vec(), idxs))
+    }
+
+    /// A chunk at sp > 0 through the compressor and indexer one position at a time: group
+    /// boundaries inside the chunk complete where a decode step would complete them, and each
+    /// query's top-k sees only the groups complete at its own position.
+    fn compress_kv_steps(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: &[f32],
+        qr: &[f32],
+        sp: usize,
+        offset: usize,
+    ) -> Result<(Vec<f32>, Vec<Vec<i32>>)> {
+        let d = self.cfg.dim;
+        let t = x.len() / d;
+        let ql = qr.len() / t;
+        let topk_in = std::mem::take(&mut self.shared.topk);
+        let cand_in = std::mem::take(&mut self.shared.cand);
+        let (mut idxs, mut topk, mut cand, mut ckv) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for e in 0..t {
+            self.shared.topk = topk_in.get(e).cloned().into_iter().collect();
+            self.shared.cand = cand_in.get(e).cloned().into_iter().collect();
+            let (c, mut ie) = self.compress_kv(
+                p,
+                lid,
+                &x[e * d..(e + 1) * d],
+                &qr[e * ql..(e + 1) * ql],
+                sp + e,
+                offset,
+            )?;
+            ckv = c;
+            idxs.push(ie.pop().unwrap_or_default());
+            topk.append(&mut self.shared.topk);
+            cand.append(&mut self.shared.cand);
+        }
+        self.shared.topk = topk;
+        self.shared.cand = cand;
+        Ok((ckv, idxs))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1063,6 +1133,22 @@ impl Model {
         sp: usize,
         hook: &mut dyn FnMut(&str, &[f32]),
     ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward_impl(ids, sp, hook, false)
+    }
+
+    /// [`Self::forward`] with every position's logits [T][V]: the verify window of speculative
+    /// decoding. A chunk at sp > 0 is the same math as feeding its tokens one at a time.
+    pub fn forward_all(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward_impl(ids, sp, &mut |_, _| {}, true)
+    }
+
+    fn forward_impl(
+        &mut self,
+        ids: &[usize],
+        sp: usize,
+        hook: &mut dyn FnMut(&str, &[f32]),
+        all: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let c = self.cfg.clone();
         let (hc, d, t) = (c.hc_mult, c.dim, ids.len());
         let hashes = if self.engram.is_some() {
@@ -1116,7 +1202,7 @@ impl Model {
         }
         let mut x = self.hc_pre(&h, &pre_mix);
         self.rms(&mut x, "norm.weight")?;
-        let logits = self.logits(&x[(t - 1) * d..], "head.weight")?;
+        let logits = self.logits(&x[if all { 0 } else { (t - 1) * d }..], "head.weight")?;
         let n = mains.len();
         let mut main = vec![0f32; t * d * n];
         for ti in 0..t {
@@ -1168,12 +1254,16 @@ impl Model {
         self.rms(&mut kv, &format!("{p}.attn.kv_norm.weight"))?;
         rope(&mut kv, hd, rd, 1, &tab, |i| pos0 + i, false);
         fp8_qdq(&mut kv, 32);
-        let row: Vec<i32> = (0..win.min(sp + 1) as i32)
+        let row: Vec<i32> = (0..win.min(sp + t) as i32)
             .chain((0..b as i32).map(|i| win as i32 + i))
             .collect();
         let idxs = vec![row; b];
         let ring = &mut self.win[lid];
-        ring[(sp % win) * hd..(sp % win + 1) * hd].copy_from_slice(&mkv[..hd]);
+        // main rows for positions sp..sp+t (one at decode, the accepted ones after a verify)
+        for i in 0..t {
+            let s = (sp + i) % win;
+            ring[s * hd..(s + 1) * hd].copy_from_slice(&mkv[i * hd..(i + 1) * hd]);
+        }
         let mut all = ring.clone();
         all.extend_from_slice(&kv);
         self.attn_out(p, &q, &all, &idxs, &tab, pos0)
@@ -1251,6 +1341,108 @@ impl Model {
     }
 }
 
+/// The state a verify window can damage past the accepted position: the backbone's window
+/// rings (a slot written for a rejected position held the position one window earlier) and
+/// the ratio-r compressors' partial group (a rejected position overwrites the slot of a kept
+/// one in the same slot class; restored from the snapshot plus the journal of kept writes).
+/// Everything else is position-indexed and rewritten before it is read again: compressed KV and
+/// index keys are read only up to the groups complete at the query (`clen`), the Engram hash
+/// cache is written before it is read, and `shared` is recomputed every forward.
+pub struct Snapshot {
+    win: Vec<Vec<f32>>,
+    cstate: HashMap<usize, (Vec<f32>, Vec<f32>)>,
+}
+
+/// One speculative step's result.
+pub struct SpecStep {
+    /// The new tokens: the accepted drafts, then the main model's own next token.
+    pub tokens: Vec<usize>,
+    pub drafted: usize,
+    pub accepted: usize,
+    /// DSpark target hiddens [k+1][D * n] of the fed positions `sp..sp+k+1`, for the next
+    /// [`Model::decode_spec`] (with `sp` as its start).
+    pub main: Vec<f32>,
+    pub sp: usize,
+}
+
+/// Greedy pick (temperature 0). Sampling would replace this and the accept rule with the
+/// standard rejection test over the draft and target distributions.
+pub fn argmax(v: &[f32]) -> usize {
+    (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b })
+}
+
+impl Model {
+    /// Open a rewind point (until the next [`Self::rewind`]).
+    pub fn snapshot(&mut self) -> Snapshot {
+        self.journal = Some(Vec::new());
+        Snapshot {
+            win: self.win[..self.cfg.n_layers].to_vec(),
+            cstate: self.cstate.clone(),
+        }
+    }
+
+    /// Undo a forward of positions `from..end` past `from`: afterwards the state is as if only
+    /// positions `< from` had been fed.
+    pub fn rewind(&mut self, snap: &Snapshot, from: usize, end: usize) {
+        let (win, hd) = (self.cfg.window_size, self.cfg.head_dim);
+        for (ring, old) in self.win.iter_mut().zip(&snap.win) {
+            for pos in from..end.min(from + win) {
+                let s = (pos % win) * hd;
+                ring[s..s + hd].copy_from_slice(&old[s..s + hd]);
+            }
+        }
+        self.cstate = snap.cstate.clone();
+        for (lid, pos, kv, sc) in self.journal.take().unwrap_or_default() {
+            if pos < from {
+                let (kst, sst) = self.cstate.get_mut(&lid).unwrap();
+                let s = (pos % self.cfg.compress_ratios[lid]) * hd;
+                kst[s..s + hd].copy_from_slice(&kv);
+                sst[s..s + hd].copy_from_slice(&sc);
+            }
+        }
+    }
+
+    /// One greedy speculative step. `token` is the sampled, not yet fed, token at position
+    /// `sp + rows(main)`; `main` the target hiddens of positions `sp..`. Drafts with DSpark,
+    /// verifies `[token, drafts]` as one window, keeps the longest prefix the main model agrees
+    /// with and rewinds the rest. `edit(pos, drafts)` may rewrite the drafts, the first at
+    /// position `pos` (tests force wrong ones).
+    pub fn decode_spec(
+        &mut self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        edit: &mut dyn FnMut(usize, &mut [usize]),
+    ) -> Result<SpecStep> {
+        let c = &self.cfg;
+        let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
+        let pos0 = sp + main.len() / w;
+        let draft = self
+            .forward_spec(token, main, sp)?
+            .ok_or_else(|| anyhow::anyhow!("decode_spec needs sp > 0"))?;
+        let mut ids = draft.ids;
+        edit(pos0 + 1, &mut ids[1..]);
+        let snap = self.snapshot();
+        let (logits, mains) = self.forward_all(&ids, pos0)?;
+        let n = ids.len();
+        let mut k = 0;
+        while k + 1 < n && argmax(&logits[k * v..(k + 1) * v]) == ids[k + 1] {
+            k += 1;
+        }
+        let next = argmax(&logits[k * v..(k + 1) * v]);
+        self.rewind(&snap, pos0 + k + 1, pos0 + n);
+        let mut tokens = ids[1..=k].to_vec();
+        tokens.push(next);
+        Ok(SpecStep {
+            tokens,
+            drafted: n - 1,
+            accepted: k,
+            main: mains[..(k + 1) * w].to_vec(),
+            sp: pos0,
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1283,10 +1475,6 @@ pub(crate) mod tests {
         };
         let (p, q) = (ls(p_logits), ls(q_logits));
         p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum()
-    }
-
-    fn argmax(v: &[f32]) -> usize {
-        (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b })
     }
 
     /// Each layer fed the reference's own input stream and pre-mix, and the drafter the
@@ -1454,5 +1642,149 @@ pub(crate) mod tests {
         let mean = kls.iter().sum::<f64>() / kls.len() as f64;
         eprintln!("top1 {top1}/{} mean KL {mean:.2e}", steps.len());
         assert!(top1 + 1 >= steps.len(), "top-1 {top1}/{}", steps.len());
+    }
+
+    fn prompt() -> Option<(Model, Vec<usize>)> {
+        let dir = Path::new(&tiny()).join("hf");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skip: no {} (run scripts/deepseek_tiny.py)", tiny());
+            return None;
+        }
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        Some((Model::open(&dir).unwrap(), ids))
+    }
+
+    /// A verify window then a rewind leaves the state exactly as feeding only the accepted
+    /// tokens one at a time: the window's own logits and every later step's are bit-identical.
+    #[test]
+    fn tiny_chunk_and_rewind_exact() {
+        let Some((mut a, ids)) = prompt() else { return };
+        let v = a.cfg.vocab_size;
+        let n = ids.len();
+        a.forward(&ids, 0, &mut |_, _| {}).unwrap();
+        // A: one at a time over a fixed token stream
+        let stream: Vec<usize> = (0..14).map(|i| (37 * i + 11) % v).collect();
+        let mut want = Vec::new();
+        for (i, &t) in stream.iter().enumerate() {
+            want.push(a.forward(&[t], n + i, &mut |_, _| {}).unwrap().0);
+        }
+        for keep in 1..=6 {
+            let mut b = Model::open(&Path::new(&tiny()).join("hf")).unwrap();
+            b.forward(&ids, 0, &mut |_, _| {}).unwrap();
+            // a window of 6 at sp > 0 on top of a decode step
+            b.forward(&stream[..1], n, &mut |_, _| {}).unwrap();
+            let snap = b.snapshot();
+            let (lw, _) = b.forward_all(&stream[1..7], n + 1).unwrap();
+            for e in 0..6 {
+                assert_eq!(lw[e * v..(e + 1) * v], want[1 + e][..], "window row {e}");
+            }
+            b.rewind(&snap, n + 1 + keep, n + 7);
+            for i in 1 + keep..stream.len() {
+                let (l, _) = b.forward(&[stream[i]], n + i, &mut |_, _| {}).unwrap();
+                assert_eq!(l, want[i], "keep {keep} step {i}");
+            }
+        }
+    }
+
+    fn greedy(m: &mut Model, ids: &[usize], len: usize) -> Vec<usize> {
+        let (mut l, _) = m.forward(ids, 0, &mut |_, _| {}).unwrap();
+        let mut out = Vec::new();
+        while out.len() < len {
+            let t = argmax(&l);
+            out.push(t);
+            l = m
+                .forward(&[t], ids.len() + out.len() - 1, &mut |_, _| {})
+                .unwrap()
+                .0;
+        }
+        out
+    }
+
+    /// Greedy speculative decoding: prefill, one plain step, then DSpark draft + verify.
+    pub(crate) fn spec(
+        m: &mut Model,
+        ids: &[usize],
+        len: usize,
+        edit: &mut dyn FnMut(usize, &mut [usize]),
+    ) -> (Vec<usize>, usize, usize) {
+        let n = ids.len();
+        let (l, main) = m.forward(ids, 0, &mut |_, _| {}).unwrap();
+        let t0 = argmax(&l);
+        m.forward_spec(t0, &main, 0).unwrap();
+        let (l, mut main) = m.forward(&[t0], n, &mut |_, _| {}).unwrap();
+        let mut out = vec![t0, argmax(&l)];
+        let (mut sp, mut drafted, mut accepted) = (n, 0, 0);
+        while out.len() < len {
+            let s = m
+                .decode_spec(*out.last().unwrap(), &main, sp, edit)
+                .unwrap();
+            drafted += s.drafted;
+            accepted += s.accepted;
+            out.extend(s.tokens);
+            main = s.main;
+            sp = s.sp;
+        }
+        out.truncate(len);
+        (out, drafted, accepted)
+    }
+
+    #[test]
+    fn tiny_spec_matches_greedy() {
+        let Some((mut m, ids)) = prompt() else { return };
+        let want = greedy(&mut m, &ids, 40);
+        let v = m.cfg.vocab_size;
+        let mut rng = 1u64;
+        let n = ids.len();
+        let (oracle, oracle2) = (want.clone(), want.clone());
+        type Edit = Box<dyn FnMut(usize, &mut [usize])>;
+        let runs: Vec<(&str, Edit)> = vec![
+            ("dspark", Box::new(|_, _: &mut [usize]| {})),
+            // the true continuation (as far as it is known): every draft accepted
+            (
+                "oracle",
+                Box::new(move |pos, d: &mut [usize]| {
+                    for (i, x) in d.iter_mut().enumerate() {
+                        if let Some(&w) = oracle.get(pos + i - n) {
+                            *x = w;
+                        }
+                    }
+                }),
+            ),
+            (
+                "wrong",
+                // the true continuation with random drafts broken: every acceptance length
+                Box::new(move |pos, d: &mut [usize]| {
+                    for (i, x) in d.iter_mut().enumerate() {
+                        if let Some(&w) = oracle2.get(pos + i - n) {
+                            *x = w;
+                        }
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        if (rng >> 33) % 5 == 0 {
+                            *x = (*x + 1 + (rng >> 40) as usize % (v - 1)) % v;
+                        }
+                    }
+                }),
+            ),
+        ];
+        for (name, mut edit) in runs {
+            let mut m = Model::open(&Path::new(&tiny()).join("hf")).unwrap();
+            let (got, drafted, accepted) = spec(&mut m, &ids, 40, &mut *edit);
+            eprintln!(
+                "{name}: accepted {accepted}/{drafted} ({:.1}%)",
+                100.0 * accepted as f64 / drafted.max(1) as f64
+            );
+            assert_eq!(got, want, "{name}");
+        }
     }
 }
