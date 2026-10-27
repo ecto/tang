@@ -940,6 +940,8 @@ mod gemv8_tests {
             1e-2,
         );
         assert!(sq.0 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
-        assert!(s.1 < 2e-2, "gemv8 layer output diverges: rel {:.3e}", s.0);
+        // relative, like the taps above. s.1 is an ABSOLUTE l2: it grew 1.1e-2 -> 1.5e-1 when
+        // k5_beta began computing every (t, h) (output scale, not error; rel stayed 9.2e-3)
+        assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 layer output diverges: rel {:.3e}", s.0);
     }
 }
