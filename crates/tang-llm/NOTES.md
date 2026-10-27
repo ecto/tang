@@ -4,6 +4,38 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 (late) — MTP: the NextN layer drafts at 85–93% (branch claude/glm5-mtp)
+GGUF facts (unsloth UD-Q4_K_XL, dumped on the H200): `nextn_predict_layers = 1`,
+`block_count = 46`; `blk.45` is the NextN block — `nextn.eh_proj` [8192→4096] Q8_0,
+`nextn.{enorm,hnorm,shared_head_norm}` F32, a full DSA attention (MLA + indexer tensors) and
+the 288-expert MoE + shared expert. No `nextn.embed_tokens` / `shared_head.head` (uses
+`token_embd` / `output`), no mHC tensors. `index_share_mtp = true`. Forward per llama.cpp
+`graph_mtp` (/private/tmp/llamacpp-ref/glm5-next.cpp): `eh_proj @ [enorm(embed(x_{i+1})) ;
+hnorm(h_i)]`, plain-residual DSA + MoE, `shared_head_norm`, `output`. `h_i` is the trunk's
+**post-output_norm** hidden; a chain step's `h` is the previous MTP cell's post-shared_head_norm.
+Code: `mtp.rs` (CPU drafter + greedy draft-and-verify, `--mtp K` / `TANG_GLM5_MTP=K`),
+`mtp_tests.rs`; engine.rs hooks `last_h`, `snapshot`/`restore` (KDA host copies, read back
+from resident layers first; DSA caches truncate), and the GPU head now runs every window row.
+A partial accept rewinds and re-runs the accepted prefix (no per-token KDA checkpoints).
+Results (H200, fast env: GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT
+GPU_HEAD, k=3, -n 128; depth d rate is conditional on depths < d accepted):
+- gate "Write a haiku about the sea." -n 8 --mtp 3: ids `785 1196 6801 264 6386 38038 911 279`
+  (= oracle), 2 verify passes, 100% accept.
+- code: d1 88.4% d2 78.4% d3 62.1%; 1.91 tok/pass actual, 2.98 verify-only.
+- prose: d1 84.8% d2 64.1% d3 75.0%; 1.75 actual, 2.78 verify-only.
+- chat: d1 93.0% d2 70.0% d3 57.1%; 1.81 actual, 2.95 verify-only.
+- haiku -n 64: 1.85 actual / 2.86 verify-only.
+NOT identical at -n 64: MTP on/off agree for 60 tokens, then plain gives `30957 11 342`, MTP
+`342 69898 11` (inside an accepted verify window). Not the head (same with the per-row GPU
+head, logs2). It's a t=4-window vs t=1-step numerics difference in the trunk (KDA fused
+decode / MoE fast / mHC t=1 paths vs window paths) at a near-tie; unbisected.
+Tiny fixture (CPU): output == plain greedy for MTP / junk / oracle drafters, k=1..3; the
+oracle is never rewound. Drafting is CPU (~2 s/cell at 4096: CPU MoE for blk.45).
+GPU version needs: blk.45 resident (MLA via mla_dev + its MoE in GpuFfn + eh_proj gemv +
+device head/argmax, no host round trip per cell); per-token KDA state checkpoints in the
+window kernel (drop the re-run: 1.8 → 2.9 tok/pass); trunk window rows bitwise equal to t=1
+decode (or bisect the near-tie flip first).
+
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
 clearly-marked WIP (709f70a7) and a resumed worker verified it on the H200 (r16, tree
