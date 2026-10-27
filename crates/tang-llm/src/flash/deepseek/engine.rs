@@ -1907,7 +1907,7 @@ impl GpuModel {
             && self.expert_slots == 0
             && (self.moe_reduce.is_none() || self.reduce_graphable)
             && std::env::var_os("DS_TAP").is_none()
-            && !super::obs::force_direct()
+            && !self.obs.direct()
     }
 
     fn forward_impl(
@@ -2714,6 +2714,128 @@ mod tests {
         eprintln!("graph: {:?}, direct: {:?}", a.graph_stats, b.graph_stats);
         assert!(a.graph_stats.replays >= 8, "{:?}", a.graph_stats);
         assert_eq!(b.graph_stats.captures + b.graph_stats.replays, 0);
+    }
+
+    /// `DS_OBS=2` on a direct step: one `layer` span per backbone layer, and the ops inside
+    /// the layers plus `embed` and `head` account for the step's device time (within 20%).
+    #[test]
+    fn gpu_tiny_obs_layers_sum_to_step() {
+        use super::super::obs;
+        let Some((mut m, meta)) = open() else { return };
+        m.obs.over.set(Some((2, 1, true)));
+        obs::collect(true);
+        let ids = prompt(&meta);
+        let (mut l, _) = m.forward(&ids, 0, None).unwrap();
+        let mut pos = ids.len();
+        for _ in 0..5 {
+            l = m.forward(&[argmax(&l)], pos, None).unwrap().0;
+            pos += 1;
+        }
+        let recs: Vec<_> = obs::take()
+            .into_iter()
+            .filter(|r| r.kind == "decode" && r.t == 1 && r.sp >= ids.len())
+            .collect();
+        obs::collect(false);
+        assert_eq!(recs.len(), 5);
+        let nl = m.cpu.cfg.n_layers;
+        for r in &recs {
+            assert_eq!(r.path, "direct");
+            assert!(
+                r.counts.launches > 0 && r.counts.syncs >= 1,
+                "{:?}",
+                r.counts
+            );
+            assert_eq!(r.spans.iter().filter(|s| s.name == "layer").count(), nl);
+            let top: f64 = r
+                .spans
+                .iter()
+                .filter(|s| s.name == "embed" || s.name == "head")
+                .map(|s| s.gpu_ms)
+                .sum();
+            let ops = obs::layer_ops_ms(r) + top;
+            let ratio = ops / r.gpu_ms;
+            eprintln!(
+                "step {} gpu {:.3} ms, ops {:.3} ms ({:.1}%), covered {:.3} ms, launches {}",
+                r.step,
+                r.gpu_ms,
+                ops,
+                100.0 * ratio,
+                obs::covered_ms(r),
+                r.counts.launches
+            );
+            for (n, ms, k) in obs::breakdown(r) {
+                eprintln!("  {n:<26} {ms:>8.3} ms x{k}");
+            }
+            assert!(
+                (0.8..=1.2).contains(&ratio),
+                "ops {ops} vs gpu {}",
+                r.gpu_ms
+            );
+        }
+    }
+
+    /// The timeline doesn't change the math, and graph capture works with it on.
+    #[test]
+    fn gpu_tiny_obs_graph_exact() {
+        let Some((mut a, meta)) = open() else { return };
+        let mut b = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+        b.obs.over.set(Some((2, 1, false)));
+        let ids = prompt(&meta);
+        let (la, _) = a.forward(&ids, 0, None).unwrap();
+        let (lb, _) = b.forward(&ids, 0, None).unwrap();
+        assert_eq!(la, lb);
+        let (mut ta, mut pos) = (argmax(&la), ids.len());
+        for _ in 0..6 {
+            let la = a.forward(&[ta], pos, None).unwrap().0;
+            let lb = b.forward(&[ta], pos, None).unwrap().0;
+            assert_eq!(la, lb, "at {pos}");
+            ta = argmax(&la);
+            pos += 1;
+        }
+        assert!(
+            b.graph_stats.captures >= 1 && b.graph_stats.replays >= 2,
+            "{:?}",
+            b.graph_stats
+        );
+    }
+
+    /// Timeline overhead: decode us/step with it off, at 1 and at 2 (graph path), and off vs 2
+    /// on the direct path.
+    #[test]
+    #[ignore]
+    fn gpu_tiny_obs_overhead() {
+        let Some((_, meta)) = open() else { return };
+        let dir = Path::new(&tiny()).join("hf");
+        let ids = prompt(&meta);
+        // the fixture's context is short: every round restarts the sequence
+        let ctx = GpuModel::open(&dir).unwrap().cpu.cfg.max_seq_len;
+        let steps = ctx.saturating_sub(ids.len() + 8).max(8);
+        for (lvl, direct) in [(0, false), (1, false), (2, false), (0, true), (2, true)] {
+            let mut m = GpuModel::open(&dir).unwrap();
+            m.obs.over.set(Some((lvl, 1, direct)));
+            let (l, _) = m.forward(&ids, 0, None).unwrap();
+            let mut tok = argmax(&l);
+            let mut pos = ids.len();
+            for _ in 0..4 {
+                tok = argmax(&m.forward(&[tok], pos, None).unwrap().0);
+                pos += 1;
+            }
+            let mut best = f64::MAX;
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..steps {
+                    tok = argmax(&m.forward(&[tok], pos, None).unwrap().0);
+                    pos += 1;
+                }
+                best = best.min(t0.elapsed().as_secs_f64() * 1e6 / steps as f64);
+                m.reset().unwrap();
+                pos = 0;
+                let (l, _) = m.forward(&ids, 0, None).unwrap();
+                tok = argmax(&l);
+                pos += ids.len();
+            }
+            eprintln!("DS_OBS={lvl} direct={direct}: {best:.0} us/step");
+        }
     }
 
     /// Decode-step time on the tiny model, graphs on vs off (launch overhead is the whole

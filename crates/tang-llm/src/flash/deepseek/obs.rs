@@ -323,12 +323,27 @@ pub struct Obs {
     interior: Cell<bool>,
     pub rank: Cell<usize>,
     pub parent: Cell<u64>,
+    /// This model's (level, every, direct) instead of the process's (tests, benches).
+    pub over: Cell<Option<(u8, u64, bool)>>,
     st: RefCell<St>,
 }
 
 pub const NONE: u32 = u32::MAX;
 
 impl Obs {
+    fn lvl(&self) -> u8 {
+        self.over.get().map_or_else(level, |o| o.0)
+    }
+
+    fn ev(&self) -> u64 {
+        self.over.get().map_or_else(every, |o| o.1.max(1))
+    }
+
+    /// Decode steps run directly (`DS_OBS_DIRECT`, or the override).
+    pub fn direct(&self) -> bool {
+        self.over.get().map_or_else(force_direct, |o| o.2)
+    }
+
     fn event(st: &mut St, s: &Stream) -> Option<usize> {
         if st.used == st.pool.len() {
             st.pool.push(Event::new(true).ok()?);
@@ -351,8 +366,8 @@ impl Obs {
         self.flush();
         let n = self.n.get();
         self.n.set(n + 1);
-        let lvl = level();
-        let sampled = n % every() == 0;
+        let lvl = self.lvl();
+        let sampled = n % self.ev() == 0;
         let on = lvl > 0 || (sampled && crate::telemetry::ds_enabled());
         self.on.set(on);
         self.interior.set(false);

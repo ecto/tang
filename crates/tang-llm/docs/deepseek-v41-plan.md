@@ -68,6 +68,36 @@ a host callback), so EP steps run the direct path with its syncs; (2) the MoE lo
 ~5 kernels for each of the 384 experts per layer (~80k launches a forward) instead of one
 grouped launch over the routing CSR.
 
+## How to profile a step
+
+The step timeline (`flash/deepseek/obs.rs`, [observability.md](observability.md#deepseek-v41-flash-the-step-timeline-flashdeepseekobsrs))
+says where a forward's time goes; no guessing.
+
+```bash
+# the table: per-forward wall/gpu/host, launches, syncs, bytes; per-op means with % of step
+tang-llm deepseek-profile /workspace/ds41 --devices 0,1,2,3 --steps 20 --graph-debug
+# the same with decode/verify interiors timed (graphs off for the run)
+tang-llm deepseek-profile /workspace/ds41 --devices 0,1,2,3 --steps 20 --direct
+# while serving: a line per forward, JSON lines for later
+DS_OBS=1 DS_OBS_FILE=/tmp/steps.jsonl tang-llm deepseek-serve /workspace/ds41 --devices 0,1,2,3
+```
+
+Read it as: `gpu_ms` vs `wall_ms` (host-bound if they differ), `launches` per forward (a
+graph replay is 0 on top of its inputs), `path` (did the decode step actually replay a graph,
+see `--graph-debug`), `syncs` (1 on the token path), `expup` (expert uploads after warm-up
+mean the LRU or a table rebuild), and per-op `%step` plus `reduce_wait` per rank for EP.
+
+Overhead, RTX 3090, tiny fixture, decode µs/step (best of 10 rounds of ~100 steps):
+
+| | `DS_OBS` unset | `DS_OBS=1` | `DS_OBS=2` (every step) |
+|---|---|---|---|
+| graph path | 2151 | 2157 (+0.3%) | 2157 (+0.3%; graph interiors aren't recorded) |
+| direct path (`DS_OBS_DIRECT=1`) | 2527 | — | 3304 (+31%: ~1100 events on a 554-launch step) |
+
+So `DS_OBS=1` is free; `DS_OBS=2` costs only on the sampled (`DS_OBS_EVERY`, default 50)
+direct steps it records, and is for profiling runs. On the tiny decode step the interior's ops
+cover 94–99% of the step's device time.
+
 ## M0 findings (2026-10-27)
 
 Read from the checkpoint's `config.json`, `model.safetensors.index.json`, shard headers (range
