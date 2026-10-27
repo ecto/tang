@@ -282,6 +282,22 @@ impl DevMoe {
             dense: up3(p.dense_gate, p.dense_up, p.dense_down, 1, p.ff_dense, hid)?,
         })
     }
+
+    /// Weight bytes one token's FFN call reads: top_k experts' gate + up + down rows, the
+    /// shared expert, the router (or the dense MLP). The bandwidth floor's numerator.
+    pub fn active_bytes(&self) -> usize {
+        let p = &self.p;
+        let mlp = |m: &Mlp, ff: usize| {
+            ff * (m.0.w.row_bytes as usize + m.1.w.row_bytes as usize) + p.hidden * m.2.w.row_bytes as usize
+        };
+        if let Some(d) = &self.dense {
+            return mlp(d, p.ff_dense);
+        }
+        let r = self.router.as_ref().map_or(0, |w| p.n_expert * w.w.row_bytes as usize);
+        let e = self.exps.as_ref().map_or(0, |m| p.top_k * mlp(m, p.ff_exp));
+        let s = self.sh.as_ref().map_or(0, |m| mlp(m, p.ff_shexp));
+        r + e + s
+    }
 }
 
 const BLOCK: (u32, u32, u32) = (128, 1, 1);
@@ -337,9 +353,20 @@ fn mlp(
 pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
     if k.fast {
         let mut pool = k.pool.borrow_mut();
-        return ffn_fast(k, &mut pool, s, m, x, y, t_len);
+        ffn_fast(k, &mut pool, s, m, x, y, t_len)?;
+        s.sync()?;
+        return Ok(());
     }
     ffn_naive(k, s, m, x, y, t_len)
+}
+
+/// The fast path's `ffn` without the sync: queued on `s`, `x` / `y` device-resident, so a
+/// caller that keeps the residual stream on the device (or captures a graph) pays no host
+/// round trip for the layer. Errors when `k.fast` is off (naive syncs internally).
+pub fn ffn_async(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
+    ensure!(k.fast, "ffn_async: fast path only (TANG_GLM5_MOE=fast)");
+    let mut pool = k.pool.borrow_mut();
+    ffn_fast(k, &mut pool, s, m, x, y, t_len)
 }
 
 fn ffn_naive(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
@@ -498,6 +525,7 @@ fn nan_fill(ptr: u64, n_f32: usize, s: &Stream) -> Result<()> {
 }
 
 /// The fast path: q8(x) → [router → select] → grouped gate|up → q8(h) → grouped down + combine.
+/// Async on `s` (no sync, no host copies: routing stays on the device); callers sync.
 #[allow(clippy::too_many_arguments)]
 fn ffn_fast(
     k: &Kernels,
@@ -612,10 +640,17 @@ fn ffn_fast(
     let (r16g, smg) = smem_for(k, pool, 0, k.f_gu, row16(&[gate, up, sg, su]))?;
     let (r16d, smd) = smem_for(k, pool, 1, k.f_down, row16(&[down, sd]))?;
     let lims = p.limit_shexp;
+    // weight bytes the two grouped launches stream (per token; T tokens re-read them only
+    // when they route to different experts — this is the T=1 figure x T, an upper bound)
+    let rb = |w: G5W| w.row_bytes as u64;
+    let (nr64, t64) = (nr as u64, t as u64);
+    let gu_b = t64 * (nr64 * ff as u64 * (rb(gate) + rb(up)) + ffs as u64 * (rb(sg) + rb(su)));
+    let dn_b = t64 * hid as u64 * (nr64 * rb(down) + rb(sd));
     unsafe {
+        gpu::trace::bytes(gu_b);
         gpu::launch(
             k.f_gu,
-            (hs.div_ceil(4) as u32, t as u32, 1),
+            (hs.div_ceil(4) as u32, slots as u32, t as u32),
             blk,
             smg,
             s,
@@ -631,16 +666,16 @@ fn ffn_fast(
             s,
             tang_moe::args![h, hq, hq2, hd, hsi],
         )?;
+        gpu::trace::bytes(dn_b);
         gpu::launch(
             k.f_down,
-            (hid.div_ceil(8) as u32, t as u32, 1),
+            (hid.div_ceil(2) as u32, t as u32, 1),
             blk,
             smd,
             s,
             tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d],
         )?;
     }
-    s.sync()?;
     Ok(())
 }
 
@@ -663,6 +698,7 @@ pub fn ffn_host(k: &Kernels, m: &DevMoe, x: &[f32], t_len: usize) -> Result<Vec<
             };
             let yp = pool.get(P_Y, x.len() * 4)?;
             ffn_fast(k, &mut pool, &s, m, xp, yp, t_len)?;
+            s.sync()?;
             Ok(pool.buf(P_Y, x.len() * 4)?.read::<f32>(0, x.len())?)
         })();
         pool.stream = Some(s);

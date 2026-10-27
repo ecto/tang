@@ -631,7 +631,7 @@ mod cuda {
                 _ => "-".into(),
             };
             eprintln!(
-                "moebench l{l} {} gate {} up {} down {} sh {}/{}/{} (upload {:.1} s)",
+                "moebench l{l} {} gate {} up {} down {} sh {}/{}/{} (upload {:.1} s) active {:.2} MB/token",
                 if p.is_dense() { "dense" } else { "moe" },
                 tys(if p.is_dense() { &p.dense_gate } else { &p.gate_exps }),
                 tys(if p.is_dense() { &p.dense_up } else { &p.up_exps }),
@@ -639,7 +639,8 @@ mod cuda {
                 tys(&p.sh_gate),
                 tys(&p.sh_up),
                 tys(&p.sh_down),
-                t_up.elapsed().as_secs_f64()
+                t_up.elapsed().as_secs_f64(),
+                m.active_bytes() as f64 / 1e6
             );
             for t_len in list("TANG_GLM5_MOE_BENCH_T", "1,8") {
                 let hid = p.hidden;
@@ -666,8 +667,8 @@ mod cuda {
                         ffn_host(&k, &m, &x, t_len).unwrap();
                     });
                     eprintln!(
-                        "moebench l{l} T{t_len} {mode:<9} rel {:.3e} cos {:.7} max {:.3e} nonfinite {} | {:.0} us/call (device x/y), {:.0} us/call (host x/y) | cpu {:.0} ms",
-                        st.rel_l2, st.cos, st.max_abs, st.nonfinite_gpu, us, us_host, cpu_ms
+                        "moebench l{l} T{t_len} {mode:<9} rel {:.3e} cos {:.7} max {:.3e} nonfinite {} | {:.0} us/call (device x/y, {:.2} TB/s T1-equiv), {:.0} us/call (host x/y) | cpu {:.0} ms",
+                        st.rel_l2, st.cos, st.max_abs, st.nonfinite_gpu, us, m.active_bytes() as f64 / us / 1e6, us_host, cpu_ms
                     );
                     assert_eq!(st.nonfinite_gpu, 0, "l{l} {mode}: non-finite output");
                     let bar = if !fast { 1e-4 } else if act2 { 1e-3 } else { 1e-1 };

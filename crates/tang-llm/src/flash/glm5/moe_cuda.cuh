@@ -494,80 +494,72 @@ extern "C" __global__ void g5f_select(const float* s, const float* bias, unsigne
         }
 }
 
-// h[t*S + j][r] = silu(min(gate_r . x_t, L)) * clamp(up_r . x_t, ±L) for every slot j of token t
+// h[t*S + j][r] = silu(min(gate_r . x_t, L)) * clamp(up_r . x_t, ±L) for slot j of token t
 // (routed slots j < nr on matrix ids[t][j] — 0 for an id >= ne — then the shared slot on
-// sgate/sup when sgate.base != 0, limit lims). grid (ceil(max(ff, ffs)/4), T), block 128,
-// one row r per warp (gate and up rows staged together).
+// sgate/sup when sgate.base != 0, limit lims). grid (ceil(max(ff, ffs)/4), S, T), block 128,
+// one (slot, row r) per warp (gate and up rows staged together): every active expert's rows
+// are in flight at once instead of a warp walking the slots in turn.
 extern "C" __global__ void __launch_bounds__(128) g5f_gu(
     const G5W gate, const G5W up, const G5W sgate, const G5W sup, const unsigned* ids, int k, int ne,
     const float* x, const unsigned char* xq, const unsigned char* xq2, const float* xd, float* h, int hs, int ff,
     int ffs, int hid,
     float lim, float lims, int row16) {
-    __shared__ unsigned sid[32];
     extern __shared__ uint4 g5f_sm[];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = blockIdx.y, t = blockIdx.z;
     const int nr = ids ? k : 1, ns = sgate.base ? 1 : 0, S = nr + ns;
-    if ((int)threadIdx.x < nr) sid[threadIdx.x] = ids ? ids[(size_t)t * k + threadIdx.x] : 0u;
-    __syncthreads();
+    const bool sh = j >= nr;
+    const int r = blockIdx.x * 4 + warp;
+    if (r >= (sh ? ffs : ff)) return;
     uint4* sm0 = g5f_sm + (size_t)(warp * 2) * row16;
     uint4* sm1 = sm0 + row16;
-    const int r = blockIdx.x * 4 + warp;
     const unsigned char* xqt = xq + (size_t)t * hid;
     const unsigned char* xq2t = xq2 ? xq2 + (size_t)t * hid : 0;
     const float* xdt = xd + (size_t)t * (hid / 32);
     const float* xft = x + (size_t)t * hid;
-    for (int j = 0; j < S; j++) {
-        const bool sh = j >= nr;
-        if (r >= (sh ? ffs : ff)) continue;
-        float* hp = h + (size_t)(t * S + j) * hs;
-        const unsigned e = sh ? 0u : sid[j];
-        if (!sh && ids && e >= (unsigned)ne) {
-            if (lane == 0) hp[r] = 0.f;
-            continue;
-        }
-        const G5W g = sh ? sgate : gate, u = sh ? sup : up;
-        const unsigned char* wg = g5f_stage(g, e, r, sm0, row16, lane);
-        const unsigned char* wu = g5f_stage(u, e, r, sm1, row16, lane);
-        g5f_stage_wait();
-        const float a = g5f_warp_sum(g5f_dot_any(g.ty, wg, xqt, xq2t, xdt, xft, hid));
-        const float b = g5f_warp_sum(g5f_dot_any(u.ty, wu, xqt, xq2t, xdt, xft, hid));
-        if (lane == 0) {
-            const float L = sh ? lims : lim;
-            const float gg = fminf(a, L), uu = fminf(fmaxf(b, -L), L);
-            hp[r] = gg / (1.0f + expf(-gg)) * uu;
-        }
-        __syncwarp();  // all lanes done with sm0/sm1 before the next slot refills them
+    float* hp = h + (size_t)(t * S + j) * hs;
+    const unsigned e = sh ? 0u : (ids ? ids[(size_t)t * k + j] : 0u);
+    if (!sh && ids && e >= (unsigned)ne) {
+        if (lane == 0) hp[r] = 0.f;
+        return;
+    }
+    const G5W g = sh ? sgate : gate, u = sh ? sup : up;
+    const unsigned char* wg = g5f_stage(g, e, r, sm0, row16, lane);
+    const unsigned char* wu = g5f_stage(u, e, r, sm1, row16, lane);
+    g5f_stage_wait();
+    const float a = g5f_warp_sum(g5f_dot_any(g.ty, wg, xqt, xq2t, xdt, xft, hid));
+    const float b = g5f_warp_sum(g5f_dot_any(u.ty, wu, xqt, xq2t, xdt, xft, hid));
+    if (lane == 0) {
+        const float L = sh ? lims : lim;
+        const float gg = fminf(a, L), uu = fminf(fmaxf(b, -L), L);
+        hp[r] = gg / (1.0f + expf(-gg)) * uu;
     }
 }
 
 // y[t][c] = sum_{j < nr} wts[t][j] * (down_{ids[t][j]} row c . h[t*S + j]) (+ sdown row c .
 // h[t*S + nr] if sdown.base != 0); with ids = null: one slot of weight 1 on matrix 0 (dense).
-// Ids >= ne contribute nothing. grid (ceil(hid/8), T), block 128: two rows c a warp.
+// Ids >= ne contribute nothing. grid (ceil(hid/2), T), block 128: a block owns rows c0, c0+1;
+// warp w takes slots w, w+4, ... (two rows each, staged), then warp 0 sums the four partials
+// in a fixed order (deterministic).
 extern "C" __global__ void __launch_bounds__(128) g5f_down(
     const G5W down, const G5W sdown, const unsigned* ids, const float* wts, int k, int ne,
     const float* h, const unsigned char* hq, const unsigned char* hq2, const float* hd, int hs, float* y, int ff,
     int ffs, int hid,
     int row16) {
-    __shared__ unsigned sid[32];
-    __shared__ float swt[32];
+    __shared__ float red[4][2];
     extern __shared__ uint4 g5f_sm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = blockIdx.y;
     const int nr = ids ? k : 1, ns = sdown.base ? 1 : 0, S = nr + ns;
-    if ((int)threadIdx.x < nr) {
-        sid[threadIdx.x] = ids ? ids[(size_t)t * k + threadIdx.x] : 0u;
-        swt[threadIdx.x] = ids ? wts[(size_t)t * k + threadIdx.x] : 1.f;
-    }
-    __syncthreads();
     uint4* sm0 = g5f_sm + (size_t)(warp * 2) * row16;
     uint4* sm1 = sm0 + row16;
-    const int c0 = (blockIdx.x * 4 + warp) * 2;
+    const int c0 = blockIdx.x * 2;
     if (c0 >= hid) return;
     const bool two = c0 + 1 < hid;
     float acc0 = 0.f, acc1 = 0.f;
-    for (int j = 0; j < S; j++) {
+    for (int j = warp; j < S; j += 4) {
         const bool sh = j >= nr;
-        const unsigned e = sh ? 0u : sid[j];
+        const unsigned e = sh ? 0u : (ids ? ids[(size_t)t * k + j] : 0u);
         if (!sh && ids && e >= (unsigned)ne) continue;
+        const float wj = sh ? 1.f : (ids ? wts[(size_t)t * k + j] : 1.f);
         const G5W w = sh ? sdown : down;
         const int kk = sh ? ffs : ff;
         const size_t row = (size_t)t * S + j;
@@ -580,13 +572,15 @@ extern "C" __global__ void __launch_bounds__(128) g5f_down(
         g5f_stage_wait();
         const float a = g5f_warp_sum(g5f_dot_any(w.ty, w0, q, q2, d, f, kk));
         const float b = two ? g5f_warp_sum(g5f_dot_any(w.ty, w1, q, q2, d, f, kk)) : 0.f;
-        if (sh) { acc0 += a; acc1 += b; }
-        else { acc0 += swt[j] * a; acc1 += swt[j] * b; }
+        acc0 = fmaf(wj, a, acc0);
+        acc1 = fmaf(wj, b, acc1);
         __syncwarp();
     }
-    if (lane == 0) {
-        y[(size_t)t * hid + c0] = acc0;
-        if (two) y[(size_t)t * hid + c0 + 1] = acc1;
+    if (lane == 0) { red[warp][0] = acc0; red[warp][1] = acc1; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        y[(size_t)t * hid + c0] = (red[0][0] + red[1][0]) + (red[2][0] + red[3][0]);
+        if (two) y[(size_t)t * hid + c0 + 1] = (red[0][1] + red[1][1]) + (red[2][1] + red[3][1]);
     }
 }
 
