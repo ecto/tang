@@ -98,6 +98,8 @@ pub struct Kernels {
     pub act2: bool,
     /// Stage weight rows in shared memory (`TANG_GLM5_MOE_STAGE=0`: read them from global).
     pub stage: bool,
+    /// Warps sharing one down row pair on routed layers (1, 2, 4; `TANG_GLM5_MOE_DOWN_SW`).
+    pub down_sw: usize,
     /// NaN-fill h / y before each fast call (`TANG_GLM5_MOE_DEBUG=1`, unless `..._POISON=0`).
     pub poison: bool,
     smem_optin: u32,
@@ -138,6 +140,11 @@ impl Kernels {
             f_down: m.func("g5f_down")?,
             fast: std::env::var("TANG_GLM5_MOE").is_ok_and(|v| v == "fast"),
             stage: env_on("TANG_GLM5_MOE_STAGE", true),
+            down_sw: match std::env::var("TANG_GLM5_MOE_DOWN_SW").ok().as_deref() {
+                Some("1") => 1,
+                Some("2") => 2,
+                _ => 4,
+            },
             act2: !std::env::var("TANG_GLM5_MOE_ACT").is_ok_and(|v| v == "q8"),
             poison: debug && env_on("TANG_GLM5_MOE_DEBUG_POISON", true),
             smem_optin,
@@ -640,6 +647,10 @@ fn ffn_fast(
     let (r16g, smg) = smem_for(k, pool, 0, k.f_gu, row16(&[gate, up, sg, su]))?;
     let (r16d, smd) = smem_for(k, pool, 1, k.f_down, row16(&[down, sd]))?;
     let lims = p.limit_shexp;
+    // warps sharing a down row pair: the routed layers' 9 slots spread over a block's 4 warps
+    // (TANG_GLM5_MOE_DOWN_SW overrides: 1, 2 or 4); dense has one slot, so one warp a pair
+    let sw = if slots >= 4 { k.down_sw } else { 1 };
+    let swi = sw as i32;
     // weight bytes the two grouped launches stream (per token; T tokens re-read them only
     // when they route to different experts — this is the T=1 figure x T, an upper bound)
     let rb = |w: G5W| w.row_bytes as u64;
@@ -669,11 +680,11 @@ fn ffn_fast(
         gpu::trace::bytes(dn_b);
         gpu::launch(
             k.f_down,
-            (hid.div_ceil(2) as u32, t as u32, 1),
+            (hid.div_ceil(8 / sw) as u32, t as u32, 1),
             blk,
             smd,
             s,
-            tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d],
+            tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d, swi],
         )?;
     }
     Ok(())

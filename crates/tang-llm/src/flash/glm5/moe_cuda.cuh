@@ -537,25 +537,26 @@ extern "C" __global__ void __launch_bounds__(128) g5f_gu(
 
 // y[t][c] = sum_{j < nr} wts[t][j] * (down_{ids[t][j]} row c . h[t*S + j]) (+ sdown row c .
 // h[t*S + nr] if sdown.base != 0); with ids = null: one slot of weight 1 on matrix 0 (dense).
-// Ids >= ne contribute nothing. grid (ceil(hid/2), T), block 128: a block owns rows c0, c0+1;
-// warp w takes slots w, w+4, ... (two rows each, staged), then warp 0 sums the four partials
-// in a fixed order (deterministic).
+// Ids >= ne contribute nothing. grid (ceil(hid / (8 / sw)), T), block 128. sw (1, 2 or 4) warps
+// share a row pair c0, c0+1: warp sub-index i takes slots i, i+sw, ... (two rows each, staged),
+// then the group's first warp sums the sw partials in a fixed order (deterministic). sw = 4
+// for the routed layers (9 slots: every expert's rows in flight at once), 1 for dense.
 extern "C" __global__ void __launch_bounds__(128) g5f_down(
     const G5W down, const G5W sdown, const unsigned* ids, const float* wts, int k, int ne,
     const float* h, const unsigned char* hq, const unsigned char* hq2, const float* hd, int hs, float* y, int ff,
     int ffs, int hid,
-    int row16) {
+    int row16, int sw) {
     __shared__ float red[4][2];
     extern __shared__ uint4 g5f_sm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = blockIdx.y;
     const int nr = ids ? k : 1, ns = sdown.base ? 1 : 0, S = nr + ns;
     uint4* sm0 = g5f_sm + (size_t)(warp * 2) * row16;
     uint4* sm1 = sm0 + row16;
-    const int c0 = blockIdx.x * 2;
-    if (c0 >= hid) return;
-    const bool two = c0 + 1 < hid;
+    const int grp = warp / sw, sub = warp % sw;
+    const int c0 = (blockIdx.x * (4 / sw) + grp) * 2;
+    const bool live = c0 < hid, two = c0 + 1 < hid;
     float acc0 = 0.f, acc1 = 0.f;
-    for (int j = warp; j < S; j += 4) {
+    for (int j = sub; live && j < S; j += sw) {
         const bool sh = j >= nr;
         const unsigned e = sh ? 0u : (ids ? ids[(size_t)t * k + j] : 0u);
         if (!sh && ids && e >= (unsigned)ne) continue;
@@ -576,11 +577,20 @@ extern "C" __global__ void __launch_bounds__(128) g5f_down(
         acc1 = fmaf(wj, b, acc1);
         __syncwarp();
     }
+    if (sw == 1) {
+        if (live && lane == 0) {
+            y[(size_t)t * hid + c0] = acc0;
+            if (two) y[(size_t)t * hid + c0 + 1] = acc1;
+        }
+        return;
+    }
     if (lane == 0) { red[warp][0] = acc0; red[warp][1] = acc1; }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        y[(size_t)t * hid + c0] = (red[0][0] + red[1][0]) + (red[2][0] + red[3][0]);
-        if (two) y[(size_t)t * hid + c0 + 1] = (red[0][1] + red[1][1]) + (red[2][1] + red[3][1]);
+    if (live && sub == 0 && lane == 0) {
+        float s0 = 0.f, s1 = 0.f;
+        for (int i = 0; i < sw; i++) { s0 += red[warp + i][0]; s1 += red[warp + i][1]; }
+        y[(size_t)t * hid + c0] = s0;
+        if (two) y[(size_t)t * hid + c0 + 1] = s1;
     }
 }
 
