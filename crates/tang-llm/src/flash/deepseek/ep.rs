@@ -11,7 +11,7 @@
 //! device broadcast is needed); each rank's reply is collected, and rank 0's returned.
 
 use super::engine::GpuModel;
-use super::forward::Draft;
+use super::forward::{Draft, SpecSampler, SpecStep};
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -69,6 +69,10 @@ impl HostReduce {
 enum Cmd {
     Forward(Vec<usize>, usize),
     Spec(usize, Vec<f32>, usize),
+    /// A whole speculative step on every rank with an identically seeded sampler: the
+    /// logits are the same on every rank (one NCCL reduction), so the drafts, the accept walk
+    /// and the rewind agree without a broadcast.
+    DecodeSpec(usize, Vec<f32>, usize, SpecSampler),
     Reset,
     Misses,
 }
@@ -76,6 +80,7 @@ enum Cmd {
 enum Reply {
     Forward(Vec<f32>, Vec<f32>),
     Spec(Option<Draft>),
+    DecodeSpec(SpecStep, u64),
     Done,
     Misses(usize),
 }
@@ -88,6 +93,7 @@ struct Rank {
 
 pub struct EpGroup {
     ranks: Vec<Rank>,
+    cfg: super::Config,
 }
 
 impl EpGroup {
@@ -152,6 +158,9 @@ impl EpGroup {
                             Cmd::Spec(tok, main, sp) => {
                                 m.forward_spec(tok, &main, sp).map(Reply::Spec)
                             }
+                            Cmd::DecodeSpec(tok, main, sp, mut pick) => m
+                                .decode_spec(tok, &main, sp, &mut |_, _| {}, &mut pick)
+                                .map(|st| Reply::DecodeSpec(st, pick.rng)),
                             Cmd::Reset => m.reset().map(|_| Reply::Done),
                             Cmd::Misses => Ok(Reply::Misses(m.expert_misses())),
                         };
@@ -162,9 +171,21 @@ impl EpGroup {
                 })?;
             ranks.push(Rank { tx, rx, h: Some(h) });
         }
-        let g = EpGroup { ranks };
+        let cfg = super::Config::load(&{
+            let inf = dir.join("inference/config.json");
+            if inf.exists() {
+                inf
+            } else {
+                dir.join("config.json")
+            }
+        })?;
+        let g = EpGroup { ranks, cfg };
         g.collect()?;
         Ok(g)
+    }
+
+    pub fn config(&self) -> &super::Config {
+        &self.cfg
     }
 
     pub fn world(&self) -> usize {
@@ -213,6 +234,27 @@ impl EpGroup {
             Reply::Spec(d) => Ok(d),
             _ => unreachable!(),
         }
+    }
+
+    /// [`GpuModel::decode_spec`] on every rank, each with a copy of `pick` (see
+    /// [`Cmd::DecodeSpec`]); rank 0's step, and `pick`'s RNG set to rank 0's.
+    pub fn decode_spec(
+        &self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        pick: &mut SpecSampler,
+    ) -> Result<SpecStep> {
+        let p = pick.clone();
+        let (step, rng) = match self
+            .send(|| Cmd::DecodeSpec(token, main.to_vec(), sp, p.clone()))?
+            .swap_remove(0)
+        {
+            Reply::DecodeSpec(s, r) => (s, r),
+            _ => unreachable!(),
+        };
+        pick.rng = rng;
+        Ok(step)
     }
 
     pub fn reset(&self) -> Result<()> {

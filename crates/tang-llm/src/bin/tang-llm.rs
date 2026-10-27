@@ -631,10 +631,11 @@ fn serve_flash(args: &[String]) -> Result<()> {
 #[cfg(feature = "cuda")]
 fn deepseek_serve(args: &[String]) -> Result<()> {
     let usage =
-        "deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N] [--expert-slots N]";
+        "deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N] [--expert-slots N] [--devices 0,1,..]";
     let dir = PathBuf::from(args.first().context(usage)?);
     let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
     let mut key = std::env::var("TANG_API_KEY").ok();
+    let mut devices: Vec<usize> = Vec::new();
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
@@ -643,6 +644,13 @@ fn deepseek_serve(args: &[String]) -> Result<()> {
             "--port" => port = val()?.parse()?,
             "--ctx" => std::env::set_var("DS41_CTX", val()?),
             "--expert-slots" => std::env::set_var("DS_EXPERT_SLOTS", val()?),
+            // GPU ordinals for expert parallelism (needs --features ep), e.g. 0,1,2,3
+            "--devices" => {
+                devices = val()?
+                    .split(',')
+                    .map(|d| d.trim().parse::<usize>())
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
             "--api-key-file" => {
                 let path = val()?;
                 key =
@@ -667,7 +675,7 @@ fn deepseek_serve(args: &[String]) -> Result<()> {
         hardware: probe(Backend::Cuda),
     };
     tang_llm::server::serve(opts, move |_name: &str| {
-        tang_llm::flash::deepseek::serve::DsServe::load(&dir)
+        tang_llm::flash::deepseek::serve::DsServe::load_on(&dir, &devices)
     })
 }
 

@@ -1402,6 +1402,11 @@ pub trait SpecPick {
     /// draft `d` drawn from `q`: returns `(d, true)` to accept it, else `(replacement, false)`.
     /// With `None` (every draft accepted, or no drafts) the bonus token from `p`.
     fn verify(&mut self, p: &[f32], draft: Option<(&[f32], usize)>) -> (usize, bool);
+    /// The concrete sampler, for callers that must copy its state (expert parallelism runs
+    /// one per rank).
+    fn as_sampler(&mut self) -> Option<&mut SpecSampler> {
+        None
+    }
 }
 
 /// Temperature 0: argmax drafts, a draft is kept iff it is the target's argmax.
@@ -1423,6 +1428,7 @@ impl SpecPick for Greedy {
 /// runs between the transformed P and Q, so each emitted token is distributed exactly as a
 /// plain draw from P: what [`Self::sample`] would give decoding one token at a time. At
 /// temperature 0 it is [`Greedy`] (the transform is a point mass at the argmax).
+#[derive(Clone, Debug)]
 pub struct SpecSampler {
     pub temp: f32,
     pub top_p: f32,
@@ -1510,6 +1516,9 @@ impl SpecSampler {
 }
 
 impl SpecPick for SpecSampler {
+    fn as_sampler(&mut self) -> Option<&mut SpecSampler> {
+        Some(self)
+    }
     fn draft(&mut self, q: &[f32]) -> usize {
         self.sample(q)
     }

@@ -32,8 +32,71 @@ use std::time::Instant;
 
 const DSML: &str = "｜DSML｜";
 
+/// One GPU, or expert-parallel across several (`--devices`).
+pub enum Engine {
+    Single(GpuModel),
+    #[cfg(feature = "ep")]
+    Ep(super::ep::EpGroup),
+}
+
+impl Engine {
+    fn reset(&mut self) -> Result<()> {
+        match self {
+            Engine::Single(m) => m.reset(),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => g.reset(),
+        }
+    }
+}
+
+impl Decoder for Engine {
+    fn config(&self) -> &Config {
+        match self {
+            Engine::Single(m) => &m.cpu.cfg,
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => g.config(),
+        }
+    }
+    fn feed(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        match self {
+            Engine::Single(m) => m.forward(ids, sp, None),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => g.forward(ids, sp),
+        }
+    }
+    fn seed_drafter(&mut self, main: &[f32]) -> Result<()> {
+        match self {
+            Engine::Single(m) => m.forward_spec(0, main, 0).map(|_| ()),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => g.forward_spec(0, main, 0).map(|_| ()),
+        }
+    }
+    fn spec_ok(&self, greedy: bool) -> bool {
+        greedy || SPEC_SAMPLING
+    }
+    fn spec_step(
+        &mut self,
+        token: usize,
+        main: &[f32],
+        sp: usize,
+        pick: &mut dyn SpecPick,
+    ) -> Result<SpecStep> {
+        match self {
+            Engine::Single(m) => m.decode_spec(token, main, sp, &mut |_, _| {}, pick),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => {
+                // the ranks each run the sampler, so they need its concrete state
+                let sampler = pick
+                    .as_sampler()
+                    .ok_or_else(|| anyhow::anyhow!("EP spec needs a SpecSampler"))?;
+                g.decode_spec(token, main, sp, sampler)
+            }
+        }
+    }
+}
+
 pub struct DsServe {
-    m: GpuModel,
+    m: Engine,
     tok: tokenizers::Tokenizer,
     tpl: Template,
     tags: Tags,
@@ -45,8 +108,27 @@ impl DsServe {
     /// `dir`: the checkpoint with `tokenizer.json`, `tokenizer_config.json`,
     /// `chat_template.jinja`, `inference/config.json` and `engram.json`.
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_on(dir, &[])
+    }
+
+    /// `devices`: GPU ordinals for expert parallelism (needs the `ep` feature); empty or one
+    /// means a single GPU.
+    pub fn load_on(dir: &Path, devices: &[usize]) -> Result<Self> {
         let t = Instant::now();
-        let m = GpuModel::open(dir)?;
+        let m = if devices.len() <= 1 {
+            Engine::Single(GpuModel::open(dir)?)
+        } else {
+            #[cfg(feature = "ep")]
+            {
+                Engine::Ep(super::ep::EpGroup::open(
+                    dir,
+                    devices,
+                    super::ep::Backend::Nccl,
+                )?)
+            }
+            #[cfg(not(feature = "ep"))]
+            bail!("--devices needs a build with --features ep")
+        };
         let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
         let tpl = Template::load(dir)?;
@@ -58,15 +140,22 @@ impl DsServe {
         if eos.is_empty() {
             bail!("tokenizer has no <｜end▁of▁sentence｜>");
         }
-        let ctx = m.cpu.cfg.max_seq_len;
+        let ctx = m.config().max_seq_len;
+        let how = match &m {
+            Engine::Single(g) => format!(
+                "1 GPU, expert slots {}",
+                if g.expert_slots == 0 {
+                    "all".to_string()
+                } else {
+                    g.expert_slots.to_string()
+                }
+            ),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => format!("expert parallel over {} GPUs (NCCL)", g.world()),
+        };
         eprintln!(
-            "tang-llm: deepseek ready in {:.1} s: ctx {ctx}, expert slots {}",
-            t.elapsed().as_secs_f64(),
-            if m.expert_slots == 0 {
-                "all".to_string()
-            } else {
-                m.expert_slots.to_string()
-            }
+            "tang-llm: deepseek ready in {:.1} s: ctx {ctx}, {how}",
+            t.elapsed().as_secs_f64()
         );
         Ok(Self {
             m,
