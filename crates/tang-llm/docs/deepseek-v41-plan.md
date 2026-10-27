@@ -8,6 +8,47 @@ Shapes below are from the real `config.json` (`deepseek_v41_text`), not the esti
 a Coder-Next GPU engine (`flash/coder.rs`) and most of GLM-5.3-Flash on the CPU reference
 (`flash/glm5/`). Both cut the DeepSeek bill.
 
+## M0 findings (2026-10-27)
+
+Read from the checkpoint's `config.json`, `model.safetensors.index.json`, shard headers (range
+requests) and DeepSeek's reference `inference/model.py`, `engram.py`, `kernel.py`, `convert.py`.
+
+- **Experts are MXFP4 in all but name**: e2m1 values packed two to an `I8` byte along K, low
+  nibble first, one `F8_E8M0` scale per row × 32. tang's MXFP4 GEMV (`tang-compute` moe) is the
+  starting point, not a new format. 40 × 384 × 3 × 2304 × 5120 / 2 bytes = **272 GB**.
+- **Dense weights** are `F8_E4M3` with `F8_E8M0` (power-of-two) scales per 32 × 32 block.
+  `wo_a` is dequantized to bf16 at load (convert.py does the same). Norms, `embed`, `head`,
+  the router, compressor and indexer projections are bf16; mHC and sinks are f32.
+- **No dense layers.** All 40 layers route; 6 of 384 plus one shared expert.
+- **Every GEMM quantizes its activation** to fp8 per 32 with power-of-two scales first. The
+  window KV and the attention output are fp8 quant-dequantized; compressed KV and index keys
+  fp4 (block 16 with e4m3 scales, and block 32 with e8m0, respectively).
+- **Engram tables are `F8_E4M3` [384M, 256] + `F8_E8M0` [384M, 8]: ~101 GB each, ~202 GB
+  for both.** Each token reads 3 × 8 = 24 rows a layer (256 B each). Host RAM or NVMe with a
+  row cache, as PLE.
+- **Attention** (model.py `Attention`): every layer attends over a 128-token ring of raw KV
+  plus, when `compress_ratio > 0`, `index_topk` = 512 compressed positions. Only
+  `kv_source_layers` compress (ratio 2: softmax-gated pooling of 2 tokens; ratio 1: a plain
+  projection); the layers after a source read its cache. Only `index_source_layers` run the
+  indexer; the others reuse the last source's top-k. Layer 20 also picks 2048 candidate blocks
+  of 8 that later indexers are confined to. Ratio > 0 layers use YaRN at θ 160000 for all
+  their RoPE; window-only layers plain θ 10000. A learned per-head sink logit joins the
+  softmax denominator, and the output has the query's RoPE removed again.
+- **mHC** carries 4 copies; each sublayer's Sinkhorn mixes are applied by the *next* sublayer.
+- **DSpark** is the 3 `mtp.*` blocks: a block of 5 (the sampled token + 4 noise tokens)
+  attends over its own window KV, seeded from target layers 37–39's inputs, plus the whole
+  block (unmasked within it). A rank-256 Markov head adds a bigram bias to each draft
+  position as it samples left to right; a confidence head scores each draft.
+- **safetensors 0.4.5 can't read the headers** (no `F8_E8M0`). The port reads them itself.
+
+Reference and fixture (no DeepSeek code is run): `scripts/deepseek_ref.py` is a torch
+transcription of model.py with its kernels' numerics and stable (lowest-index) top-k ties;
+`scripts/deepseek_tiny.py` writes a tiny model in the real checkpoint format plus dumps to
+`/private/tmp/ds41-tiny`. Prefill-then-decode agrees with one long prefill exactly for 1–3
+decode steps; later steps drift because batched and single-row bf16 rounding flips indexer
+top-k near-ties (layer 0, which has no indexer, already differs by 3e-4). So parity replays
+the fixture's own chunking and is judged by KL and top-1, as for GLM.
+
 ## The model, in tang's terms
 
 | Piece | config | tang has | Gap |
