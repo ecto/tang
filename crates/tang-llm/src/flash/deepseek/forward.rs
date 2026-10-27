@@ -291,6 +291,20 @@ impl Model {
         let engram = if cfg.engram_layer_ids.is_empty() {
             None
         } else {
+            // the tables stay on the host and are read by row per step: warm them now
+            // (`DS_ENGRAM_PREFAULT=0` skips it), or every cold row is a disk/network read
+            if std::env::var("DS_ENGRAM_PREFAULT").map_or(true, |v| v != "0") {
+                let t0 = std::time::Instant::now();
+                for &l in &cfg.engram_layer_ids {
+                    for w in ["weight", "scale"] {
+                        st.prefault(&format!("layers.{l}.engram.embed.{w}"))?;
+                    }
+                }
+                eprintln!(
+                    "deepseek: engram tables faulted in {:.1} s",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
             Some(EngramMeta::load(&dir.join("engram.json"))?)
         };
         let s = cfg.max_seq_len;

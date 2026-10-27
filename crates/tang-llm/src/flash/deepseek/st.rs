@@ -140,6 +140,29 @@ impl St {
         Ok(&self.maps[i.file][i.start..i.end])
     }
 
+    /// Fault every page of a tensor into the page cache, in parallel. For tables read a few
+    /// random rows at a time from a memory map (Engram's, 100 GB each): on a network mount a
+    /// cold row costs a round trip (~2 ms on RunPod's MooseFS), so a step that touches 300 of
+    /// them stalls for the better part of a second until the rows it needs happen to be warm.
+    pub fn prefault(&self, name: &str) -> Result<()> {
+        let b = self.bytes(name)?;
+        const PAGE: usize = 4096;
+        let threads = std::thread::available_parallelism().map_or(16, |n| n.get().min(64));
+        let chunk = b.len().div_ceil(threads).next_multiple_of(PAGE);
+        std::thread::scope(|sc| {
+            for part in b.chunks(chunk.max(PAGE)) {
+                sc.spawn(move || {
+                    let mut acc = 0u8;
+                    for page in part.chunks(PAGE) {
+                        acc ^= std::hint::black_box(page[0]);
+                    }
+                    std::hint::black_box(acc);
+                });
+            }
+        });
+        Ok(())
+    }
+
     /// Any tensor as f32 with its shape. Quantized weights (`F8_E4M3`, or `I8`-packed fp4) are
     /// dequantized with their `.scale` sibling: per 32 × 32 block, or per row × 32 when the
     /// scale has one row per weight row.
