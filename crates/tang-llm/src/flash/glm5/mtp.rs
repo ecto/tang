@@ -381,6 +381,8 @@ pub fn generate(
         st.tokens += new.len();
     }
     gen.truncate(n);
+    // the last window may run past n; count only the kept tokens
+    st.tokens = gen.len() - 1;
     Ok((gen, st))
 }
 
