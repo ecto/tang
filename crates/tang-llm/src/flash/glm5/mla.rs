@@ -1208,6 +1208,23 @@ extern "C" __global__ void idx_select(
     for (; wi < width; wi++) out[wi] = -1;
 }
 
+// mla_rms_norm: in place, one block (256 threads) per token: x[t][n] *= w / sqrt(mean(x^2) + eps)
+// (q_a_layernorm on the device-resident projection path).
+extern "C" __global__ void mla_rms_norm(float* __restrict__ x, const float* __restrict__ w, int n, float eps)
+{
+    float* xt = x + (size_t)blockIdx.x * n;
+    __shared__ float red[256];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += xt[i] * xt[i];
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) xt[i] = xt[i] * inv * w[i];
+}
 "#;
 
 /// The `#define` prelude for [`CUDA_SRC`] at this geometry.
@@ -1959,12 +1976,49 @@ pub mod cuda {
         }
         let iqd_ptr = self.iq_d.borrow().ptr;
         let hwd_ptr = self.hw_d.borrow().ptr;
+        self.idx_select_at(iqd_ptr, hwd_ptr, pool_keys.len(), kv_len, first_key, n_pool, t, pos0, sel, stream)
+    }
 
+    /// [`Self::idx_run`] with `iq` [t][idx_heads*idx_dim] and `hw` [t][idx_heads] already
+    /// on the device (the resident projection path computes them there).
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_run_dev(
+        &self,
+        iq: u64,
+        hw: u64,
+        kv_len: usize,
+        first_key: usize,
+        n_pool: usize,
+        t: usize,
+        pos0: usize,
+        sel: &mut [i32],
+        stream: &Stream,
+    ) -> Result<(), gpu::Error> {
+        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+        self.ensure_scratch(t)?;
+        self.idx_select_at(iq, hw, n_pool * self.idxd, kv_len, first_key, n_pool, t, pos0, sel, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn idx_select_at(
+        &self,
+        iqd_ptr: u64,
+        hwd_ptr: u64,
+        pool_len: usize,
+        kv_len: usize,
+        first_key: usize,
+        n_pool: usize,
+        t: usize,
+        pos0: usize,
+        sel: &mut [i32],
+        stream: &Stream,
+    ) -> Result<(), gpu::Error> {
+        let (nh, hd) = (self.idxh, self.idxd);
         // pool keys: always the RESIDENT pool_d. Every caller builds its slice from the
         // immediately preceding idx_pool host copy (engine and tests both do), so pool_d
         // holds exactly these values — reading it skips the 256 KB re-upload per window.
         assert!(
-            pool_keys.len() * 4
+            pool_len * 4
                 <= self
                     .seqs
                     .borrow()
@@ -2129,6 +2183,77 @@ pub mod cuda {
             out_v.copy_from_slice(&self.o_d.borrow().read(0, out_v.len())?);
             Ok(())
         }
+        /// [`Self::attend`] for the device-resident projection path: `q` [t][nh*dk] is a
+        /// device pointer (q_b's output), the latents must be resident (`kv_append` wrote
+        /// every row of this sequence: the engine flow), and the output stays on the
+        /// device: returns the `[t][nh*dv]` f32 pointer (this MlaCuda's scratch, valid
+        /// until its next attend). Async on `stream` (no sync).
+        #[allow(clippy::too_many_arguments)]
+        pub fn attend_dev(
+            &self,
+            q: u64,
+            n_kv: usize,
+            t: usize,
+            pos0: usize,
+            sel: Option<&[i32]>,
+            stream: &Stream,
+        ) -> Result<u64, gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            let width = sel.map_or(pos0 + t, |s| {
+                assert_eq!(s.len() % t, 0);
+                s.len() / t
+            });
+            self.ensure_scratch(t)?;
+            let ld_ptr = {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                if lru.entries[i].lat_rows != n_kv {
+                    return Err(gpu::Error(format!(
+                        "attend_dev: {} resident latent rows, want {n_kv} (kv_append first)",
+                        lru.entries[i].lat_rows
+                    )));
+                }
+                lru.entries[i].lat_d.as_ref().unwrap().ptr
+            };
+            // sel staged into the resident select scratch (s_d), not a fresh alloc
+            let sel_ptr = match sel {
+                Some(s) => {
+                    let b = self.s_d.borrow();
+                    b.write(0, s)?;
+                    b.ptr
+                }
+                None => 0,
+            };
+            let od_ptr = self.o_d.borrow().ptr;
+            let f = self.m.func("mla_attn_naive")?;
+            let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+            let (mut nh, mut dk, mut dv, mut dl, mut wd) =
+                (self.nh as i32, self.dk as i32, self.dv as i32, self.dl as i32, width as i32);
+            let mut scale = 1.0f32 / (self.dk as f32).sqrt();
+            let (mut qp, mut lp, mut wkp, mut wvp, mut sp, mut op) =
+                (q, ld_ptr, self.wk_d.ptr, self.wv_d.ptr, sel_ptr, od_ptr);
+            let smem = ((self.dk + self.dv) * 4) as u32;
+            unsafe {
+                gpu::launch(
+                    f,
+                    (self.nh as u32, t as u32, 1),
+                    (256, 1, 1),
+                    smem,
+                    stream,
+                    tang_moe::args![qp, lp, wkp, wvp, sp, op, tt, nkv, p0, nh, dk, dv, dl, wd, scale],
+                )?
+            };
+            Ok(od_ptr)
+        }
+
+        /// `x [t][n]` in place: `x * w / sqrt(mean(x^2) + eps)` per token (device pointers).
+        pub fn rms_norm_dev(&self, x: u64, w: u64, n: usize, t: usize, eps: f32, stream: &Stream) -> Result<(), gpu::Error> {
+            let f = self.m.func("mla_rms_norm")?;
+            let (mut xp, mut wp, mut ni, mut e) = (x, w, n as i32, eps);
+            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![xp, wp, ni, e])? };
+            Ok(())
+        }
+
         /// Absorbed attention ([`mla_forward_absorbed`]'s GPU twin): `q` [t][nh*dk]
         /// f32, folded on-device by `mla_fold_q` into `qa` [t][nh*dl], then
         /// `mla_attn_absorbed` scores 512-dim dots against the bf16 latent cache and

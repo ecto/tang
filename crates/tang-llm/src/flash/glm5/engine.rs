@@ -68,6 +68,10 @@ pub struct GpuFfn {
     /// layer on the first layer's weights and let the next window's first DSA layer
     /// attend over the last layer's latents (the watermark matched, so no re-upload).
     mla_k: Vec<Option<super::mla::cuda::MlaCuda>>,
+    /// The device-resident MLA projections per DSA layer ([`super::mla_dev::MlaProj`]:
+    /// q_a + norm, q_b, o_proj, the indexer's wq_b / weights_proj on g5f_gemv), built
+    /// when `TANG_GLM5_MLA_RESIDENT=1` (default off). `None`: the host GEMVs.
+    pub(crate) mla_p: Vec<Option<super::mla_dev::MlaProj>>,
     /// W2's resident mHC per layer ([`super::mhc::MhcGpu`]: both blocks' weights + a
     /// scratch pool on the device; `TANG_GLM5_GPU_MHC=0`: mHC stays on the CPU).
     mhc_g: Vec<Option<super::mhc::MhcGpu>>,
@@ -97,6 +101,7 @@ impl Drop for GpuFfn {
             let _ = g.bind();
         }
         self.kda_l.clear();
+        self.mla_p.clear();
         self.mla_k.clear();
         self.mhc_f = None;
         self.mhc_g.clear();
@@ -144,7 +149,9 @@ impl GpuFfn {
         let kda_on = !std::env::var("TANG_GLM5_GPU_KDA").is_ok_and(|v| v == "0");
         let mut kda_kernels = Vec::new();
         let mla_on = !std::env::var("TANG_GLM5_GPU_MLA").is_ok_and(|v| v == "0");
+        let mla_res = std::env::var("TANG_GLM5_MLA_RESIDENT").is_ok_and(|v| v == "1");
         let mut mla_k = Vec::new();
+        let mut mla_p = Vec::new();
         let mhc_on = hp.hc == 4
             && hp.n_embd % 32 == 0
             && !std::env::var("TANG_GLM5_GPU_MHC").is_ok_and(|v| v == "0");
@@ -234,8 +241,17 @@ impl GpuFfn {
                         super::mla::cuda::MlaCuda::new_at(&w, d)
                             .map_err(|e| anyhow::anyhow!("MLA layer {l} on GPU {d}: {e}"))?,
                     ));
+                    mla_p.push(if mla_res {
+                        Some(
+                            super::mla_dev::MlaProj::new(&devs[d].0, g, l, &w)
+                                .with_context(|| format!("MLA projections layer {l} on GPU {d}"))?,
+                        )
+                    } else {
+                        None
+                    });
                 } else {
                     mla_k.push(None);
+                    mla_p.push(None);
                 }
                 if !hp.is_kda[l] || !kda_on {
                     kda_l.push(None);
@@ -342,6 +358,7 @@ impl GpuFfn {
             kda_kernels: kda_kernels,
             max_t,
             mla_k,
+            mla_p,
             mhc_g,
             mhc_f: None,
             layers,
@@ -355,6 +372,25 @@ impl GpuFfn {
             f.enable_mhc_fused(g, hp)?;
         }
         Ok(Some(f))
+    }
+
+    /// Build the device-resident MLA projections for every DSA layer that has an
+    /// `MlaCuda` (`load` does when `TANG_GLM5_MLA_RESIDENT=1`). Returns how many.
+    pub(crate) fn enable_mla_resident(
+        &mut self,
+        g: &crate::gguf::Gguf,
+        mla_w: &dyn Fn(usize) -> Result<MlaWeights>,
+    ) -> Result<usize> {
+        for l in 0..self.mla_k.len() {
+            if self.mla_k[l].is_none() || self.mla_p[l].is_some() {
+                continue;
+            }
+            let d = self.dev_of[l];
+            self.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            let w = mla_w(l)?;
+            self.mla_p[l] = Some(super::mla_dev::MlaProj::new(&self.devs[d].0, g, l, &w)?);
+        }
+        Ok(self.mla_p.iter().filter(|p| p.is_some()).count())
     }
 
     /// Build the fused mHC ([`Self::mhc_f`]; `load` does when `TANG_GLM5_MHC_FUSED=1`).
@@ -671,6 +707,9 @@ impl Glm5Engine {
             if let Some(cu) = &g.mla_k[l] {
                 g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 let dbg = self.mla_dbg.as_mut().filter(|d| d.wants(l));
+                if let Some(p) = &g.mla_p[l] {
+                    return dsa_gpu_resident(l, w, cu, p, x, t, pos0, &mut self.dsa[l], dbg);
+                }
                 return dsa_gpu(l, w, cu, x, t, pos0, &mut self.dsa[l], dbg);
             }
         }
@@ -1305,6 +1344,69 @@ fn dsa_gpu(
     Ok(out)
 }
 
+/// [`dsa_gpu`] with the projections on the device ([`super::mla_dev::MlaProj::window`]):
+/// `x` up, `y` down, nothing else crosses per layer except the cache mirrors' new rows.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn dsa_gpu_resident(
+    l: usize,
+    w: &MlaWeights,
+    cu: &super::mla::cuda::MlaCuda,
+    p: &super::mla_dev::MlaProj,
+    x: &[f32],
+    t: usize,
+    pos0: usize,
+    c: &mut DsaCache,
+    dbg: Option<&mut super::mla_debug::Shadow>,
+) -> Result<Vec<f32>> {
+    let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla cuda: {e}");
+    let s = tang_moe::gpu::Stream::blocking().map_err(gerr)?;
+    let (n, dl, idd) = (w.hidden, w.kv_lora, w.idx_dim);
+    let kv_len = pos0 + t;
+    ensure!(x.len() == t * n, "layer input");
+    ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
+    if dbg.as_ref().is_some_and(|d| d.poison()) {
+        cu.debug_poison(pos0, t).map_err(gerr)?;
+    }
+    c.lat16.resize(kv_len * dl, 0);
+    c.idx_k.resize(kv_len * idd, 0.0);
+    c.idx_g.resize(kv_len * idd, 0.0);
+    c.valid.resize(kv_len, 0);
+    let mut pool = Vec::new();
+    let o = p.window(
+        cu, w, x, t, pos0, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid,
+        dbg.is_some().then_some(&mut pool), dbg.is_some(), &s,
+    )?;
+    if let Some(d) = dbg {
+        let (lat_dev, idk_dev, idg_dev, val_dev) = cu.debug_rows(0, kv_len).map_err(gerr)?;
+        let q_resid = o.q_resid.clone().unwrap_or_default();
+        d.check(
+            l,
+            w,
+            &super::mla_debug::GpuWindow {
+                x,
+                q_resid: &q_resid,
+                t,
+                pos0,
+                lat_dev,
+                idk_dev,
+                idg_dev,
+                val_dev,
+                lat_mirror: &c.lat16,
+                idk_mirror: &c.idx_k,
+                idg_mirror: &c.idx_g,
+                val_mirror: &c.valid,
+                pool: o.sel.is_some().then_some(pool),
+                sel: o.sel.clone(),
+                out: &o.y,
+                q_resid_dev: true,
+                q_dev: o.q.as_deref(),
+            },
+        );
+    }
+    Ok(o.y)
+}
+
 pub(crate) fn argmax(v: &[f32]) -> u32 {
     let mut best = 0;
     for (i, &x) in v.iter().enumerate() {
@@ -1883,6 +1985,50 @@ mod tests {
         assert!(f_gpu32 as f32 <= 0.02 * total as f32, "top-1 vs CPU-f32 {f_gpu32}/{total}");
     }
 
+    /// The device-resident projections (`TANG_GLM5_MLA_RESIDENT=1`: q_a + norm, q_b,
+    /// o_proj and the indexer GEMVs on g5f_gemv) against the naive GPU path on the same
+    /// windows, with the shadow on every DSA window (its `q_resid` / `q` taps check the
+    /// new GEMVs against the CPU). f32 fixture: f32 rows, no activation quantisation, so
+    /// the two GPU engines differ only by accumulation order.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_mla_resident_matches_naive() {
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("fixture/GPU");
+            return;
+        }
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let mut naive = Glm5Engine::open(Path::new(TINY)).unwrap();
+        let mut res = Glm5Engine::open(Path::new(TINY)).unwrap();
+        assert!(naive.use_gpu().unwrap() && res.use_gpu().unwrap(), "GPU did not load");
+        let n = {
+            let m = &res.m;
+            res.gpu.as_mut().unwrap().enable_mla_resident(&m.g, &|l| m.mla_weights(l)).unwrap()
+        };
+        assert_eq!(n, res.m.hp.is_kda.iter().filter(|&&k| !k).count(), "one MlaProj per DSA layer");
+        res.mla_dbg = Some(super::super::mla_debug::Shadow::always());
+        let nv = res.m.hp.n_vocab;
+        let (mut worst, mut flips) = (0f32, 0usize);
+        for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
+            let a = naive.window(w).unwrap();
+            let b = res.window(w).unwrap();
+            for p in 0..w.len() {
+                flips += (argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])) as usize;
+            }
+            worst = a.iter().zip(&b).fold(worst, |m, (x, y)| m.max((x - y).abs()));
+        }
+        let (checked, failed, sel) = res.mla_dbg.as_ref().unwrap().totals();
+        eprintln!(
+            "MLA resident vs naive GPU: {flips} top-1 flips / 170, logits max abs {worst:.3e}; \
+             shadow {checked} windows, {failed} failed, selection {}/{} differ",
+            sel.differ, sel.queries
+        );
+        assert!(checked == 5 && failed == 0, "MLA shadow (resident): {failed}/{checked} windows failed");
+        assert_eq!(flips, 0, "resident vs naive top-1 flips");
+        assert!(worst <= 1e-2, "resident vs naive logits max abs {worst}");
+    }
 
     /// reset() gives a fresh sequence.
     #[test]
