@@ -86,11 +86,26 @@ pub struct GpuModel {
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     /// Intermediates read back by name when `DS_TAP` is set (as [`Model::taps`]).
     pub taps: RefCell<Vec<(String, Vec<f32>)>>,
+    /// Expert parallelism ([`super::ep`]): the routed experts this rank runs. Others are
+    /// skipped in `moe` and never uploaded. All of them when unsharded.
+    pub owns_expert: Box<dyn Fn(usize) -> bool>,
+    /// Expert parallelism: combines the routed partial sum `y` ([t][d] f32, the buffer and its
+    /// element count) across ranks in place, before the shared expert is added.
+    pub moe_reduce: Option<MoeReduce>,
 }
+
+/// See [`GpuModel::moe_reduce`].
+pub type MoeReduce = Box<dyn Fn(&DevBuf, usize, &Stream) -> Result<()>>;
 
 impl GpuModel {
     pub fn open(dir: &Path) -> Result<Self> {
-        let g = Gpu::new()?;
+        Self::open_on(dir, 0)
+    }
+
+    /// [`Self::open`] on device `ordinal`, binding its context to the calling thread (the
+    /// model is not `Send`: it lives on that thread).
+    pub fn open_on(dir: &Path, ordinal: usize) -> Result<Self> {
+        let g = Gpu::at(ordinal)?;
         g.bind()?;
         let k = Kernels::new(&g)?;
         // blocking: weight uploads (pageable `cuMemcpyHtoD`) finish their DMA on the legacy
@@ -146,6 +161,8 @@ impl GpuModel {
             cand: Vec::new(),
             force: None,
             taps: RefCell::new(Vec::new()),
+            owns_expert: Box::new(|_| true),
+            moe_reduce: None,
         })
     }
 
@@ -744,7 +761,7 @@ impl GpuModel {
         }
         let y = zbuf(t * d)?;
         for (e, rs) in routes.iter().enumerate() {
-            if rs.is_empty() {
+            if rs.is_empty() || !(self.owns_expert)(e) {
                 continue;
             }
             let n = rs.len();
@@ -774,6 +791,9 @@ impl GpuModel {
                 )?
             };
             self.s.sync()?;
+        }
+        if let Some(reduce) = &self.moe_reduce {
+            reduce(&y, t * d, &self.s)?;
         }
         let sh = self.mlp(&format!("{p}.ffn.shared_experts"), x, t, 0)?;
         let nn = (t * d) as i64;
