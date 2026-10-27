@@ -58,7 +58,9 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--out")
     a = ap.parse_args()
-    c = json.load(open(os.path.join(a.model_dir, "config.json")))
+    # DeepSeek's repo keeps the runtime config at inference/config.json
+    inf = os.path.join(a.model_dir, "inference", "config.json")
+    c = json.load(open(inf if os.path.exists(inf) else os.path.join(a.model_dir, "config.json")))
     c.setdefault("max_seq_len", 1)
     token_map, n = compressed_token_map(os.path.join(a.model_dir, "tokenizer.json"))
     want = c["engram_compressed_vocab_size"]

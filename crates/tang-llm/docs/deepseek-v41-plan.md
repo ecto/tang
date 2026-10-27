@@ -1,6 +1,9 @@
 # DeepSeek-V4.1-Flash on tang: the port, milestone by milestone
 
-Status: plan (2026-10-27). Nothing here has landed. The goal is frog cloud's "bull" model:
+Status (2026-10-27): M0–M2 landed and **the real model serves**: `tang-llm deepseek-serve` on
+1× H200 (RunPod, experts streamed through an 18000-tensor LRU) answers chat and DSML tool calls
+correctly through the OpenAI API. Speed is bring-up speed (decode ~1.2 tok/s, prefill
+~0.7 tok/s warm): naive kernels, host-side top-k / routing, one GPU. M3–M6 are the speed work. The goal is frog cloud's "bull" model:
 `cloud/bull` in frog, served by tang.
 
 Shapes below are from the real `config.json` (`deepseek_v41_text`), not the estimates in
