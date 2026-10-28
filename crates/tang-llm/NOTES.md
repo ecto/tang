@@ -4,6 +4,56 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 (late) — MoE FFN step 2: routing / fold / bandwidth tried, all regressions — nothing landed (H200, branch claude/glm5-ffn2)
+
+Second H200, `real_layers_fast_matches_cpu`, l4 T1 unless noted, on top of the repack head
+3b96bac7. Every variant was built as its own binary (`bin-<tag>`) and run back to back with the
+base binary (the pod shares one cargo target: comparing two `tang_llm-<hash>` runs across builds
+silently compares the newest build with itself). Parity: every variant below kept fast-q8x2 rel
+<= 4.66e-5 and routing sets = CPU; the folds and the block select were bit-identical (same rel).
+
+Base (repack head), traced µs (TB/s): route 16.9-17.6 | gu 41.9-42.0 (2.23) | q8(h) 5.9 |
+down_split 30.0 (1.84) | sum 6.0 | total 100.7-101.5. Untraced device x/y: l4 92, l12 94-95,
+l0 67 µs/call. 5 launches a routed layer.
+
+| change | measured | verdict |
+|---|---|---|
+| top-k in g5f_route by the whole last block (rank = #larger, one pass, early exit) | route 17 -> 43 | dropped |
+| q8(h) folded into g5f_gu: per-32-row counter, fence + atomic per warp, last warp quantises | gu 42.7 -> 50.4 | dropped |
+| g5f_sum folded into g5f_down_split: counter per row pair / per block tile | down 30.4 -> 37.8 / 36.7 | dropped |
+| both folds, 3 launches a layer, UNTRACED | l4 95-96 -> 104, l12 98 -> 106-107 | dropped |
+| q8(h) fold as 32 rows a block (8 rows a warp, one __syncthreads, no atomics) | gu 58.6 | dropped |
+| rows a warp in turn, GU_RPW 2 / 4 / 8 / 16 (cp.async double-buffered staging for >1) | gu 58 / 56 / 70 / 95 | dropped |
+| row pairs a warp, DN_RPW 2 / 4 | down 36-40 | dropped |
+| per-chunk activation code sums from the quantiser (skips 16 of 32 dp4a a Q4_K chunk) | gu 44.2 -> 47.0 | dropped: not issue-bound |
+| MINB 10 / 12 / 16 (48 / 40 / 32 regs) | gu 45 / 59 / 100, down 35.5 / 56 / 76 | MINB 8 (64 regs) stays |
+| UNROLL 2 | gu 46.0, down 35.6 | — |
+| L2 prefetch of the whole row(s) at warp start (`prefetch.global.L2`) | gu 42.1 -> 44.3, l0 gu 34 -> 41 | dropped |
+| Q4_K / Q5_K chunk pair a lane (one nibble plane, 16 B header load) | gu 42 -> 115 (x preloaded) / 60 | dropped |
+| 16 B header load alone (d, dmin, 12 scale bytes as one uint4) | gu 43.7 -> 48.4 | dropped |
+| packed 1-D gu grid (no blocks for routed rows >= ff, shared slot first) | gu 43.1 vs 43.4 | neutral, not kept |
+
+Reading: g5f_gu / g5f_down_split at 64 regs and 32 warps an SM are a local optimum. Anything
+that adds a live register (header uint4, a second x chunk, a prefetched row), a dependent load
+(xs, ids before the dot), or per-warp latency at exit (fence + atomic: the warps are short-lived —
+~3.6 waves for gu, ~4.9 for down — so every µs a warp lingers is lost bandwidth) costs more than
+it saves. The separate q8(h) / sum launches are cheap untraced (in-stream back-to-back); the
+traced split overstates them (~6 µs each with the event gaps). The same kernel reaches 3.15 TB/s
+on dense l0 (Q8_0, no ids) vs 2.2 on routed Q4_K: the gap is the K-quant chunk path under the
+register cap, not launch shape (the packed grid changed nothing).
+
+Next levers (structural, not tried): (1) a producer warp per block streaming rows into smem with
+`cp.async.bulk` + mbarrier (register-free bytes in flight; sm_90 / sm_100 only, keep the current
+kernel for sm_86), consumers dotting from smem; (2) PDL (`cuLaunchKernelEx` +
+`griddepcontrol`) so the shared expert's gate|up — no ids needed, ~30 MB of the 93 — overlaps
+routing (it needs x codes, which route produces: dot it from f32 x, or quantise x in the
+producer kernel); (3) route: the 288 router rows are 4.7 MB, ~1 µs of bandwidth — its traced 17 µs
+is mostly the inter-call gap it absorbs plus the fence / last-block / serial select tail; measure
+it untraced (e.g. a route-only bench) before optimising it.
+Real-weights gate on the repack head (unchanged code, flags GPU_FFN_LAYERS=0-29 GEMV8=1
+KDA_PF2=1 MHC_FUSED=1 MOE=fast MLA_RESIDENT=1 GPU_HEAD=1 KDA_G5F=2 KDA_FUSED=1 KDA_GRAPH=1):
+`785 1196 6801 264 6386 38038 911 279` (= oracle). MoE debug shadow (TANG_GLM5_MOE_DEBUG=1, -n 8): 240 calls checked, 0 failed, 0 routing mismatches, worst rel 9.70e-5 (l0 dense, T1) — ids unchanged under the shadow.
+
 ## 2026-10-27 — MoE FFN: Q8_0 / Q6_K repacked at upload, fused gate|up rows, one routing launch (H200, branch claude/glm5-ffn-repack)
 
 Second H200 (pod nxn0swopws2xi8), real layers, `real_layers_fast_matches_cpu`. New knob
