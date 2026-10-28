@@ -588,6 +588,23 @@ __device__ __forceinline__ float g5f_warp_sum(float a) {
     return a;
 }
 
+// G5F_PF (TANG_GLM5_MOE_PF, bit mask: 1 gate|up, 2 down): before its dot, a warp asks L2 for every 128-byte line of the
+// rows it is about to stream (one prefetch.global.L2 per lane per line, no registers held), so
+// a row's DRAM reads are all in flight at once instead of one chunk iteration at a time.
+#ifndef G5F_PF
+#define G5F_PF 0
+#endif
+__device__ __forceinline__ const unsigned char* g5f_row(const G5W w, unsigned e, int r) {
+    return (const unsigned char*)(w.base + (unsigned long long)e * w.estride + (unsigned long long)r * w.row_bytes);
+}
+template <int BIT>
+__device__ __forceinline__ void g5f_pf(const unsigned char* p, int bytes, int lane) {
+    if (!(G5F_PF & BIT)) return;
+    const unsigned long long a = (unsigned long long)p & ~127ull;
+    const int n = (int)(((unsigned long long)p + bytes - a + 127) >> 7);
+    for (int i = lane; i < n; i += 32) asm volatile("prefetch.global.L2 [%0];" :: "l"(a + 128ull * i));
+}
+
 // Issue the copy of row r of matrix e of w into sm (aligned 16-byte pieces; cp.async on sm_80+).
 // Returns where the row starts (in sm, or the global row when not staged). Call g5f_stage_wait
 // + __syncwarp before reading.
@@ -783,6 +800,10 @@ extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_gu(
         return;
     }
     const G5W g = sh ? sgate : gate, u = sh ? sup : up;
+    if (row16 == 0) {
+        g5f_pf<1>(g5f_row(g, e, r), (int)g.row_bytes, lane);
+        g5f_pf<1>(g5f_row(u, e, r), (int)u.row_bytes, lane);
+    }
     const unsigned char* wg = g5f_stage(g, e, r, sm0, row16, lane);
     const unsigned char* wu = g5f_stage(u, e, r, sm1, row16, lane);
     g5f_stage_wait();
@@ -892,6 +913,7 @@ extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down_split(
     const unsigned char* q2 = hq2 ? hq2 + row * hs : 0;
     const float* d = hd + row * (hs / 32);
     const float* f = h + row * hs;
+    if (row16 == 0) g5f_pf<2>(g5f_row(w, e, c0), (int)w.row_bytes * (two ? 2 : 1), lane);
     const unsigned char* w0 = g5f_stage(w, e, c0, sm0, row16, lane);
     const unsigned char* w1 = two ? g5f_stage(w, e, c0 + 1, sm1, row16, lane) : w0;
     g5f_stage_wait();
@@ -949,6 +971,259 @@ extern "C" __global__ void __launch_bounds__(128) g5f_gemv(
             y[(size_t)t * ystride + r0] = a;
             if (two) y[(size_t)t * ystride + r0 + 1] = b;
         }
+    }
+}
+
+
+// ---- N rows a warp (TANG_GLM5_MOE_ROWS): more weight bytes in flight per lane -------------------
+// Each row's lane partial is summed exactly as g5f_lane_dot32x / g5f_dot_any (chunks c = lane +
+// 32 i ascending, one accumulator per row), so outputs are bit-identical to the 1-2 row kernels;
+// only the number of independent row streams per iteration grows (all N rows' loads issue before
+// any use). Non-32-chunk types (and misaligned Q4_K / Q5_K) take g5f_dot_any per row.
+// Chunk c's contribution with the activations already in registers (x: codes, y: residual codes
+// or unused when !has2, dx = xd[c]) and the block header / scales read as whole words: the same
+// values and the same float ops as g5f_c32k / g5f_c32r, ~4x fewer load instructions per chunk.
+__device__ __forceinline__ unsigned g5f_byte(unsigned w, int i) { return (w >> (8 * i)) & 0xFFu; }
+template <int TY>
+__device__ __forceinline__ float g5f_c32v(const unsigned char* w, int c, int k, const unsigned* xw, const unsigned* yw,
+                                         bool has2, float dx) {
+    unsigned n[8];
+    float d0, d1, mw = 0.f;
+    if (TY == 12 || TY == 13) {
+        const int bb = TY == 12 ? 144 : 176;
+        const unsigned char* b = w + (c >> 3) * bb;
+        const int j = c & 7, up = j & 1;
+        const uint4 hd = *(const uint4*)b;  // d, dmin | scales[12]
+        int s, m;
+        if (j < 4) {
+            s = (int)(g5f_byte(hd.y, j) & 63);
+            m = (int)(g5f_byte(hd.z, j) & 63);
+        } else {
+            const unsigned q4 = g5f_byte(hd.w, j - 4), qm4 = g5f_byte(hd.y, j - 4), q0 = g5f_byte(hd.z, j - 4);
+            s = (int)((q4 & 0xF) | ((qm4 >> 6) << 4));
+            m = (int)((q4 >> 4) | ((q0 >> 6) << 4));
+        }
+        d0 = g5f_h2f((unsigned short)(hd.x & 0xFFFFu)) * (float)s;
+        mw = g5f_h2f((unsigned short)(hd.x >> 16)) * (float)m;
+        const uint4* qp = (const uint4*)(b + (TY == 12 ? 16 : 48) + (j >> 1) * 32);
+        const uint4 q0 = qp[0], q1 = qp[1];
+        n[0] = q0.x; n[1] = q0.y; n[2] = q0.z; n[3] = q0.w; n[4] = q1.x; n[5] = q1.y; n[6] = q1.z; n[7] = q1.w;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) n[i] = (n[i] >> (4 * up)) & 0x0F0F0F0Fu;
+        if (TY == 13) {
+            const uint4* hp = (const uint4*)(b + 16);
+            const uint4 h0 = hp[0], h1 = hp[1];
+            const unsigned hw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            #pragma unroll
+            for (int i = 0; i < 8; i++) n[i] |= ((hw[i] >> j) & 0x01010101u) << 4;
+        }
+        int sf = 0, sx = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            sf = __dp4a((int)n[i], (int)xw[i], sf);
+            sx = __dp4a(0x01010101, (int)xw[i], sx);
+        }
+        float fsf = (float)sf, fsx = (float)sx;
+        if (has2) {
+            int sf2 = 0, sx2 = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                sf2 = __dp4a((int)n[i], (int)yw[i], sf2);
+                sx2 = __dp4a(0x01010101, (int)yw[i], sx2);
+            }
+            fsf = fmaf((float)sf2, 1.0f / 254.0f, fsf);
+            fsx = fmaf((float)sx2, 1.0f / 254.0f, fsx);
+        }
+        return dx * fmaf(d0, fsf, -mw * fsx);
+    } else {
+        const int nb = k / 256;
+        if (TY == 108) {
+            const uint4* qp = (const uint4*)(w + (size_t)c * 32);
+            const uint4 q0 = qp[0], q1 = qp[1];
+            n[0] = q0.x; n[1] = q0.y; n[2] = q0.z; n[3] = q0.w; n[4] = q1.x; n[5] = q1.y; n[6] = q1.z; n[7] = q1.w;
+            d0 = d1 = g5f_h2f(*(const unsigned short*)(w + k + 2 * c));
+        } else {
+            const int bi = c >> 3, j = c & 7, hn = j >> 2, qt = j & 3;
+            const unsigned char* b = w + (size_t)bi * 192;
+            const uint4* lp = (const uint4*)(b + hn * 64 + 32 * (qt & 1));
+            const uint4* hp = (const uint4*)(b + 128 + hn * 32);
+            const uint4 l0 = lp[0], l1 = lp[1], h0 = hp[0], h1 = hp[1];
+            const unsigned lw[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+            const unsigned hw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            const int ls = 4 * (qt >> 1), hs = 2 * qt;
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                n[i] = __vsub4(((lw[i] >> ls) & 0x0F0F0F0Fu) | (((hw[i] >> hs) & 0x03030303u) << 4), 0x20202020u);
+            const float d = g5f_h2f(*(const unsigned short*)(w + nb * 208 + 2 * bi));
+            const unsigned short sc2 = *(const unsigned short*)(w + nb * 192 + bi * 16 + hn * 8 + 2 * qt);
+            d0 = d * (float)(int)(signed char)(sc2 & 0xFF);
+            d1 = d * (float)(int)(signed char)(sc2 >> 8);
+        }
+        int a0 = 0, a1 = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) a0 = __dp4a((int)n[i], (int)xw[i], a0);
+        #pragma unroll
+        for (int i = 4; i < 8; i++) a1 = __dp4a((int)n[i], (int)xw[i], a1);
+        float f0 = (float)a0, f1 = (float)a1;
+        if (has2) {
+            int b0 = 0, b1 = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) b0 = __dp4a((int)n[i], (int)yw[i], b0);
+            #pragma unroll
+            for (int i = 4; i < 8; i++) b1 = __dp4a((int)n[i], (int)yw[i], b1);
+            f0 = fmaf((float)b0, 1.0f / 254.0f, f0);
+            f1 = fmaf((float)b1, 1.0f / 254.0f, f1);
+        }
+        return dx * fmaf(d0, f0, d1 * f1);
+    }
+}
+template <int TY, int N>
+__device__ __forceinline__ void g5f_lane_dot32n(const unsigned char* const* w, const unsigned char* xq,
+                                               const unsigned char* xq2, const float* xd, int k, float* acc) {
+    const int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int i = 0; i < N; i++) acc[i] = 0.f;
+    #pragma unroll G5F_UNROLL
+    for (int c = lane; c < k / 32; c += 32) {
+        const uint4* xp = (const uint4*)(xq + (size_t)c * 32);
+        const uint4 x0 = xp[0], x1 = xp[1];
+        const unsigned xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+        unsigned yw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (xq2) {
+            const uint4* yp = (const uint4*)(xq2 + (size_t)c * 32);
+            const uint4 y0 = yp[0], y1 = yp[1];
+            yw[0] = y0.x; yw[1] = y0.y; yw[2] = y0.z; yw[3] = y0.w; yw[4] = y1.x; yw[5] = y1.y; yw[6] = y1.z; yw[7] = y1.w;
+        }
+        const float dx = xd[c];
+        #pragma unroll
+        for (int i = 0; i < N; i++) acc[i] += g5f_c32v<TY>(w[i], c, k, xw, yw, xq2 != 0, dx);
+    }
+}
+template <int N>
+__device__ __forceinline__ void g5f_dot_anyn(unsigned ty, const unsigned char* const* w, const unsigned char* xq,
+                                            const unsigned char* xq2, const float* xd, const float* xf, int k,
+                                            float* acc) {
+    unsigned long long o = 0;
+    #pragma unroll
+    for (int i = 0; i < N; i++) o |= (unsigned long long)w[i];
+    const bool al = (o & 15) == 0 && (k & 255) == 0 && G5F_DOT32;
+    if (ty == 12 && al) { g5f_lane_dot32n<12, N>(w, xq, xq2, xd, k, acc); return; }
+    if (ty == 13 && al) { g5f_lane_dot32n<13, N>(w, xq, xq2, xd, k, acc); return; }
+    if (ty == 108) { g5f_lane_dot32n<108, N>(w, xq, xq2, xd, k, acc); return; }
+    if (ty == 114) { g5f_lane_dot32n<114, N>(w, xq, xq2, xd, k, acc); return; }
+    #pragma unroll
+    for (int i = 0; i < N; i++) acc[i] = g5f_dot_any(ty, w[i], xq, xq2, xd, xf, k);
+}
+
+// g5f_gu with G5F_GUR rows a warp (gate and up of each: 2 * G5F_GUR streams). grid
+// (ceil(max(ff, ffs) / (4 * G5F_GUR)), S, T), block 128, no staging. Same h as g5f_gu.
+#ifndef G5F_GUR
+#define G5F_GUR 2
+#endif
+extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_gun(
+    const G5W gate, const G5W up, const G5W sgate, const G5W sup, const unsigned* ids, int k, int ne,
+    const float* x, const unsigned char* xq, const unsigned char* xq2, const float* xd, float* h, int hs, int ff,
+    int ffs, int hid, float lim, float lims) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = blockIdx.y, t = blockIdx.z;
+    const int nr = ids ? k : 1;
+    const bool sh = j >= nr;
+    const int rows = sh ? ffs : ff;
+    const int r0 = (blockIdx.x * 4 + warp) * G5F_GUR;
+    if (r0 >= rows) return;
+    const int S = nr + (sgate.base ? 1 : 0);
+    float* hp = h + (size_t)(t * S + j) * hs;
+    const unsigned e = sh ? 0u : (ids ? ids[(size_t)t * k + j] : 0u);
+    if (!sh && ids && e >= (unsigned)ne) {
+        if (lane < G5F_GUR && r0 + lane < rows) hp[r0 + lane] = 0.f;
+        return;
+    }
+    const unsigned char* xqt = xq + (size_t)t * hid;
+    const unsigned char* xq2t = xq2 ? xq2 + (size_t)t * hid : 0;
+    const float* xdt = xd + (size_t)t * (hid / 32);
+    const float* xft = x + (size_t)t * hid;
+    const G5W g = sh ? sgate : gate, u = sh ? sup : up;
+    float a[G5F_GUR], b[G5F_GUR];
+    if (g.ty == u.ty) {
+        const unsigned char* w[2 * G5F_GUR];
+        #pragma unroll
+        for (int i = 0; i < G5F_GUR; i++) {
+            const int r = r0 + i < rows ? r0 + i : r0;
+            w[2 * i] = g5f_row(g, e, r);
+            w[2 * i + 1] = g5f_row(u, e, r);
+        }
+        #pragma unroll
+        for (int i = 0; i < 2 * G5F_GUR; i++) g5f_pf<1>(w[i], (int)g.row_bytes, lane);
+        float p[2 * G5F_GUR];
+        g5f_dot_anyn<2 * G5F_GUR>(g.ty, w, xqt, xq2t, xdt, xft, hid, p);
+        #pragma unroll
+        for (int i = 0; i < G5F_GUR; i++) { a[i] = g5f_warp_sum(p[2 * i]); b[i] = g5f_warp_sum(p[2 * i + 1]); }
+    } else {
+        const unsigned char* wg[G5F_GUR];
+        const unsigned char* wu[G5F_GUR];
+        #pragma unroll
+        for (int i = 0; i < G5F_GUR; i++) {
+            const int r = r0 + i < rows ? r0 + i : r0;
+            wg[i] = g5f_row(g, e, r);
+            wu[i] = g5f_row(u, e, r);
+        }
+        float pa[G5F_GUR], pb[G5F_GUR];
+        g5f_dot_anyn<G5F_GUR>(g.ty, wg, xqt, xq2t, xdt, xft, hid, pa);
+        g5f_dot_anyn<G5F_GUR>(u.ty, wu, xqt, xq2t, xdt, xft, hid, pb);
+        #pragma unroll
+        for (int i = 0; i < G5F_GUR; i++) { a[i] = g5f_warp_sum(pa[i]); b[i] = g5f_warp_sum(pb[i]); }
+    }
+    if (lane == 0) {
+        const float L = sh ? lims : lim;
+        #pragma unroll
+        for (int i = 0; i < G5F_GUR; i++) {
+            if (r0 + i >= rows) break;
+            const float gg = fminf(a[i], L), uu = fminf(fmaxf(b[i], -L), L);
+            hp[r0 + i] = gg / (1.0f + expf(-gg)) * uu;
+        }
+    }
+}
+
+// g5f_down_split with G5F_DNR rows a warp (G5F_DNR even). grid (ceil(hid / (4 * G5F_DNR)), S, T),
+// block 128, no staging. Same yp as g5f_down_split (the pair-fused dot is the same per-row sum).
+#ifndef G5F_DNR
+#define G5F_DNR 4
+#endif
+extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down_splitn(
+    const G5W down, const G5W sdown, const unsigned* ids, const float* wts, int k, int ne,
+    const float* h, const unsigned char* hq, const unsigned char* hq2, const float* hd, int hs, float* yp, int ff,
+    int ffs, int hid) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = blockIdx.y, t = blockIdx.z;
+    const int nr = ids ? k : 1, ns = sdown.base ? 1 : 0, S = nr + ns;
+    const int c0 = (blockIdx.x * 4 + warp) * G5F_DNR;
+    if (c0 >= hid) return;
+    const bool sh = j >= nr;
+    const size_t row = (size_t)t * S + j;
+    float* out = yp + row * hid;
+    const unsigned e = sh ? 0u : (ids ? ids[(size_t)t * k + j] : 0u);
+    if (!sh && ids && e >= (unsigned)ne) {
+        if (lane < G5F_DNR && c0 + lane < hid) out[c0 + lane] = 0.f;
+        return;
+    }
+    const float wj = sh ? 1.f : (ids ? wts[(size_t)t * k + j] : 1.f);
+    const G5W w = sh ? sdown : down;
+    const int kk = sh ? ffs : ff;
+    const unsigned char* q = hq + row * hs;
+    const unsigned char* q2 = hq2 ? hq2 + row * hs : 0;
+    const float* d = hd + row * (hs / 32);
+    const float* f = h + row * hs;
+    const unsigned char* wr[G5F_DNR];
+    #pragma unroll
+    for (int i = 0; i < G5F_DNR; i++) wr[i] = g5f_row(w, e, c0 + i < hid ? c0 + i : c0);
+    g5f_pf<2>(wr[0], (int)w.row_bytes * (c0 + G5F_DNR <= hid ? G5F_DNR : hid - c0), lane);
+    float p[G5F_DNR];
+    g5f_dot_anyn<G5F_DNR>(w.ty, wr, q, q2, d, f, kk, p);
+    float o[G5F_DNR];
+    #pragma unroll
+    for (int i = 0; i < G5F_DNR; i++) o[i] = g5f_warp_sum(p[i]);
+    if (lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < G5F_DNR; i++)
+            if (c0 + i < hid) out[c0 + i] = wj * o[i];
     }
 }
 

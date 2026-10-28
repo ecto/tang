@@ -98,6 +98,12 @@ pub struct Kernels {
     f_down_split: Func,
     f_sum: Func,
     f_route: Func,
+    f_gun: Func,
+    f_down_splitn: Func,
+    /// Rows a warp in `g5f_gun` (`TANG_GLM5_MOE_GUR`; 0 = `g5f_gu`, one row a warp).
+    pub gur: usize,
+    /// Rows a warp in `g5f_down_splitn` (`TANG_GLM5_MOE_DNR`, even; 0 = `g5f_down_split`, two).
+    pub dnr: usize,
     /// q8(x) + router + select as one launch (`g5f_route`; `TANG_GLM5_MOE_ROUTE1=0`: three).
     pub route1: bool,
     /// The fast path (`TANG_GLM5_MOE=fast`). Tests flip it directly.
@@ -143,8 +149,21 @@ impl Kernels {
         let unroll = std::env::var("TANG_GLM5_MOE_UNROLL").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
         // TANG_GLM5_MOE_FUSE2=0: gate / up (and the down row pair) as two separate row loops
         let fuse2 = i32::from(env_on("TANG_GLM5_MOE_FUSE2", true));
+        // TANG_GLM5_MOE_GUR / _DNR: rows a warp in the routed gate|up / split down (0 = the
+        // one-row g5f_gu / two-row g5f_down_split); same sums, so the same h / y bit for bit
+        // TANG_GLM5_MOE_PF (mask, default 2): L2 prefetch of a warp's whole rows before its dot,
+        // 1 = gate|up, 2 = down (no-op on the math; B300 l11 Q6_K down 52 -> 44 us, gate|up no gain)
+        let pf = std::env::var("TANG_GLM5_MOE_PF").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(2);
+        let rows = |key: &str, d: usize| std::env::var(key).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d);
+        let gur = rows("TANG_GLM5_MOE_GUR", 1).min(8);
+        let dnr = match rows("TANG_GLM5_MOE_DNR", 2).min(16) {
+            1 => 2,
+            n => n & !1,
+        };
         let src = format!(
-            "#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n{}",
+            "#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
+            gur.max(1),
+            dnr.max(2),
             super::SRC
         );
         let m = g.module(&src)?;
@@ -166,6 +185,10 @@ impl Kernels {
             f_down_split: m.func("g5f_down_split")?,
             f_sum: m.func("g5f_sum")?,
             f_route: m.func("g5f_route")?,
+            f_gun: m.func("g5f_gun")?,
+            f_down_splitn: m.func("g5f_down_splitn")?,
+            gur,
+            dnr,
             route1: env_on("TANG_GLM5_MOE_ROUTE1", true),
             fast: std::env::var("TANG_GLM5_MOE").is_ok_and(|v| v == "fast"),
             stage: env_on("TANG_GLM5_MOE_STAGE", false),
@@ -819,6 +842,16 @@ fn ffn_fast(
     let dn_b = t64 * hid as u64 * (nr64 * rb(down) + rb(sd));
     unsafe {
         gpu::trace::bytes(gu_b);
+        if k.gur > 0 && smg == 0 {
+            gpu::launch(
+                k.f_gun,
+                (hs.div_ceil(4 * k.gur) as u32, slots as u32, t as u32),
+                blk,
+                0,
+                s,
+                tang_moe::args![gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims],
+            )?;
+        } else {
         gpu::launch(
             k.f_gu,
             (hs.div_ceil(4) as u32, slots as u32, t as u32),
@@ -829,6 +862,7 @@ fn ffn_fast(
                 gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims, r16g
             ],
         )?;
+        }
         gpu::launch(
             k.f_q8,
             (hs.div_ceil(128) as u32, (t * slots) as u32, 1),
@@ -840,6 +874,16 @@ fn ffn_fast(
         gpu::trace::bytes(dn_b);
         if split {
             let yp = pool.get(P_YP, t * slots * hid * 4)?;
+            if k.dnr > 0 && smd == 0 {
+                gpu::launch(
+                    k.f_down_splitn,
+                    (hid.div_ceil(4 * k.dnr) as u32, slots as u32, t as u32),
+                    blk,
+                    0,
+                    s,
+                    tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi],
+                )?;
+            } else {
             gpu::launch(
                 k.f_down_split,
                 (hid.div_ceil(8) as u32, slots as u32, t as u32),
@@ -848,6 +892,7 @@ fn ffn_fast(
                 s,
                 tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi, r16d],
             )?;
+            }
             let si = slots as i32;
             gpu::launch(
                 k.f_sum,

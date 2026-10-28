@@ -4,6 +4,33 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MoE fast path on B300: word-wide headers, hoisted activations, down-row L2 prefetch; +0.4–1.2 tok/s, ids unchanged (branch claude/glm5-moe2)
+
+What was wrong: per layer (T=1, `real_layers_fast_matches_cpu`, `TANG_GLM5_MOE_SPLIT=1`, traced µs) g5f_gu
+44–48 (2.1–2.3 TB/s), g5f_down_split 32 (Q5_K) / 52 (Q6_K, 1.2 TB/s), g5f_route 27, q8 7, sum 7; total
+118 (l4) / 142 (l11). ncu is unusable on this pod (ERR_NVGPUCTRPERM), so attribution is by A/B only.
+
+What did not help (B300, traced µs gu / down on l4, l11):
+- UNROLL=4: gu 44 -> 50/55. UNROLL=4 + MINB=4: did not run (binary rebuilt under the queued run).
+- More rows a warp (new g5f_gun / g5f_down_splitn): GUR=2 DNR=4 gu 50/54; GUR=4 DNR=8 gu 61/65, down 38/55;
+  GUR=2 DNR=4 MINB=4 gu 54/63, down 39/86. Fewer, fatter warps are consistently slower.
+- L2 prefetch of the gate|up rows (`prefetch.global.L2` over the row's lines): gu unchanged/slightly worse.
+So the gu kernel is not bound by per-warp load latency or row-level MLP; the true limiter is still open.
+
+Kept (cac0e91c, defaults GUR=1 DNR=2 PF=2):
+1. `g5f_c32v`: Q4_K/Q5_K block header (d, dmin, 12 scale bytes) as one 16-byte load instead of ~7 byte
+   loads; Q8_0r/Q6_Kr d and the scale pair as 16-bit loads; activations loaded once per chunk for all rows.
+   Same values, same float ops and per-row sum order -> h / y bit-identical. l4 119 -> 115 us/call,
+   l11 143 -> 139 (untraced, device x/y).
+2. `TANG_GLM5_MOE_PF` mask (1 gate|up, 2 down; default 2): L2 prefetch of a warp's down row pair. l11
+   (Q6_K down) down 52 -> 44 traced, call 139 -> 134.
+`TANG_GLM5_MOE_GUR=0 DNR=0 PF=0` restores the previous kernels.
+
+Bench (scripts/glm5-bench.sh, B flags, bin 6e93f80f, haiku gate OK): -n 128 58.64 tok/s ids md5 7174cdd6
+(baseline 58.28, same md5); GLM5_N=512 59.64 tok/s md5 1453cf0e (baseline 58.48, same md5).
+Target (MoE <= 2.5 ms/token) NOT reached: this is ~5% of the MoE time. Next: g5f_route (27 us traced,
+serial top-8 in one warp) and a different gu mapping (lane-contiguous 16 B reads); needs counters.
+
 ## 2026-10-28 — KDA resident upload 462 s -> 17 s: NVRTC ran 3x per layer (branch claude/glm5-kda-load)
 
 What was wrong: `kda_dev::DevLayer::new_gguf` builds three CUDA modules per KDA layer
