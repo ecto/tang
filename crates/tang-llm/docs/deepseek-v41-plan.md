@@ -212,6 +212,14 @@ gone; d1ad44b0), 1017 weights, 8× H100, 200 tokens: greedy **149.2 / 149.1** (4
 acceptance-lucky run), direct greedy 112.3. Per step the verify+draft is now ~28 ms; the
 remaining budget split is roughly attn 10.6, moe 10.5, hc 3.7 ms on the direct path.
 
+Wave 7e merged (+ attn3 f0d801c9 o-quant in the attention merge, 23213c65 hc stage 21.9 → 16.1
+µs per launch; 2eb3da81), 1017 weights, 8× H100, 200 tokens: greedy **154.2 / 152.9** (48 steps,
+154/235; 27.0 ms per step), sampled T=0.6 145.9 / **153.5**, T=1.0 137.6 (50 steps), direct
+greedy 114.8. The moe3 lane's second round (h quantised in the down kernel, relaxed-order router
+GEMV, persistent gu+act+down) measured no gain and was dropped; `layer.moe` stays 10.6 ms,
+latency-bound per expert slot (gu 63 µs for ~12 MB of fp4 per layer ≈ 190 GB/s) — the grouped
+kernels' grids are the next target, not more fusion.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
