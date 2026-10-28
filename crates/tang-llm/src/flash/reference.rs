@@ -456,7 +456,7 @@ impl Act {
 }
 
 /// f32 -> bf16 -> f32, round to nearest even (ggml's `ggml_fp32_to_bf16`).
-fn round_bf16(x: f32) -> f32 {
+pub(crate) fn round_bf16(x: f32) -> f32 {
     if x.is_nan() {
         return x;
     }
@@ -590,7 +590,7 @@ pub(crate) fn silu(x: f32) -> f32 {
 
 /// ggml's softplus: `log(1 + e^x)`, passed through above 20.
 #[inline]
-fn softplus(x: f32) -> f32 {
+pub(crate) fn softplus(x: f32) -> f32 {
     if x > 20.0 {
         x
     } else {
@@ -613,11 +613,53 @@ pub(crate) fn rms_norm_mul(x: &mut [f32], w: &[f32], eps: f32) {
 }
 
 /// In place: `x / sqrt(Σx² + eps)` — the GDN q/k norm, eps on the *squared* norm.
-fn l2_norm(x: &mut [f32], eps: f32) {
+pub(crate) fn l2_norm(x: &mut [f32], eps: f32) {
     let s: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
     let r = 1.0 / ((s as f32) + eps).sqrt();
     for v in x {
         *v *= r;
+    }
+}
+
+/// One token of one GDN value head, in place on its state `st[a * s + b]` (a = key dim, b =
+/// value dim; `s = q.len()`): decay first, then the delta update `st += k ⊗ β (v − kᵀst)`, then
+/// `out = qᵀ st` read from the updated state. `q` and `k` are already L2-normed (q also scaled);
+/// `sk` is scratch of length `s`. The reference forward and the compiled-layer runner
+/// ([`super::chip`]) both step through this, so they share one statement of the recurrence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdn_head_step(
+    st: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    decay: f32,
+    beta: f32,
+    sk: &mut [f32],
+    out: &mut [f32],
+) {
+    let s = q.len();
+    for e in st.iter_mut() {
+        *e *= decay;
+    }
+    sk.iter_mut().for_each(|e| *e = 0.0);
+    for (ai, &ka) in k.iter().enumerate() {
+        for (acc, &sv) in sk.iter_mut().zip(&st[ai * s..(ai + 1) * s]) {
+            *acc += sv * ka;
+        }
+    }
+    for (vv, kk) in sk.iter_mut().zip(v) {
+        *vv = (kk - *vv) * beta;
+    }
+    for (ai, &ka) in k.iter().enumerate() {
+        for (sv, &dv) in st[ai * s..(ai + 1) * s].iter_mut().zip(sk.iter()) {
+            *sv += ka * dv;
+        }
+    }
+    out.iter_mut().for_each(|e| *e = 0.0);
+    for (ai, &qa) in q.iter().enumerate() {
+        for (acc, &sv) in out.iter_mut().zip(&st[ai * s..(ai + 1) * s]) {
+            *acc += sv * qa;
+        }
     }
 }
 
@@ -1289,30 +1331,17 @@ impl FlashRef {
                     let k = &row[kd + kh * s..kd + (kh + 1) * s];
                     let v = &row[2 * kd + vh * s..2 * kd + (vh + 1) * s];
                     let g = softplus(alpha[t * hv + vh] + dt[vh]) * a[vh];
-                    let decay = g.exp();
                     let b = sigmoid(beta[t * hv + vh]);
-                    // decay first, then the delta update, then read the updated state
-                    for e in st.iter_mut() {
-                        *e *= decay;
-                    }
-                    sk.iter_mut().for_each(|e| *e = 0.0);
-                    for (ai, &ka) in k.iter().enumerate() {
-                        for (acc, &sv) in sk.iter_mut().zip(&st[ai * s..(ai + 1) * s]) {
-                            *acc += sv * ka;
-                        }
-                    }
-                    let d: Vec<f32> = v.iter().zip(&sk).map(|(&vv, &kk)| (vv - kk) * b).collect();
-                    for (ai, &ka) in k.iter().enumerate() {
-                        for (sv, &dv) in st[ai * s..(ai + 1) * s].iter_mut().zip(&d) {
-                            *sv += ka * dv;
-                        }
-                    }
-                    let ot = &mut o[t * s..(t + 1) * s];
-                    for (ai, &qa) in q.iter().enumerate() {
-                        for (acc, &sv) in ot.iter_mut().zip(&st[ai * s..(ai + 1) * s]) {
-                            *acc += sv * qa;
-                        }
-                    }
+                    gdn_head_step(
+                        &mut st,
+                        q,
+                        k,
+                        v,
+                        g.exp(),
+                        b,
+                        &mut sk,
+                        &mut o[t * s..(t + 1) * s],
+                    );
                 }
                 let norm2: f64 = st.iter().map(|&e| (e as f64) * (e as f64)).sum();
                 (o, norm2.sqrt() as f32)
