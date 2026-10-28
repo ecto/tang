@@ -14,6 +14,8 @@ pub mod coder_kernels;
 #[cfg(feature = "cuda")]
 pub mod engine;
 pub mod chip;
+#[cfg(feature = "cuda")]
+pub mod chip_gpu;
 pub mod fa2;
 pub mod glm5;
 #[cfg(feature = "cuda")]

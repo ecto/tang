@@ -869,6 +869,11 @@ pub struct Coder {
     peer: Option<Box<Peer>>,
     /// The GDN memstore's layer (`enable_store`; `None`: no store, nothing touches it).
     pub store: Option<super::memserve::StoreMeta>,
+    /// The compiled store layers' window (`load_chip`; `None`: store ops take the memstore
+    /// path). Its own GDN/conv state per slot; nothing else in the engine reads it.
+    pub chip: Option<super::chip_gpu::ChipGpu>,
+    /// Store ops ↔ chip tokens (`load_chip`); without it `store_op_at` keeps the memstore path.
+    chip_codec: Option<Box<dyn super::chip_gpu::ChipCodec>>,
 }
 
 #[derive(Default)]
@@ -1149,6 +1154,8 @@ impl Coder {
             last_mtp_ms: 0.0,
             peer,
             store: None,
+            chip: None,
+            chip_codec: None,
         };
         let mut c = c;
         c.write_slot_tables();
@@ -1334,6 +1341,9 @@ impl Coder {
     /// Release slot `i` (not 0) and its memory, on every stage.
     pub fn free_slot(&mut self, i: usize) {
         if i > 0 && i < MAX_SLOTS && self.slots[i].take().is_some() {
+            if let Some(c) = self.chip.as_mut() {
+                c.free(i);
+            }
             if let Some(p) = self.peer.as_deref_mut() {
                 p.slots[i] = None;
             }
@@ -2036,6 +2046,10 @@ impl Coder {
                 }
             }
             p.ctx.sync().expect("GPU 1 sync");
+        }
+        // The chip window's states (like the memstore heads, which live in the GDN states).
+        if let Some(c) = self.chip.as_mut() {
+            c.zero_all().expect("chip state reset");
         }
         // GPU 0's slot states.
         for sl in self.slots.iter_mut().skip(1).flatten() {
@@ -4709,14 +4723,57 @@ impl Coder {
         Ok(())
     }
 
-    /// A store op as GDN windows on slot `slot`'s state of the store layer, through the
-    /// device's `gdn_step` with that layer's params: no other layer, the head, the K/V caches,
-    /// the MTP layer or the sampler is touched, and the slot's tokens don't change.
+    // ---- the chip window (`super::chip_gpu`): compiled store layers driven by tokens
+
+    /// Load compiled store layers (`ChipPack`, emitted by `tang-chip` for this model's GDN
+    /// shape) as the engine's chip window, on GPU 0. With `codec`, [`store_op_at`]
+    /// (Self::store_op_at) runs store ops through it instead of the memstore.
+    pub fn load_chip(
+        &mut self,
+        pack: &super::chip::ChipPack,
+        codec: Option<Box<dyn super::chip_gpu::ChipCodec>>,
+    ) -> Result<()> {
+        self.sync_all();
+        self.chip = Some(super::chip_gpu::ChipGpu::new(&self.gpu, pack)?);
+        self.chip_codec = codec;
+        Ok(())
+    }
+
+    /// Feed `tokens` (a store tool call) to slot `slot`'s chip window and return what the chip
+    /// fed: the call, its records and its printed answer (`ChipOut::printed`). Only the chip
+    /// stack and the slot's chip state run: no base layer, LM head, KV cache, MTP layer or
+    /// sampler, and the slot's tokens don't change.
+    pub fn chip_op(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+    ) -> Result<super::chip_gpu::ChipOut> {
+        ensure!(
+            slot == 0 || self.slots.get(slot).is_some_and(|s| s.is_some()),
+            "slot {slot} isn't allocated"
+        );
+        self.sync_all();
+        self.chip
+            .as_mut()
+            .context("no chip layers (load_chip)")?
+            .op(slot, tokens)
+    }
+
+    /// A store op. With chip layers and a codec loaded: the op's call tokens through the chip
+    /// window ([`chip_op`](Self::chip_op)) and its printed answer decoded. Otherwise as GDN
+    /// windows on slot `slot`'s state of the memstore layer, through the device's `gdn_step`
+    /// with that layer's params. Either way no other layer, the head, the K/V caches, the MTP
+    /// layer or the sampler is touched, and the slot's tokens don't change.
     pub fn store_op_at(
         &mut self,
         slot: usize,
         op: &super::memserve::StoreOp,
     ) -> Result<super::memserve::OpOut> {
+        if self.chip.is_some() && self.chip_codec.is_some() {
+            let call = self.chip_codec.as_ref().unwrap().encode(op)?;
+            let out = self.chip_op(slot, &call)?;
+            return self.chip_codec.as_ref().unwrap().decode(op, &out);
+        }
         let l = self.store_layer(slot)?;
         self.sync_all();
         let GdnL {
