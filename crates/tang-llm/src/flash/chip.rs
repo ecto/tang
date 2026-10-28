@@ -758,6 +758,366 @@ impl<'a> Driver<'a> {
     }
 }
 
+// --- device packing (the CUDA chip window, `chip_gpu`) ------------------------------------
+
+/// Several CSR matrices with the same column space stacked row-wise: what one device GEMV
+/// launch runs (row `r` of the stack is row `r - offset` of its source). Each row's entries
+/// stay in column order, so a row's sum is [`Csr::apply`]'s, term for term.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedCsr {
+    pub rows: usize,
+    pub ptr: Vec<u32>,
+    pub idx: Vec<u32>,
+    pub val: Vec<f32>,
+}
+
+impl PackedCsr {
+    pub fn stack(mats: &[&Mat]) -> Result<Self> {
+        let mut p = PackedCsr {
+            rows: 0,
+            ptr: vec![0],
+            idx: vec![],
+            val: vec![],
+        };
+        for m in mats {
+            let Mat::Csr(c) = m else {
+                bail!("the device chip window runs emitted (CSR) layers, not dense blocks")
+            };
+            let base = p.idx.len() as u32;
+            p.ptr.extend(c.ptr[1..].iter().map(|v| v + base));
+            p.idx.extend_from_slice(&c.idx);
+            p.val.extend_from_slice(&c.val);
+            p.rows += c.rows;
+        }
+        Ok(p)
+    }
+    pub fn nnz(&self) -> usize {
+        self.val.len()
+    }
+    /// Device bytes (ptr + idx + val).
+    pub fn bytes(&self) -> usize {
+        4 * (self.ptr.len() + self.idx.len() + self.val.len())
+    }
+}
+
+/// One chip layer as the device runs it: the four input projections stacked (`qkv | z | a |
+/// b`, one launch), the output projection, gate|up stacked, down; the small vectors as they
+/// are.
+#[derive(Clone, Debug)]
+pub struct PackedLayer {
+    pub proj: PackedCsr,
+    pub out: PackedCsr,
+    pub gu: PackedCsr,
+    pub down: PackedCsr,
+    pub in_norm: Vec<f32>,
+    pub post_norm: Vec<f32>,
+    pub conv: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub a_neg: Vec<f32>,
+    pub gnorm: Vec<f32>,
+}
+
+/// [`Decoder`] as flat arrays: families as `[kind, a, b]` (kind 0 `Q`, 1 `Control(a)`, 2
+/// `Range { base: a, size: b }`).
+#[derive(Clone, Debug)]
+pub struct PackedDecoder {
+    pub nfam: u32,
+    pub fam: Vec<u32>,
+    pub printable: Vec<u32>,
+    pub v0: u32,
+    pub code_dims: Vec<u32>,
+    pub id_code_dims: Vec<u32>,
+}
+
+impl PackedDecoder {
+    pub fn new(d: &Decoder) -> Self {
+        let fam = d
+            .families
+            .iter()
+            .flat_map(|f| match f {
+                Family::Q => [0, 0, 0],
+                Family::Control(t) => [1, *t, 0],
+                Family::Range { base, size } => [2, *base, *size],
+            })
+            .collect();
+        Self {
+            nfam: d.nfam as u32,
+            fam,
+            printable: d.printable.clone(),
+            v0: d.v0,
+            code_dims: d.code_dims.iter().map(|&v| v as u32).collect(),
+            id_code_dims: d.id_code_dims.iter().map(|&v| v as u32).collect(),
+        }
+    }
+
+    /// What the device's `chip_pick` decodes, on the host (`Err` where it flags an error):
+    /// [`Decoder::token`] over the packed arrays.
+    pub fn token(&self, hc: &[f32]) -> Result<Option<u32>> {
+        if self.id_code_dims.iter().any(|&d| hc[d as usize] != 0.0) {
+            return Ok(Some(
+                self.id_code_dims
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &d)| hc[d as usize] > 0.0)
+                    .map(|(i, _)| 1u32 << i)
+                    .sum(),
+            ));
+        }
+        if self.code_dims.iter().all(|&d| hc[d as usize] == 0.0) {
+            return Ok(None);
+        }
+        let bit = |i: usize| (hc[self.code_dims[i] as usize] > 0.0) as u32;
+        let nf = self.nfam as usize;
+        let fid: u32 = (0..nf).map(|i| bit(i) << i).sum();
+        let p: u32 = (nf..self.code_dims.len()).map(|i| bit(i) << (i - nf)).sum();
+        let f = self.fam.get(3 * fid as usize..3 * fid as usize + 3);
+        match f {
+            Some(&[0, _, _]) if (p as usize) < self.printable.len() => {
+                Ok(Some(self.printable[p as usize]))
+            }
+            Some(&[1, t, _]) => Ok(Some(self.v0 + t)),
+            Some(&[2, base, size]) if p < size => Ok(Some(self.v0 + base + p)),
+            _ => bail!("the circuit predicts no token (family {fid}, payload {p})"),
+        }
+    }
+}
+
+/// An emitted chip stack flattened for upload: layers, the embedding rows of the tokens it is
+/// fed (`tokmap[token]` = row, −1 none), the decoder.
+pub struct ChipPack {
+    pub shape: Shape,
+    pub eps: f32,
+    pub layers: Vec<PackedLayer>,
+    pub rows: Vec<f32>,
+    pub tokmap: Vec<i32>,
+    pub dec: PackedDecoder,
+}
+
+impl ChipPack {
+    /// `tokens`: every token id the window may be fed (their rows come from `model.embed`).
+    pub fn new(model: &ChipModel, dec: &Decoder, tokens: &[usize]) -> Result<Self> {
+        let layers = model
+            .layers
+            .iter()
+            .map(|l| -> Result<PackedLayer> {
+                Ok(PackedLayer {
+                    proj: PackedCsr::stack(&[&l.qkv, &l.z, &l.a, &l.b])?,
+                    out: PackedCsr::stack(&[&l.out])?,
+                    gu: PackedCsr::stack(&[&l.gate, &l.up])?,
+                    down: PackedCsr::stack(&[&l.down])?,
+                    in_norm: l.in_norm.clone(),
+                    post_norm: l.post_norm.clone(),
+                    conv: l.conv.clone(),
+                    dt_bias: l.dt_bias.clone(),
+                    a_neg: l.a_neg.clone(),
+                    gnorm: l.gnorm.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let n = tokens.iter().max().map_or(0, |m| m + 1);
+        let mut tokmap = vec![-1i32; n];
+        let mut rows = Vec::with_capacity(tokens.len() * model.shape.hidden);
+        for (i, &t) in tokens.iter().enumerate() {
+            tokmap[t] = i as i32;
+            rows.extend(model.embed(t));
+        }
+        Ok(Self {
+            shape: model.shape,
+            eps: model.eps,
+            layers,
+            rows,
+            tokmap,
+            dec: PackedDecoder::new(dec),
+        })
+    }
+
+    /// Device bytes of the weights (CSR blocks, vectors), the embedding rows and the decoder.
+    pub fn bytes(&self) -> (usize, usize) {
+        let w = self
+            .layers
+            .iter()
+            .map(|l| {
+                l.proj.bytes()
+                    + l.out.bytes()
+                    + l.gu.bytes()
+                    + l.down.bytes()
+                    + 4 * (l.in_norm.len()
+                        + l.post_norm.len()
+                        + l.conv.len()
+                        + l.dt_bias.len()
+                        + l.a_neg.len()
+                        + l.gnorm.len())
+            })
+            .sum();
+        (w, 4 * (self.rows.len() + self.tokmap.len()))
+    }
+}
+
+/// The driver's rule for the next token after `cur` (whose residual decoded to `ct`), as the
+/// device's `chip_pick` applies it: a chip token is always followed by the circuit's; a text
+/// token by the circuit's when it owns the position, else by the next queued (forced) token;
+/// `None`: the op is over. Same as [`Driver::op`].
+pub fn pick_next(
+    v0: u32,
+    cur: u32,
+    ct: Option<u32>,
+    queue: &mut VecDeque<u32>,
+) -> Result<Option<(u32, bool)>> {
+    if cur >= v0 {
+        return Ok(Some((
+            ct.context("a chip token without a successor")?,
+            true,
+        )));
+    }
+    if let Some(t) = ct {
+        return Ok(Some((t, true)));
+    }
+    Ok(queue.pop_front().map(|t| (t, false)))
+}
+
+/// The retarget fixture (`chip_retarget_coder_next`, the GPU chip window's oracle): the store
+/// program emitted at Coder-Next-like shapes (base 2048, 16 k / 32 v, chip tokens at 262144),
+/// the put/get/list trace remapped to those ids, embedding rows with a fixed pseudo-random
+/// host part.
+pub struct RetargetFixture {
+    pub compiled: tang_chip::Compiled,
+    pub model: ChipModel,
+    pub dec: Decoder,
+    /// `(op, tokens fed, forced prefix length)`.
+    pub ops: Vec<(String, Vec<u32>, usize)>,
+    /// Token ids with embedding rows.
+    pub row_tokens: Vec<usize>,
+    /// The trace's store heads and states (`store_heads`, `states` of the bundled fixture).
+    pub fx: serde_json::Value,
+}
+
+impl RetargetFixture {
+    pub fn new() -> Result<Self> {
+        let g = tang_chip::store_program()?;
+        let shape = tang_chip::ChipShape {
+            hidden_base: 2048,
+            hidden_chip: None,
+            ballast: None,
+            k_heads: 16,
+            v_heads: 32,
+            d_state: 128,
+            d_conv: 4,
+            inter: 9216,
+            n_layers: g.n_layers(),
+            vocab_offset: 262_144,
+        };
+        let c = tang_chip::emit(&g, &shape)?;
+        let fx: serde_json::Value =
+            serde_json::from_str(&tang_chip::gunzip(tang_chip::TRACE_PUT_GET_LIST)?)?;
+        let v0_old = fx["v0"].as_u64().context("v0")? as u32;
+        let remap = |t: u32| {
+            if t >= v0_old {
+                t - v0_old + shape.vocab_offset
+            } else {
+                t
+            }
+        };
+        // the host part of each row: a fixed pseudo-random pattern (must survive untouched)
+        let host =
+            |t: u32, i: usize| ((t as usize * 7919 + i * 104_729) % 2001) as f32 / 1000.0 - 1.0;
+        let mut rows = std::collections::HashMap::new();
+        let mut row_tokens = vec![];
+        for (t, feats) in fx["rows"].as_object().context("rows")? {
+            let t: u32 = t.parse()?;
+            let f: Vec<(u32, f64)> = feats
+                .as_array()
+                .context("row")?
+                .iter()
+                .map(|p| (p[0].as_u64().unwrap() as u32, p[1].as_f64().unwrap()))
+                .collect();
+            let mut r = c.embedding_row(&f)?;
+            for (i, v) in r[..shape.hidden_base].iter_mut().enumerate() {
+                *v = round_bf16(host(t, i));
+            }
+            rows.insert(remap(t) as usize, r);
+            row_tokens.push(remap(t) as usize);
+        }
+        row_tokens.sort_unstable();
+        let model = ChipModel::from_compiled(&c, 1e-6, rows);
+        let d = &fx["decoder"];
+        let us = |v: &serde_json::Value| v.as_u64().unwrap() as u32;
+        let dec = Decoder {
+            nfam: d["nfam"].as_u64().context("nfam")? as usize,
+            families: d["families"]
+                .as_array()
+                .context("families")?
+                .iter()
+                .map(|f| match f["kind"].as_str().unwrap() {
+                    "q" => Family::Q,
+                    "control" => Family::Control(us(&f["token"])),
+                    _ => Family::Range {
+                        base: us(&f["base"]),
+                        size: us(&f["size"]),
+                    },
+                })
+                .collect(),
+            printable: d["printable"]
+                .as_array()
+                .context("printable")?
+                .iter()
+                .map(us)
+                .collect(),
+            v0: shape.vocab_offset,
+            code_dims: c.code_dims.clone(),
+            id_code_dims: c.id_code_dims.clone(),
+        };
+        let ops = fx["ops"]
+            .as_array()
+            .context("ops")?
+            .iter()
+            .map(|op| {
+                (
+                    op["op"].as_str().unwrap().to_string(),
+                    op["tokens"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| remap(us(v)))
+                        .collect(),
+                    op["forced"].as_u64().unwrap() as usize,
+                )
+            })
+            .collect();
+        Ok(Self {
+            compiled: c,
+            model,
+            dec,
+            ops,
+            row_tokens,
+            fx,
+        })
+    }
+
+    /// The trace's store states after op `label`: `(layer, v head, [d_k][d_v])`.
+    pub fn store_states(&self, label: &str) -> Vec<(usize, usize, Vec<f32>)> {
+        let sh = self.model.shape;
+        let r = sh.v_heads / sh.k_heads;
+        let mut out = vec![];
+        for (name, h) in self.fx["store_heads"].as_object().unwrap() {
+            let l = h["layer"].as_u64().unwrap() as usize;
+            let kh = h["key_head"].as_u64().unwrap() as usize;
+            let nvh = h["value_heads"].as_array().unwrap().len();
+            for x in 0..nvh {
+                let st = &self.fx["states"][label][name][x];
+                let mut want = vec![0f32; sh.d_state * sh.d_state];
+                for (i, rr) in st["rows"].as_array().unwrap().iter().enumerate() {
+                    let rr = rr.as_u64().unwrap() as usize;
+                    for (j, v) in st["vals"][i].as_array().unwrap().iter().enumerate() {
+                        want[rr * sh.d_state + j] = v.as_f64().unwrap() as f32;
+                    }
+                }
+                out.push((l, kh * r + x, want));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,87 +1406,19 @@ mod tests {
     #[test]
     fn chip_retarget_coder_next() {
         let t0 = std::time::Instant::now();
-        let g = tang_chip::store_program().unwrap();
-        let shape = tang_chip::ChipShape {
-            hidden_base: 2048,
-            hidden_chip: None,
-            ballast: None,
-            k_heads: 16,
-            v_heads: 32,
-            d_state: 128,
-            d_conv: 4,
-            inter: 9216,
-            n_layers: g.n_layers(),
-            vocab_offset: 262_144,
-        };
-        let c = tang_chip::emit(&g, &shape).unwrap();
+        let fxt = RetargetFixture::new().unwrap();
+        let (c, model, dec) = (&fxt.compiled, &fxt.model, &fxt.dec);
+        let shape = c.shape;
         assert_eq!(
             (c.hidden, c.layout.m),
             (3968, 62),
             "1920 chip dims: 62 ballast + tau + 1806 slots + 51 spare"
         );
-        let fx: serde_json::Value =
-            serde_json::from_str(&tang_chip::gunzip(tang_chip::TRACE_PUT_GET_LIST).unwrap())
-                .unwrap();
-        let v0_old = fx["v0"].as_u64().unwrap() as u32;
-        let remap = |t: u32| {
-            if t >= v0_old {
-                t - v0_old + shape.vocab_offset
-            } else {
-                t
-            }
-        };
-        // embedding rows: the host part a fixed pseudo-random pattern (must survive untouched)
-        let host =
-            |t: u32, i: usize| ((t as usize * 7919 + i * 104_729) % 2001) as f32 / 1000.0 - 1.0;
-        let mut rows = HashMap::new();
-        for (t, feats) in fx["rows"].as_object().unwrap() {
-            let t: u32 = t.parse().unwrap();
-            let f: Vec<(u32, f64)> = feats
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|p| (p[0].as_u64().unwrap() as u32, p[1].as_f64().unwrap()))
-                .collect();
-            let mut r = c.embedding_row(&f).unwrap();
-            for (i, v) in r[..shape.hidden_base].iter_mut().enumerate() {
-                *v = round_bf16(host(t, i));
-            }
-            rows.insert(remap(t) as usize, r);
-        }
-        let model = ChipModel::from_compiled(&c, 1e-6, rows);
-        let d = &fx["decoder"];
-        let dec = Decoder {
-            nfam: d["nfam"].as_u64().unwrap() as usize,
-            families: d["families"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| match f["kind"].as_str().unwrap() {
-                    "q" => Family::Q,
-                    "control" => Family::Control(f["token"].as_u64().unwrap() as u32),
-                    _ => Family::Range {
-                        base: f["base"].as_u64().unwrap() as u32,
-                        size: f["size"].as_u64().unwrap() as u32,
-                    },
-                })
-                .collect(),
-            printable: d["printable"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as u32)
-                .collect(),
-            v0: shape.vocab_offset,
-            code_dims: c.code_dims.clone(),
-            id_code_dims: c.id_code_dims.clone(),
-        };
         eprintln!("emitted in {:?}, {} MACs/token", t0.elapsed(), model.macs());
         let sh = model.shape;
-        let r = sh.v_heads / sh.k_heads;
         let mut drv = Driver {
-            model: &model,
-            dec: &dec,
+            model,
+            dec,
             num: Numerics::Bf16,
             state: model.state(),
         };
@@ -1154,20 +1446,11 @@ mod tests {
                 .chain(&lw.up_proj.entries)
                 .all(|e| e.1 >= hb));
         }
-        let store = fx["store_heads"].as_object().unwrap();
-        for op in fx["ops"].as_array().unwrap() {
-            let label = op["op"].as_str().unwrap();
-            let want: Vec<u32> = op["tokens"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| remap(v.as_u64().unwrap() as u32))
-                .collect();
-            let nf = op["forced"].as_u64().unwrap() as usize;
-            let fed = drv.op(&want[..nf]).unwrap();
-            assert_eq!(fed, want, "{label}: fed tokens differ");
+        for (label, want, nf) in &fxt.ops {
+            let fed = drv.op(&want[..*nf]).unwrap();
+            assert_eq!(&fed, want, "{label}: fed tokens differ");
             // the host dims come out as embedded (checked on the op's last token; the weights
-            // below show it holds for every token)
+            // above show it holds for every token)
             let t = *fed.last().unwrap() as usize;
             let mut st = drv.state.clone();
             let hc = model.step(t, &mut st, Numerics::Bf16);
@@ -1175,31 +1458,15 @@ mod tests {
                 &hc[..shape.hidden_base],
                 &model.embed(t)[..shape.hidden_base]
             );
-            let mut n_rows = 0;
-            for (name, h) in store {
-                let (l, kh) = (
-                    h["layer"].as_u64().unwrap() as usize,
-                    h["key_head"].as_u64().unwrap() as usize,
+            let states = fxt.store_states(label);
+            for (l, vh, want) in &states {
+                let ours = drv.state.head(&sh, *l, *vh);
+                assert!(
+                    ours.iter()
+                        .zip(want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{label} l{l} v{vh}: store state differs"
                 );
-                let nvh = h["value_heads"].as_array().unwrap().len();
-                for x in 0..nvh {
-                    let st = &fx["states"][label][name][x];
-                    let mut want = vec![0f32; sh.d_state * sh.d_state];
-                    for (i, rr) in st["rows"].as_array().unwrap().iter().enumerate() {
-                        let rr = rr.as_u64().unwrap() as usize;
-                        for (j, v) in st["vals"][i].as_array().unwrap().iter().enumerate() {
-                            want[rr * sh.d_state + j] = v.as_f64().unwrap() as f32;
-                        }
-                        n_rows += 1;
-                    }
-                    let ours = drv.state.head(&sh, l, kh * r + x);
-                    assert!(
-                        ours.iter()
-                            .zip(&want)
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "{label} {name} v{x}: store state differs"
-                    );
-                }
             }
             for l in 0..model.layers.len() {
                 for vh in 0..sh.v_heads {
@@ -1209,10 +1476,67 @@ mod tests {
                 }
             }
             eprintln!(
-                "{label}: {} tokens, store heads exact ({n_rows} rows)",
-                fed.len()
+                "{label}: {} tokens, store heads exact ({} heads)",
+                fed.len(),
+                states.len()
             );
         }
         eprintln!("retarget run in {:?}", t0.elapsed());
+    }
+
+    /// The device packing on the host: the stacked CSR rows are the layer's rows, the packed
+    /// decoder decodes every residual of the trace as [`Decoder::token`] does, and
+    /// [`pick_next`] replays [`Driver::op`]'s token sequence.
+    #[test]
+    fn chip_pack_decoder_and_pick() {
+        let fxt = RetargetFixture::new().unwrap();
+        let (model, dec) = (&fxt.model, &fxt.dec);
+        let pack = ChipPack::new(model, dec, &fxt.row_tokens).unwrap();
+        let x: Vec<f32> = (0..model.shape.hidden)
+            .map(|i| ((i * 37) % 11) as f32 - 5.0)
+            .collect();
+        let l0 = &model.layers[0];
+        let want: Vec<f32> = [&l0.qkv, &l0.z, &l0.a, &l0.b]
+            .iter()
+            .flat_map(|m| m.apply(&x))
+            .collect();
+        let p = &pack.layers[0].proj;
+        let got: Vec<f32> = (0..p.rows)
+            .map(|r| {
+                let (a, b) = (p.ptr[r] as usize, p.ptr[r + 1] as usize);
+                p.idx[a..b]
+                    .iter()
+                    .zip(&p.val[a..b])
+                    .map(|(&c, &w)| w * x[c as usize])
+                    .sum()
+            })
+            .collect();
+        assert!(got
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        let mut st = model.state();
+        for (label, want, nf) in &fxt.ops {
+            let mut q: VecDeque<u32> = want[1..*nf].iter().copied().collect();
+            let mut cur = want[0];
+            let mut fed = vec![];
+            loop {
+                let hc = model.step(cur as usize, &mut st, Numerics::Bf16);
+                fed.push(cur);
+                let ct = pack.dec.token(&hc).unwrap();
+                assert_eq!(ct, dec.token(&hc).unwrap(), "{label} token {}", fed.len());
+                match pick_next(pack.dec.v0, cur, ct, &mut q).unwrap() {
+                    Some((t, _)) => cur = t,
+                    None => break,
+                }
+            }
+            assert_eq!(&fed, want, "{label}");
+        }
+        let (w, e) = pack.bytes();
+        eprintln!(
+            "pack: {:.1} MB weights, {:.1} MB rows",
+            w as f64 / 1e6,
+            e as f64 / 1e6
+        );
     }
 }
