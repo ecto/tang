@@ -841,6 +841,7 @@ fn run_window(g: &CudaComputeDevice, ts: &[usize]) {
             total as f64 / (graph_ms as f64 * 1e6) / 9.36
         );
         let mut sum = 0.0;
+        let mut gdn_ro = 0.0;
         for (c, name) in CLASSES {
             let graph = g.capture(&mut || {
                 window(g, &mut m, &mut s, t, ti, Some(c));
@@ -853,6 +854,9 @@ fn run_window(g: &CudaComputeDevice, ts: &[usize]) {
             );
             let n = window_launches(c);
             sum += ms;
+            if c == Class::Gdn {
+                gdn_ro = ms;
+            }
             println!("  {name:<38} {ms:7.3} ms  ({n} launches)");
         }
         println!("  {:<38} {sum:7.3} ms", "sum of classes");
@@ -866,6 +870,90 @@ fn run_window(g: &CudaComputeDevice, ts: &[usize]) {
             "  {:<38} {ms:7.3} ms  (72 launches, separate graph)",
             "GDN commit, n_keep = T"
         );
+        gdn_share(t, sum - gdn_ro, ms);
+    }
+}
+
+/// Prefill view of a window: the non-GDN classes plus the committing GDN step (what
+/// `prefill_wide` runs), the recurrence's share of it, and the chunked-kernel ceiling.
+fn gdn_share(t: usize, rest_ms: f32, gdn_ms: f32) {
+    let total = rest_ms + gdn_ms;
+    let per_layer = gdn_ms as f64 * 1e3 / 36.0;
+    println!(
+        "  prefill window ≈ {total:.3} ms = {:.0} tok/s; GDN (36 layers) {gdn_ms:.3} ms = {:.1}% ; {per_layer:.1} µs/layer, {:.2} µs/token/layer",
+        t as f64 / (total as f64 * 1e-3),
+        100.0 * gdn_ms / total,
+        per_layer / t as f64
+    );
+    // Chunked delta rule (C = 64) per v head: per chunk KK^T, QK^T (2·C²·D each), the
+    // UT-transform triangular solve (~C³/3·2), W = A·K and U = A·V (2·C²·D each),
+    // V' = U - W·S and O = Q·S (2·C·D² each), O += (QK^T∘M)·V' (2·C²·D), S += K^T·V' (2·C·D²).
+    let (c, d, h) = (64f64, GDN_D as f64, GDN_HV as f64);
+    let chunks = (t as f64 / c).ceil();
+    let per_chunk = 5.0 * 2.0 * c * c * d + 3.0 * 2.0 * c * d * d + 2.0 * c * c * c / 3.0;
+    let flops = chunks * per_chunk * h * 36.0;
+    let state = 36.0 * h * d * d * 4.0 * 2.0; // f32 state read + write once per window
+    println!(
+        "  chunked ceiling (36 layers): {:.2} GFLOP -> {:.1} µs at 71 TFLOP/s bf16 TC, {:.1} µs at 35.6 TFLOP/s fp32; state traffic {:.1} MB -> {:.1} µs at 936 GB/s",
+        flops / 1e9,
+        flops / 71e6,
+        flops / 35.6e6,
+        state / 1e6,
+        state / 936e3
+    );
+}
+
+/// `gdn [T ..]`: the committing GDN conv + step alone (one layer's weights, 36 launches as a
+/// graph), for widths whose full `window` model does not fit beside other GPU tenants.
+/// The wrapper takes T <= 64, so wider T runs as T/64 back-to-back 64-token steps over the
+/// same state: the kernel is a serial token loop either way (the engine's raw launch
+/// takes the whole window in one), so this differs only by the extra launches' state reload.
+fn gdn_only(g: &CudaComputeDevice, ts: &[usize]) {
+    let mut rng = Rng(11);
+    let gd = Gdn {
+        conv: g.upload_f32(&rng.vec(GDN_CONV * GDN_TAPS, 0.5)),
+        dt: g.upload_f32(&rng.vec(GDN_HV, 1.0)),
+        a: g.upload_f32(&[-0.5; GDN_HV]),
+        norm: g.upload_f32(&vec![1.0; GDN_D]),
+        state: g.upload_f32(&rng.vec(flash::GDN_STATE, 0.1)),
+        hist: g.upload_f32(&rng.vec(flash::GDN_HIST, 0.5)),
+    };
+    let mut state = gd.state;
+    let mut hist = gd.hist;
+    for &t in ts {
+        let (tc, reps) = if t > 64 { (64, t / 64) } else { (t, 1) };
+        let win = g.upload_u32(&[(CTX - tc) as u32, tc as u32, 0]);
+        let proj = g.upload_f32(&rng.vec(tc * GDN_PROJ, 0.5));
+        let mut y = g.alloc_f32(tc * GDN_V);
+        let p = GdnParams {
+            conv: &gd.conv,
+            dt_bias: &gd.dt,
+            ssm_a: &gd.a,
+            norm: &gd.norm,
+        };
+        let mut run = || {
+            for _ in 0..36 * reps {
+                let commit = GdnMode::Commit { win: &win };
+                let (st, h) = (&mut state, &hist);
+                g.gdn_conv_step(st, &proj, GDN_PROJ, h, &p, &mut y, None, tc, commit, 1e-6);
+                g.gdn_conv_commit(&mut hist, &proj, GDN_PROJ, &win, tc);
+            }
+        };
+        run();
+        g.sync();
+        let graph = g.capture(&mut run);
+        let ms = median(
+            (0..10)
+                .map(|_| g.event_ms(&mut || graph.launch().unwrap()))
+                .collect(),
+        );
+        println!(
+            "gdn T={t}: 36 layers {ms:.3} ms, {:.1} µs/layer, {:.2} µs/token/layer, {:.0} tok/s through the GDN stack",
+            ms * 1e3 / 36.0,
+            ms * 1e3 / 36.0 / t as f32,
+            t as f32 / (ms * 1e-3)
+        );
+        gdn_share(t, 0.0, ms);
     }
 }
 
@@ -1232,6 +1320,17 @@ fn main() {
         Some("hc") => hc(&g),
         Some("stack") => stack(&g),
         Some("native") => native(&g),
+        Some("gdn") => {
+            let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
+            gdn_only(
+                &g,
+                if ts.is_empty() {
+                    &[8, 64, 256, 512]
+                } else {
+                    &ts
+                },
+            );
+        }
         Some("window") => {
             let ts: Vec<usize> = args[1..].iter().map(|a| a.parse().expect("T")).collect();
             run_window(&g, if ts.is_empty() { &[1, 2, 4] } else { &ts });
