@@ -3207,6 +3207,7 @@ mod tests {
     /// at engine load (layer construction), so they are set around the loads only.
     #[cfg(feature = "cuda")]
     fn gpu_slots_case(ids: &[u32], moe: &str) {
+        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let load = |slots: usize| {
             let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // the batched KDA rows need it
@@ -3373,6 +3374,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cuda")]
     fn engine_gpu_resident_step_matches_host() {
+        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;
@@ -3421,6 +3423,17 @@ mod tests {
         eprintln!("step graph: {segs} segments, ids {}", if c == a { "= host" } else { "DIFFER" });
         assert_eq!(segs, gr.m.hp.is_kda.iter().filter(|&&k| !k).count() + 1, "step graph segments");
         assert_eq!(a, c, "step graph vs host greedy ids");
+        // the whole-step graph (TANG_GLM5_STEP_GRAPH=2): one replay per token, the device
+        // position counter / embed gather; dense and sparse graphs across the switch
+        std::env::set_var("TANG_GLM5_STEP_GRAPH", "2");
+        let mut gw = mk();
+        let d = run(&mut gw, true);
+        std::env::remove_var("TANG_GLM5_STEP_GRAPH");
+        let whole = gw.gpu.as_ref().unwrap().resident.as_ref().map_or([0, 0], |r| r.whole_replays);
+        eprintln!("whole step graph: replays [dense, sparse] {whole:?}, ids {}", if d == a { "= host" } else { "DIFFER" });
+        eprintln!("                  host  {a:?}\n                  whole {d:?}");
+        assert!(whole[0] > 0 && whole[1] > 0 && whole[0] + whole[1] == 39, "whole graph replays {whole:?}");
+        assert_eq!(a, d, "whole step graph vs host greedy ids");
         assert!(host.gpu.as_ref().unwrap().resident.is_none(), "the host run took the resident step");
         assert!(res.gpu.as_ref().unwrap().resident.is_some(), "the resident step never ran");
         eprintln!("resident step: host {a:?}\n               res  {b:?}");
