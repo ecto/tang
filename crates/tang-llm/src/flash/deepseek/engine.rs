@@ -3814,6 +3814,10 @@ mod tests {
     #[test]
     fn gpu_tiny_free_running() {
         let Some((mut m, meta)) = open() else { return };
+        // free-running top-1 against the CPU model is an exact-path property: the tiny random
+        // fixture amplifies the K-split mixes' ulp-level drift over steps (6/10 top-1 on the
+        // relaxed path, which `gpu_tiny_hc_ks_matches_exact` holds to a KL/argmax bar instead)
+        m.hc_exact = true;
         let steps = meta["steps"].as_array().unwrap();
         let mut top1 = 0;
         for (s, step) in steps.iter().enumerate() {
