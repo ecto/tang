@@ -206,6 +206,12 @@ one launch, `MOE_KS_ITEMS` 4 → 2; 4854062f), 1017 weights, 8× H100, 200 token
 **147.3 / 147.2** (48 steps, 153/235; 28.3 ms per step vs 29.6 at 7b — the step got faster, the
 run took two more steps), sampled T=0.6 **148.4 / 150.2**, T=1.0 146.1, direct greedy 109.7.
 
+Wave 7d merged (+ attn3 03076460: index rows built inside `ds_attn_fdm`, one launch per layer
+gone; d1ad44b0), 1017 weights, 8× H100, 200 tokens: greedy **149.2 / 149.1** (48 steps, 153/235;
+27.9 ms per step), sampled T=0.6 148.1 / **152.1**, T=1.0 172.4 (39 steps, 165/190 — an
+acceptance-lucky run), direct greedy 112.3. Per step the verify+draft is now ~28 ms; the
+remaining budget split is roughly attn 10.6, moe 10.5, hc 3.7 ms on the direct path.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
