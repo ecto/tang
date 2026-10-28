@@ -1866,6 +1866,16 @@ extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn
 DS_MOE_TILES(2)
 DS_MOE_TILES(3)
 
+// dg_rope's value of element col (>= d - rd) of a d-wide row whose rotated pair is (a, b), at
+// position pos, bit for bit (inverse: by -theta). The fused q / o ropes of the tiled attention.
+__device__ __forceinline__ float ds_rope_at(float a, float b, int col, int d, int rd, const float2* tab, int pos,
+                                            int inverse) {
+    int e = col - (d - rd), j = e >> 1;
+    float2 cs = tab[(long long)pos * (rd / 2) + j];
+    float s = inverse ? -cs.y : cs.y;
+    return (e & 1) ? bf(a * s + b * cs.x) : bf(a * cs.x - b * s);
+}
+
 // ---- tiled sparse attention (default; DS_EXACT=1 selects ds_sparse_attn) ---------------------
 //
 // Three launches over a scratch buffer, same numerics as ds_sparse_attn up to summation order:
@@ -1879,7 +1889,8 @@ DS_MOE_TILES(3)
 
 extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, const float* kv0, int split,
                                                              const float* kv1, const int* idxs, float* part,
-                                                             int h, int d, int k) {
+                                                             int h, int d, int k, const float2* tab, const int* Pp,
+                                                             int rd, int add, int ps) {
     __shared__ float Qs[64][65];
     __shared__ float Ks[32][65];
     int nkt = (k + 31) / 32, nds = d / 64, nhc = h / 64;
@@ -1892,7 +1903,14 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, con
     const int* ix = idxs + (long long)ti * k;
     for (int e = tid; e < 64 * 64; e += 256) {
         int hh = e / 64, i = e % 64;
-        Qs[hh][i] = q[((long long)ti * h + hc * 64 + hh) * d + ds * 64 + i];
+        const float* qr = q + ((long long)ti * h + hc * 64 + hh) * d;
+        int col = ds * 64 + i;
+        float v = qr[col];
+        if (tab && col >= d - rd) {
+            int c0 = col - ((col - (d - rd)) & 1);
+            v = ds_rope_at(qr[c0], qr[c0 + 1], col, d, rd, tab, Pp[0] + add + ti * ps, 0);
+        }
+        Qs[hh][i] = v;
     }
     for (int e = tid; e < 32 * 64; e += 256) {
         int kk = e / 64, i = e % 64;
@@ -1957,7 +1975,8 @@ extern "C" __global__ void ds_attn_soft(const float* part, const float* sink, co
 extern "C" __global__ void __launch_bounds__(256) ds_attn_spv(const float* part, const float* sink,
                                                               const float* kv0, int split, const float* kv1,
                                                               const int* idxs, float* o, int h, int d, int k,
-                                                              float scale, int dsb) {
+                                                              float scale, int dsb, const float2* tab, const int* Pp,
+                                                              int rd, int add, int ps) {
     extern __shared__ float P[];  // [8][k], then the k indices
     __shared__ float red[4][8][64];
     __shared__ float dens[8];
@@ -2020,15 +2039,25 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_spv(const float* part,
         for (int e = tid; e < 8 * 64; e += 256) {
             int m = e / 64, c = e % 64;
             float s = red[0][m][c] + red[1][m][c] + red[2][m][c] + red[3][m][c];
-            int hi = g * 8 + m;
-            o[((long long)ti * h + hi) * d + ds * 64 + c] = bf(s / dens[m]);
+            int hi = g * 8 + m, col = ds * 64 + c;
+            float v = bf(s / dens[m]);
+            if (tab && col >= d - rd) {
+                // the inverse rope of the stored pair: the partner recomputed as it is stored
+                int c2 = c ^ 1;
+                float s2 = red[0][m][c2] + red[1][m][c2] + red[2][m][c2] + red[3][m][c2];
+                float v2 = bf(s2 / dens[m]);
+                bool odd = (col - (d - rd)) & 1;
+                v = ds_rope_at(odd ? v2 : v, odd ? v : v2, col, d, rd, tab, Pp[0] + add + ti * ps, 1);
+            }
+            o[((long long)ti * h + hi) * d + col] = v;
         }
     }
 }
 
 extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, const float* den, const float* kv0,
                                                              int split, const float* kv1, const int* idxs,
-                                                             float* o, int h, int d, int k) {
+                                                             float* o, int h, int d, int k, const float2* tab,
+                                                             const int* Pp, int rd, int add, int ps) {
     extern __shared__ float P[];  // [8][k], then the k indices
     __shared__ float red[4][8][64];
     int* Is = (int*)(P + 8 * k);
@@ -2064,7 +2093,16 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, co
     for (int e = tid; e < 8 * 64; e += 256) {
         int m = e / 64, c = e % 64;
         float s = red[0][m][c] + red[1][m][c] + red[2][m][c] + red[3][m][c];
-        int hi = g * 8 + m;
-        o[((long long)ti * h + hi) * d + ds * 64 + c] = bf(s / den[ti * h + hi]);
+        int hi = g * 8 + m, col = ds * 64 + c;
+        float v = bf(s / den[ti * h + hi]);
+        if (tab && col >= d - rd) {
+            // the inverse rope of the stored pair (as ds_attn_spv)
+            int c2 = c ^ 1;
+            float s2 = red[0][m][c2] + red[1][m][c2] + red[2][m][c2] + red[3][m][c2];
+            float v2 = bf(s2 / den[ti * h + hi]);
+            bool odd = (col - (d - rd)) & 1;
+            v = ds_rope_at(odd ? v2 : v, odd ? v : v2, col, d, rd, tab, Pp[0] + add + ti * ps, 1);
+        }
+        o[((long long)ti * h + hi) * d + col] = v;
     }
 }
