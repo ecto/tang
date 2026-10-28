@@ -2420,7 +2420,7 @@ impl GpuModel {
                 args![
                     h.ptr, h2, res.ptr, post, comb, xo.ptr, wv, part.ptr, pre.ptr, hin.ptr, nv,
                     scp, bp, o.pre.ptr, o.post.ptr, o.comb.ptr, cnt, ti, hci, di, it, eps, neps,
-                    neps
+                    neps, 0i32
                 ],
             )?
         };
