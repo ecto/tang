@@ -3809,6 +3809,7 @@ impl GpuModel {
         }
         .context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
+        ids.truncate(1 + c.draft_keep(&draft.conf));
         edit(pos0 + 1, &mut ids[1..]);
         let t1 = std::time::Instant::now();
         let snap = self.snapshot()?;
@@ -4648,6 +4649,64 @@ mod tests {
                 100.0 * accepted as f64 / drafted.max(1) as f64
             );
             assert_eq!(out, want, "{name}");
+        }
+    }
+
+    /// `DS_DRAFT_N` below (3) and above (7, the drafter's block grown past the trained 5) the
+    /// trained block, and the confidence early stop: greedy spec equals plain greedy, with
+    /// windows of at most n + 1 rows.
+    #[test]
+    fn gpu_tiny_spec_draft_n() {
+        let Some((mut m, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let (n, len) = (ids.len(), 40);
+        let (mut l, _) = m.forward(&ids, 0, None).unwrap();
+        let mut want = Vec::new();
+        while want.len() < len {
+            want.push(argmax(&l));
+            l = m
+                .forward(&[*want.last().unwrap()], n + want.len() - 1, None)
+                .unwrap()
+                .0;
+        }
+        drop(m);
+        for (dn, conf) in [("3", "0"), ("7", "0"), ("7", "0.3")] {
+            std::env::set_var("DS_DRAFT_N", dn);
+            std::env::set_var("DS_DRAFT_CONF", conf);
+            let m = GpuModel::open(&Path::new(&tiny()).join("hf"));
+            std::env::remove_var("DS_DRAFT_N");
+            std::env::remove_var("DS_DRAFT_CONF");
+            let mut m = m.unwrap();
+            let dn: usize = dn.parse().unwrap();
+            assert_eq!(m.cpu.cfg.draft_n, dn);
+            assert_eq!(m.cpu.cfg.dspark_block_size, dn.max(5));
+            let (l, main) = m.forward(&ids, 0, None).unwrap();
+            let t0 = argmax(&l);
+            m.forward_spec(t0, &main, 0).unwrap();
+            let (l, mut main) = m.forward(&[t0], n, None).unwrap();
+            let mut out = vec![t0, argmax(&l)];
+            let (mut sp, mut drafted, mut accepted, mut steps) = (n, 0, 0, 0);
+            while out.len() < len {
+                let s = m
+                    .decode_spec(
+                        *out.last().unwrap(),
+                        &main,
+                        sp,
+                        &mut |_, _| {},
+                        &mut super::super::forward::Greedy,
+                    )
+                    .unwrap();
+                assert!(s.drafted <= dn && s.drafted >= 1, "drafted {}", s.drafted);
+                drafted += s.drafted;
+                accepted += s.accepted;
+                steps += 1;
+                out.extend(s.tokens);
+                main = s.main;
+                sp = s.sp;
+            }
+            out.truncate(len);
+            eprintln!("n {dn} conf {conf}: accepted {accepted}/{drafted} in {steps} steps");
+            assert_eq!(out, want, "n {dn} conf {conf}");
         }
     }
 }
