@@ -4,6 +4,35 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MTP near-tie bisected: the KDA chunked core (t>1) vs the recurrent step (branch claude/glm5-mtp-bisect)
+Tool: `TANG_GLM5_WINDIFF=S,T` (engine.rs `windiff`): step-decode to gen[S], snapshot, then
+(A) T single steps, (A2) again, (B) one T-token window over the same tokens; per-layer taps
+(attn in/out, ffn in/out, l2 rel per row) + logits top-2. H200 /root/w-bisect, fast env
+(GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT GPU_HEAD), haiku prompt.
+- A vs A2: 0 everywhere (steps deterministic; snapshot/restore exact).
+- Near-tie (S=59, feeding `42612 11 30957 11`, row 1 = the token after `…42612 11`): step
+  30957 19.2940 vs 342 19.2044, **margin 0.0897**; window flips it: 342 19.4025 vs 30957
+  19.2110. Row logits window-vs-step rel 1.3e-2, max abs 0.24.
+- First difference: **l00 attn_out (KDA), row 0, rel 2.7e-7** with bit-identical input
+  (attn_in 0). Grows through the stack: l01 attn_out ~1e-3, l02 2.5e-3, l06 ffn_out 3e-2 (one
+  row jumps — MoE routing amplifies), l07–l10 up to 1e-1 on that row, settling ~5e-3–1e-2.
+  (Table at S=56: l00 attn_out 2.6e-7, ffn_out 1.1e-5, l01 attn_out 6.3e-4, l04 3.8e-3, l06
+  ffn_out 3.0e-2, l07 ffn_out 1.0e-1, l09 ffn_out 1.0e-1, l12 1.9e-2, l19 ~5e-3.)
+- Cause: `kda_dev::core_pf2` runs t>1 through `prefill_dev` (conv_ip + PF2 chunked WY form),
+  t=1 through `decode_dev` (fused conv + recurrent delta step). Same math, different fp
+  order. Everything else (gemv8/xq8 projections, gates, MoE fast tile, fused mHC, resident
+  MLA, GPU head) is already per-token bit-identical between t=4 and 4×t=1 — proven by the fix:
+- Fix (flag): `TANG_GLM5_KDA_WIN_STEP=N` — windows with t ≤ N run the core as t
+  `decode_dev` launches (token offsets into qkvb/gb_out/bb/ob). With N=4 at S=59: **every tap
+  of all 45 layers and all 4 logit rows bit-identical (0.0)**.
+- Verified: `--mtp 3 -n 64` with WIN_STEP=4 ids == plain decode, all 64 (ends `42612 11 30957
+  11 342`); 1.75 tok/pass (23 verify + 13 rerun). Gate -n 8: plain and --mtp 3 both `785 1196
+  6801 264 6386 38038 911 279`.
+- Cost: t serial step launches per KDA layer per window instead of one chunk (tiny at t≤4;
+  not timed). Default off. Unverified: prefill/long windows untouched (still chunked, so a
+  prefill-vs-decode difference of the same ~1e-2 logit band remains by design); bound
+  otherwise is logits ~1e-2 rel / ~0.3 abs, so near-ties with margin < ~0.3 can flip.
+
 ## 2026-10-27 (late) — MTP: the NextN layer drafts at 85–93% (branch claude/glm5-mtp)
 GGUF facts (unsloth UD-Q4_K_XL, dumped on the H200): `nextn_predict_layers = 1`,
 `block_count = 46`; `blk.45` is the NextN block — `nextn.eh_proj` [8192→4096] Q8_0,

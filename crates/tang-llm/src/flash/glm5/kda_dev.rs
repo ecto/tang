@@ -597,8 +597,25 @@ impl DevLayer {
             p.read(tap::G, &self.gb_out, t * di)?;
             p.read(tap::BETA, &self.bb, t * nh)?;
         }
-        if t == 1 {
-            self.core.decode_dev(&self.kers, &self.s, self.qkvb.ptr, self.gb_out.ptr, self.bb.ptr, self.ob.ptr)?;
+        // TANG_GLM5_KDA_WIN_STEP=N: windows of t <= N run the core as t recurrent decode
+        // steps (the t=1 kernel, token by token) instead of the chunked prefill form, so a
+        // short verify window (MTP) computes exactly what t single decode steps would.
+        let win_step = std::env::var("TANG_GLM5_KDA_WIN_STEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if t == 1 || t <= win_step {
+            let f = std::mem::size_of::<f32>() as u64;
+            for i in 0..t as u64 {
+                self.core.decode_dev(
+                    &self.kers,
+                    &self.s,
+                    self.qkvb.ptr + i * (3 * di) as u64 * f,
+                    self.gb_out.ptr + i * di as u64 * f,
+                    self.bb.ptr + i * nh as u64 * f,
+                    self.ob.ptr + i * di as u64 * f,
+                )?;
+            }
         } else {
             self.core.prefill_dev(
                 &self.kers,
