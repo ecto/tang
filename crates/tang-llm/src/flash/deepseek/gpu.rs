@@ -129,6 +129,7 @@ pub struct Kernels {
 const MORE: &[&str] = &[
     "ds_copy",
     "ds_hc_scale",
+    "ds_hc_sinkhorn",
     "ds_hc_pre",
     "ds_hc_post",
     "ds_embed",

@@ -39,7 +39,7 @@ use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::rc::Rc;
 use tang_moe::args;
-use tang_moe::gpu::{DevBuf, Gpu, Graph, Stream};
+use tang_moe::gpu::{DevBuf, Event, Gpu, Graph, Stream};
 
 const B256: (u32, u32, u32) = (256, 1, 1);
 
@@ -200,6 +200,12 @@ pub struct GpuModel {
     pub skip_readback: bool,
     /// The step timeline ([`super::obs`]; `DS_OBS`).
     pub obs: super::obs::Obs,
+    /// The expert-parallel reduce's stream: a graphable `moe_reduce` forks onto it (`fork`,
+    /// recorded on `s`) so the shared expert overlaps the all-reduce, and `s` joins it
+    /// (`join`) before the sum. Captured graphs take the fork/join as edges.
+    side: Stream,
+    fork: Event,
+    join: Event,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -211,6 +217,7 @@ impl Drop for GpuModel {
     /// Drain the stream and destroy the graphs before any memory they use is freed.
     fn drop(&mut self) {
         let _ = self.s.sync();
+        let _ = self.side.sync();
         self.graphs.clear();
     }
 }
@@ -275,6 +282,9 @@ impl GpuModel {
             k,
             gk,
             s,
+            side: Stream::new()?,
+            fork: Event::new(false)?,
+            join: Event::new(false)?,
             _g: g,
             w: RefCell::new(HashMap::new()),
             experts: RefCell::new(ExpertCache::default()),
@@ -1620,14 +1630,28 @@ impl GpuModel {
     /// expert added and the sum bf16-rounded once.
     fn moe_finish(&self, p: &str, x: Buf, t: usize, y: Buf) -> Result<Buf> {
         let d = self.cpu.cfg.dim;
+        // a reduce that only enqueues runs on `side`, overlapping the shared expert (which
+        // does not read `y`); one that syncs the host (Host) stays in order on `s`
+        let forked = self.moe_reduce.is_some() && self.reduce_graphable;
         if let Some(reduce) = &self.moe_reduce {
-            let s = self.span("reduce");
-            reduce(&y.dev(), t * d, &self.s)?;
-            self.end(s);
+            let rs = if forked { &self.side } else { &self.s };
+            if forked {
+                self.fork.record(&self.s)?;
+                self.side.wait(&self.fork)?;
+            }
+            let s = self.obs.span(rs, "reduce", None);
+            reduce(&y.dev(), t * d, rs)?;
+            self.obs.end(rs, s);
+            if forked {
+                self.join.record(&self.side)?;
+            }
         }
         let s = self.span("shared");
         let sh = self.mlp(&format!("{p}.ffn.shared_experts"), x, t, 0)?;
         self.end(s);
+        if forked {
+            self.s.wait(&self.join)?;
+        }
         let s = self.span("finish");
         let nn = (t * d) as i64;
         unsafe {
@@ -1651,17 +1675,6 @@ impl GpuModel {
         let (hc, d) = (c.hc_mult, c.dim);
         let mix = (2 + hc) * hc;
         let mixes = self.raw(x.ptr, t, &format!("{p}.hc_{kind}_fn"))?;
-        let (n, mi, eps) = ((hc * d) as i32, mix as i32, c.norm_eps);
-        unsafe {
-            self.k.go(
-                "ds_hc_scale",
-                (t as u32, 1, 1),
-                B256,
-                0,
-                &self.s,
-                args![x.ptr, mixes.ptr, n, mi, eps],
-            )?
-        };
         let m = Mix {
             pre: self.fbuf(t * hc)?,
             post: self.fbuf(t * hc)?,
@@ -1669,19 +1682,24 @@ impl GpuModel {
         };
         let sc = self.dw(&format!("{p}.hc_{kind}_scale"))?;
         let base = self.dw(&format!("{p}.hc_{kind}_base"))?;
-        self.k.sinkhorn(
-            &self.s,
-            mixes.ptr,
-            sc.v.w,
-            base.v.w,
-            m.pre.ptr,
-            m.post.ptr,
-            m.comb.ptr,
-            t,
-            hc,
-            c.hc_sinkhorn_iters,
-            c.hc_eps,
-        )?;
+        assert!(mix <= 80, "ds_hc_sinkhorn stages <= 80 mixes");
+        // the row rsqrt and the Sinkhorn in one launch (ds_hc_scale + ds_sinkhorn, bit for bit)
+        let (n, neps, hci) = ((hc * d) as i32, c.norm_eps, hc as i32);
+        let (it, eps) = (c.hc_sinkhorn_iters as i32, c.hc_eps);
+        let (scp, bp) = (sc.v.w, base.v.w);
+        unsafe {
+            self.k.go(
+                "ds_hc_sinkhorn",
+                (t as u32, 1, 1),
+                B256,
+                0,
+                &self.s,
+                args![
+                    x.ptr, mixes.ptr, n, neps, scp, bp, m.pre.ptr, m.post.ptr, m.comb.ptr, hci, it,
+                    eps
+                ],
+            )?
+        };
         Ok(m)
     }
 
@@ -2727,6 +2745,78 @@ mod tests {
         eprintln!("graph: {:?}, direct: {:?}", a.graph_stats, b.graph_stats);
         assert!(a.graph_stats.replays >= 8, "{:?}", a.graph_stats);
         assert_eq!(b.graph_stats.captures + b.graph_stats.replays, 0);
+    }
+
+    /// The forked expert-parallel reduce (a graphable `moe_reduce` on the side stream, joined
+    /// before the sum) orders like the in-line one: a device "reduce" doubling `y` (what two
+    /// identical ranks would all-reduce), forked, captured and replayed, or forked and direct,
+    /// gives the logits of the same doubling done by a syncing host reduce on the main
+    /// stream, bit for bit. Single-GPU stand-in for NCCL's all-reduce.
+    #[test]
+    fn gpu_tiny_forked_reduce_exact() {
+        let Some((_, meta)) = open() else { return };
+        let dir = Path::new(&tiny()).join("hf");
+        let ids = prompt(&meta);
+        let mut host = GpuModel::open(&dir).unwrap();
+        host.moe_reduce = Some(Box::new(|y, n, s| {
+            s.sync()?;
+            let v: Vec<f32> = y.read::<f32>(0, n)?.iter().map(|a| a + a).collect();
+            y.write(0, &v)?;
+            Ok(())
+        }));
+        let dev = |graph: bool| {
+            let mut m = GpuModel::open(&dir).unwrap();
+            let k = Rc::new(Kernels::new(&Gpu::at(0).unwrap()).unwrap());
+            m.moe_reduce = Some(Box::new(move |y, n, s| {
+                let (p, nn) = (y.ptr, n as i64);
+                unsafe { k.go("ds_add", blocks(n, 256), B256, 0, s, args![p, p, nn])? };
+                Ok(())
+            }));
+            m.reduce_graphable = true;
+            m.graph = graph;
+            m
+        };
+        let (mut g, mut d) = (dev(true), dev(false));
+        let v = host.cpu.cfg.vocab_size;
+        let lh = host.forward(&ids, 0, None).unwrap().0;
+        assert_eq!(lh, g.forward(&ids, 0, None).unwrap().0, "prefill graph");
+        assert_eq!(lh, d.forward(&ids, 0, None).unwrap().0, "prefill direct");
+        let mut tok = argmax(&lh);
+        let mut pos = ids.len();
+        for i in 0..4 {
+            let lh = host.forward(&[tok], pos, None).unwrap().0;
+            assert_eq!(
+                lh,
+                g.forward(&[tok], pos, None).unwrap().0,
+                "decode {i} graph"
+            );
+            assert_eq!(
+                lh,
+                d.forward(&[tok], pos, None).unwrap().0,
+                "decode {i} direct"
+            );
+            tok = argmax(&lh);
+            pos += 1;
+        }
+        for round in 0..3 {
+            let win: Vec<usize> = (0..6).map(|i| (tok + 31 * i + round) % v).collect();
+            let lh = host.forward_all(&win, pos).unwrap().0;
+            assert_eq!(
+                lh,
+                g.forward_all(&win, pos).unwrap().0,
+                "verify {round} graph"
+            );
+            assert_eq!(
+                lh,
+                d.forward_all(&win, pos).unwrap().0,
+                "verify {round} direct"
+            );
+            tok = argmax(&lh);
+            pos += 6;
+        }
+        eprintln!("forked graph: {:?}", g.graph_stats);
+        assert!(g.graph_stats.replays >= 3, "{:?}", g.graph_stats);
+        assert_eq!(host.graph_stats.captures + host.graph_stats.replays, 0);
     }
 
     /// `DS_OBS=2` on a direct step: one `layer` span per backbone layer, and the ops inside

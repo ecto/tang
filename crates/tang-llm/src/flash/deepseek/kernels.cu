@@ -222,12 +222,8 @@ extern "C" __global__ void ds_sparse_attn(const float* q, const float* kv, const
 
 // mHC mixes for one token per thread: mixes [T][mix] (already scaled by the row's rsqrt) ->
 // pre [T][hc], post [T][hc], comb [T][hc][hc]. hc <= 8.
-extern "C" __global__ void ds_sinkhorn(const float* mixes, const float* scale, const float* base,
-                                       float* pre, float* post, float* comb, int t, int hc, int iters, float eps) {
-    int ti = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ti >= t) return;
-    int mix = (2 + hc) * hc;
-    const float* m = mixes + (long long)ti * mix;
+__device__ __forceinline__ void sinkhorn_row(const float* m, const float* scale, const float* base, float* pre,
+                                             float* post, float* comb, int ti, int hc, int iters, float eps) {
     float c[64];
     for (int j = 0; j < hc; j++) {
         pre[ti * hc + j] = 1.f / (1.f + expf(-(m[j] * scale[0] + base[j]))) + eps;
@@ -254,6 +250,41 @@ extern "C" __global__ void ds_sinkhorn(const float* mixes, const float* scale, c
         }
     }
     for (int i = 0; i < hc * hc; i++) comb[(long long)ti * hc * hc + i] = c[i];
+}
+
+extern "C" __global__ void ds_sinkhorn(const float* mixes, const float* scale, const float* base,
+                                       float* pre, float* post, float* comb, int t, int hc, int iters, float eps) {
+    int ti = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ti >= t) return;
+    int mix = (2 + hc) * hc;
+    sinkhorn_row(mixes + (long long)ti * mix, scale, base, pre, post, comb, ti, hc, iters, eps);
+}
+
+// ds_hc_scale then ds_sinkhorn in one launch: block per token (blockDim a multiple of 32,
+// <= 1024), the row's rsqrt as ds_hc_scale (same reduction order), the scaled mixes
+// (bf-exact: one f32 product each, as ds_hc_scale stores them) staged in shared memory, then
+// thread 0 runs the token's Sinkhorn. `mixes` is left unscaled.
+extern "C" __global__ void ds_hc_sinkhorn(const float* x, const float* mixes, int n, float neps, const float* scale,
+                                          const float* base, float* pre, float* post, float* comb, int hc, int iters,
+                                          float eps) {
+    __shared__ float red[32];
+    __shared__ float sm[80];
+    int mix = (2 + hc) * hc;
+    const float* r = x + (long long)blockIdx.x * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += r[i] * r[i];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = 0.f;
+        for (int w = 0; w < blockDim.x / 32; w++) a += red[w];
+        red[0] = 1.f / sqrtf(a / n + neps);
+    }
+    __syncthreads();
+    for (int m = threadIdx.x; m < mix; m += blockDim.x) sm[m] = __fmul_rn(mixes[(long long)blockIdx.x * mix + m], red[0]);
+    __syncthreads();
+    if (threadIdx.x == 0) sinkhorn_row(sm, scale, base, pre, post, comb, blockIdx.x, hc, iters, eps);
 }
 
 // ---- the rest of the forward -------------------------------------------------------------
