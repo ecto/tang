@@ -46,7 +46,7 @@ for ids), qgemv9 at 23.5 vs the 19.5 us read ceiling, o_proj 11.8 vs 7.4.
 32b0a45a = forward + claude/glm5-kda-load 76539eda + claude/glm5-moe2 2dd23da7 + claude/glm5-mhc2
 c894d609 (`--no-ff`, NOTES conflicts kept both). B300, B flags, whole-step graph default:
 -n 128 **71.54 tok/s** (ids md5 7174cdd6), -n 512 **71.92** (1453cf0e), haiku oracle OK, open ~50 s.
-Ladder: 22.9 → 30.9 → 35.0 → 56.7 → 58.5 → 71.9. In flight: claude/glm5-kda3 (k5 kernels),
+Ladder: 22.9 → 30.9 → 35.0 → 56.7 → 58.5 → 71.9 → **75.1** (f45a2883 = + claude/glm5-kda3 a5c618e2: -n 128 74.30 tok/s 7174cdd6, -n 512 75.08 1453cf0e). In flight: claude/glm5-kda3 (k5 kernels),
 claude/glm5-moe3 (roofline + route), claude/glm5-dsa2 (fold_q2 / attn_abs2 / k5_gemv8).
 
 ## 2026-10-28 — fused mHC 45 -> 13 µs per pass, decode 58.3 -> 68.8 tok/s, bit-identical (branch claude/glm5-mhc2)
