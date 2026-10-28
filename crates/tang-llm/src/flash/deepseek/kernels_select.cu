@@ -417,6 +417,7 @@ extern "C" __global__ void __launch_bounds__(128) ds_moe_gate(DsW w, const float
     {
         int n = blockIdx.x * 4 + wid;
         if (n < w.rows) {
+            row_prefetch(w, n, lane);
             float s[8];
 #pragma unroll
             for (int i = 0; i < 8; i++) s[i] = 0.f;

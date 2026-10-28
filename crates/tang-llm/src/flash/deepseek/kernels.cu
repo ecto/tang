@@ -98,6 +98,16 @@ __device__ __forceinline__ float wget(const DsW& w, int r, int c) {
 }
 
 // y[t][n] = Σ_k x[t][k] w[n][k], one warp per output; rounded to bf16 when `round`.
+// Prefetch row r of an f32/bf16 `w` into L2, the warp's lanes striding its 128-byte lines: the
+// GEMV loops below then wait on L2, not DRAM, per unrolled chunk. Touches no results.
+__device__ __forceinline__ void row_prefetch(const DsW& w, int r, int lane) {
+    if (w.fmt > 1) return;
+    long long rb = (long long)w.cols * (w.fmt == 0 ? 4 : 2);
+    const char* p = (const char*)w.w + r * rb;
+    for (long long o = (long long)lane * 128; o < rb; o += 32 * 128)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
+}
+
 extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int round) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (warp >= t * w.rows) return;
@@ -114,6 +124,7 @@ extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int
 extern "C" __global__ void ds_linear_t8(DsW w, const float* x, float* y, int t, int round) {
     int n = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (n >= w.rows) return;
+    row_prefetch(w, n, lane);
     float s[8];
 #pragma unroll
     for (int i = 0; i < 8; i++) s[i] = 0.f;
