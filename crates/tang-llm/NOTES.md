@@ -4,6 +4,46 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MoE round 3 on B300: roofline microbench; shared-expert tail fix; +1.0 tok/s, ids unchanged (branch claude/glm5-moe3)
+
+Roofline (new `bench/glm5-moe-roofline/roofline.cu`, nvcc sm_100, one routed layer's gate|up at T=1:
+8 experts x 2 x 2048 rows x 2304 B Q4_K = 75.5 MB, 16 disjoint expert sets so every rep is L2-cold):
+- pure streaming of those bytes: grid-stride flat read 4.6–5.3 TB/s; warp-per-row-group with all
+  16-byte loads issued up front 5.8–5.9 TB/s (12.7–13.1 us) for EVERY shape tried (1/2/4 rows a warp,
+  1/2/4 warps a row, 4/8 warps a block, min-blocks 4/8/16). Shape / bytes in flight is not the limiter.
+- g5f_gun's own access pattern without the math (`gunlite`): weight loads only 14.4 us (5.2 TB/s);
+  + the per-chunk activation loads (xq, xq2, xd: 2 KB per warp per iteration) 18.3 us, warm-L2 9.9 -> 17.7 us.
+- production g5f_gun, routed slots only: 24.7 us cold / 23.2 warm (3.0 TB/s) -> L2-warm is no faster, so
+  it is issue/LSU bound, not DRAM: ~4 us activation re-reads + ~6 us decode math over the 14.4 us floor.
+  No residual codes (q8 only): 22.5 us. UNROLL 2/4 (any MINB) slower (26.9–37.7), MINB 16 spills (75 us).
+- + the shared expert slot (Q8_0, 8-weight fma chain of g5f_lane_dot): 35.7 us, i.e. +11 us for 17.8 MB,
+  because it is the last grid row and runs as a tail.
+- Splitting a row's chunk loop over warps (or keeping activations in registers across rows, `g5f_gux`
+  v1: routed 23.0 us) is NOT bit-identical: nvcc contracts `acc += dx * (...)` into an fma, so the
+  per-lane chunk sum cannot be re-associated (2616/18432 h values differed). Dropped.
+
+Kept:
+1. `g5f_gux` (TANG_GLM5_MOE_GUX=4 rows a block, 0 = g5f_gun): g5f_gun's per-row math with the shared
+   slot as block row 0 (scheduled first) and its gate / up rows on separate warps. Microbench gate|up
+   + shared 35.7 -> 31.0 us, h bit-identical to g5f_gun (0/18432 differ). Same slot remap in g5f_down_splitn.
+2. Top-k select with the choice values in registers and the id/weight stores done once by lane j
+   (TANG_GLM5_MOE_SEL2=0: old). Same float ops.
+3. The K-quant min term (sum of activation codes) once per chunk for all rows (same ints/float ops).
+4. g5f_lane_dot U template: 0 = compiler's unrolling (as before). An intermediate `#pragma unroll 1`
+   slowed g5f_gemv 2.19 -> 2.77 ms/token in nsys — fixed before the numbers below. LDU 0/4/8 on the
+   Q8_0 shared slot: no measurable difference (31.0 / 30.8 / 30.4 us).
+
+nsys (B flags, -n 32, ms/token; base = /root/tang-moe2 binary = moe2 kernels, same pod):
+g5f_gun 2.384 -> g5f_gux 2.028 | down_splitn 1.428 -> 1.482 | route 0.561 -> 0.518 | down (dense) 0.155 -> 0.151 |
+q8 0.118 -> 0.119 | sum 0.069 -> 0.068 | MoE total 4.72 -> 4.38. g5f_gemv 2.188 -> 2.184 (unchanged).
+Bench (scripts/glm5-bench.sh, e5083544, haiku gate OK): -n 128 59.60 tok/s md5 7174cdd6 (was 58.64);
+GLM5_N=512 60.22 tok/s md5 1453cf0e (was 59.64). mew (3090): flash::glm5 83 passed / 0 failed.
+Target (MoE <= 3 ms/token) NOT reached. route is 12.3 us/call after the select rewrite, so the select was
+not its cost (unattributed). Next for gate|up: cut the activation re-reads (they cost as much L1 traffic
+as the weights) without re-associating the per-lane sum, e.g. 2 rows a warp sharing one x load
+with x in registers only for the chunk being processed (GUR=2 was slower in round 2 — registers),
+or stage x in shared memory per block.
+
 ## 2026-10-28 — MoE fast path on B300: word-wide headers, hoisted activations, down-row L2 prefetch; +0.4–1.2 tok/s, ids unchanged (branch claude/glm5-moe2)
 
 What was wrong: per layer (T=1, `real_layers_fast_matches_cpu`, `TANG_GLM5_MOE_SPLIT=1`, traced µs) g5f_gu
