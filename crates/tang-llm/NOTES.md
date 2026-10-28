@@ -4,6 +4,30 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — DSA attend 128 -> ~39 µs per layer, decode 70.9 -> 75.8 tok/s, bit-identical (branch claude/glm5-dsa2)
+
+What was wrong: `mla_fold_q2` and `mla_attn_abs2`'s W_v step are per-head GEMVs over f32 weights
+(nh 64 × dl 512 × dk/dv 256 × 4 B = 33.5 MB each per DSA layer) run on a grid of nh = 64 blocks,
+each warp looping 64 rows serially: ~0.45 TB/s. Short-context attention itself is negligible.
+Evidence (nsys `--cuda-graph-trace=node`, B300, B flags, haiku -n 32, 0acdfabd with
+`TANG_GLM5_MLA_SPLIT=0`): fold_q2 352 inst avg 73.9 µs, attn_abs2_p 330 inst avg 54.3 µs.
+
+Fix (0acdfabd): `mla_hgemv` (grid nh × rows/32 × t, 4 rows a warp, each row summed exactly as the
+old warps: lane-strided fma, xor tree) for the fold and for W_v (÷ den as before), and
+`mla_attn_lat[_p]` = abs2 through the weighted latent sum, written over its own qa row (den after
+the qa block). Same per-output float ops -> ids identical. `TANG_GLM5_MLA_SPLIT=0` = old kernels.
+After: mla_hgemv 704 inst avg 11.6 µs (2 per layer), mla_attn_lat_p 330 avg 15.9 µs.
+
+| run | -n 128 tok/s | md5 | -n 512 tok/s | md5 |
+|---|---|---|---|---|
+| SPLIT=0 | 70.88 | 7174cdd6 | 57.93 | 1453cf0e |
+| split (default) | **75.79** | 7174cdd6 | **76.06** | 1453cf0e |
+
+(The SPLIT=0 512 run at 57.93 looks like pod contention; the earlier mHC 512 number was 70.26.)
+Haiku gate OK on all runs; mew `flash::glm5` 83 passed / 0 failed.
+`k5_gemv8` (51 inst, 254.4 µs) is the GPU LM head (`engine.rs` head_logits: n_vocab rows × Q8_0),
+not DSA; ~1 GB per call -> ~4 TB/s, left alone. Next: attn_lat's serial latent-sum over keys.
+
 ## 2026-10-28 — fused mHC 45 -> 13 µs per pass, decode 58.3 -> 68.8 tok/s, bit-identical (branch claude/glm5-mhc2)
 
 What was wrong: `mhcf_finish` was one block of 256 threads running the 20-iteration
