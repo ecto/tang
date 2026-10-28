@@ -365,17 +365,165 @@ extern "C" __global__ void ds_hc_pre(const float* x, const float* pre, float* ou
     out[i] = bf(s);
 }
 
-// out[t][k][i] = bf(post[t][k] h[t][i] + Σ_j comb[t][j][k] res[t][j][i]). Thread per element.
-extern "C" __global__ void ds_hc_post(const float* h, const float* res, const float* post, const float* comb,
-                                      float* out, int t, int hc, int d) {
+// One element of the mHC post-mix: bf(post[t][k] h[t][i] + Σ_j comb[t][j][k] res[t][j][i]), where
+// h is bf(h + h2) when h2 is given (ds_add_round folded in).
+__device__ __forceinline__ float hc_post_at(const float* h, const float* h2, const float* res, const float* post,
+                                            const float* comb, int ti, int k, int i, int hc, int d) {
+    float acc = 0.f;
+    for (int j = 0; j < hc; j++) acc += comb[((long long)ti * hc + j) * hc + k] * res[((long long)ti * hc + j) * d + i];
+    long long hi = (long long)ti * d + i;
+    float hv = h2 ? bf(h[hi] + h2[hi]) : h[hi];
+    return bf(post[ti * hc + k] * hv + acc);
+}
+
+// out[t][k][i] = hc_post_at(..). Thread per element. h2 may be null.
+extern "C" __global__ void ds_hc_post(const float* h, const float* h2, const float* res, const float* post,
+                                      const float* comb, float* out, int t, int hc, int d) {
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)t * hc * d) return;
     int i = e % d;
     int k = (e / d) % hc;
     int ti = e / ((long long)d * hc);
-    float acc = 0.f;
-    for (int j = 0; j < hc; j++) acc += comb[((long long)ti * hc + j) * hc + k] * res[((long long)ti * hc + j) * d + i];
-    out[e] = bf(post[ti * hc + k] * h[(long long)ti * d + i] + acc);
+    out[e] = hc_post_at(h, h2, res, post, comb, ti, k, i, hc, d);
+}
+
+// ds_hc_post then the next mHC mixes GEMM (ds_linear / ds_linear_t8, unrounded) in one
+// launch, or (post null) the GEMM alone on the stream res: one warp per block per (token,
+// mix row n), so the long per-lane chains spread over the SMs. Each lane walks k = lane +
+// 32 j in order (the linear's per-lane order, then its shuffle tree), producing x[ti][k] on
+// the fly; the n == 0 warps also store the stream. d % 256 == 0, hc <= 8.
+extern "C" __global__ void __launch_bounds__(32) ds_hc_post_mix(const float* __restrict__ h,
+                                                                 const float* __restrict__ h2,
+                                                                 const float* __restrict__ res,
+                                                                 const float* __restrict__ post,
+                                                                 const float* __restrict__ comb, float* __restrict__ out,
+                                                                 DsW w, float* __restrict__ y, int t, int hc, int d) {
+    const int U = 8;
+    int ti = blockIdx.x / w.rows, n = blockIdx.x % w.rows, lane = threadIdx.x;
+    float s = 0.f;
+    float* o = out + (long long)ti * hc * d;
+    const float* rr = res + (long long)ti * hc * d;
+    for (int c = 0; c < hc; c++) {
+        float cj[8], pc = 0.f;
+        if (post) {
+            pc = post[ti * hc + c];
+#pragma unroll
+            for (int j = 0; j < 8; j++) cj[j] = j < hc ? comb[((long long)ti * hc + j) * hc + c] : 0.f;
+        }
+        for (int i0 = lane; i0 < d; i0 += 32 * U) {
+            float xv[U], wv[U];
+            if (post) {
+                float acc[U], hv[U];
+#pragma unroll
+                for (int u = 0; u < U; u++) {
+                    int i = i0 + 32 * u;
+                    long long hi = (long long)ti * d + i;
+                    hv[u] = h2 ? bf(h[hi] + h2[hi]) : h[hi];
+                    acc[u] = 0.f;
+                }
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    if (j >= hc) break;
+#pragma unroll
+                    for (int u = 0; u < U; u++) acc[u] += cj[j] * rr[(long long)j * d + i0 + 32 * u];
+                }
+#pragma unroll
+                for (int u = 0; u < U; u++) {
+                    xv[u] = bf(pc * hv[u] + acc[u]);
+                    if (n == 0) o[(long long)c * d + i0 + 32 * u] = xv[u];
+                }
+            } else {
+#pragma unroll
+                for (int u = 0; u < U; u++) xv[u] = rr[(long long)c * d + i0 + 32 * u];
+            }
+#pragma unroll
+            for (int u = 0; u < U; u++) wv[u] = wget(w, n, c * d + i0 + 32 * u);
+#pragma unroll
+            for (int u = 0; u < U; u++) s = fmaf(xv[u], wv[u], s);
+        }
+    }
+    for (int q = 16; q; q >>= 1) s += __shfl_xor_sync(0xffffffffu, s, q);
+    if (lane == 0) y[(long long)ti * w.rows + n] = s;
+}
+
+// sinkhorn_row on one warp, bit for bit: lane l holds comb element l (hc * hc <= 32); every
+// row / column sum is taken in sinkhorn_row's order (each lane redoing its own row's or
+// column's sum from shuffles). All 32 lanes call it.
+__device__ __forceinline__ void sinkhorn_warp(const float* m, const float* scale, const float* base, float* pre,
+                                              float* post, float* comb, int ti, int hc, int iters, float eps) {
+    int l = threadIdx.x & 31, j = l / hc, k = l % hc, nn = hc * hc;
+    if (l < hc) {
+        pre[ti * hc + l] = 1.f / (1.f + expf(-(m[l] * scale[0] + base[l]))) + eps;
+        post[ti * hc + l] = 2.f / (1.f + expf(-(m[hc + l] * scale[1] + base[hc + l])));
+    }
+    float c = l < nn ? m[2 * hc + l] * scale[2] + base[2 * hc + l] : 0.f;
+    float mx = -DS_INF;
+    for (int q = 0; q < hc; q++) mx = fmaxf(mx, __shfl_sync(0xffffffffu, c, (j * hc + q) & 31));
+    c = expf(c - mx);
+    float s = 0.f;
+    for (int q = 0; q < hc; q++) s += __shfl_sync(0xffffffffu, c, (j * hc + q) & 31);
+    c = c / s + eps;
+    for (int it = 0; it < iters; it++) {
+        if (it > 0) {
+            s = 0.f;
+            for (int q = 0; q < hc; q++) s += __shfl_sync(0xffffffffu, c, (j * hc + q) & 31);
+            c /= s + eps;
+        }
+        s = 0.f;
+        for (int q = 0; q < hc; q++) s += __shfl_sync(0xffffffffu, c, (q * hc + k) & 31);
+        c /= s + eps;
+    }
+    if (l < nn) comb[(long long)ti * nn + l] = c;
+}
+
+// The rest of an mHC stage in one launch, block (1024 threads) per token: ds_hc_sinkhorn on
+// the stream x (its rsqrt reduced as that kernel's 256 threads do) -> pre_o/post/comb, and
+// ds_hc_pre(x, pre_i) then ds_rms(w) (1024 threads, its reduction order) -> out.
+extern "C" __global__ void ds_hc_stage(const float* x, const float* mixes, float neps, const float* scale,
+                                       const float* base, float* pre_o, float* post, float* comb, int hc, int iters,
+                                       float eps, const float* pre_i, float* out, DsW w, int d, float reps) {
+    __shared__ float ra[32], rb[32], sm[80];
+    int mix = (2 + hc) * hc, n = hc * d, tid = threadIdx.x;
+    const float* r = x + (long long)blockIdx.x * n;
+    if (tid < 256) {
+        float s = 0.f;
+        for (int i = tid; i < n; i += 256) s += r[i] * r[i];
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if ((tid & 31) == 0) ra[tid / 32] = s;
+    }
+    float* orow = out + (long long)blockIdx.x * d;
+    const float* pr = pre_i + blockIdx.x * hc;
+    float s = 0.f;
+    for (int i = tid; i < d; i += blockDim.x) {
+        float v = 0.f;
+        for (int c = 0; c < hc; c++) v += pr[c] * r[(long long)c * d + i];
+        v = bf(v);
+        orow[i] = v;
+    }
+    // the stored row read back, as ds_rms reads it
+    for (int i = tid; i < d; i += blockDim.x) s += orow[i] * orow[i];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((tid & 31) == 0) rb[tid / 32] = s;
+    __syncthreads();
+    if (tid < 32) {
+        s = tid < blockDim.x / 32 ? rb[tid] : 0.f;
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (tid == 0) rb[0] = s;
+    }
+    __syncthreads();
+    float rs = 1.f / sqrtf(rb[0] / d + reps);
+    for (int i = tid; i < d; i += blockDim.x) orow[i] = bf(wget(w, 0, i) * (orow[i] * rs));
+    if (tid < 32) {
+        float a = 0.f;
+        for (int q = 0; q < 8; q++) a += ra[q];
+        float rr = 1.f / sqrtf(a / n + neps);
+        for (int m = tid; m < mix; m += 32) sm[m] = __fmul_rn(mixes[(long long)blockIdx.x * mix + m], rr);
+        __syncwarp();
+        if (hc * hc <= 32)
+            sinkhorn_warp(sm, scale, base, pre_o, post, comb, blockIdx.x, hc, iters, eps);
+        else if (tid == 0)
+            sinkhorn_row(sm, scale, base, pre_o, post, comb, blockIdx.x, hc, iters, eps);
+    }
 }
 
 // out[t][c][i] = table[ids[t]][i] for every copy c (bf16 table). Thread per element.
