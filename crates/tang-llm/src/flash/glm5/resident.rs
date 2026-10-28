@@ -156,9 +156,9 @@ pub(super) struct Resident {
     /// One eager resident token has run since the last host window (every buffer the
     /// step touches is allocated): the step graph may be captured.
     warm: bool,
-    /// The step graph (default on, `TANG_GLM5_STEP_GRAPH=0` off): the captured segments (see [`Glm5Engine::step_resident`]).
+    /// `TANG_GLM5_STEP_GRAPH=1`: the captured segments (see [`Glm5Engine::step_resident`]).
     pub(super) graphs: Option<Vec<tang_moe::gpu::Graph>>,
-    /// `TANG_GLM5_STEP_GRAPH=2`: the whole-step graphs, `[dense, sparse]` (the indexer
+    /// The whole-step graphs (default; `TANG_GLM5_STEP_GRAPH=2`), `[dense, sparse]` (the indexer
     /// branch; picked on the host from `pos0`, no transfer).
     pub(super) whole: [Option<tang_moe::gpu::Graph>; 2],
     /// The DSA cache rows the whole graphs may reach (their baked cache bases stay valid
@@ -262,7 +262,8 @@ impl Glm5Engine {
     /// One greedy decode token on the resident step, or `None` when it doesn't apply
     /// (the caller runs the host path).
     ///
-    /// The step graph (default on; `TANG_GLM5_STEP_GRAPH=0` = eager): after one eager token (every buffer allocated), the step
+    /// The step graph (`TANG_GLM5_STEP_GRAPH=2` whole step, the default; `1` segments; `0` = eager):
+    /// after one eager token (every buffer allocated), with `=1` the step
     /// is captured as `n_dsa + 1` graph segments split at the DSA attention cores, which
     /// stay eager between the segment launches (their `pos0`/`kv_len`/cache-row pointers
     /// move every token). Any host window drops the segments ([`Self::drop_step_graph`]):
@@ -300,10 +301,10 @@ impl Glm5Engine {
             }
             Ok(r)
         };
-        // `TANG_GLM5_STEP_GRAPH`: unset / `1` = segments (default), `2` = whole step, `0` = eager
+        // `TANG_GLM5_STEP_GRAPH`: unset / `2` = whole step (default), `1` = segments, `0` = eager
         let mode = std::env::var("TANG_GLM5_STEP_GRAPH").unwrap_or_default();
-        let whole_on = mode == "2";
-        let graph_on = mode != "0" && !whole_on;
+        let whole_on = mode.is_empty() || mode == "2";
+        let graph_on = mode == "1";
         // the indexer branch of this token (every DSA layer shares topk / kpool)
         let dsa_l: Vec<usize> = (0..hp.n_layer).filter(|&l| !hp.is_kda[l]).collect();
         let (topk, kpool) = dsa_l.first().map_or((usize::MAX, 1), |&l| {
