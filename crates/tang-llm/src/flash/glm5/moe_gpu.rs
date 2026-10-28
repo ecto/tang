@@ -100,6 +100,9 @@ pub struct Kernels {
     f_route: Func,
     f_gun: Func,
     f_down_splitn: Func,
+    f_gux: Func,
+    /// Rows a block in `g5f_gux` (`TANG_GLM5_MOE_GUX`, 1..16, default 4; 0 = `g5f_gun` / `g5f_gu`).
+    pub gux: usize,
     /// Rows a warp in `g5f_gun` (`TANG_GLM5_MOE_GUR`; 0 = `g5f_gu`, one row a warp).
     pub gur: usize,
     /// Rows a warp in `g5f_down_splitn` (`TANG_GLM5_MOE_DNR`, even; 0 = `g5f_down_split`, two).
@@ -160,8 +163,15 @@ impl Kernels {
             1 => 2,
             n => n & !1,
         };
+        // TANG_GLM5_MOE_GUX: rows a block of the activation-resident gate|up (0 = off)
+        let gux = rows("TANG_GLM5_MOE_GUX", 4).min(16);
+        // TANG_GLM5_MOE_SEL2=0: the previous top-k select (smem scan, per-round global stores)
+        let sel2 = i32::from(env_on("TANG_GLM5_MOE_SEL2", true));
+        // TANG_GLM5_MOE_LDU: unroll of the 8-weight row loop (Q8_0 shared / dense rows; same order)
+        let ldu = rows("TANG_GLM5_MOE_LDU", 4).clamp(1, 16);
         let src = format!(
-            "#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
+            "#define G5F_GUX_R {}\n#define G5F_SEL2 {sel2}\n#define G5F_LDU {ldu}\n#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
+            gux.max(1),
             gur.max(1),
             dnr.max(2),
             super::SRC
@@ -187,6 +197,8 @@ impl Kernels {
             f_route: m.func("g5f_route")?,
             f_gun: m.func("g5f_gun")?,
             f_down_splitn: m.func("g5f_down_splitn")?,
+            f_gux: m.func("g5f_gux")?,
+            gux,
             gur,
             dnr,
             route1: env_on("TANG_GLM5_MOE_ROUTE1", true),
@@ -842,7 +854,16 @@ fn ffn_fast(
     let dn_b = t64 * hid as u64 * (nr64 * rb(down) + rb(sd));
     unsafe {
         gpu::trace::bytes(gu_b);
-        if k.gur > 0 && smg == 0 {
+        if k.gux > 0 && smg == 0 {
+            gpu::launch(
+                k.f_gux,
+                (hs.div_ceil(k.gux) as u32, slots as u32, t as u32),
+                blk,
+                0,
+                s,
+                tang_moe::args![gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims],
+            )?;
+        } else if k.gur > 0 && smg == 0 {
             gpu::launch(
                 k.f_gun,
                 (hs.div_ceil(4 * k.gur) as u32, slots as u32, t as u32),
