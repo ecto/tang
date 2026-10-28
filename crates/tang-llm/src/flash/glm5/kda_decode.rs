@@ -94,6 +94,8 @@ pub struct Fast {
     proj: sys::CUfunction,
     gate2: sys::CUfunction,
     step: sys::CUfunction,
+    /// `k5d_tail`: beta + gate2 + step + o_proj's q8 in one launch (the G5F path).
+    tail: sys::CUfunction,
     /// The captured decode step and the `TANG_GLM5_GEMV8` value it was captured with.
     graph: Option<(Graph, bool)>,
 }
@@ -108,7 +110,7 @@ impl Fast {
         );
         let m = g.module(&src).map_err(|e| anyhow::anyhow!("kda_decode nvrtc: {e}"))?;
         let f = |n: &str| m.func(n).map_err(|e| anyhow::anyhow!("kda_decode {n}: {e}"));
-        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, graph: None, _m: m })
+        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail: f("k5d_tail")?, graph: None, _m: m })
     }
 }
 
@@ -164,6 +166,24 @@ impl DevLayer {
                 // same launches as the naive window), beta on k5_beta as the naive path does —
                 // k5d_proj would compute only beta, one THREAD per 4096-wide row (~1.3 ms)
                 self.g5f_x(s, 1)?;
+                if self.tail_ok() {
+                    mark(1)?;
+                    self.tail_launch(s, fast, h0, st, lb)?;
+                    mark(3)?;
+                    match self.sego.as_ref() {
+                        // k5d_tail wrote yb's k5_q8 codes: o_proj straight on k5_qgemv
+                        Some(tab) => {
+                            let codes = self.xq8.ptr;
+                            self.qgemv_launch(s, tab, 1, self.wo.w.row_bytes, hidden, self.wo.w.estride, codes,
+                                codes + (self.max_t * di) as u64, di)?;
+                        }
+                        None => {
+                            self.g5f_o(s, 1)?;
+                        }
+                    }
+                    mark(4)?;
+                    return Ok(());
+                }
                 launch(
                     self.gv.beta,
                     (nh.div_ceil(super::K5_WARPS) as u32, 1, 1),
@@ -760,5 +780,199 @@ mod tests {
             n += (*y as f64).powi(2);
         }
         (d / n.max(1e-30)).sqrt()
+    }
+}
+
+/// `TANG_GLM5_KDA_TAIL` (default 1): `0` keeps the G5F fused step on the separate
+/// k5_beta / k5d_gate2 / k5d_step / k5_q8 launches (the A/B control for `k5d_tail`).
+fn tail_flag() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_TAIL").map_or(true, |v| v != "0"))
+}
+
+impl DevLayer {
+    /// `k5d_tail`'s preconditions (kda_decode.cuh): f_b / g_b / b_proj Q8_0 with hd-wide
+    /// f_b / g_b rows, hd % 32 == 0, hidden <= K5D_HIDMAX and a multiple of 256.
+    fn tail_ok(&self) -> bool {
+        let q8 = |w: &super::super::moe::gpu::DevW| w.w.ty == 8;
+        tail_flag()
+            && self.fast.is_some()
+            && q8(&self.fb)
+            && q8(&self.gb)
+            && q8(&self.bproj)
+            && self.hd % 32 == 0
+            && self.fb.w.row_bytes as usize == self.hd / 32 * 34
+            && self.gb.w.row_bytes as usize == self.hd / 32 * 34
+            && self.hidden <= 4096
+            && self.hidden % 256 == 0
+    }
+
+    /// One `k5d_tail` launch: grid nh, block hd. `h0` / `st` = the slot's conv history /
+    /// state bases. Writes bb, gb_out, g2b, ob, yb and yb's k5_q8 codes into xq8.
+    unsafe fn tail_launch(&self, s: &Stream, fast: &Fast, h0: u64, st: u64, lb: f32) -> Result<()> {
+        unsafe {
+            launch(
+                fast.tail,
+                (self.nh as u32, 1, 1),
+                (self.hd as u32, 1, 1),
+                0,
+                s,
+                args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
+                    self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, h0, self.core.wconv.ptr, st,
+                    self.on.ptr, self.cfg.eps, self.bb.ptr, self.gb_out.ptr, self.g2b.ptr,
+                    self.ob.ptr, self.yb.ptr, self.xq8.ptr, self.max_t as u32, self.hidden as u32],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use super::super::super::kda::{ConvState, KdaConfig, KdaState};
+    use std::path::Path;
+
+    /// REAL WEIGHTS (TANG_GLM5_REAL_GGUF, run with TANG_GLM5_KDA_G5F=2): (a) the G5F fused
+    /// step kernel by kernel (CUDA events around each launch, median of 56 steps) on the
+    /// old launches (k5_q8 x, k5_qgemv q|k|v|f_a|g_a, k5_beta, k5d_gate2, k5d_step, k5_q8 yb,
+    /// k5_qgemv o) and on the k5d_tail form (k5_q8 x, k5_qgemv, k5d_tail, k5_qgemv o);
+    /// (b) parity, 64 steps: the tail form (eager and graph via `decode_fast`) vs the old
+    /// launches — bit-equal output, state and conv.
+    #[test]
+    fn kda_tail_real_bench() {
+        let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let g = Gpu::for_test().expect("GPU");
+        g.bind().unwrap();
+        let gguf = crate::gguf::Gguf::open(Path::new(&real)).unwrap();
+        let hp = super::super::super::Hparams::from_gguf(&gguf).unwrap();
+        let l = (0..hp.n_layer).find(|&l| hp.is_kda[l]).unwrap();
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let n = hp.n_embd;
+        let mk = || {
+            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
+            d.fast = Some(Fast::new(&g, &cfg).unwrap());
+            d
+        };
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let steps = 64usize;
+        let xs: Vec<Vec<f32>> = (0..steps).map(|_| (0..n).map(|_| rnd()).collect()).collect();
+        let d0 = mk();
+        assert!(d0.g5f == 2 && d0.segx.is_some() && d0.sego.is_some(), "run with TANG_GLM5_KDA_G5F=2 (Q8_0 weights)");
+        assert!(d0.tail_ok(), "k5d_tail preconditions fail on the real layer");
+        let (nh, hd, di, hidden) = (d0.nh, d0.hd, d0.d_inner, d0.hidden);
+        eprintln!("layer {l}: nh {nh} hd {hd} d_inner {di} hidden {hidden}; state {:.2} MiB/layer", (nh * hd * hd * 4) as f64 / 1048576.0);
+        let lb = d0.cfg.gate_lower_bound.unwrap_or(f32::NAN);
+        drop(d0);
+        // the launches, one closure per kernel (index into the timing table)
+        type K<'a> = Box<dyn Fn(&DevLayer, &Stream) + 'a>;
+        let q8x: K = Box::new(|d, s| unsafe {
+            launch(d.gv.q8, ((d.hidden / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![d.xb.ptr, d.xq8.ptr, d.hidden as u32, d.max_t as u32]).unwrap();
+        });
+        let qx: K = Box::new(|d, s| unsafe {
+            let c = d.xq8.ptr;
+            let bytes = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga].iter().map(|w| w.w.estride).sum();
+            d.qgemv_launch(s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * d.d_inner + 2 * d.hd, bytes, c, c + (d.max_t * d.hidden) as u64, d.hidden).unwrap();
+        });
+        let beta: K = Box::new(|d, s| unsafe {
+            launch(d.gv.beta, (d.nh.div_ceil(super::super::K5_WARPS) as u32, 1, 1), (128, 1, 1), 0, s,
+                args![d.bproj.w, d.xb.ptr, d.bb.ptr, 1u32, d.hidden as u32, d.nh as u32]).unwrap();
+        });
+        let gate2: K = Box::new(move |d, s| unsafe {
+            launch(d.fast.as_ref().unwrap().gate2, grid(2 * d.d_inner), (128, 1, 1), 0, s,
+                args![d.fb.w, d.gb.w, d.g1b.ptr, d.g2a.ptr, d.dt.ptr, d.rate.ptr, d.gb_out.ptr, d.g2b.ptr,
+                    d.nh as u32, d.hd as u32, lb]).unwrap();
+        });
+        let step: K = Box::new(|d, s| unsafe {
+            launch(d.fast.as_ref().unwrap().step, (d.nh as u32, 1, 1), (d.hd as u32, 1, 1), 0, s,
+                args![d.qkvb.ptr, d.core.h0.ptr, d.core.wconv.ptr, d.gb_out.ptr, d.bb.ptr, d.core.st.ptr,
+                    d.ob.ptr, d.on.ptr, d.g2b.ptr, d.yb.ptr, d.cfg.eps]).unwrap();
+        });
+        let q8y: K = Box::new(|d, s| unsafe {
+            launch(d.gv.q8, ((d.d_inner / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![d.yb.ptr, d.xq8.ptr, d.d_inner as u32, d.max_t as u32]).unwrap();
+        });
+        let qo: K = Box::new(|d, s| unsafe {
+            let c = d.xq8.ptr;
+            d.qgemv_launch(s, d.sego.as_ref().unwrap(), 1, d.wo.w.row_bytes, d.hidden, d.wo.w.estride, c, c + (d.max_t * d.d_inner) as u64, d.d_inner).unwrap();
+        });
+        let tail: K = Box::new(move |d, s| unsafe {
+            d.tail_launch(s, d.fast.as_ref().unwrap(), d.core.h0.ptr, d.core.st.ptr, lb).unwrap();
+        });
+        let old: Vec<(&str, &K)> = vec![("k5_q8 x", &q8x), ("k5_qgemv q|k|v|f_a|g_a", &qx), ("k5_beta", &beta),
+            ("k5d_gate2", &gate2), ("k5d_step", &step), ("k5_q8 yb", &q8y), ("k5_qgemv o", &qo)];
+        let new: Vec<(&str, &K)> = vec![("k5_q8 x", &q8x), ("k5_qgemv q|k|v|f_a|g_a", &qx), ("k5d_tail", &tail), ("k5_qgemv o", &qo)];
+        let mut outs = Vec::new();
+        let mut states = Vec::new();
+        for (form, seq) in [("old", &old), ("tail", &new)] {
+            let d = mk();
+            let ev: Vec<Event> = (0..=seq.len()).map(|_| Event::new(true).unwrap()).collect();
+            let mut per: Vec<Vec<f32>> = vec![Vec::new(); seq.len() + 1];
+            let mut ys = Vec::new();
+            for (i, x) in xs.iter().enumerate() {
+                d.xb.write(0, x).unwrap();
+                ev[0].record(&d.s).unwrap();
+                for (j, (_, k)) in seq.iter().enumerate() {
+                    k(&d, &d.s);
+                    ev[j + 1].record(&d.s).unwrap();
+                }
+                d.s.sync().unwrap();
+                ys.push(d.outb.read::<f32>(0, hidden).unwrap());
+                if i >= 8 {
+                    for j in 0..seq.len() {
+                        per[j].push(ev[j + 1].since(&ev[j]).unwrap() * 1e3);
+                    }
+                    per[seq.len()].push(ev[seq.len()].since(&ev[0]).unwrap() * 1e3);
+                }
+            }
+            let med = |v: &mut Vec<f32>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            for (j, (name, _)) in seq.iter().enumerate() {
+                eprintln!("tail bench {form}: {name:<24} {:7.1} us", med(&mut per[j]));
+            }
+            eprintln!("tail bench {form}: {:<24} {:7.1} us (events, back to back, one stream)", "TOTAL step", med(&mut per[seq.len()]));
+            let mut conv = ConvState::zeros(&cfg, 1);
+            let mut st = KdaState::zeros(&cfg, 1);
+            d.read_back(&mut conv, &mut st).unwrap();
+            outs.push(ys);
+            states.push((conv, st));
+        }
+        // the production entry: decode_fast eager and graph (tail on unless TANG_GLM5_KDA_TAIL=0)
+        for mode in [Mode::Fused, Mode::Graph] {
+            let mut d = mk();
+            let mut conv = ConvState::zeros(&cfg, 1);
+            let mut ys = Vec::new();
+            let t0 = std::time::Instant::now();
+            for x in &xs {
+                ys.push(d.decode_fast(x, &mut conv, mode).unwrap());
+            }
+            eprintln!("tail bench decode_fast {mode:?}: {:.0} us/step host wall (64 steps, incl. capture)", t0.elapsed().as_secs_f64() * 1e6 / steps as f64);
+            let mut hc = conv.clone();
+            let mut st = KdaState::zeros(&cfg, 1);
+            d.read_back(&mut hc, &mut st).unwrap();
+            outs.push(ys);
+            states.push((hc, st));
+        }
+        for (mi, name) in [(1, "tail eager"), (2, "decode_fast fused"), (3, "decode_fast graph")] {
+            let diff = outs[mi].iter().zip(&outs[0]).flat_map(|(a, b)| a.iter().zip(b)).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let sdiff = states[mi].1 .0.iter().zip(&states[0].1 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let cdiff = states[mi].0 .0.iter().zip(&states[0].0 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            eprintln!("{name} vs old launches: {diff} output values differ (bits), state {sdiff}, conv {cdiff}");
+            assert_eq!((diff, sdiff, cdiff), (0, 0, 0), "{name} is not bit-equal to the old launches");
+        }
     }
 }
