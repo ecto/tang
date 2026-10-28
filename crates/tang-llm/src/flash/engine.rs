@@ -4209,8 +4209,12 @@ impl Engine {
             .nth(gdn_layer)
             .map(|(i, _)| i)
             .with_context(|| format!("no GDN layer {gdn_layer}"))?;
-        super::memserve::check_shape(GDN_HK, GDN_HV)?;
-        self.store = Some(super::memserve::StoreMeta { gdn_layer, layer });
+        let layout = super::memserve::check_shape(GDN_HK, GDN_HV)?;
+        self.store = Some(super::memserve::StoreMeta {
+            gdn_layer,
+            layer,
+            layout,
+        });
         Ok(())
     }
 

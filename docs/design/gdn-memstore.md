@@ -187,6 +187,62 @@ it client-side, then `POST /v1/memory/end`. `tang-llm memory dump <blob> [--toke
 tokenizer.json|model.gguf]` prints what a blob remembers: each file's name, length, token ids
 and, with a tokenizer, the text.
 
+## 32-head layout
+
+Qwen3-Coder-Next and Qwen3.5-4B have GDN layers of 16 k / 32 v heads, d 128, with the grouped
+mapping: v head `vh` reads k head `vh / 2` (`Hparams::gdn_k_head`, `Arch::Qwen3Next`), not the
+Flash-Next tiling `vh % 16`. `memstore::Layout` carries (k heads, v heads, d, tiled or grouped,
+output gate) and the store's heads; `Layout::FLASH` is the layout above, unchanged bitwise (every
+phase-1 test passes as before), and `Layout::CODER` is this one. `MemStore::open` picks the
+layout from the state's size; `memserve::check_shape(hk, hv)` returns it from the engine's GDN
+shape and `StoreMeta.layout` carries it.
+
+The store keeps k heads 12..=15 and takes both of their v heads, 8 of 32 (25% of the layer, as
+before): v head `2·kh` is directory, `2·kh + 1` content.
+
+| | 48-head (tiled) | 32-head (grouped) |
+|---|---|---|
+| store v heads | 12–15, 28–31, 44–47 | 24–31 |
+| directory heads | 8 (groups 0, 1) | 4: 24, 26, 28, 30 |
+| directory slots / bucket | 1,024 / 8 | **512 / 4** |
+| live files (load 1/2) | 512 | **256** |
+| content heads | 44–47 | 25, 27, 29, 31 |
+| content rows / tokens | 512 / 65,024 | 512 / 65,024 |
+| per file | 75 rows, 9,525 tokens, 96-byte name | same |
+| blob (heads + 24-byte header) | 768 KiB | 512 KiB |
+
+The 1,024-slot directory doesn't fit: with two v heads per k head one group is content, so the
+directory is one group of 4 heads × 128 rows = 512 slots. Slot `s` is store k head `s % 4`, row
+`s / 4`; a bucket is still one state row of every directory head, so a lookup is still one
+1-token window at load 1/2, and a scan is still 16 windows (128 buckets). Content is unchanged.
+Values, markers, the slot format and the driver discipline are the same.
+
+**Which kernel runs it.** The device's `gdn_step` (CPU and CUDA alike) is compiled to the
+Flash-Next shape (`GDN_HK = 16`, `GDN_HV = 48`, `hv % GDN_HK`); it has no grouped mapping and
+can't run a 32-head state. So the 32-head layout's windows run on the host: `MemStore` downloads
+the layer state, steps each v head through `reference::gdn_head_step` (the recurrence the
+reference forward and the chip runner share) reading k head `Layout::k_head(vh)`, with the
+device kernel's gates (`g = exp(softplus(a + dt) · ssm_a)`, `β = σ(b)`, q · 1/√128, gated RMS
+norm; the gate is SiLU for this layout, as qwen3next's), and uploads it back after a commit.
+`memstore_host_ref_matches_device` runs the same ops through both paths on the 48-head layout
+and gets bitwise-equal states, so the host path is the device's arithmetic for store windows.
+The Coder engine's own CUDA `gdn_step` kernel (in `coder.rs`) is not what `run_op` calls: it
+goes through `ComputeDevice::gdn_step`, which is why the host path is needed. Per window it
+moves the whole layer state (2 MiB) both ways, fine for store ops (a put is a handful of
+windows).
+
+**Blob format.** A blob is now `MEMB`, version 1, k heads, v heads, d and the mapping (0 tiled,
+1 grouped) as little-endian u32s, then the heads. `Sessions` holds the engine's layout and
+`load` refuses a blob of the other layout with an error naming both; a header whose layout
+doesn't match the blob's size is refused; a headerless 768 KiB blob (the phase-1 format) still
+reads as the 48-head layout. The state-file trailer already lists the store v heads, which name
+the layout (`StoreMeta::from_trailer` matches them to one).
+
+**Not done.** `Coder::enable_store` (in `coder.rs`, owned elsewhere for now) still builds
+`StoreMeta { gdn_layer, layer }` and checks `heads.len() == HEAD_FLOATS` in
+`set_store_heads_at`; it needs `let layout = check_shape(..)?;`, the `layout` field, and
+`layout.head_floats()` before Coder-Next serves a store (the `cuda` build fails until then).
+
 ## How it plugs into frog's memory
 
 The post reports facts that changed between chats recalled 90% of the time from the filesystem

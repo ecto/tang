@@ -809,7 +809,7 @@ impl FlashServe {
             gdn_layers,
             requests: 0,
             line: Line::default(),
-            mem: store.map(|_| Sessions::new(s.memory_ephemeral)),
+            mem: store.map(|m| Sessions::with_layout(s.memory_ephemeral, m.layout)),
             store,
         };
         // Capture the wide prefill graphs (64, 32, 16) now, not in the first request.
