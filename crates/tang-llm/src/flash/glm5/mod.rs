@@ -33,6 +33,8 @@ mod mtp_tests;
 pub mod moe_debug;
 #[cfg(feature = "cuda")]
 pub mod serve_glue;
+#[cfg(test)]
+mod splice_probe;
 pub mod trace;
 
 use crate::gguf::Gguf;
