@@ -217,8 +217,13 @@ extern "C" __global__ void ds_rope(float* v, const float2* tab, int rows, int pe
 // Gathered attention with a per-head sink: block per (t, h), d threads (d <= 1024).
 // q [T][H][d], kv [n][d], idxs [T][k] (-1 = none), o [T][H][d] (bf16-rounded).
 // Scores live in shared memory (k floats), so k <= smem / 4.
-extern "C" __global__ void ds_sparse_attn(const float* q, const float* kv, const float* sink,
-                                          const int* idxs, float* o, int h, int d, int k, float scale) {
+// Keys live in two places: row r < split of kv0, else row r - split of kv1 (a window, then a
+// source layer's compressed cache), so neither is copied.
+#define DS_KROW(r) ((r) < split ? kv0 + (long long)(r) * d : kv1 + (long long)((r) - split) * d)
+
+extern "C" __global__ void ds_sparse_attn(const float* q, const float* kv0, int split, const float* kv1,
+                                          const float* sink, const int* idxs, float* o, int h, int d, int k,
+                                          float scale) {
     extern __shared__ float sc[];
     __shared__ float red[32];
     __shared__ float den_s;
@@ -228,8 +233,10 @@ extern "C" __global__ void ds_sparse_attn(const float* q, const float* kv, const
     for (int j = 0; j < k; j++) {
         int r = ix[j];
         float part = 0.f;
-        if (r >= 0)
-            for (int i = threadIdx.x; i < d; i += blockDim.x) part += qv[i] * kv[(long long)r * d + i];
+        if (r >= 0) {
+            const float* kr = DS_KROW(r);
+            for (int i = threadIdx.x; i < d; i += blockDim.x) part += qv[i] * kr[i];
+        }
         for (int o2 = 16; o2; o2 >>= 1) part += __shfl_xor_sync(0xffffffffu, part, o2);
         if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = part;
         __syncthreads();
@@ -257,7 +264,7 @@ extern "C" __global__ void ds_sparse_attn(const float* q, const float* kv, const
         float acc = 0.f;
         for (int j = 0; j < k; j++) {
             int r = ix[j];
-            if (r >= 0) acc += bf(sc[j]) * kv[(long long)r * d + i];
+            if (r >= 0) acc += bf(sc[j]) * DS_KROW(r)[i];
         }
         o[((long long)t * h + hi) * d + i] = bf(acc / den_s);
     }
@@ -547,17 +554,69 @@ extern "C" __global__ void ds_index_score(const float* q, const float* ik, const
 }
 
 // wo_a, block-diagonal over groups: mid[t][g][r] = bf(Σ_i o[t][g][i] w[g*ol + r][i]).
-// Warp per output.
+// Warp per DS_WO_R weight rows of one group, every token at once (up to DS_WO_T a pass): each
+// weight is read and decoded once rather than once a token, and each activation load feeds
+// DS_WO_R rows. Each output's sum runs in the same order as a warp per output (lane-strided,
+// then the xor tree), so the result is unchanged.
+#define DS_WO_T 8
+#define DS_WO_R 1
+__device__ __forceinline__ float ds_fp8w(const unsigned char* wr, const unsigned char* sr, int i, int m) {
+    // the e4m3 decode built from its bits (the same float as e4m3()); the column block's
+    // scale is warp-uniform (i / 32 = m)
+    unsigned int v = wr[i];
+    int e = (v >> 3) & 0xf;
+    float dv = e ? __uint_as_float(((v & 0x80u) << 24) | ((unsigned int)(e + 120) << 23) | ((v & 7u) << 20))
+                 : ((v & 0x80u) ? -1.f : 1.f) * (float)(v & 7u) * 0.001953125f;
+    return bf(dv * e8m0(sr[m]));
+}
+
 extern "C" __global__ void ds_wo_a(const float* o, DsW w, float* mid, int t, int g, int ol) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
-    if (warp >= t * g * ol) return;
-    int r = warp % ol, gi = (warp / ol) % g, ti = warp / (ol * g);
-    int gd = w.cols;
-    const float* ov = o + ((long long)ti * g + gi) * gd;
-    float s = 0.f;
-    for (int i = lane; i < gd; i += 32) s += ov[i] * bf(wget(w, gi * ol + r, i));
-    for (int o2 = 16; o2; o2 >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o2);
-    if (lane == 0) mid[warp] = bf(s);
+    int per = (ol + DS_WO_R - 1) / DS_WO_R;
+    if (warp >= g * per) return;
+    int gi = warp / per, r0 = (warp % per) * DS_WO_R;
+    int nr = min(DS_WO_R, ol - r0);
+    int gd = w.cols, nsc = (gd + 31) / 32;
+    long long ts = (long long)g * gd;
+    for (int t0 = 0; t0 < t; t0 += DS_WO_T) {
+        int nt = min(DS_WO_T, t - t0);
+        float s[DS_WO_R][DS_WO_T];
+#pragma unroll
+        for (int j = 0; j < DS_WO_R; j++)
+#pragma unroll
+            for (int u = 0; u < DS_WO_T; u++) s[j][u] = 0.f;
+        const float* ov = o + ((long long)t0 * g + gi) * gd;
+        for (int m = 0; m * 32 < gd; m++) {
+            int i = m * 32 + lane;
+            if (i >= gd) break;
+            float x[DS_WO_T];
+#pragma unroll
+            for (int u = 0; u < DS_WO_T; u++) x[u] = u < nt ? __ldg(ov + u * ts + i) : 0.f;
+#pragma unroll
+            for (int j = 0; j < DS_WO_R; j++) {
+                if (j >= nr) break;
+                int row = gi * ol + r0 + j;
+                float wv = w.fmt == 2
+                               ? ds_fp8w((const unsigned char*)w.w + (long long)row * gd,
+                                         (const unsigned char*)w.s + (long long)(row / 32) * nsc, i, m)
+                               : bf(wget(w, row, i));
+#pragma unroll
+                for (int u = 0; u < DS_WO_T; u++)
+                    if (u < nt) s[j][u] += x[u] * wv;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < DS_WO_R; j++) {
+            if (j >= nr) break;
+#pragma unroll
+            for (int u = 0; u < DS_WO_T; u++) {
+                if (u >= nt) break;
+                float v = s[j][u];
+                for (int o2 = 16; o2; o2 >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o2);
+                if (lane == 0) mid[((long long)(t0 + u) * g + gi) * ol + r0 + j] = bf(v);
+            }
+        }
+    }
 }
 
 // Engram's gate, block per (t, c): out = bf(h + sigmoid(signed sqrt(normalized h·qk·key)) val).
@@ -1044,8 +1103,9 @@ DS_MOE_KS(3)
 // 3. ds_attn_pv: block per (t, 8 heads, 64-wide d slice), 4 key slices × 64 dims: each kv
 //    value is read once for 8 heads; o = bf(Σ P kv / den).
 
-extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, const float* kv, const int* idxs,
-                                                             float* part, int h, int d, int k) {
+extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, const float* kv0, int split,
+                                                             const float* kv1, const int* idxs, float* part,
+                                                             int h, int d, int k) {
     __shared__ float Qs[64][65];
     __shared__ float Ks[32][65];
     int nkt = (k + 31) / 32, nds = d / 64, nhc = h / 64;
@@ -1064,7 +1124,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, con
         int kk = e / 64, i = e % 64;
         int j = kt * 32 + kk;
         int r = j < k ? ix[j] : -1;
-        Ks[kk][i] = r >= 0 ? kv[(long long)r * d + ds * 64 + i] : 0.f;
+        Ks[kk][i] = r >= 0 ? DS_KROW(r)[ds * 64 + i] : 0.f;
     }
     __syncthreads();
     int kq = tid & 15, hq = tid >> 4;
@@ -1117,8 +1177,9 @@ extern "C" __global__ void ds_attn_soft(const float* part, const float* sink, co
     if (lane == 0) den[warp] = sum + expf(sink[hi] - mx);
 }
 
-extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, const float* den, const float* kv,
-                                                             const int* idxs, float* o, int h, int d, int k) {
+extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, const float* den, const float* kv0,
+                                                             int split, const float* kv1, const int* idxs,
+                                                             float* o, int h, int d, int k) {
     extern __shared__ float P[];  // [8][k], then the k indices
     __shared__ float red[4][8][64];
     int* Is = (int*)(P + 8 * k);
@@ -1130,7 +1191,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, co
     for (int e = tid; e < k; e += 256) Is[e] = idxs[(long long)ti * k + e];
     __syncthreads();
     int ks = tid >> 6, di = tid & 63;
-    const float* kc = kv + ds * 64 + di;
+    int off = ds * 64 + di;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int j0 = ks; j0 < k; j0 += 32) {
         float v[8];
@@ -1138,7 +1199,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, co
         for (int u = 0; u < 8; u++) {
             int j = j0 + 4 * u;
             int r = j < k ? Is[j] : -1;
-            v[u] = r >= 0 ? kc[(long long)r * d] : 0.f;
+            v[u] = r >= 0 ? DS_KROW(r)[off] : 0.f;
         }
 #pragma unroll
         for (int u = 0; u < 8; u++) {

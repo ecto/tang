@@ -822,19 +822,11 @@ impl GpuModel {
         let s = self.span("sparse_attn");
         let sink = self.dw(&format!("{p}.attn.attn_sink"))?;
         let o = self.fbuf(t * h * hd)?;
-        let (kv0, split, kv1) = (kv.0.ptr, kv.1 as i32, kv.2);
-        let (hi, dd, ki, scale) = (h as i32, hd as i32, k as i32, (hd as f32).powf(-0.5));
-        let threads = hd.clamp(32, 1024) as u32;
-        unsafe {
-            self.gk.go(
-                "dg_sparse_attn",
-                ((t * h) as u32, 1, 1),
-                (threads, 1, 1),
-                (k * 4) as u32,
-                &self.s,
-                args![q.ptr, kv0, split, kv1, sink.v.w, di.ptr, o.ptr, hi, dd, ki, scale],
-            )?
-        };
+        // the tiled kernels at the real shapes (see `Kernels::sparse_attn`), else the exact one
+        let scale = (hd as f32).powf(-0.5);
+        self.k.sparse_attn(
+            &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale,
+        )?;
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
         self.end(s);
         let s = self.span("wo");
@@ -846,7 +838,7 @@ impl GpuModel {
         unsafe {
             self.k.go(
                 "ds_wo_a",
-                blocks(t * g * ol * 32, 256),
+                blocks(g * ol * 32, 256),
                 B256,
                 0,
                 &self.s,
@@ -1115,7 +1107,7 @@ impl GpuModel {
         offset: usize,
     ) -> Result<usize> {
         let c = self.cpu.cfg.clone();
-        let (r, hd, d, ql) = (c.compress_ratios[lid], c.head_dim, c.dim, c.q_lora_rank);
+        let (r, hd, d) = (c.compress_ratios[lid], c.head_dim, c.dim);
         let (is_kv, is_idx) = (c.is_kv_source(lid), c.is_index_source(lid));
         let (wmax, kmax) = (c.max_seq_len / r, c.index_topk);
         let src_l = c.candidate_source_layer;
@@ -1137,27 +1129,16 @@ impl GpuModel {
             None
         };
         for e in 0..t {
-            let (xe, qe) = (x.at(e * d * 4), qr.at(e * ql * 4));
+            let xe = x.at(e * d * 4);
             let latent = if is_kv {
                 self.sh_ckv = lid;
                 Some(self.compressor_dyn(p, lid, xe, e)?)
             } else {
                 None
             };
-            if let Some(tk) = tk {
+            if is_idx {
                 let s = self.span("indexer");
-                self.indexer_dyn(
-                    p,
-                    lid,
-                    xe,
-                    qe,
-                    latent,
-                    e,
-                    offset,
-                    tk.at(e * kmax * 4),
-                    cand_out.map(|cb| cb.at(e * wmax)),
-                    cand_in.map(|(cb, st)| cb.at(e * st)),
-                )?;
+                self.indexer_keys(p, lid, latent, e)?;
                 self.end(s);
             }
             if let Some(lat) = latent {
@@ -1172,6 +1153,11 @@ impl GpuModel {
             }
         }
         if let Some(tk) = tk {
+            // the queries batched over the step: row e reads only the complete groups below
+            // its width, all final once every position's key is written
+            let s = self.span("indexer");
+            self.indexer_dyn(p, lid, x, qr, t, offset, tk, cand_out, cand_in)?;
+            self.end(s);
             self.topk = Some((tk, kmax));
         }
         if let Some(cb) = cand_out {
@@ -1204,99 +1190,106 @@ impl GpuModel {
         Ok(out)
     }
 
-    /// One position's indexer (see [`Self::compress_dyn`]).
+    /// One position's indexer key (see [`Self::compress_dyn`]), when this layer owns them.
+    fn indexer_keys(&mut self, p: &str, lid: usize, latent: Option<Buf>, e: usize) -> Result<()> {
+        let c = &self.cpu.cfg;
+        let (r, ihd) = (c.compress_ratios[lid], c.index_head_dim);
+        if !c.is_kv_source(lid) {
+            return Ok(());
+        }
+        self.sh_idxk = lid;
+        let Some(lat) = latent else { return Ok(()) };
+        let k = self.lin(lat, 1, &format!("{p}.attn.indexer.wk.weight"))?;
+        self.rms(k, 1, &format!("{p}.attn.indexer.k_norm.weight"))?;
+        let at = At::Dev {
+            add: e,
+            stride: 0,
+            fixed_r: r,
+        };
+        self.rope(k, 1, 1, ihd, lid, at, false)?;
+        self.k.fp4_qdq(&self.s, k.ptr, ihd, 32, false)?;
+        self.row_write(self.idxk[&lid].ptr, k, ihd, e, r)
+    }
+
+    /// The step's `t` indexer queries, scores and top-k rows into `out` [t][index_topk] (see
+    /// [`Self::compress_dyn`]); the candidate mask out [t][wmax] or in [t][stride].
     #[allow(clippy::too_many_arguments)]
     fn indexer_dyn(
         &mut self,
         p: &str,
         lid: usize,
-        xe: Buf,
-        qe: Buf,
-        latent: Option<Buf>,
-        e: usize,
+        x: Buf,
+        qr: Buf,
+        t: usize,
         offset: usize,
         out: Buf,
         cand_out: Option<Buf>,
-        cand_in: Option<Buf>,
+        cand_in: Option<(Buf, usize)>,
     ) -> Result<()> {
         let c = self.cpu.cfg.clone();
         let (r, nh, ihd) = (c.compress_ratios[lid], c.index_n_heads, c.index_head_dim);
         let (wmax, kmax) = (c.max_seq_len / r, c.index_topk);
-        let owns = c.is_kv_source(lid);
-        if let (true, Some(lat)) = (owns, latent) {
-            let k = self.lin(lat, 1, &format!("{p}.attn.indexer.wk.weight"))?;
-            self.rms(k, 1, &format!("{p}.attn.indexer.k_norm.weight"))?;
-            let at = At::Dev {
-                add: e,
-                stride: 0,
-                fixed_r: r,
-            };
-            self.rope(k, 1, 1, ihd, lid, at, false)?;
-            self.k.fp4_qdq(&self.s, k.ptr, ihd, 32, false)?;
-            self.row_write(self.idxk[&lid].ptr, k, ihd, e, r)?;
-        }
-        if owns {
-            self.sh_idxk = lid;
-        }
-        let q = self.lin(qe, 1, &format!("{p}.attn.indexer.wq_b.weight"))?;
+        let q = self.lin(qr, t, &format!("{p}.attn.indexer.wq_b.weight"))?;
         let at = At::Dev {
-            add: e,
+            add: 0,
             stride: 1,
             fixed_r: 0,
         };
-        self.rope(q, 1, nh, ihd, lid, at, false)?;
-        self.k.fp4_qdq(&self.s, q.ptr, nh * ihd, 32, false)?;
-        let wts = self.index_weights(p, xe, 1)?;
-        let score = self.fbuf(wmax)?;
+        self.rope(q, t, nh, ihd, lid, at, false)?;
+        self.k.fp4_qdq(&self.s, q.ptr, t * nh * ihd, 32, false)?;
+        let wts = self.index_weights(p, x, t)?;
+        let score = self.fbuf(t * wmax)?;
         let ik = self.idxk[&self.sh_idxk].ptr;
-        let (pp, ai, ri, nhi, ihdi) = (self.p.ptr, e as i32, r as i32, nh as i32, ihd as i32);
+        let (pp, ri, nhi, ihdi, wi) = (self.p.ptr, r as i32, nh as i32, ihd as i32, wmax as i32);
+        let (sg, ty) = (blocks(wmax * 32, 256), t as u32);
         unsafe {
             self.gk.go(
                 "dg_index_score",
-                blocks(wmax * 32, 256),
+                (sg.0, ty, 1),
                 B256,
                 0,
                 &self.s,
-                args![q.ptr, ik, wts.ptr, score.ptr, pp, ai, ri, nhi, ihdi],
+                args![q.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi],
             )?
         };
         if let Some(cb) = cand_out {
             let (bs, kb) = (c.candidate_block_size, c.candidate_topk_blocks);
             let nb = wmax.div_ceil(bs);
-            let (sc, sel) = (self.fbuf(nb)?, self.fbuf(nb)?);
-            let (bsi, kbi) = (bs as i32, kb as i32);
+            let (sc, sel) = (self.fbuf(t * nb)?, self.fbuf(t * nb)?);
+            let (bsi, kbi, nbi) = (bs as i32, kb as i32, nb as i32);
             unsafe {
                 self.gk.go(
                     "dg_candidates",
-                    (1, 1, 1),
+                    (ty, 1, 1),
                     SEL,
                     0,
                     &self.s,
-                    args![score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, ai, ri, bsi, kbi],
+                    args![score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi],
                 )?
             };
-        } else if let Some(cb) = cand_in {
+        } else if let Some((cb, st)) = cand_in {
+            let (mg, sti) = (blocks(wmax, 256), st as i32);
             unsafe {
                 self.gk.go(
                     "dg_mask_scores",
-                    blocks(wmax, 256),
+                    (mg.0, ty, 1),
                     B256,
                     0,
                     &self.s,
-                    args![score.ptr, cb.ptr, pp, ai, ri],
+                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti],
                 )?
             };
         }
-        let sel = self.fbuf(kmax)?;
+        let sel = self.fbuf(t * kmax)?;
         let (ki, oi) = (kmax as i32, offset as i32);
         unsafe {
             self.gk.go(
                 "dg_topk",
-                (1, 1, 1),
+                (ty, 1, 1),
                 SEL,
                 0,
                 &self.s,
-                args![score.ptr, sel.ptr, out.ptr, pp, ai, ri, ki, oi],
+                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi],
             )
         }
     }

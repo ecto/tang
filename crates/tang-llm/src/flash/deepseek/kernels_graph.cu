@@ -74,8 +74,14 @@ __device__ __forceinline__ int dg_width(const int* P, int add, int r) { return (
 
 // As ds_index_score for one row at position P[0] + add (width (pos + 1) / r of at most the
 // launch's).
+// Row blockIdx.y of a batch: q [y][nh][ihd], w [y][nh], score [y][sst], position add + y.
 extern "C" __global__ void dg_index_score(const float* q, const float* ik, const float* w, float* score, const int* P,
-                                          int add, int r, int nh, int ihd) {
+                                          int add, int r, int nh, int ihd, int sst) {
+    int y = blockIdx.y;
+    q += (long long)y * nh * ihd;
+    w += y * nh;
+    score += (long long)y * sst;
+    add += y;
     int j = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (j >= dg_width(P, add, r)) return;
     const float* kj = ik + (long long)j * ihd;
@@ -90,8 +96,13 @@ extern "C" __global__ void dg_index_score(const float* q, const float* ik, const
     if (lane == 0) score[j] = dg_bf(s);
 }
 
-// As ds_mask_scores (no causal part) for one row.
-extern "C" __global__ void dg_mask_scores(float* score, const unsigned char* cand, const int* P, int add, int r) {
+// As ds_mask_scores (no causal part), row blockIdx.y of a batch.
+extern "C" __global__ void dg_mask_scores(float* score, const unsigned char* cand, const int* P, int add, int r,
+                                          int sst, int cst) {
+    int y = blockIdx.y;
+    score += (long long)y * sst;
+    cand += (long long)y * cst;
+    add += y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= dg_width(P, add, r)) return;
     if (!cand[j]) score[j] = -DG_INF;
@@ -174,9 +185,15 @@ __device__ void dg_select_row(const float* v, int n, int k, int* sel) {
     __syncthreads();
 }
 
-// As ds_candidates (decode: no causal prefix) for one row, one block.
+// As ds_candidates (decode: no causal prefix), block per row of a batch (position add + row).
 extern "C" __global__ void dg_candidates(const float* score, float* s, int* sel, unsigned char* out, const int* P,
-                                         int add, int r, int bs, int kb) {
+                                         int add, int r, int bs, int kb, int sst, int nbs, int ost) {
+    int y = blockIdx.x;
+    score += (long long)y * sst;
+    s += (long long)y * nbs;
+    sel += (long long)y * nbs;
+    out += (long long)y * ost;
+    add += y;
     int width = dg_width(P, add, r);
     int nb = (width + bs - 1) / bs;
     int len = width;
@@ -200,10 +217,15 @@ extern "C" __global__ void dg_candidates(const float* score, float* s, int* sel,
     }
 }
 
-// As ds_topk for one row (no causal prefix): the min(kmax, width) largest, ascending, as
+// As ds_topk, block per row of a batch (position add + row; no causal prefix): the min(kmax, width) largest, ascending, as
 // idx + offset, then -1 up to kmax (holes ds_sparse_attn skips exactly).
 extern "C" __global__ void dg_topk(const float* score, int* sel, int* out, const int* P, int add, int r, int kmax,
-                                   int offset) {
+                                   int offset, int sst) {
+    int y = blockIdx.x;
+    score += (long long)y * sst;
+    sel += (long long)y * kmax;
+    out += (long long)y * kmax;
+    add += y;
     int width = dg_width(P, add, r);
     int k = min(kmax, width);
     dg_select_row(score, width, k, sel);

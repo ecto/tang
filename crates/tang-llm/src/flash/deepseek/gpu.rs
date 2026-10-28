@@ -954,6 +954,8 @@ impl Kernels {
         s: &Stream,
         q: u64,
         kv: u64,
+        split: usize,
+        kv1: u64,
         sink: u64,
         idxs: u64,
         o: u64,
@@ -964,6 +966,7 @@ impl Kernels {
         scale: f32,
     ) -> Result<()> {
         let (hi, di, ki) = (h as i32, d as i32, k as i32);
+        let sp = split.min(i32::MAX as usize) as i32;
         let need = t * h * k * (d / 64 + 1) + t * h;
         if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 960 && need <= ATTN_SCRATCH {
             let part = self.scratch.ptr;
@@ -977,7 +980,7 @@ impl Kernels {
                     (256, 1, 1),
                     0,
                     s,
-                    tang_moe::args![q, kv, idxs, part, hi, di, ki],
+                    tang_moe::args![q, kv, sp, kv1, idxs, part, hi, di, ki],
                 )?;
                 super::obs::launch(
                     self.attn_soft,
@@ -993,7 +996,7 @@ impl Kernels {
                     (256, 1, 1),
                     (9 * k * 4) as u32,
                     s,
-                    tang_moe::args![pr, den, kv, idxs, o, hi, di, ki],
+                    tang_moe::args![pr, den, kv, sp, kv1, idxs, o, hi, di, ki],
                 )?;
             }
             return Ok(());
@@ -1006,7 +1009,7 @@ impl Kernels {
                 (threads, 1, 1),
                 (k * 4) as u32,
                 s,
-                tang_moe::args![q, kv, sink, idxs, o, hi, di, ki, scale],
+                tang_moe::args![q, kv, sp, kv1, sink, idxs, o, hi, di, ki, scale],
             )?
         }
         Ok(())
@@ -1225,6 +1228,8 @@ mod tests {
             &s,
             dq.ptr,
             dkv.ptr,
+            usize::MAX,
+            0,
             ds.ptr,
             di.ptr,
             o.ptr,
@@ -2097,7 +2102,19 @@ mod tests {
                 k.exact = exact;
                 time(&|| {
                     k.sparse_attn(
-                        &s, q.ptr, kv.ptr, sink.ptr, ix.ptr, o.ptr, t, 64, 512, kk, 0.04,
+                        &s,
+                        q.ptr,
+                        kv.ptr,
+                        usize::MAX,
+                        0,
+                        sink.ptr,
+                        ix.ptr,
+                        o.ptr,
+                        t,
+                        64,
+                        512,
+                        kk,
+                        0.04,
                     )
                     .unwrap()
                 })
@@ -2145,11 +2162,14 @@ mod tests {
         for (t, kk) in [(1, 640), (6, 640), (5, 100), (2, 960)] {
             let [q, kv, sink, ix] = attn_case(t, kk);
             let o = DevBuf::alloc(t * h * d * 4).unwrap();
-            let run = |k: &Kernels| {
+            // the tiled run reads its keys split in two (window rows, then the rest)
+            let run = |k: &Kernels, split: usize| {
                 k.sparse_attn(
                     &s,
                     q.ptr,
                     kv.ptr,
+                    split,
+                    kv.ptr + (split.min(4096) * d * 4) as u64,
                     sink.ptr,
                     ix.ptr,
                     o.ptr,
@@ -2164,9 +2184,9 @@ mod tests {
                 o.read::<f32>(0, t * h * d).unwrap()
             };
             k.exact = true;
-            let want = run(&k);
+            let want = run(&k, usize::MAX);
             k.exact = false;
-            let got = run(&k);
+            let got = run(&k, 134);
             k.exact = false;
             // Reordered sums flip bf(p) of a few keys by an ulp, and outputs that cancel to
             // near zero then miss by more than an ulp of themselves: ≥ 99% equal, normwise within
@@ -2476,5 +2496,245 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The attention block of a verify step at the real shapes (t 6, 64 heads × 512, window
+    /// 128 + top-k 512, dim 5120, pos ~2000): wo_a, sparse attention (the decode kernel and
+    /// the tiled one), the indexer's score + top-k. `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn attn_block_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let mut k = Kernels::new(&g).unwrap();
+        let gk = super::super::graph::GKernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let ev = |f: &dyn Fn()| -> f64 {
+            f();
+            s.sync().unwrap();
+            let n = 50;
+            let (a, b) = (
+                gpu::Event::new(true).unwrap(),
+                gpu::Event::new(true).unwrap(),
+            );
+            a.record(&s).unwrap();
+            for _ in 0..n {
+                f();
+            }
+            b.record(&s).unwrap();
+            s.sync().unwrap();
+            b.since(&a).unwrap() as f64 * 1e3 / n as f64
+        };
+        let (t, h, d, g8, ol) = (6usize, 64usize, 512usize, 8usize, 1024usize);
+        // wo_a: fp8 [8 × 1024, 4096]
+        let (rows, cols) = (g8 * ol, h * d / g8);
+        let mut wb: Vec<u8> = (0..rows * cols)
+            .map(|i| (i * 2654435761 >> 13) as u8)
+            .collect();
+        wb.iter_mut()
+            .filter(|b| **b & 0x7f == 0x7f)
+            .for_each(|b| *b = 0x10);
+        let sb: Vec<u8> = (0..rows.div_ceil(32) * cols / 32)
+            .map(|i| 118 + (i % 8) as u8)
+            .collect();
+        let (w, sc) = (
+            DevBuf::from_slice(&wb).unwrap(),
+            DevBuf::from_slice(&sb).unwrap(),
+        );
+        let wv = DsW {
+            w: w.ptr,
+            s: sc.ptr,
+            rows: rows as i32,
+            cols: cols as i32,
+            fmt: 2,
+            _pad: 0,
+        };
+        let o = DevBuf::from_slice(&data(t * h * d, 3, 1.0)).unwrap();
+        let mid = DevBuf::alloc(t * rows * 4).unwrap();
+        let (ti, gi, oli) = (t as i32, g8 as i32, ol as i32);
+        let us = ev(&|| unsafe {
+            k.go(
+                "ds_wo_a",
+                blocks(g8 * ol * 32, 256),
+                (256, 1, 1),
+                0,
+                &s,
+                tang_moe::args![o.ptr, wv, mid.ptr, ti, gi, oli],
+            )
+            .unwrap()
+        });
+        eprintln!("attn_block_bench wo_a t {t}: {us:.1} us");
+        // sparse attention: window 128 + 6 chunk rows, then 512 compressed rows
+        let (win, kc) = (128 + t, 512usize);
+        let kk = win + kc;
+        let q = DevBuf::from_slice(&data(t * h * d, 5, 1.0)).unwrap();
+        let kv0 = DevBuf::from_slice(&data(win * d, 6, 1.0)).unwrap();
+        let kv1 = DevBuf::from_slice(&data(2048 * d, 7, 1.0)).unwrap();
+        let sink = DevBuf::from_slice(&data(h, 8, 1.0)).unwrap();
+        let ix: Vec<i32> = (0..t * kk)
+            .map(|i| {
+                let j = i % kk;
+                if j < win {
+                    j as i32
+                } else {
+                    (win + (j * 7 + i / kk) % 500) as i32
+                }
+            })
+            .collect();
+        let ix = DevBuf::from_slice(&ix).unwrap();
+        let ob = DevBuf::alloc(t * h * d * 4).unwrap();
+        let (hi, di, ki, split, scale) = (h as i32, d as i32, kk as i32, win as i32, 0.04f32);
+        let us = ev(&|| unsafe {
+            gk.go(
+                "dg_sparse_attn",
+                ((t * h) as u32, 1, 1),
+                (512, 1, 1),
+                (kk * 4) as u32,
+                &s,
+                tang_moe::args![
+                    q.ptr, kv0.ptr, split, kv1.ptr, sink.ptr, ix.ptr, ob.ptr, hi, di, ki, scale
+                ],
+            )
+            .unwrap()
+        });
+        eprintln!("attn_block_bench dg_sparse_attn t {t} k {kk}: {us:.1} us");
+        k.exact = false;
+        let us = ev(&|| {
+            k.sparse_attn(
+                &s, q.ptr, kv0.ptr, win, kv1.ptr, sink.ptr, ix.ptr, ob.ptr, t, h, d, kk, scale,
+            )
+            .unwrap()
+        });
+        eprintln!("attn_block_bench tiled sparse_attn t {t} k {kk}: {us:.1} us");
+        // indexer at pos 2000, ratio 4: 64 heads × 128, width 500, top-512
+        let (nh, ihd, r, wmax, kmax) = (64usize, 128usize, 4usize, 4096usize, 512usize);
+        let qi = DevBuf::from_slice(&data(t * nh * ihd, 9, 1.0)).unwrap();
+        let ik = DevBuf::from_slice(&data(wmax * ihd, 10, 1.0)).unwrap();
+        let wts = DevBuf::from_slice(&data(t * nh, 11, 1.0)).unwrap();
+        let score = DevBuf::alloc(t * wmax * 4).unwrap();
+        let sel = DevBuf::alloc(t * kmax * 4).unwrap();
+        let out = DevBuf::alloc(t * kmax * 4).unwrap();
+        let pp = DevBuf::from_slice(&[2000i32]).unwrap();
+        let (ri, nhi, ihdi, kmi, offi) = (r as i32, nh as i32, ihd as i32, kmax as i32, win as i32);
+        let wi = wmax as i32;
+        let us = ev(&|| unsafe {
+            let sg = blocks(wmax * 32, 256);
+            gk.go(
+                "dg_index_score",
+                (sg.0, t as u32, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                tang_moe::args![
+                    qi.ptr, ik.ptr, wts.ptr, score.ptr, pp.ptr, 0i32, ri, nhi, ihdi, wi
+                ],
+            )
+            .unwrap();
+            gk.go(
+                "dg_topk",
+                (t as u32, 1, 1),
+                super::super::graph::SEL,
+                0,
+                &s,
+                tang_moe::args![score.ptr, sel.ptr, out.ptr, pp.ptr, 0i32, ri, kmi, offi, wi],
+            )
+            .unwrap();
+        });
+        eprintln!("attn_block_bench indexer score+topk t {t} batched (per layer): {us:.1} us");
+    }
+
+    /// `ds_wo_a`'s fp8 fast path against its generic (wget) path on the same weights
+    /// dequantized to f32: identical sums, so bit-equal. t 9 crosses the 8-token pass.
+    #[test]
+    fn wo_a_fp8_matches_f32() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (t, gn, ol, gd) = (9usize, 2usize, 40usize, 96usize);
+        let rows = gn * ol;
+        let mut wb: Vec<u8> = (0..rows * gd)
+            .map(|i| (i * 2654435761 >> 11) as u8)
+            .collect();
+        wb.iter_mut()
+            .filter(|b| **b & 0x7f == 0x7f)
+            .for_each(|b| *b = 0x08);
+        let nsc = gd.div_ceil(32);
+        let sb: Vec<u8> = (0..rows.div_ceil(32) * nsc)
+            .map(|i| 120 + (i % 9) as u8)
+            .collect();
+        let wf: Vec<f32> = (0..rows * gd)
+            .map(|i| {
+                let (r, c) = (i / gd, i % gd);
+                super::super::quant::e4m3_to_f32(wb[i])
+                    * super::super::quant::e8m0_to_f32(sb[(r / 32) * nsc + c / 32])
+            })
+            .collect();
+        let (dw, ds, df) = (
+            DevBuf::from_slice(&wb).unwrap(),
+            DevBuf::from_slice(&sb).unwrap(),
+            DevBuf::from_slice(&wf).unwrap(),
+        );
+        let o = DevBuf::from_slice(&data(t * gn * gd, 3, 2.0)).unwrap();
+        let run = |w: DsW| {
+            let mid = DevBuf::alloc(t * rows * 4).unwrap();
+            let (ti, gi, oli) = (t as i32, gn as i32, ol as i32);
+            unsafe {
+                k.go(
+                    "ds_wo_a",
+                    blocks(gn * ol * 32, 256),
+                    (256, 1, 1),
+                    0,
+                    &s,
+                    tang_moe::args![o.ptr, w, mid.ptr, ti, gi, oli],
+                )
+                .unwrap()
+            };
+            s.sync().unwrap();
+            mid.read::<f32>(0, t * rows).unwrap()
+        };
+        let (rw, cw) = (rows as i32, gd as i32);
+        let got = run(DsW {
+            w: dw.ptr,
+            s: ds.ptr,
+            rows: rw,
+            cols: cw,
+            fmt: 2,
+            _pad: 0,
+        });
+        let want = run(DsW {
+            w: df.ptr,
+            s: 0,
+            rows: rw,
+            cols: cw,
+            fmt: 0,
+            _pad: 0,
+        });
+        // a CPU check of the sum too (any order: within an ulp or so of bf16)
+        for ti in 0..t {
+            for gi in 0..gn {
+                for r in 0..ol {
+                    let row = gi * ol + r;
+                    let ov =
+                        &data(t * gn * gd, 3, 2.0)[(ti * gn + gi) * gd..(ti * gn + gi + 1) * gd];
+                    let cpu: f32 = ov
+                        .iter()
+                        .zip(&wf[row * gd..(row + 1) * gd])
+                        .map(|(a, b)| a * bf(*b))
+                        .sum();
+                    let gv = got[(ti * gn + gi) * ol + r];
+                    assert!(
+                        (gv - cpu).abs() <= 2e-2 * (1.0 + cpu.abs()),
+                        "t {ti} g {gi} r {r}: {gv} vs {cpu}"
+                    );
+                }
+            }
+        }
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "fp8 path != f32 path"
+        );
     }
 }
