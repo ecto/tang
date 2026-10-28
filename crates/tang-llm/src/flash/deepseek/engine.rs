@@ -33,7 +33,7 @@ use super::gpu::{blocks, DevW, DsW, Kernels};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
 use anyhow::{bail, Context, Result};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -154,6 +154,14 @@ pub struct GpuModel {
     idxk: HashMap<usize, DevBuf>,
     cst: HashMap<usize, (DevBuf, DevBuf)>,
     qk: RefCell<HashMap<usize, Rc<DevBuf>>>,
+    /// Set by [`GpuModel::block`]: `moe_finish` leaves the shared expert's output here,
+    /// unsummed, for the post-mix to add (`ds_add_round` folded into `ds_hc_post`).
+    defer_sh: Cell<bool>,
+    sh: Cell<Option<Buf>>,
+    /// Set by the forward loop: the next block's prefix when it reads this block's stream
+    /// as is, so the last post-mix also computes its attention mixes (`pend_mixes`).
+    next_hc: Option<String>,
+    pend_mixes: Option<Buf>,
     sh_ckv: usize,
     sh_idxk: usize,
     /// The last index source's selection: [t][k] positions (offset into the attention's
@@ -311,6 +319,10 @@ impl GpuModel {
             idxk,
             cst,
             qk: RefCell::new(HashMap::new()),
+            defer_sh: Cell::new(false),
+            sh: Cell::new(None),
+            next_hc: None,
+            pend_mixes: None,
             sh_ckv: 0,
             sh_idxk: 0,
             topk: None,
@@ -1697,6 +1709,10 @@ impl GpuModel {
         if forked {
             self.s.wait(&self.join)?;
         }
+        if self.defer_sh.get() {
+            self.sh.set(Some(sh));
+            return Ok(y);
+        }
         let s = self.span("finish");
         let nn = (t * d) as i64;
         unsafe {
@@ -1766,9 +1782,15 @@ impl GpuModel {
     }
 
     fn hc_post(&self, h: Buf, res: Buf, m: &Mix, t: usize) -> Result<Buf> {
+        self.hc_post2(h, None, res, m, t)
+    }
+
+    /// [`GpuModel::hc_post`] of `bf(h + h2)` when `h2` is given.
+    fn hc_post2(&self, h: Buf, h2: Option<Buf>, res: Buf, m: &Mix, t: usize) -> Result<Buf> {
         let (hc, d) = (self.cpu.cfg.hc_mult, self.cpu.cfg.dim);
         let out = self.fbuf(t * hc * d)?;
         let (ti, hci, di) = (t as i32, hc as i32, d as i32);
+        let h2 = h2.map_or(0, |b| b.ptr);
         unsafe {
             self.k.go(
                 "ds_hc_post",
@@ -1776,10 +1798,90 @@ impl GpuModel {
                 B256,
                 0,
                 &self.s,
-                args![h.ptr, res.ptr, m.post.ptr, m.comb.ptr, out.ptr, ti, hci, di],
+                args![h.ptr, h2, res.ptr, m.post.ptr, m.comb.ptr, out.ptr, ti, hci, di],
             )?
         };
         Ok(out)
+    }
+
+    /// `hc_post` and the next stage's mixes GEMM (`{p}.hc_{kind}_fn`) in one launch: the
+    /// new stream and its unscaled mixes. With no `m`, the GEMM alone on the stream `res`
+    /// (as [`GpuModel::raw`], bit for bit, spread over more SMs).
+    #[allow(clippy::too_many_arguments)]
+    fn hc_post_mix(
+        &self,
+        h: Buf,
+        h2: Option<Buf>,
+        res: Buf,
+        m: Option<&Mix>,
+        t: usize,
+        p: &str,
+        kind: &str,
+    ) -> Result<(Buf, Buf)> {
+        let (hc, d) = (self.cpu.cfg.hc_mult, self.cpu.cfg.dim);
+        let w = self.dw(&format!("{p}.hc_{kind}_fn"))?;
+        let out = match m {
+            Some(_) => self.fbuf(t * hc * d)?,
+            None => res,
+        };
+        let (post, comb) = m.map_or((0, 0), |m| (m.post.ptr, m.comb.ptr));
+        let mixes = self.fbuf(t * w.v.rows as usize)?;
+        let (ti, hci, di) = (t as i32, hc as i32, d as i32);
+        let (h2, wv) = (h2.map_or(0, |b| b.ptr), w.v);
+        unsafe {
+            self.k.go(
+                "ds_hc_post_mix",
+                (w.v.rows as u32, t.div_ceil(8) as u32, 1),
+                (32 * t.min(8) as u32, 1, 1),
+                0,
+                &self.s,
+                args![h.ptr, h2, res.ptr, post, comb, out.ptr, wv, mixes.ptr, ti, hci, di],
+            )?
+        };
+        Ok((out, mixes))
+    }
+
+    /// An mHC stage after its mixes GEMM, in one launch: the Sinkhorn of `mixes` (this
+    /// stage's coefficients) and `rms(hc_pre(x, pre), norm)` (the block input).
+    #[allow(clippy::too_many_arguments)]
+    fn hc_stage(
+        &self,
+        p: &str,
+        kind: &str,
+        x: Buf,
+        mixes: Buf,
+        pre: Buf,
+        t: usize,
+        norm: &str,
+    ) -> Result<(Mix, Buf)> {
+        let c = &self.cpu.cfg;
+        let (hc, d) = (c.hc_mult, c.dim);
+        assert!((2 + hc) * hc <= 80, "ds_hc_stage stages <= 80 mixes");
+        let m = Mix {
+            pre: self.fbuf(t * hc)?,
+            post: self.fbuf(t * hc)?,
+            comb: self.fbuf(t * hc * hc)?,
+        };
+        let out = self.fbuf(t * d)?;
+        let sc = self.dw(&format!("{p}.hc_{kind}_scale"))?;
+        let base = self.dw(&format!("{p}.hc_{kind}_base"))?;
+        let nw = self.dw(norm)?;
+        let (hci, it, eps, neps) = (hc as i32, c.hc_sinkhorn_iters as i32, c.hc_eps, c.norm_eps);
+        let (scp, bp, nv, di) = (sc.v.w, base.v.w, nw.v, d as i32);
+        unsafe {
+            self.k.go(
+                "ds_hc_stage",
+                (t as u32, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![
+                    x.ptr, mixes.ptr, neps, scp, bp, m.pre.ptr, m.post.ptr, m.comb.ptr, hci, it,
+                    eps, pre.ptr, out.ptr, nv, di, neps
+                ],
+            )?
+        };
+        Ok((m, out))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1794,6 +1896,9 @@ impl GpuModel {
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
         let d = self.cpu.cfg.dim;
+        if std::env::var_os("DS_TAP").is_none() && d % 32 == 0 && self.cpu.cfg.hc_mult <= 8 {
+            return self.block_fused(p, lid, x, t, sp, pre_mix, attn);
+        }
         let s = self.span("hc");
         let am = self.hc_mixes(p, "attn", x, t)?;
         let h = self.hc_pre(x, pre_mix, t)?;
@@ -1821,6 +1926,61 @@ impl GpuModel {
         self.tap(&format!("{p}.moe"), h, t * d)?;
         let s = self.span("hc");
         let x = self.hc_post(h, x, &fm, t)?;
+        self.end(s);
+        Ok((x, fm.pre))
+    }
+
+    /// [`GpuModel::block`] with the mHC glue fused: per stage the mixes GEMM (the ffn
+    /// stage's with the attention's post-mix) and [`GpuModel::hc_stage`]; the MoE's shared
+    /// add folded into the last post-mix. Same values, bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    fn block_fused(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+        sp: usize,
+        pre_mix: Buf,
+        attn: Attn,
+    ) -> Result<(Buf, Buf)> {
+        let s = self.span("hc");
+        let next = self.next_hc.take();
+        let mixes = match self.pend_mixes.take() {
+            Some(m) => m,
+            None => self.hc_post_mix(x, None, x, None, t, p, "attn")?.1,
+        };
+        let norm = format!("{p}.attn_norm.weight");
+        let (am, h) = self.hc_stage(p, "attn", x, mixes, pre_mix, t, &norm)?;
+        self.end(s);
+        let s = self.span("attn");
+        let h = match attn {
+            Attn::Main => self.attention(p, lid, h, t, sp)?,
+            Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
+        };
+        self.end(s);
+        let s = self.span("hc");
+        let (x, mixes) = self.hc_post_mix(h, None, x, Some(&am), t, p, "ffn")?;
+        let norm = format!("{p}.ffn_norm.weight");
+        let (fm, h) = self.hc_stage(p, "ffn", x, mixes, am.pre, t, &norm)?;
+        self.end(s);
+        let s = self.span("moe");
+        self.defer_sh.set(true);
+        self.sh.set(None);
+        let r = self.moe(p, h, t, lid);
+        self.defer_sh.set(false);
+        let h = r?;
+        let sh = self.sh.take();
+        self.end(s);
+        let s = self.span("hc");
+        let x = match next {
+            Some(np) => {
+                let (x, m) = self.hc_post_mix(h, sh, x, Some(&fm), t, &np, "attn")?;
+                self.pend_mixes = Some(m);
+                x
+            }
+            None => self.hc_post2(h, sh, x, &fm, t)?,
+        };
         self.end(s);
         Ok((x, fm.pre))
     }
@@ -2190,6 +2350,7 @@ impl GpuModel {
         self.end(sp_embed);
         let mut pre_mix = inp.one_hot;
         let mut mains: Vec<Buf> = Vec::new();
+        self.pend_mixes = None;
         for i in 0..c.n_layers {
             let p = format!("layers.{i}");
             let sp_layer = self.obs.span(&self.s, "layer", Some(i));
@@ -2220,7 +2381,12 @@ impl GpuModel {
                 mains.push(m);
                 self.end(sh);
             }
+            let j = i + 1;
+            self.next_hc =
+                (j < c.n_layers && self.force.is_none() && !c.engram_layer_ids.contains(&j))
+                    .then(|| format!("layers.{j}"));
             let (nh, npm) = self.block(&p, i, h, t, sp, pre_mix, Attn::Main)?;
+            self.next_hc = None;
             h = nh;
             pre_mix = npm;
             self.end(sp_layer);

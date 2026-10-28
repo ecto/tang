@@ -134,6 +134,8 @@ const MORE: &[&str] = &[
     "ds_hc_sinkhorn",
     "ds_hc_pre",
     "ds_hc_post",
+    "ds_hc_post_mix",
+    "ds_hc_stage",
     "ds_embed",
     "ds_mean_hc",
     "ds_swiglu",
@@ -2146,7 +2148,9 @@ mod tests {
                             (256, 1, 1),
                             0,
                             &s,
-                            tang_moe::args![hb.ptr, xb.ptr, pre.ptr, comb.ptr, out.ptr, ti, hc, di],
+                            tang_moe::args![
+                                hb.ptr, 0u64, xb.ptr, pre.ptr, comb.ptr, out.ptr, ti, hc, di
+                            ],
                         )
                         .unwrap()
                     }),
@@ -2880,5 +2884,289 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "fp8 path != f32 path"
         );
+    /// The fused mHC glue of one layer (ds_hc_stage, ds_hc_post_mix, ds_hc_post with the
+    /// shared add) against the unfused kernels, bit for bit, at the real shapes.
+    fn hc_glue(bench: bool) {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::new().unwrap();
+        let (hc, d) = (4usize, 5120usize);
+        let mix = (2 + hc) * hc;
+        let up = |v: &[f32]| DevBuf::from_slice(v).unwrap();
+        let fns: Vec<DevBuf> = (0..2)
+            .map(|i| up(&data(mix * hc * d, 20 + i, 0.02)))
+            .collect();
+        let fw = |i: usize| DsW {
+            w: fns[i].ptr,
+            s: 0,
+            rows: mix as i32,
+            cols: (hc * d) as i32,
+            fmt: 0,
+            _pad: 0,
+        };
+        let scale = up(&[0.5, 0.25, 0.125]);
+        let base = up(&data(mix, 31, 0.5));
+        let nw = DevBuf::from_slice(
+            &data(d, 33, 1.0)
+                .iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let nv = DsW {
+            w: nw.ptr,
+            s: 0,
+            rows: 1,
+            cols: d as i32,
+            fmt: 1,
+            _pad: 0,
+        };
+        let (hci, di, it, eps, neps) = (hc as i32, d as i32, 20i32, 1e-6f32, 1e-6f32);
+        for t in [1usize, 6] {
+            let ti = t as i32;
+            let x = up(&data(t * hc * d, 1, 1.0));
+            let pre0 = up(&data(t * hc, 2, 1.0));
+            let ha = up(&data(t * d, 3, 1.0));
+            let y = up(&data(t * d, 4, 1.0));
+            let sh = up(&data(t * d, 5, 1.0));
+            let a = |n: usize| DevBuf::alloc(n * 4).unwrap();
+            // [mixA, preA, postA, combA, hA, x2, mixF, preF, postF, combF, hF, x3]
+            let sizes = [
+                mix,
+                hc,
+                hc,
+                hc * hc,
+                d,
+                hc * d,
+                mix,
+                hc,
+                hc,
+                hc * hc,
+                d,
+                hc * d,
+            ];
+            let mk = || sizes.iter().map(|&n| a(t * n)).collect::<Vec<_>>();
+            let (o, f) = (mk(), mk());
+            let y2 = a(t * d);
+            let old = |s: &Stream| -> Result<()> {
+                let b = &o;
+                let nn = (t * d) as i64;
+                unsafe {
+                    k.go(
+                        "ds_copy",
+                        blocks(t * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![y2.ptr, y.ptr, nn],
+                    )?;
+                }
+                k.linear(s, &fw(0), x.ptr, b[0].ptr, t, false)?;
+                let n = (hc * d) as i32;
+                unsafe {
+                    k.go(
+                        "ds_hc_sinkhorn",
+                        (ti as u32, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            x.ptr, b[0].ptr, n, neps, scale.ptr, base.ptr, b[1].ptr, b[2].ptr,
+                            b[3].ptr, hci, it, eps
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_pre",
+                        blocks(t * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![x.ptr, pre0.ptr, b[4].ptr, ti, hci, di],
+                    )?;
+                }
+                k.rms(s, b[4].ptr, &nv, t, neps)?;
+                unsafe {
+                    k.go(
+                        "ds_hc_post",
+                        blocks(t * hc * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            ha.ptr, 0u64, x.ptr, b[2].ptr, b[3].ptr, b[5].ptr, ti, hci, di
+                        ],
+                    )?;
+                }
+                k.linear(s, &fw(1), b[5].ptr, b[6].ptr, t, false)?;
+                unsafe {
+                    k.go(
+                        "ds_hc_sinkhorn",
+                        (ti as u32, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            b[5].ptr, b[6].ptr, n, neps, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
+                            b[9].ptr, hci, it, eps
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_pre",
+                        blocks(t * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![b[5].ptr, b[1].ptr, b[10].ptr, ti, hci, di],
+                    )?;
+                }
+                k.rms(s, b[10].ptr, &nv, t, neps)?;
+                let nn = (t * d) as i64;
+                unsafe {
+                    k.go(
+                        "ds_add_round",
+                        blocks(t * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![y2.ptr, sh.ptr, nn],
+                    )?;
+                    k.go(
+                        "ds_hc_post",
+                        blocks(t * hc * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            y2.ptr, 0u64, b[5].ptr, b[8].ptr, b[9].ptr, b[11].ptr, ti, hci, di
+                        ],
+                    )?;
+                }
+                Ok(())
+            };
+            let new = |s: &Stream| -> Result<()> {
+                let b = &f;
+                let (w0, w1) = (nv, fw(1));
+                let wa = fw(0);
+                unsafe {
+                    k.go(
+                        "ds_hc_post_mix",
+                        (mix as u32, t.div_ceil(8) as u32, 1),
+                        (32 * t.min(8) as u32, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, b[0].ptr, ti, hci, di
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_stage",
+                        (ti as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            x.ptr, b[0].ptr, neps, scale.ptr, base.ptr, b[1].ptr, b[2].ptr,
+                            b[3].ptr, hci, it, eps, pre0.ptr, b[4].ptr, w0, di, neps
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_post_mix",
+                        (mix as u32, t.div_ceil(8) as u32, 1),
+                        (32 * t.min(8) as u32, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            ha.ptr, 0u64, x.ptr, b[2].ptr, b[3].ptr, b[5].ptr, w1, b[6].ptr, ti,
+                            hci, di
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_stage",
+                        (ti as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            b[5].ptr, b[6].ptr, neps, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
+                            b[9].ptr, hci, it, eps, b[1].ptr, b[10].ptr, w0, di, neps
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_post",
+                        blocks(t * hc * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            y.ptr, sh.ptr, b[5].ptr, b[8].ptr, b[9].ptr, b[11].ptr, ti, hci, di
+                        ],
+                    )?;
+                }
+                Ok(())
+            };
+            old(&s).unwrap();
+            new(&s).unwrap();
+            s.sync().unwrap();
+            for (i, &n) in sizes.iter().enumerate() {
+                let (u, v) = (
+                    o[i].read::<f32>(0, t * n).unwrap(),
+                    f[i].read::<f32>(0, t * n).unwrap(),
+                );
+                let bad = u
+                    .iter()
+                    .zip(&v)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(bad, 0, "t {t} buffer {i}: {bad} of {} differ", t * n);
+            }
+            if !bench {
+                continue;
+            }
+            // 40 layers of glue per graph, replayed; CUDA events around the replays
+            for (name, body) in [
+                (
+                    "unfused (11 launches/layer)",
+                    &old as &dyn Fn(&Stream) -> Result<()>,
+                ),
+                ("fused (5 launches/layer)", &new),
+            ] {
+                let gr = gpu::Graph::capture(&s, |s| {
+                    for _ in 0..40 {
+                        body(s).unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                gr.launch(&s).unwrap();
+                let (e0, e1) = (
+                    gpu::Event::new(true).unwrap(),
+                    gpu::Event::new(true).unwrap(),
+                );
+                let n = 20;
+                e0.record(&s).unwrap();
+                for _ in 0..n {
+                    gr.launch(&s).unwrap();
+                }
+                e1.record(&s).unwrap();
+                e1.sync().unwrap();
+                let us = e1.since(&e0).unwrap() as f64 * 1e3 / n as f64;
+                eprintln!(
+                    "hc_glue t {t} {name}: {us:.0} us / 40 layers, {:.1} us / layer",
+                    us / 40.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hc_glue_fused_exact() {
+        hc_glue(false);
+    }
+
+    #[test]
+    #[ignore]
+    fn hc_glue_bench() {
+        hc_glue(true);
     }
 }
