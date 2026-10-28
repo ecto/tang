@@ -1782,8 +1782,8 @@ impl GpuModel {
         unsafe {
             self.k.go(
                 "ds_hc_post_mix",
-                ((t * w.v.rows as usize) as u32, 1, 1),
-                (32, 1, 1),
+                (w.v.rows as u32, t.div_ceil(8) as u32, 1),
+                (32 * t.min(8) as u32, 1, 1),
                 0,
                 &self.s,
                 args![h.ptr, h2, res.ptr, post, comb, out.ptr, wv, mixes.ptr, ti, hci, di],
@@ -1847,7 +1847,7 @@ impl GpuModel {
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
         let d = self.cpu.cfg.dim;
-        if std::env::var_os("DS_TAP").is_none() && d % 256 == 0 && self.cpu.cfg.hc_mult <= 8 {
+        if std::env::var_os("DS_TAP").is_none() && d % 32 == 0 && self.cpu.cfg.hc_mult <= 8 {
             return self.block_fused(p, lid, x, t, sp, pre_mix, attn);
         }
         let s = self.span("hc");

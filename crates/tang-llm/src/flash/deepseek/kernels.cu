@@ -388,21 +388,25 @@ extern "C" __global__ void ds_hc_post(const float* h, const float* h2, const flo
 }
 
 // ds_hc_post then the next mHC mixes GEMM (ds_linear / ds_linear_t8, unrounded) in one
-// launch, or (post null) the GEMM alone on the stream res: one warp per block per (token,
-// mix row n), so the long per-lane chains spread over the SMs. Each lane walks k = lane +
+// launch, or (post null) the GEMM alone on the stream res: block (mix row n, 8 tokens), warp
+// per token, so the long per-lane chains spread over the SMs and the weight row is read once
+// per block. Grid (rows, ceil(t / 8)), block 32 min(t, 8). Each lane walks k = lane +
 // 32 j in order (the linear's per-lane order, then its shuffle tree), producing x[ti][k] on
-// the fly; the n == 0 warps also store the stream. d % 256 == 0, hc <= 8.
-extern "C" __global__ void __launch_bounds__(32) ds_hc_post_mix(const float* __restrict__ h,
+// the fly; the n == 0 warps also store the stream. d % 32 == 0, hc <= 8.
+extern "C" __global__ void __launch_bounds__(256) ds_hc_post_mix(const float* __restrict__ h,
                                                                  const float* __restrict__ h2,
                                                                  const float* __restrict__ res,
                                                                  const float* __restrict__ post,
                                                                  const float* __restrict__ comb, float* __restrict__ out,
                                                                  DsW w, float* __restrict__ y, int t, int hc, int d) {
     const int U = 8;
-    int ti = blockIdx.x / w.rows, n = blockIdx.x % w.rows, lane = threadIdx.x;
+    int ti = blockIdx.y * 8 + threadIdx.x / 32, n = blockIdx.x, lane = threadIdx.x & 31;
+    if (ti >= t) return;
     float s = 0.f;
     float* o = out + (long long)ti * hc * d;
     const float* rr = res + (long long)ti * hc * d;
+    const float* hr = h + (long long)ti * d;
+    const float* h2r = h2 ? h2 + (long long)ti * d : nullptr;
     for (int c = 0; c < hc; c++) {
         float cj[8], pc = 0.f;
         if (post) {
@@ -410,15 +414,27 @@ extern "C" __global__ void __launch_bounds__(32) ds_hc_post_mix(const float* __r
 #pragma unroll
             for (int j = 0; j < 8; j++) cj[j] = j < hc ? comb[((long long)ti * hc + j) * hc + c] : 0.f;
         }
-        for (int i0 = lane; i0 < d; i0 += 32 * U) {
+        // x[ti][c][i] (as hc_post_at), stored by the n == 0 warps
+        auto xat = [&](int i) -> float {
+            if (!post) return rr[(long long)c * d + i];
+            float acc = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                if (j < hc) acc += cj[j] * rr[(long long)j * d + i];
+            float hv = h2r ? bf(hr[i] + h2r[i]) : hr[i];
+            float v = bf(pc * hv + acc);
+            if (n == 0) o[(long long)c * d + i] = v;
+            return v;
+        };
+        int i0 = lane;
+        for (; i0 + 32 * (U - 1) < d; i0 += 32 * U) {
             float xv[U], wv[U];
             if (post) {
                 float acc[U], hv[U];
 #pragma unroll
                 for (int u = 0; u < U; u++) {
                     int i = i0 + 32 * u;
-                    long long hi = (long long)ti * d + i;
-                    hv[u] = h2 ? bf(h[hi] + h2[hi]) : h[hi];
+                    hv[u] = h2r ? bf(hr[i] + h2r[i]) : hr[i];
                     acc[u] = 0.f;
                 }
 #pragma unroll
@@ -428,10 +444,10 @@ extern "C" __global__ void __launch_bounds__(32) ds_hc_post_mix(const float* __r
                     for (int u = 0; u < U; u++) acc[u] += cj[j] * rr[(long long)j * d + i0 + 32 * u];
                 }
 #pragma unroll
-                for (int u = 0; u < U; u++) {
-                    xv[u] = bf(pc * hv[u] + acc[u]);
-                    if (n == 0) o[(long long)c * d + i0 + 32 * u] = xv[u];
-                }
+                for (int u = 0; u < U; u++) xv[u] = bf(pc * hv[u] + acc[u]);
+                if (n == 0)
+#pragma unroll
+                    for (int u = 0; u < U; u++) o[(long long)c * d + i0 + 32 * u] = xv[u];
             } else {
 #pragma unroll
                 for (int u = 0; u < U; u++) xv[u] = rr[(long long)c * d + i0 + 32 * u];
@@ -441,6 +457,7 @@ extern "C" __global__ void __launch_bounds__(32) ds_hc_post_mix(const float* __r
 #pragma unroll
             for (int u = 0; u < U; u++) s = fmaf(xv[u], wv[u], s);
         }
+        for (; i0 < d; i0 += 32) s = fmaf(xat(i0), wget(w, n, c * d + i0), s);
     }
     for (int q = 16; q; q >>= 1) s += __shfl_xor_sync(0xffffffffu, s, q);
     if (lane == 0) y[(long long)ti * w.rows + n] = s;

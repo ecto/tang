@@ -2649,8 +2649,8 @@ mod tests {
                 unsafe {
                     k.go(
                         "ds_hc_post_mix",
-                        ((t * mix) as u32, 1, 1),
-                        (32, 1, 1),
+                        (mix as u32, t.div_ceil(8) as u32, 1),
+                        (32 * t.min(8) as u32, 1, 1),
                         0,
                         s,
                         tang_moe::args![
@@ -2670,8 +2670,8 @@ mod tests {
                     )?;
                     k.go(
                         "ds_hc_post_mix",
-                        ((t * mix) as u32, 1, 1),
-                        (32, 1, 1),
+                        (mix as u32, t.div_ceil(8) as u32, 1),
+                        (32 * t.min(8) as u32, 1, 1),
                         0,
                         s,
                         tang_moe::args![
