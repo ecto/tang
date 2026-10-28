@@ -135,6 +135,7 @@ const MORE: &[&str] = &[
     "ds_mean_hc",
     "ds_swiglu",
     "ds_router",
+    "ds_linear_t8",
     "ds_gather_rows",
     "ds_scatter_add",
     "ds_add",
@@ -418,6 +419,36 @@ impl Kernels {
         Ok(())
     }
 
+    /// The MoE router: raw gate logits [t][ne] (f32) and bias [ne] -> ids/weights [t][k]
+    /// (sqrt-softplus scores, top-k of score + bias ties to the lower id, weights normalized
+    /// when `norm` and scaled by `scale`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn router(
+        &self,
+        s: &Stream,
+        raw: u64,
+        bias: u64,
+        ids: u64,
+        wts: u64,
+        t: usize,
+        ne: usize,
+        k: usize,
+        norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        let (ti, nei, ki, ni) = (t as i32, ne as i32, k as i32, norm as i32);
+        unsafe {
+            self.go(
+                "ds_router",
+                (t as u32, 1, 1),
+                (128, 1, 1),
+                (ne * 5) as u32,
+                s,
+                tang_moe::args![raw, bias, ids, wts, ti, nei, ki, ni, scale],
+            )
+        }
+    }
+
     /// Router ids/weights [t][k] to per-expert CSR: counts [ne], off [ne + 1], rows and
     /// route weights [t * k], rows ascending within an expert.
     #[allow(clippy::too_many_arguments)]
@@ -450,6 +481,18 @@ impl Kernels {
     /// `y = x · wᵀ` for `t` rows (`x` already activation-quantized when the weight is).
     pub fn linear(&self, s: &Stream, w: &DsW, x: u64, y: u64, t: usize, round: bool) -> Result<()> {
         let (wv, ti, r) = (*w, t as i32, round as i32);
+        if (2..=8).contains(&t) {
+            return unsafe {
+                self.go(
+                    "ds_linear_t8",
+                    blocks(w.rows as usize * 32, 256),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![wv, x, y, ti, r],
+                )
+            };
+        }
         unsafe {
             super::obs::launch(
                 self.linear,
@@ -994,6 +1037,26 @@ mod tests {
             k.linear(&s, &w.v, dx.ptr, dy.ptr, t, true).unwrap();
             s.sync().unwrap();
             let got = dy.read::<f32>(0, t * rows).unwrap();
+            // the t <= 8 kernel is bit-identical to one row at a time
+            for ti in 0..t {
+                k.linear(
+                    &s,
+                    &w.v,
+                    dx.ptr + (ti * cols * 4) as u64,
+                    dy.ptr + (ti * rows * 4) as u64,
+                    1,
+                    true,
+                )
+                .unwrap();
+            }
+            s.sync().unwrap();
+            let one = dy.read::<f32>(0, t * rows).unwrap();
+            assert!(
+                got.iter()
+                    .zip(&one)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{name}: t8 != t1"
+            );
             let r = rel(&got, &want);
             eprintln!("{name}: rel {r:.2e}");
             assert!(r < 1e-2, "{name}: rel {r}");
@@ -1993,6 +2056,138 @@ mod tests {
                 assert_eq!(go[e + 1] as usize, o + routes[e].len());
                 for (q, &(r, w)) in routes[e].iter().enumerate() {
                     assert_eq!((gr[o + q], gw[o + q]), (r, w), "route e{e}");
+                }
+            }
+        }
+    }
+
+    /// The MoE router on the real shape (manual: `--ignored --nocapture router_bench`):
+    /// bf16 gate [384, 5120] GEMV, `ds_router`, `route`, each timed alone.
+    #[test]
+    #[ignore]
+    fn router_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (ne, topk, d, t) = (384usize, 6usize, 5120usize, 6usize);
+        let wb: Vec<u16> = data(ne * d, 5, 0.05)
+            .iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let wdev = DevBuf::from_slice(&wb).unwrap();
+        let w = DsW {
+            w: wdev.ptr,
+            s: 0,
+            rows: ne as i32,
+            cols: d as i32,
+            fmt: 1,
+            _pad: 0,
+        };
+        let x = DevBuf::from_slice(&data(t * d, 7, 1.0)).unwrap();
+        let bias = DevBuf::from_slice(&data(ne, 9, 0.1)).unwrap();
+        let raw = DevBuf::alloc(t * ne * 4).unwrap();
+        let (ids, wts) = (
+            DevBuf::alloc(t * topk * 4).unwrap(),
+            DevBuf::alloc(t * topk * 4).unwrap(),
+        );
+        let (counts, off) = (
+            DevBuf::alloc(ne * 4).unwrap(),
+            DevBuf::alloc((ne + 1) * 4).unwrap(),
+        );
+        let (rows, rw) = (
+            DevBuf::alloc(t * topk * 4).unwrap(),
+            DevBuf::alloc(t * topk * 4).unwrap(),
+        );
+        let time = |name: &str, f: &dyn Fn()| {
+            f();
+            s.sync().unwrap();
+            let iters = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            s.sync().unwrap();
+            let us = t0.elapsed().as_secs_f64() / iters as f64 * 1e6;
+            eprintln!("router_bench {name}: {us:.1} us");
+        };
+        time("gate", &|| {
+            k.linear(&s, &w, x.ptr, raw.ptr, t, false).unwrap();
+        });
+        time("ds_router", &|| {
+            k.router(
+                &s, raw.ptr, bias.ptr, ids.ptr, wts.ptr, t, ne, topk, true, 1.5,
+            )
+            .unwrap();
+        });
+        time("route", &|| {
+            k.route(
+                &s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+            )
+            .unwrap();
+        });
+    }
+
+    /// `ds_router` against the CPU router math on exact ties (coarse raw values shared by
+    /// many experts, so the order rests on the lower-id rule) and on random logits.
+    #[test]
+    fn router_matches_cpu() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        for (t, ne, kk, norm, coarse) in [
+            (1, 8, 1, true, false),
+            (6, 384, 6, true, true),
+            (6, 384, 6, true, false),
+            (5, 256, 8, false, true),
+            (40, 1000, 16, true, true),
+        ] {
+            let mut raw = data(t * ne, (ne + kk) as u64, 3.0);
+            let mut bias = data(ne, 11, 0.5);
+            if coarse {
+                raw.iter_mut().for_each(|v| *v = (*v * 2.0).round() / 2.0);
+                bias.iter_mut().for_each(|v| *v = (*v * 4.0).round() / 4.0);
+            }
+            let (dr, db) = (
+                DevBuf::from_slice(&raw).unwrap(),
+                DevBuf::from_slice(&bias).unwrap(),
+            );
+            let (ids, wts) = (
+                DevBuf::alloc(t * kk * 4).unwrap(),
+                DevBuf::alloc(t * kk * 4).unwrap(),
+            );
+            k.router(&s, dr.ptr, db.ptr, ids.ptr, wts.ptr, t, ne, kk, norm, 1.5)
+                .unwrap();
+            s.sync().unwrap();
+            let (gi, gw) = (
+                ids.read::<i32>(0, t * kk).unwrap(),
+                wts.read::<f32>(0, t * kk).unwrap(),
+            );
+            for ti in 0..t {
+                let row: Vec<f32> = raw[ti * ne..(ti + 1) * ne]
+                    .iter()
+                    .map(|&x| forward::softplus(x).sqrt())
+                    .collect();
+                let biased: Vec<f32> = row.iter().zip(&bias).map(|(a, b)| a + b).collect();
+                let sel = forward::topk_stable(&biased, kk);
+                let want: Vec<i32> = sel.iter().map(|&e| e as i32).collect();
+                assert_eq!(
+                    &gi[ti * kk..(ti + 1) * kk],
+                    &want[..],
+                    "ids t{t} ne{ne} row {ti}"
+                );
+                let mut w: Vec<f32> = sel.iter().map(|&e| row[e]).collect();
+                if norm && kk > 1 {
+                    let sm: f32 = w.iter().sum::<f32>() + 1e-20;
+                    w.iter_mut().for_each(|v| *v /= sm);
+                }
+                for (j, &wv) in w.iter().enumerate() {
+                    let gv = gw[ti * kk + j];
+                    assert!(
+                        (gv - wv * 1.5).abs() <= 1e-5 * (1.0 + gv.abs()),
+                        "wts row {ti}"
+                    );
                 }
             }
         }

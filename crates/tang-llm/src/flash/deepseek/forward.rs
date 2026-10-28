@@ -58,7 +58,7 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 /// torch's softplus (beta 1, threshold 20).
-fn softplus(x: f32) -> f32 {
+pub(crate) fn softplus(x: f32) -> f32 {
     if x > 20.0 {
         x
     } else {

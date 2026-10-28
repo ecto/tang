@@ -109,6 +109,49 @@ extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int
     if (lane == 0) y[(long long)ti * w.rows + n] = round ? bf(s) : s;
 }
 
+// ds_linear for t <= 8 rows, one warp per output column n across all t rows: the weight row
+// is read once, not t times. Bit-identical to ds_linear (same per-lane order and shuffle tree).
+extern "C" __global__ void ds_linear_t8(DsW w, const float* x, float* y, int t, int round) {
+    int n = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+    if (n >= w.rows) return;
+    float s[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) s[i] = 0.f;
+    int k = lane;
+    if (w.fmt <= 1) {
+        // loads for U steps issued ahead of the in-order FMAs (memory-level parallelism)
+        const int U = 8;
+        for (; k + 32 * (U - 1) < w.cols; k += 32 * U) {
+            float wv[U];
+#pragma unroll
+            for (int u = 0; u < U; u++) wv[u] = wget(w, n, k + 32 * u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (i >= t) break;
+                const float* xr = x + (long long)i * w.cols + k;
+                float xv[U];
+#pragma unroll
+                for (int u = 0; u < U; u++) xv[u] = xr[32 * u];
+#pragma unroll
+                for (int u = 0; u < U; u++) s[i] = fmaf(xv[u], wv[u], s[i]);
+            }
+        }
+    }
+    for (; k < w.cols; k += 32) {
+        float wv = wget(w, n, k);
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (i < t) s[i] = fmaf(x[(long long)i * w.cols + k], wv, s[i]);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i >= t) break;
+        float v = s[i];
+        for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) y[(long long)i * w.rows + n] = round ? bf(v) : v;
+    }
+}
+
 // In place: fp8 quant-dequant per 32 with power-of-two scales (warp per group, lane per value).
 extern "C" __global__ void ds_fp8_qdq(float* v, int n_groups) {
     int g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
@@ -339,39 +382,63 @@ extern "C" __global__ void ds_swiglu(const float* g, const float* u, const float
     h[i] = swiglu1(g[i], u[i], w ? w + i / inter : 0, lim);
 }
 
-// The router for one token per thread: raw [t][ne] gate logits (f32) -> ids/weights [t][k].
+// The router, one block per token: raw [t][ne] gate logits (f32) -> ids/weights [t][k].
 // sqrt(softplus) scores, top-k of score + bias (ties to the lower id), weights normalized and
-// scaled. k <= 16.
+// scaled. k <= 16; dynamic shared memory: ne floats (score + bias) + ne bytes (used flags).
+// Each round is a block argmax; the weight sum runs serially in selection order, as before.
+__device__ __forceinline__ bool router_better(float v, int e, float bv, int be) {
+    return be < 0 || (e >= 0 && (v > bv || (v == bv && e < be)));
+}
+
 extern "C" __global__ void ds_router(const float* raw, const float* bias, int* ids, float* wts, int t, int ne, int k,
                                      int norm, float route_scale) {
-    int ti = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ti >= t) return;
+    extern __shared__ float sh[];
+    float* sv = sh;
+    unsigned char* used = (unsigned char*)(sh + ne);
+    __shared__ float rv[32];
+    __shared__ int re[32];
+    __shared__ int sel[16];
+    int ti = blockIdx.x, lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
     const float* r = raw + (long long)ti * ne;
-    int sel[16];
+    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+        float x = r[e];
+        float sc = sqrtf(x > 20.f ? x : log1pf(expf(x)));
+        sv[e] = sc + bias[e];
+        used[e] = 0;
+    }
+    __syncthreads();
     for (int j = 0; j < k; j++) {
-        int best = -1;
+        int be = -1;
         float bv = 0.f;
-        for (int e = 0; e < ne; e++) {
-            bool used = false;
-            for (int q = 0; q < j; q++) used |= sel[q] == e;
-            if (used) continue;
-            float x = r[e];
-            float sc = sqrtf(x > 20.f ? x : log1pf(expf(x)));
-            float v = sc + bias[e];
-            if (best < 0 || v > bv) { best = e; bv = v; }
+        for (int e = threadIdx.x; e < ne; e += blockDim.x)
+            if (!used[e] && router_better(sv[e], e, bv, be)) { be = e; bv = sv[e]; }
+        for (int o = 16; o; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            int oe = __shfl_xor_sync(0xffffffffu, be, o);
+            if (router_better(ov, oe, bv, be)) { be = oe; bv = ov; }
         }
-        sel[j] = best;
+        if (lane == 0) { rv[wid] = bv; re[wid] = be; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int q = 1; q < nw; q++)
+                if (router_better(rv[q], re[q], bv, be)) { be = re[q]; bv = rv[q]; }
+            sel[j] = be;
+            used[be] = 1;
+        }
+        __syncthreads();
     }
-    float w[16], sum = 0.f;
-    for (int j = 0; j < k; j++) {
-        float x = r[sel[j]];
-        w[j] = sqrtf(x > 20.f ? x : log1pf(expf(x)));
-        sum += w[j];
-    }
-    for (int j = 0; j < k; j++) {
-        float v = (norm && k > 1) ? w[j] / (sum + 1e-20f) : w[j];
-        ids[ti * k + j] = sel[j];
-        wts[ti * k + j] = v * route_scale;
+    if (threadIdx.x == 0) {
+        float w[16], sum = 0.f;
+        for (int j = 0; j < k; j++) {
+            float x = r[sel[j]];
+            w[j] = sqrtf(x > 20.f ? x : log1pf(expf(x)));
+            sum += w[j];
+        }
+        for (int j = 0; j < k; j++) {
+            float v = (norm && k > 1) ? w[j] / (sum + 1e-20f) : w[j];
+            ids[ti * k + j] = sel[j];
+            wts[ti * k + j] = v * route_scale;
+        }
     }
 }
 

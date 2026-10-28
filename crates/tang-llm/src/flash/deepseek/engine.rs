@@ -1391,23 +1391,18 @@ impl GpuModel {
         let raw = self.raw(x.ptr, t, &format!("{p}.ffn.gate.weight"))?;
         let bias = self.dw(&format!("{p}.ffn.gate.bias"))?;
         let (ids, wts) = (self.fbuf(t * topk)?, self.fbuf(t * topk)?);
-        let (ti, nei, ki, norm, rs) = (
-            t as i32,
-            ne as i32,
-            topk as i32,
-            c.norm_topk_prob as i32,
+        self.k.router(
+            &self.s,
+            raw.ptr,
+            bias.v.w,
+            ids.ptr,
+            wts.ptr,
+            t,
+            ne,
+            topk,
+            c.norm_topk_prob,
             c.route_scale,
-        );
-        unsafe {
-            self.k.go(
-                "ds_router",
-                blocks(t, 64),
-                (64, 1, 1),
-                0,
-                &self.s,
-                args![raw.ptr, bias.v.w, ids.ptr, wts.ptr, ti, nei, ki, norm, rs],
-            )?
-        };
+        )?;
         self.end(s);
         // per-expert CSR on the device
         let s = self.span("route");
