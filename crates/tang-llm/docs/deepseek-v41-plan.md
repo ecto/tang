@@ -173,6 +173,14 @@ f32 sampler). The greedy path's remaining gap to 1000 tok/s (~4 ms per token-ste
 count and per-layer glue: 1386 launches for 26 ms of graph replay on 8 H100s, where the
 bytes per rank (experts/8 + dense) put the bandwidth floor near 3 ms.
 
+Wave 7 attn3 lane, first step (cc255a81, 8× H100): q's rope and o's inverse rope fused into the
+tiled attention's q load / o store, and the window + top-k index rows in one `dg_win_idx`
+launch. Verify step 1386 → 1268 launches, direct gpu 31.58 → 31.51 ms (`layer.attn` 12.75 →
+12.59: q 2.76 → 2.59, wo 3.43 → 3.29, sparse_attn 3.51 → 3.68), greedy 125.2/133.5 → 125.6/133.3
+tok/s (noise), acceptance 152/235 unchanged. Launch count alone buys little here: the attention
+kernels are latency-bound in themselves (~45 µs a sparse_attn span for ~8 MB of keys).
+`DS_ATTN_FUSE=1` (soft+pv in one launch) measured no better (3.84 ms) and stays opt-in.
+
 Wave 6 as merged (895f89b0 → bab5bcfc): attention fusion (one
 grouped K-split launch for wo, 19 → 2 launches, 143 → 54 µs on a 3090; q + window_kv fused,
 the compressor/indexer key side batched over the window, ~150 → ~30 attention launches per
