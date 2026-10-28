@@ -4,6 +4,29 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (mtp-ready) — MTP + WIN_STEP bisect fix merged onto 9c49294d; WIN_STEP = K+1 by default under --mtp (branch claude/glm5-mtp-ready)
+- Merge of claude/glm5-mtp-bisect (contains claude/glm5-mtp) onto frog/glm5-forward 9c49294d.
+  Conflicts: this file (all entries kept), engine.rs CLI (`--slots` and `--mtp` both kept,
+  now mutually exclusive), kda_dev.rs `core_pf2` (the WIN_STEP serial loop now passes the
+  batcher's `slot`). Semantic conflict: `Snap`/`snapshot`/`restore` ported to the per-slot
+  `kda[slot][layer]` / `dsa[slot][layer]` layout — MTP rewinds slot 0 only.
+- `TANG_GLM5_KDA_WIN_STEP` unset now falls back to `mtp::WIN_STEP_DEFAULT`, which
+  `mtp::cli_run` sets to K+1 (the verify window), so `--mtp K` is exact by default; env
+  still overrides (`=0` restores the chunked core). Plain decode: default 0, unchanged.
+- Test `engine_gpu_win_step_window_matches_steps` (tiny, PF2): one t-token window with
+  win_step >= t vs t single decode steps, t = 2,3,4 — every logit row max abs 0 (bitwise),
+  and the step after the window also 0. Its PF2 env set/remove raced
+  `engine_gpu_slots_batch_matches_single` in the parallel run (slot 0 max abs 9.8); fixed
+  with a test `ENV_LOCK` around both loads.
+- Verified: local CPU `flash::glm5` 42/0. mew 3090 (TANG_REQUIRE_CUDA=1) 80 passed / 1
+  failed — the known `engine_gpu_trace_is_transparent` parallel flake (passes alone).
+- H200 #1 (/root/w-mtp, B flags): haiku -n 8 --temp 0 ids gate plain = oracle
+  `785 1196 6801 264 6386 38038 911 279`; --mtp 1 = oracle (accept 4/4, win_step=2 logged).
+  --mtp 2, --mtp 3 and --mtp 3 with WIN_STEP=0 exited rc=0 but their ids were NOT read
+  back: the box was stopped externally before the logs could be fetched. The tok/s bench
+  (plain, --mtp 1/2/3, and the WIN_STEP=0 vs default cost at depth 3) never ran — the GPU
+  lock was contended by other agents for ~3 h. OPEN: rerun all of it on a live H200.
+
 ## 2026-10-28 (integration round 2) — k5d_tail + FFN repack merged: B300 35.02 tok/s decode with repack off, now the default (branch claude/glm5-integrate2)
 
 Merged onto frog/glm5-forward 38bb2bed: claude/glm5-kda-kernels 1073e571 (k5d_tail, `TANG_GLM5_KDA_TAIL`
