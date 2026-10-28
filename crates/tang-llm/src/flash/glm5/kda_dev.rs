@@ -318,6 +318,7 @@ impl DevLayer {
     /// 48 KB, at most 8.
     unsafe fn qgemv_launch(&self, s: &Stream, tab: &DevBuf, nseg: usize, rb: u32, rows_total: usize,
         bytes: u64, codes: u64, scales: u64, cols: usize) -> Result<()> {
+        let nw = (49152 / rb as usize).clamp(1, 8);
         // a Q4_K row is cols/256 super-blocks of 144 B (a Q8_0 row: cols/32 blocks of 34 B)
         let f = match (rb as usize == cols / 256 * 144, rb as usize <= 9 * 32 * 16) {
             (true, true) if rb as usize <= 5 * 32 * 16 => self.gv.qgemv_q4k5,
@@ -325,8 +326,8 @@ impl DevLayer {
             (false, true) => self.gv.qgemv9,
             (false, false) => self.gv.qgemv17,
         };
-        // neither the Q8_0 nor the Q4_K kernels stage (kda_k5.cuh): 4 warps a block, no shared memory
-        let (nw, smem) = (4usize, 0u32);
+        // the Q8_0 kernels stage nothing (kda_k5.cuh): 4 warps a block, no shared memory
+        let (nw, smem) = if rb as usize == cols / 256 * 144 { (nw, nw as u32 * rb) } else { (4, 0) };
         tang_moe::gpu::trace::bytes(bytes);
         unsafe {
             launch(
