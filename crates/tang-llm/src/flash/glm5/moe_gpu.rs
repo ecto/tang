@@ -51,7 +51,8 @@ const P_HD: usize = 9;
 const P_XQ2: usize = 10;
 const P_HQ2: usize = 11;
 const P_YP: usize = 12;
-const P_N: usize = 13;
+const P_CNT: usize = 13;
+const P_N: usize = 14;
 
 /// Device scratch reused across calls (grown on demand), plus the stream `ffn_host` runs on.
 #[derive(Default)]
@@ -60,6 +61,8 @@ struct Pool {
     stream: Option<Stream>,
     /// dynamic-smem opt-in already set on g5f_gu / g5f_down (bytes)
     smem_set: [u32; 3],
+    /// u32s of P_CNT known zero (g5f_route resets its counters on exit)
+    cnt_zero: usize,
 }
 
 impl Pool {
@@ -94,6 +97,9 @@ pub struct Kernels {
     f_down: Func,
     f_down_split: Func,
     f_sum: Func,
+    f_route: Func,
+    /// q8(x) + router + select as one launch (`g5f_route`; `TANG_GLM5_MOE_ROUTE1=0`: three).
+    pub route1: bool,
     /// The fast path (`TANG_GLM5_MOE=fast`). Tests flip it directly.
     pub fast: bool,
     /// Two-level int8 activations (codes + residual codes; `TANG_GLM5_MOE_ACT=q8` turns it
@@ -130,10 +136,17 @@ impl Kernels {
         };
         // TANG_GLM5_MOE_MINB: __launch_bounds__ min blocks for g5f_gu / g5f_down. 6 (<= 80 regs)
         // measured best on the H200 l4 T1: 1 -> 126 us (86 / 139 regs), 4 -> 115, 6 -> 110
-        let minb = std::env::var("TANG_GLM5_MOE_MINB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(6);
+        let minb = std::env::var("TANG_GLM5_MOE_MINB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8);
         // TANG_GLM5_MOE_DOT32=0: the 8-weight Q4_K / Q5_K row decode instead of the 32-chunk one
         let dot32 = i32::from(env_on("TANG_GLM5_MOE_DOT32", true));
-        let src = format!("#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n{}", super::SRC);
+        // TANG_GLM5_MOE_UNROLL: unroll of the 32-chunk dot loops (more loads in flight per lane)
+        let unroll = std::env::var("TANG_GLM5_MOE_UNROLL").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+        // TANG_GLM5_MOE_FUSE2=0: gate / up (and the down row pair) as two separate row loops
+        let fuse2 = i32::from(env_on("TANG_GLM5_MOE_FUSE2", true));
+        let src = format!(
+            "#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n{}",
+            super::SRC
+        );
         let m = g.module(&src)?;
         let debug = std::env::var("TANG_GLM5_MOE_DEBUG").is_ok_and(|v| v == "1");
         let smem_optin = g
@@ -152,8 +165,10 @@ impl Kernels {
             f_down: m.func("g5f_down")?,
             f_down_split: m.func("g5f_down_split")?,
             f_sum: m.func("g5f_sum")?,
+            f_route: m.func("g5f_route")?,
+            route1: env_on("TANG_GLM5_MOE_ROUTE1", true),
             fast: std::env::var("TANG_GLM5_MOE").is_ok_and(|v| v == "fast"),
-            stage: env_on("TANG_GLM5_MOE_STAGE", true),
+            stage: env_on("TANG_GLM5_MOE_STAGE", false),
             down_split: env_on("TANG_GLM5_MOE_DOWN_SPLIT", true),
             down_sw: match std::env::var("TANG_GLM5_MOE_DOWN_SW").ok().as_deref() {
                 Some("1") => 1,
@@ -255,6 +270,91 @@ pub fn upload(w: &W, n_mat: usize, rows: usize, cols: usize) -> Result<DevW> {
     }
 }
 
+/// Repacked row layouts (moe_cuda.cuh `G5_Q8R` / `G5_Q6R`): the same values with every 32-weight
+/// quant payload 16-byte aligned, so `g5f_lane_dot32r` streams them as 16-byte loads.
+pub const G5_Q8R: u32 = 108;
+pub const G5_Q6R: u32 = 114;
+
+/// One GGUF row of `k` weights (ggml type `ty`: 8 Q8_0 or 14 Q6_K) in its repacked layout,
+/// appended to `out` (padded to `repacked_row_bytes`).
+fn repack_row(ty: u32, row: &[u8], k: usize, out: &mut Vec<u8>) {
+    let start = out.len();
+    match ty {
+        8 => {
+            let nb = k / 32;
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 34 + 2..b * 34 + 34]);
+            }
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 34..b * 34 + 2]);
+            }
+        }
+        14 => {
+            let nb = k / 256;
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 210..b * 210 + 192]);
+            }
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 210 + 192..b * 210 + 208]);
+            }
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 210 + 208..b * 210 + 210]);
+            }
+        }
+        _ => unreachable!(),
+    }
+    out.resize(start + repacked_row_bytes(ty, k), 0);
+}
+
+fn repacked_row_bytes(ty: u32, k: usize) -> usize {
+    let raw = if ty == 8 { k / 32 * 34 } else { k / 256 * 210 };
+    raw.next_multiple_of(16)
+}
+
+/// `TANG_GLM5_MOE_REPACK` (default on; `0` keeps the GGUF layout): repack the FFN's Q8_0 / Q6_K
+/// weights at upload.
+fn repack_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TANG_GLM5_MOE_REPACK").map_or(true, |v| v != "0"))
+}
+
+/// [`upload`] for the MoE / dense FFN weights: Q8_0 (k % 32 == 0) and Q6_K (k % 256 == 0) are
+/// repacked to [`G5_Q8R`] / [`G5_Q6R`] (when [`repack_on`]); everything else as `upload`.
+pub fn upload_ffn(w: &W, n_mat: usize, rows: usize, cols: usize) -> Result<DevW> {
+    let W::Gguf(g, t) = *w else { return upload(w, n_mat, rows, cols) };
+    let ty = ggml_id(t)?;
+    let ok = match ty {
+        8 => cols % 32 == 0,
+        14 => cols % 256 == 0,
+        _ => false,
+    };
+    if !ok || !repack_on() {
+        return upload(w, n_mat, rows, cols);
+    }
+    ensure!(
+        t.dims[0] as usize == cols && t.dims.get(1).copied().unwrap_or(1) as usize == rows,
+        "{}: dims {:?}, want [{cols}, {rows}, ..]",
+        t.name,
+        t.dims
+    );
+    let rb = t.row_bytes()?;
+    let src = g.bytes(t);
+    ensure!(src.len() == n_mat * rows * rb, "{}: {} bytes, want {n_mat}x{rows}x{rb}", t.name, src.len());
+    let nrb = repacked_row_bytes(ty, cols);
+    let mut out = Vec::with_capacity(n_mat * rows * nrb);
+    for row in src.chunks_exact(rb) {
+        repack_row(ty, row, cols, &mut out);
+    }
+    let buf = DevBuf::from_slice(&out)?;
+    let w = G5W {
+        base: buf.ptr,
+        estride: (rows * nrb) as u64,
+        row_bytes: nrb as u32,
+        ty: if ty == 8 { G5_Q8R } else { G5_Q6R },
+    };
+    Ok(DevW { buf, w })
+}
+
 /// A layer's FFN on the device: geometry (weight handles cleared) plus uploaded weights.
 pub struct DevMoe {
     pub p: MoeParams<'static>,
@@ -279,9 +379,9 @@ fn up3(
         return Ok(None);
     };
     Ok(Some((
-        upload(&g, n, ff, hid)?,
-        upload(&u, n, ff, hid)?,
-        upload(&d, n, hid, ff)?,
+        upload_ffn(&g, n, ff, hid)?,
+        upload_ffn(&u, n, ff, hid)?,
+        upload_ffn(&d, n, hid, ff)?,
     )))
 }
 
@@ -594,8 +694,16 @@ fn ffn_fast(
     let xq = pool.get(P_XQ, t * hid)?;
     let xd = pool.get(P_XD, t * hid / 32 * 4)?;
     let xq2 = if k.act2 { pool.get(P_XQ2, t * hid)? } else { 0u64 };
-    unsafe {
-        gpu::launch(
+    let fused = routed
+        && k.route1
+        && m.router.as_ref().is_some_and(|r| r.w.ty == 0)
+        && hid % 8 == 0
+        && p.n_group <= 1
+        && p.n_expert <= 1024
+        && p.n_expert >= hid / 32;
+    if !fused {
+        unsafe {
+            gpu::launch(
             k.f_q8,
             (hid.div_ceil(128) as u32, t as u32, 1),
             blk,
@@ -603,6 +711,7 @@ fn ffn_fast(
             s,
             tang_moe::args![x, xq, xq2, xd, hidi],
         )?;
+        }
     }
 
     // routing
@@ -615,6 +724,24 @@ fn ffn_fast(
         let (rw, nei) = (router.w, ne as i32);
         let bias = m.bias.as_ref().map_or(0u64, |b| b.ptr);
         let (kki, norm, scale) = (nr as i32, p.norm_topk_prob as i32, p.scale);
+        if fused {
+            if pool.cnt_zero < t {
+                let c = pool.get(P_CNT, t * 4)?;
+                gpu::check(unsafe { cu::cuMemsetD32Async(c, 0, t, s.0) }, "cuMemsetD32Async(cnt)")?;
+                pool.cnt_zero = t;
+            }
+            let cnt = pool.get(P_CNT, t * 4)?;
+            unsafe {
+                gpu::launch(
+                    k.f_route,
+                    (ne as u32, t as u32, 1),
+                    blk,
+                    0,
+                    s,
+                    tang_moe::args![rw, x, sc, nei, hidi, xq, xq2, xd, bias, idp, wtp, kki, norm, scale, cnt],
+                )?;
+            }
+        } else {
         unsafe {
             if rw.ty == 0 && hid % 8 == 0 {
                 gpu::launch(
@@ -655,6 +782,7 @@ fn ffn_fast(
                     tang_moe::args![sc, bias, idp, wtp, ti, nei, kki, ng, tg, norm, scale],
                 )?;
             }
+        }
         }
         (idp, wtp, nr as i32, ne as i32)
     } else {

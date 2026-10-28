@@ -598,6 +598,42 @@ mod cuda {
         t0.elapsed().as_secs_f64() * 1e6 / n as f64
     }
 
+    /// Per-kernel split of `f` (one FFN call) over 50 calls: mean GPU µs per call, declared
+    /// bytes (router: its F32 rows), TB/s. Needs `gpu::trace` on since before `Kernels::new`.
+    fn kernel_split(tag: &str, m: &DevMoe, mut f: impl FnMut()) {
+        use std::collections::BTreeMap;
+        f();
+        let _ = gpu::trace::drain();
+        let n = 50;
+        for _ in 0..n {
+            f();
+        }
+        let mut agg: BTreeMap<(usize, String), (f64, u64)> = BTreeMap::new();
+        let mut order = Vec::new();
+        for l in gpu::trace::drain() {
+            let name = gpu::trace::name(l.func);
+            if !order.contains(&name) {
+                order.push(name.clone());
+            }
+            let i = order.iter().position(|x| *x == name).unwrap();
+            let e = agg.entry((i, name)).or_default();
+            e.0 += l.gpu_ms.unwrap_or(0.0) as f64 * 1e3;
+            e.1 += l.bytes;
+        }
+        let rb = m.router.as_ref().map_or(0, |w| m.p.n_expert * w.w.row_bytes as usize) as u64;
+        let mut tot = 0f64;
+        for ((_, name), (us, b)) in &agg {
+            let (us, mut b) = (us / n as f64, b / n as u64);
+            if name.contains("router") {
+                b = rb;
+            }
+            tot += us;
+            let tbs = if b > 0 { b as f64 / us / 1e6 } else { 0.0 };
+            eprintln!("moesplit {tag} {name:<16} {us:7.1} us {:8.2} MB {tbs:5.2} TB/s", b as f64 / 1e6);
+        }
+        eprintln!("moesplit {tag} total {tot:.1} us kernel-only, active {:.2} MB, {:.2} TB/s", m.active_bytes() as f64 / 1e6, m.active_bytes() as f64 / tot / 1e6);
+    }
+
     /// REAL GLM-5.3 layers, one layer's FFN resident at a time (a 24 GB card can't hold all
     /// 45): naive and fast GPU vs the CPU reference on the same x (full [t][hidden] tensors,
     /// routing sets), and per-layer µs of both (device-resident x / y, sync per call — what a
@@ -613,6 +649,12 @@ mod cuda {
         let Some(g) = Gpu::for_test() else { return };
         g.bind().unwrap();
         let gg = Gguf::open(Path::new(&path)).unwrap();
+        // TANG_GLM5_MOE_SPLIT=1: per-kernel GPU µs / bytes / TB/s of the fast q8x2 call (trace
+        // must be on before the module loads so the kernels get their names)
+        let split = std::env::var("TANG_GLM5_MOE_SPLIT").is_ok_and(|v| v == "1");
+        if split {
+            gpu::trace::enable(true);
+        }
         let mut k = Kernels::new(&g).unwrap();
         let list = |key: &str, d: &str| -> Vec<usize> {
             std::env::var(key)
@@ -667,6 +709,11 @@ mod cuda {
                     let us_host = time_us(reps, || {
                         ffn_host(&k, &m, &x, t_len).unwrap();
                     });
+                    if split && fast && act2 {
+                        kernel_split(&format!("l{l} T{t_len}"), &m, || {
+                            gpu_ffn(&k, &s, &m, xd.ptr, yd.ptr, t_len).unwrap()
+                        });
+                    }
                     eprintln!(
                         "moebench l{l} T{t_len} {mode:<9} rel {:.3e} cos {:.7} max {:.3e} nonfinite {} | {:.0} us/call (device x/y, {:.2} TB/s T1-equiv), {:.0} us/call (host x/y) | cpu {:.0} ms",
                         st.rel_l2, st.cos, st.max_abs, st.nonfinite_gpu, us, m.active_bytes() as f64 / us / 1e6, us_host, cpu_ms
