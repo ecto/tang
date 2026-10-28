@@ -4660,10 +4660,10 @@ impl Coder {
     // ---- GDN memstore (`super::memserve`): engine-internal store windows
 
     /// Keep a GDN memstore in GDN layer `gdn_layer` (its index among the GDN layers; on GPU 0
-    /// when the layers are split). Needs the memstore's head layout (16 k / 48 v heads):
-    /// Qwen3-Coder-Next's GDN layers (16 k / 32 v) are refused.
+    /// when the layers are split). The head layout follows the GDN shape
+    /// (`memserve::check_shape`: 16 k / 48 v, or 16 k / 32 v grouped).
     pub fn enable_store(&mut self, gdn_layer: usize) -> Result<()> {
-        super::memserve::check_shape(self.geo.gdn_hk, self.geo.gdn_hv)?;
+        let layout = super::memserve::check_shape(self.geo.gdn_hk, self.geo.gdn_hv)?;
         let layer = self
             .layers
             .iter()
@@ -4672,7 +4672,11 @@ impl Coder {
             .nth(gdn_layer)
             .map(|(i, _)| i)
             .with_context(|| format!("no GDN layer {gdn_layer} on GPU 0"))?;
-        self.store = Some(super::memserve::StoreMeta { gdn_layer, layer });
+        self.store = Some(super::memserve::StoreMeta {
+            gdn_layer,
+            layer,
+            layout,
+        });
         Ok(())
     }
 
@@ -4712,8 +4716,9 @@ impl Coder {
 
     /// Splice `heads` into slot `slot`'s memstore heads (the base heads stay bitwise).
     pub fn set_store_heads_at(&mut self, slot: usize, heads: &[f32]) -> Result<()> {
-        ensure!(heads.len() == super::memserve::HEAD_FLOATS, "store heads size");
         let l = self.store_layer(slot)?;
+        let layout = self.store.context("no memstore layer")?.layout;
+        ensure!(heads.len() == layout.head_floats(), "store heads size");
         self.sync_all();
         let st = Self::slot_state(&mut self.layers, &mut self.slots, l, slot)?;
         let mut v = self.dev.download(st);
