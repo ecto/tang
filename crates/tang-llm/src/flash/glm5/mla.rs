@@ -2175,7 +2175,7 @@ pub mod cuda {
         }
         let iqd_ptr = self.iq_d.borrow().ptr;
         let hwd_ptr = self.hw_d.borrow().ptr;
-        self.idx_select_at(iqd_ptr, hwd_ptr, pool_keys.len(), kv_len, first_key, n_pool, t, pos0, sel, stream)
+        self.idx_select_at(iqd_ptr, hwd_ptr, pool_keys.len(), kv_len, first_key, n_pool, t, pos0, Some(sel), stream)
     }
 
     /// [`Self::idx_run`] with `iq` [t][idx_heads*idx_dim] and `hw` [t][idx_heads] already
@@ -2195,7 +2195,28 @@ pub mod cuda {
     ) -> Result<(), gpu::Error> {
         assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
         self.ensure_scratch(t)?;
-        self.idx_select_at(iq, hw, n_pool * self.idxd, kv_len, first_key, n_pool, t, pos0, sel, stream)
+        self.idx_select_at(iq, hw, n_pool * self.idxd, kv_len, first_key, n_pool, t, pos0, Some(sel), stream)
+    }
+
+    /// [`Self::idx_run_dev`] that leaves the selection on the device: returns the
+    /// `[t][select_width]` i32 pointer (this MlaCuda's `sd_out`, valid until the next
+    /// select) for [`Self::attend_dev_sel`]. Async on `stream` (no sync, no copy).
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_run_dev_resident(
+        &self,
+        iq: u64,
+        hw: u64,
+        kv_len: usize,
+        first_key: usize,
+        n_pool: usize,
+        t: usize,
+        pos0: usize,
+        stream: &Stream,
+    ) -> Result<u64, gpu::Error> {
+        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+        self.ensure_scratch(t)?;
+        self.idx_select_at(iq, hw, n_pool * self.idxd, kv_len, first_key, n_pool, t, pos0, None, stream)?;
+        Ok(self.sd_out.borrow().ptr)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2209,7 +2230,7 @@ pub mod cuda {
         n_pool: usize,
         t: usize,
         pos0: usize,
-        sel: &mut [i32],
+        sel: Option<&mut [i32]>,
         stream: &Stream,
     ) -> Result<(), gpu::Error> {
         let (nh, hd) = (self.idxh, self.idxd);
@@ -2251,7 +2272,7 @@ pub mod cuda {
         let mut hsc = 1.0f32 / (nh as f32).sqrt();
         let n_select = (self.topk / self.kpool).min(n_pool);
         let smem = (n_select * 8) as u32; // [n_select] i32 + [n_select] f32
-        let dbg = std::env::var("TANG_MLA_DBG").is_ok();
+        let dbg = std::env::var("TANG_MLA_DBG").is_ok() && sel.is_some();
         let dbgd = if dbg {
             Some(DevBuf::zeroed_elems::<f32>(t * n_pool * 2)?)
         } else {
@@ -2267,6 +2288,9 @@ pub mod cuda {
                 stream,
                 tang_moe::args![iqd_ptr, hwd_ptr, pkd_ptr, vd_ptr, sd_ptr, dbg_ptr, tt, kvlen, p0, fk, npl, nh_, hd_, kp_, tk_, wd_, ssc, hsc],
             )?
+        };
+        let Some(sel) = sel else {
+            return Ok(());
         };
         stream.sync()?;
         sel.copy_from_slice(&self.sd_out.borrow().read(0, sel.len())?);
@@ -2406,6 +2430,33 @@ pub mod cuda {
                 s.len() / t
             });
             self.ensure_scratch(t)?;
+            // sel staged into the resident select scratch (s_d), not a fresh alloc
+            let sel_ptr = match sel {
+                Some(s) => {
+                    let b = self.s_d.borrow();
+                    b.write(0, s)?;
+                    b.ptr
+                }
+                None => 0,
+            };
+            self.attend_dev_sel(q, n_kv, t, pos0, sel_ptr, width, stream)
+        }
+
+        /// [`Self::attend_dev`] with the selection already on the device: `sel_ptr`
+        /// `[t][width]` i32 (0 = dense causal, `width` then `pos0 + t`). Async, no copy.
+        #[allow(clippy::too_many_arguments)]
+        pub fn attend_dev_sel(
+            &self,
+            q: u64,
+            n_kv: usize,
+            t: usize,
+            pos0: usize,
+            sel_ptr: u64,
+            width: usize,
+            stream: &Stream,
+        ) -> Result<u64, gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            self.ensure_scratch(t)?;
             let ld_ptr = {
                 let mut lru = self.seqs.borrow_mut();
                 let i = lru.active_idx();
@@ -2416,15 +2467,6 @@ pub mod cuda {
                     )));
                 }
                 lru.entries[i].lat_d.as_ref().unwrap().ptr
-            };
-            // sel staged into the resident select scratch (s_d), not a fresh alloc
-            let sel_ptr = match sel {
-                Some(s) => {
-                    let b = self.s_d.borrow();
-                    b.write(0, s)?;
-                    b.ptr
-                }
-                None => 0,
             };
             let od_ptr = self.o_d.borrow().ptr;
             let qa_ptr = self.qa_d.borrow().ptr;

@@ -42,7 +42,16 @@ struct DsaCache {
     /// The GPU path's indexer validity marks, `[n]`.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     valid: Vec<u8>,
+    /// The resident decode step ([`resident`]) appends on the device only: rows from here
+    /// on are stale in the host mirrors above until `refresh_stale_dsa` pulls them.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    stale_from: Option<usize>,
 }
+
+/// The device-resident decode step (one stream, no per-stage host copies).
+#[cfg(feature = "cuda")]
+#[path = "resident.rs"]
+mod resident;
 
 /// warps per k5_gemv8 block (kda_k5.cuh's K5_WARPS: one staged row per warp).
 #[cfg(feature = "cuda")]
@@ -110,6 +119,8 @@ pub struct GpuFfn {
     pub split: usize,
     /// `TANG_GLM5_MOE_PROF=1`: per layer, (calls, total µs) for T = 1 / T > 1 FFN calls.
     prof: Option<Vec<[(u64, f64); 2]>>,
+    /// The resident decode step's buffers (built on its first token).
+    resident: Option<resident::Resident>,
 }
 
 /// Everything device-owned goes before the contexts it lives in. Fields drop in
@@ -126,6 +137,7 @@ impl Drop for GpuFfn {
         }
         self.kda_l.clear();
         self.head_dev = None; // its buffers, module and stream before the context
+        self.resident = None;
         self.mla_p.clear();
         self.mla_k.clear();
         self.mhc_f = None;
@@ -501,6 +513,7 @@ impl GpuFfn {
             layers,
             dev_of,
             split,
+            resident: None,
             prof: std::env::var("TANG_GLM5_MOE_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| vec![[(0u64, 0f64); 2]; n_layer]),
@@ -1155,6 +1168,8 @@ impl Glm5Engine {
         pos0: usize,
     ) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
+        self.refresh_stale_dsa(slot, l)?;
+        #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
             let d = g.dev_of[l];
             if let Some(cu) = &g.mla_k[l] {
@@ -1732,11 +1747,16 @@ impl Glm5Engine {
 
     /// Feed one token (slot 0); returns the greedy next token.
     pub fn step(&mut self, tok: u32) -> Result<u32> {
-        Ok(argmax(&self.window(&[tok])?))
+        self.step_slot(0, tok)
     }
 
-    /// Feed one token to sequence `slot`; returns the greedy next token.
+    /// Feed one token to sequence `slot`; returns the greedy next token. The device-
+    /// resident step ([`resident`]) when every stage is resident, else the host path.
     pub fn step_slot(&mut self, slot: usize, tok: u32) -> Result<u32> {
+        #[cfg(feature = "cuda")]
+        if let Some(t) = self.step_resident(slot, tok)? {
+            return Ok(t);
+        }
         Ok(argmax(&self.window_slot(slot, &[tok])?))
     }
 }
@@ -3081,6 +3101,72 @@ mod tests {
         let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         println!("engine_reset_gpu: max |a - b| {d:.3e}");
         assert!(d < 1e-4, "after reset the GPU window differs from a fresh one: {d}");
+    }
+
+    /// The device-resident decode step ([`resident`]) against the host-staged path on the
+    /// same GPU config (fused mHC + KDA graph + resident MLA + fast MoE): identical greedy
+    /// ids over a decode that crosses the indexer's dense -> sparse switch, then a host
+    /// window after it (the lazily refreshed DSA mirrors) still agrees. Sets process env:
+    /// run alone.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn engine_gpu_resident_step_matches_host() {
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("fixture/GPU");
+            return;
+        }
+        for (k, v) in [("TANG_GLM5_MOE", "fast"), ("TANG_GLM5_KDA_PF2", "1"), ("TANG_GLM5_KDA_GRAPH", "1"), ("TANG_GLM5_GEMV8", "1")] {
+            std::env::set_var(k, v);
+        }
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let mk = || {
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            assert!(e.use_gpu().unwrap(), "GPU did not load");
+            let (m, hp) = (&e.m, e.m.hp.clone());
+            let gf = e.gpu.as_mut().unwrap();
+            gf.enable_mla_resident(&m.g, &|l| m.mla_weights(l)).unwrap();
+            if gf.mhc_f.is_none() {
+                gf.enable_mhc_fused(&m.g, &hp).unwrap();
+            }
+            e
+        };
+        let (mut host, mut res) = (mk(), mk());
+        let run = |e: &mut Glm5Engine, resident: bool| -> Vec<u32> {
+            if resident {
+                std::env::remove_var("TANG_GLM5_RESIDENT");
+            } else {
+                std::env::set_var("TANG_GLM5_RESIDENT", "0");
+            }
+            let mut cur = e.prefill(&ids2[..4], 64).unwrap();
+            let mut out = vec![cur];
+            for _ in 0..40 {
+                cur = e.step(cur).unwrap();
+                out.push(cur);
+            }
+            out
+        };
+        let a = run(&mut host, false);
+        let b = run(&mut res, true);
+        assert!(host.gpu.as_ref().unwrap().resident.is_none(), "the host run took the resident step");
+        assert!(res.gpu.as_ref().unwrap().resident.is_some(), "the resident step never ran");
+        eprintln!("resident step: host {a:?}\n               res  {b:?}");
+        // a host window after the resident decode: reads the (refreshed) DSA mirrors
+        std::env::set_var("TANG_GLM5_RESIDENT", "0");
+        let nv = host.m.hp.n_vocab;
+        let la = host.window(&ids2[4..20]).unwrap();
+        let lb = res.window(&ids2[4..20]).unwrap();
+        std::env::remove_var("TANG_GLM5_RESIDENT");
+        let flips = (0..16).filter(|&p| argmax(&la[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv])).count();
+        let worst = la.iter().zip(&lb).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!("after resident decode, host window: {flips} flips / 16, logits max abs {worst:.3e}");
+        for k in ["TANG_GLM5_MOE", "TANG_GLM5_KDA_PF2", "TANG_GLM5_KDA_GRAPH", "TANG_GLM5_GEMV8"] {
+            std::env::remove_var(k);
+        }
+        assert_eq!(a, b, "resident vs host greedy ids");
+        assert_eq!(flips, 0, "host window after the resident decode");
+        assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 
     /// `TANG_GLM5_TRACE` is transparent: the same windows traced and untraced give the

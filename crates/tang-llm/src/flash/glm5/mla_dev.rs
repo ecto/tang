@@ -264,4 +264,77 @@ impl MlaProj {
         };
         Ok(ProjOut { y, sel, q_resid, q })
     }
+
+    /// The device input buffer for a `t`-row window (`[t][hidden]` f32): the resident
+    /// decode step's mHC pre writes x here, then [`Self::window_dev`] reads it.
+    pub fn x_ptr(&self, t: usize) -> Result<u64> {
+        Ok(self.scratch(t)?.x.ptr)
+    }
+
+    /// [`Self::window`] on the device-resident step: x is already in [`Self::x_ptr`]
+    /// (written on `s`), every launch is async on `s`, the selection (sparse) stays on the
+    /// device, and the host mirrors are NOT refreshed (only resized: the caller marks them
+    /// stale and refreshes them lazily before any host use). Returns y's device pointer
+    /// (`[t][hidden]` f32, this layer's scratch). `kv_len`/`pos0` are kernel arguments,
+    /// passed per call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn window_dev(
+        &self,
+        cu: &MlaCuda,
+        w: &MlaWeights,
+        t: usize,
+        pos0: usize,
+        c_lat: &[u16],
+        c_k: &[f32],
+        c_g: &[f32],
+        c_valid: &[u8],
+        s: &Stream,
+    ) -> Result<u64> {
+        let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla_dev: {e}");
+        use super::trace::span;
+        let kv_len = pos0 + t;
+        let sc = self.scratch(t)?;
+        let (h, ql) = (self.hid, self.ql);
+        let tr = span("q_a");
+        let xw = [&self.q_a, &self.ip, &self.kv_a, &self.i_wk, &self.i_gate];
+        let ax = self.act(s, &xw, sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, t)?;
+        self.k.fast.gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, t, ql, h)?;
+        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, t, self.eps, s).map_err(gerr)?;
+        drop(tr);
+        let tr = span("q_b");
+        let aq = self.act(s, &[&self.q_b, &self.iq_b], sc.qr.ptr, sc.qrq.ptr, sc.qrq2.ptr, sc.qrd.ptr, ql, t)?;
+        self.k.fast.gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, t, self.nhdk, ql)?;
+        drop(tr);
+        let tr = span("kv_append");
+        let (lp, kp, gp, vp) = cu.append_rows(pos0, t, c_lat, c_k, c_g, c_valid).map_err(gerr)?;
+        self.k.fast.gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, t, self.dl, h)?;
+        cu.lat_norm_dev(sc.ylat.ptr, self.kvan.ptr, lp, t, s).map_err(gerr)?;
+        drop(tr);
+        let tr = span("idx_append");
+        self.k.fast.gemv(s, self.i_wk.w, 0, ax, kp, self.hd, t, self.hd, h)?;
+        self.k.fast.gemv(s, self.i_gate.w, 0, ax, gp, self.hd, t, self.hd, h)?;
+        cu.idx_ln_dev(kp, self.iknw.ptr, self.iknb.ptr, vp, t, s).map_err(gerr)?;
+        cu.append_done(pos0, t);
+        drop(tr);
+        let tr = span("idx_select");
+        let (sel_ptr, width) = if super::mla::indexer_is_dense(kv_len, w.topk) {
+            (0u64, kv_len)
+        } else {
+            let n_pool = kv_len / w.kpool;
+            cu.idx_pool(c_k, c_g, &w.i_ape, kv_len, 0, n_pool, &mut [], s).map_err(gerr)?;
+            self.k.fast.gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, t, self.iqr, ql)?;
+            self.k.fast.gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, t, self.ih, h)?;
+            let p = cu.idx_run_dev_resident(sc.iq.ptr, sc.hw.ptr, kv_len, 0, n_pool, t, pos0, s).map_err(gerr)?;
+            (p, w.select_width())
+        };
+        drop(tr);
+        let tr = span("attend");
+        let ov = cu.attend_dev_sel(sc.q.ptr, kv_len, t, pos0, sel_ptr, width, s).map_err(gerr)?;
+        drop(tr);
+        let tr = span("o_proj");
+        let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, t)?;
+        self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
+        drop(tr);
+        Ok(sc.y.ptr)
+    }
 }

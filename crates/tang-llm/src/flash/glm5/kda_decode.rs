@@ -306,6 +306,52 @@ impl DevLayer {
         Ok(())
     }
 
+    /// Whether [`Self::decode_dev`] can run this layer: the fused kernels are built, the
+    /// mode is Fused or Graph, and no shadow probe is attached.
+    pub fn resident_ok(&self) -> bool {
+        self.fast.is_some() && Mode::from_env() != Mode::Naive && self.probe.is_none()
+    }
+
+    /// The decode input buffer (`[hidden]` f32): the resident step's mHC pre writes here.
+    pub fn x_ptr(&self) -> u64 {
+        self.xb.ptr
+    }
+
+    /// The decode output buffer (`[hidden]` f32), valid after [`Self::decode_dev`].
+    pub fn y_ptr(&self) -> u64 {
+        self.outb.ptr
+    }
+
+    /// The device-resident decode token (slot 0): `xb` already holds x (written on `s`),
+    /// the fused step (Graph mode: the captured graph) is enqueued on `s`, `outb` holds y
+    /// once `s` reaches it. No host copy, no sync. Graph mode captures on the layer's own
+    /// stream after the first eager enqueue (capture only records).
+    pub fn decode_dev(&mut self, s: &Stream) -> Result<()> {
+        ensure!(self.resident_ok(), "kda decode_dev: fused kernels off, naive mode, or a probe");
+        let g8 = |w: &super::super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
+        let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv);
+        let mode = Mode::from_env();
+        if mode == Mode::Graph {
+            if let Some((g, _)) = self.fast.as_ref().and_then(|f| f.graph.as_ref()).filter(|g| g.1 == gemv8) {
+                g.launch(s).map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
+                return Ok(());
+            }
+            self.enqueue_decode(s, gemv8, None)?;
+            if let Some(f) = self.fast.as_mut() {
+                f.graph = None;
+            }
+            let me = &*self;
+            let gr = Graph::capture(&me.s, |cs| {
+                me.enqueue_decode(cs, gemv8, None).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
+            })
+            .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
+            self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
+            log_once(&LOG_CAPTURE, || format!("glm5 kda: decode mode graph captured (resident, gemv8={gemv8})"));
+            return Ok(());
+        }
+        self.enqueue_decode(s, gemv8, None)
+    }
+
     /// One decode token through the fused step (`mode` Fused or Graph). Same contract as
     /// [`DevLayer::window`] at `t = 1`, including the shadow-check probe (the poisoned
     /// buffers get their taps read out of the device, `out`/`conv_host` put on the host).

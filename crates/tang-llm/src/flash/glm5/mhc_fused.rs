@@ -348,6 +348,9 @@ pub struct MhcFused {
     /// The window in flight: `t`, and whether a post is waiting on `y`.
     t: usize,
     pending: bool,
+    /// Where the pending post's `y` lives: `y.ptr` (host-uploaded by [`Self::post`]) or a
+    /// producer's device buffer ([`Self::post_dev`], the resident decode step).
+    y_src: u64,
     /// Windows completed (`end` calls): the tests' "the fused path actually ran" check.
     windows: usize,
     /// NaN-fill every output before its kernel (on with the shadow; tests set it).
@@ -400,6 +403,7 @@ impl MhcFused {
             norm_h: norms,
             t: 0,
             pending: false,
+            y_src: 0,
             windows: 0,
             poison: dbg.is_some(),
             dbg,
@@ -445,7 +449,7 @@ impl MhcFused {
     /// half's partial dots; `h != 0` also writes the head mean.
     fn part(&self, fn_: u64, h: u64) -> Result<()> {
         let f = self.module.func("mhcf_part").map_err(|e| anyhow!("mhcf_part: {e}"))?;
-        let (r, y, post, comb, part) = (self.r.ptr, self.y.ptr, self.post.ptr, self.comb.ptr, self.part.ptr);
+        let (r, y, post, comb, part) = (self.r.ptr, self.y_src, self.post.ptr, self.comb.ptr, self.part.ptr);
         let n = self.n as i32;
         let do_post = i32::from(self.pending);
         let do_part = i32::from(fn_ != 0);
@@ -465,7 +469,9 @@ impl MhcFused {
     /// Layer `l`'s half `block` (0 = attention / hc_attn + attn_norm, 1 = FFN / hc_ffn +
     /// ffn_norm): apply the pending post, then pre + norm. Returns the normed block input
     /// `[t][n]` on the host. `cpu_w` is the same block's host weights (shadow only).
-    pub fn pre(&mut self, mh: &MhcGpu, l: usize, block: usize, cpu_w: Option<&MhcWeights>) -> Result<Vec<f32>> {
+    /// The launches of [`Self::pre`]: the pending post + this half's pre + norm, the
+    /// normed `x` written to `x_dst` (device, `[t][n]` f32). Async on [`Self::stream`].
+    fn pre_launch(&mut self, mh: &MhcGpu, l: usize, block: usize, x_dst: u64) -> Result<()> {
         if block > 1 || l >= self.norm.len() || self.t == 0 {
             bail!("mhc fused pre: layer {l} block {block} t {}", self.t);
         }
@@ -484,7 +490,7 @@ impl MhcFused {
         }
         let f = self.module.func("mhcf_finish").map_err(|e| anyhow!("mhcf_finish: {e}"))?;
         let (r, part, nw, x, post, comb) =
-            (self.r.ptr, self.part.ptr, self.norm[l][block].ptr, self.x.ptr, self.post.ptr, self.comb.ptr);
+            (self.r.ptr, self.part.ptr, self.norm[l][block].ptr, x_dst, self.post.ptr, self.comb.ptr);
         let (ch, n, it, ne) = (self.ch as i32, self.n as i32, iters as i32, self.norm_eps);
         unsafe {
             tang_moe::gpu::launch(
@@ -497,6 +503,12 @@ impl MhcFused {
             )
         }
         .map_err(|e| anyhow!("mhcf_finish launch: {e}"))?;
+        Ok(())
+    }
+
+    pub fn pre(&mut self, mh: &MhcGpu, l: usize, block: usize, cpu_w: Option<&MhcWeights>) -> Result<Vec<f32>> {
+        let x_dst = self.x.ptr;
+        self.pre_launch(mh, l, block, x_dst)?;
         let ge = |e: tang_moe::gpu::Error| anyhow!("mhc fused pre: {e}");
         self.s.sync().map_err(ge)?;
         let x: Vec<f32> = self.x.read(0, self.t * self.n).map_err(ge)?;
@@ -539,11 +551,51 @@ impl MhcFused {
             bail!("mhc fused post: {} values (t {}), pending {}", y.len(), self.t, self.pending);
         }
         self.y.write(0, y).map_err(|e| anyhow!("mhc fused post: {e}"))?;
+        self.y_src = self.y.ptr;
         self.pending = true;
         if let Some(d) = self.dbg.as_mut() {
             d.y = Some(y.to_vec());
         }
         Ok(())
+    }
+
+    /// The window's stream (every fused-mHC launch goes here).
+    pub fn stream(&self) -> &Stream {
+        &self.s
+    }
+
+    /// The device-resident [`Self::pre`]: the normed block input is written to `x_dst`
+    /// (a consumer's device input buffer) and nothing is read back or synced.
+    pub fn pre_dev(&mut self, mh: &MhcGpu, l: usize, block: usize, x_dst: u64) -> Result<()> {
+        if self.dbg.is_some() {
+            bail!("mhc fused pre_dev: no shadow check on the resident path");
+        }
+        self.pre_launch(mh, l, block, x_dst)
+    }
+
+    /// The device-resident [`Self::post`]: `y_dev` (`[t][n]` f32, a producer's output
+    /// buffer, written on [`Self::stream`] before the next pre) is applied by the next
+    /// `pre_dev` / `end_dev`. Nothing is copied.
+    pub fn post_dev(&mut self, y_dev: u64) -> Result<()> {
+        if self.pending || self.t == 0 {
+            bail!("mhc fused post_dev: pending {}, t {}", self.pending, self.t);
+        }
+        self.y_src = y_dev;
+        self.pending = true;
+        Ok(())
+    }
+
+    /// The device-resident [`Self::end`]: the last post + the head mean into the device
+    /// `h` buffer; returns its pointer (`[t][n]` f32, before `output_norm`). No sync.
+    pub fn end_dev(&mut self) -> Result<u64> {
+        if !self.pending || self.dbg.is_some() {
+            bail!("mhc fused end_dev: pending {}, shadow {}", self.pending, self.dbg.is_some());
+        }
+        self.part(0, self.h.ptr)?;
+        self.pending = false;
+        self.t = 0;
+        self.windows += 1;
+        Ok(self.h.ptr)
     }
 
     /// End the window: the last post + the head's unweighted stream mean. Returns `h`
