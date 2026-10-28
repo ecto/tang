@@ -143,8 +143,37 @@ MoE grouped kernels tuned for 132 SMs + router/route in one launch + reduce over
 fusion (one wo launch, q in 2, sparse_attn in 1), and prefill (grouped MoE and GEMM tiles for
 t > 8).
 
-Wave 6 merged so far (895f89b0, not yet measured on H200 — the pod stopped when the RunPod
-balance ran out; its /workspace volume keeps the model and the build): attention fusion (one
+## Wave 6 measured, 8× H100 80 GB (2026-10-28, RunPod EUR-NO-2, NVLink NV18, NCCL 2.25)
+
+The CA-MTL-3 H200 host never came back (its GPUs went to another tenant and H200/B200 stock
+ran out everywhere), so wave 6 was measured on a fresh 8× H100 pod ($31.92/h, 2 TB host RAM:
+Engram pin 160 s, ready in 226 s). Same 35-token prompt, 200 tokens out, `bab5bcfc`:
+
+| mode | tok/s | steps | drafts accepted | graph verify | graph draft |
+|---|---|---|---|---|---|
+| greedy | **130.7** (×3 runs: 130.4–133.5) | 48 | 152/235 | 26.2 ms | 4.0 ms |
+| sampled T=0.6 | 68–70 | 49–50 | 149–153/240–245 | 27.0 ms | 13.2 ms |
+| greedy, direct path | 98.9 | 48 | 152/235 | 31.8 ms (1386 launches) | 4.4 ms (151) |
+| sampled, direct path | 55.8 | 54 | 147/265 | 32.7 ms | 13.6 ms (152) |
+
+Prefill 455–465 tok/s (was 28–53). The 4× H200 wave-5 figure was 57 greedy / 42 sampled, so
+wave 6 plus the extra ranks is 2.3×; the ranks are now balanced (every rank 31.7–32.7 ms per
+verify step; the old rank-0 skew was the CA-MTL-3 box). Direct-path verify op table (gpu
+32.7 ms): `layer.attn` 12.8 (q 2.8 over 80 launches, sparse_attn 3.5 / 80, wo 3.4, compress
+2.7), `layer.moe` 11.8 (router 2.0, route 0.8, grouped_gu 3.5, grouped_down 1.7, reduce 2.3,
+shared 2.9), `layer.hc` 4.3 over 123 launches, head 0.56. Draft (greedy) 4.4 ms: named ops
+cover 15%, the rest is the 3 MTP layers' glue and the device pick.
+
+Why sampled is half of greedy: (1) `ds_spark_sample` is one 1024-thread block over the 129k
+vocab with f64 `exp` per element, ~1.9 ms per draw × 5 draws = +9 ms per draft step; (2) the
+sampled verify reads a 129k-f32 logits row back per reached position (one sync each) and runs
+`SpecSampler::dist` on the host (f64 softmax + select_nth over the vocab), ~18 ms per step
+outside any profiled span. Both are wave-7 lanes (device-side rejection verify; a multi-block
+f32 sampler). The greedy path's remaining gap to 1000 tok/s (~4 ms per token-step) is launch
+count and per-layer glue: 1386 launches for 26 ms of graph replay on 8 H100s, where the
+bytes per rank (experts/8 + dense) put the bandwidth floor near 3 ms.
+
+Wave 6 as merged (895f89b0 → bab5bcfc): attention fusion (one
 grouped K-split launch for wo, 19 → 2 launches, 143 → 54 µs on a 3090; q + window_kv fused,
 the compressor/indexer key side batched over the window, ~150 → ~30 attention launches per
 compressing layer; every fast linear drops its copy + qdq launches), MoE (redundant quant
