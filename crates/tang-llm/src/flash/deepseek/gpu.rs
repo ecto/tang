@@ -148,6 +148,7 @@ const MORE: &[&str] = &[
     "ds_pool",
     "ds_index_score",
     "ds_wo_a",
+    "ds_perm3",
     "ds_engram_gate",
     "ds_win_idx",
     "ds_idx_cat",
@@ -2555,7 +2556,7 @@ mod tests {
         let us = ev(&|| unsafe {
             k.go(
                 "ds_wo_a",
-                blocks(g8 * ol * 32, 256),
+                ((g8 * ol / 16) as u32, 1, 1),
                 (256, 1, 1),
                 0,
                 &s,
@@ -2563,7 +2564,46 @@ mod tests {
             )
             .unwrap()
         });
-        eprintln!("attn_block_bench wo_a t {t}: {us:.1} us");
+        eprintln!("attn_block_bench wo_a exact t {t}: {us:.1} us");
+        // the K-split path as engine.rs `wo_a`: group-major copy, a GEMV a group, back
+        let og = DevBuf::alloc(t * h * d * 4).unwrap();
+        let yg = DevBuf::alloc(t * rows * 4).unwrap();
+        let perm = |src: u64, dst: u64, a: usize, b: usize, c: usize| unsafe {
+            let (ai, bi, ci) = (a as i32, b as i32, c as i32);
+            k.go(
+                "ds_perm3",
+                blocks(a * b * c, 256),
+                (256, 1, 1),
+                0,
+                &s,
+                tang_moe::args![src, dst, ai, bi, ci],
+            )
+            .unwrap()
+        };
+        let us = ev(&|| {
+            perm(o.ptr, og.ptr, t, g8, cols);
+            for gi in 0..g8 {
+                let mut v = wv;
+                v.rows = ol as i32;
+                v.w += (gi * ol * cols) as u64;
+                v.s += ((gi * ol / 32) * (cols / 32)) as u64;
+                k.linear_fast(
+                    &s,
+                    &v,
+                    None,
+                    og.ptr + (gi * t * cols * 4) as u64,
+                    yg.ptr + (gi * t * ol * 4) as u64,
+                    t,
+                    true,
+                    false,
+                    0,
+                    0.0,
+                )
+                .unwrap();
+            }
+            perm(yg.ptr, mid.ptr, g8, t, ol);
+        });
+        eprintln!("attn_block_bench wo_a K-split t {t}: {us:.1} us");
         // sparse attention: window 128 + 6 chunk rows, then 512 compressed rows
         let (win, kc) = (128 + t, 512usize);
         let kk = win + kc;
@@ -2651,7 +2691,7 @@ mod tests {
         g.bind().unwrap();
         let k = Kernels::new(&g).unwrap();
         let s = Stream::blocking().unwrap();
-        let (t, gn, ol, gd) = (9usize, 2usize, 40usize, 96usize);
+        let (t, gn, ol, gd) = (9usize, 2usize, 48usize, 96usize);
         let rows = gn * ol;
         let mut wb: Vec<u8> = (0..rows * gd)
             .map(|i| (i * 2654435761 >> 11) as u8)
@@ -2682,7 +2722,7 @@ mod tests {
             unsafe {
                 k.go(
                     "ds_wo_a",
-                    blocks(gn * ol * 32, 256),
+                    ((gn * ol / 16) as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     &s,
