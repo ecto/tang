@@ -105,6 +105,9 @@ pub struct Kernels {
     moe: [[[Func; 2]; 4]; 2],
     /// `ds_moe_ks_{gu,down}_f{fmt}`, the grouped MoE on the K-split path, by (fmt - 2, down).
     moe_ks: [[Func; 2]; 2],
+    /// `ds_wo_ks_f{fmt}`, wo_a's grouped K-split GEMV, by fmt - 2, and its quantized activation.
+    wo_ks: [Func; 2],
+    wo_x: DevBuf,
     attn_qk: Func,
     attn_soft: Func,
     attn_pv: Func,
@@ -179,6 +182,9 @@ const KS_PART: usize = 1 << 21;
 const KS_CNT: usize = 1 << 13;
 /// Bytes for the quantized activation: 8 tokens × 16384 columns, codes and scales.
 const KS_X: usize = 8 * 16384 * 2;
+/// Codes, then scales, of wo_a's activation: 8 tokens × 32768 (64 heads × 512) columns.
+const WO_X_COLS: usize = 32768;
+const WO_X: usize = 8 * WO_X_COLS + 8 * WO_X_COLS / 8;
 /// Row groups each grouped K-split block takes (blockIdx.x strides them).
 const MOE_KS_ITEMS: usize = 4;
 
@@ -267,6 +273,8 @@ impl Kernels {
                 [m.func("ds_moe_ks_gu_f2")?, m.func("ds_moe_ks_down_f2")?],
                 [m.func("ds_moe_ks_gu_f3")?, m.func("ds_moe_ks_down_f3")?],
             ],
+            wo_ks: [m.func("ds_wo_ks_f2")?, m.func("ds_wo_ks_f3")?],
+            wo_x: DevBuf::alloc(WO_X)?,
             ks: [
                 [m.func("ds_ks_f2_g0")?, m.func("ds_ks_f2_g1")?],
                 [m.func("ds_ks_f3_g0")?, m.func("ds_ks_f3_g1")?],
@@ -295,6 +303,8 @@ impl Kernels {
                     "ds_moe_ks_gu_f3",
                     "ds_moe_ks_down_f2",
                     "ds_moe_ks_down_f3",
+                    "ds_wo_ks_f2",
+                    "ds_wo_ks_f3",
                 ] {
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
@@ -732,6 +742,64 @@ impl Kernels {
                 )?
             }
             t0 += n;
+        }
+        Ok(())
+    }
+
+    /// Whether [`Kernels::wo_ks`] takes `t` tokens of `g` groups × `w.cols` columns.
+    pub fn wo_ks_ok(&self, w: &DsW, t: usize, g: usize, ol: usize) -> bool {
+        let gd = w.cols as usize;
+        !self.exact
+            && Self::fast_ok(w)
+            && ol % 32 == 0
+            && (1..=8).contains(&t)
+            && g * gd <= WO_X_COLS
+            && t * (gd.div_ceil(128) * 128 + 32) + t * (gd / 32) * 4 <= self.smem_max
+    }
+
+    /// wo_a, block-diagonal over `g` groups of `ol` rows (`w` all `g * ol` rows × gd cols),
+    /// on the K-split path in two launches (quantize + one grouped GEMV, see `ds_wo_ks`): `x`
+    /// [t][g * gd] (rope'd, unquantized: the quantize is ds_fp8_qdq's) into `y` [t][g * ol],
+    /// bf16-rounded. Relaxed bar (the K-split linears'); [`Kernels::wo_ks_ok`] first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_ks(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        x: u64,
+        y: u64,
+        t: usize,
+        g: usize,
+        ol: usize,
+    ) -> Result<()> {
+        if !self.wo_ks_ok(w, t, g, ol) {
+            bail!("wo_ks: shape t {t} g {g} ol {ol} cols {}", w.cols);
+        }
+        let gd = w.cols as usize;
+        let (codes, scales) = (self.wo_x.ptr, self.wo_x.ptr + (8 * WO_X_COLS) as u64);
+        let ng = (t * g * gd / 32) as i32;
+        unsafe {
+            super::obs::launch(
+                self.ks_quant,
+                blocks(t * g * gd, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![x, codes, scales, ng],
+            )?
+        }
+        let (sp, nbr, gx) = Self::moe_ks_grid(ol, 16, gd);
+        let (ti, oli, si, nbri) = (t as i32, ol as i32, sp as i32, nbr as i32);
+        let smem = t * (gd.div_ceil(128) * 128 + 32) + t * (gd / 32) * 4;
+        unsafe {
+            super::obs::launch(
+                self.wo_ks[w.fmt as usize - 2],
+                (gx as u32, g as u32, 1),
+                (256, 1, 1),
+                smem as u32,
+                s,
+                tang_moe::args![*w, codes, scales, y, ti, oli, si, nbri],
+            )?;
         }
         Ok(())
     }
@@ -2712,6 +2780,17 @@ mod tests {
             perm(yg.ptr, mid.ptr, g8, t, ol);
         });
         eprintln!("attn_block_bench wo_a K-split t {t}: {us:.1} us");
+        let want = mid.read::<f32>(0, t * rows).unwrap();
+        let mid2 = DevBuf::alloc(t * rows * 4).unwrap();
+        let us = ev(&|| k.wo_ks(&s, &wv, o.ptr, mid2.ptr, t, g8, ol).unwrap());
+        eprintln!("attn_block_bench wo_a grouped K-split (2 launches) t {t}: {us:.1} us");
+        let got = mid2.read::<f32>(0, t * rows).unwrap();
+        let bad = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| (*a - *b).abs() > 1e-2 * (1.0 + b.abs()))
+            .count();
+        assert_eq!(bad, 0, "grouped wo_a vs per-group K-split");
         // sparse attention: window 128 + 6 chunk rows, then 512 compressed rows
         let (win, kc) = (128 + t, 512usize);
         let kk = win + kc;
@@ -2789,6 +2868,84 @@ mod tests {
             .unwrap();
         });
         eprintln!("attn_block_bench indexer score+topk t {t} batched (per layer): {us:.1} us");
+    }
+
+    /// The grouped K-split wo_a (`Kernels::wo_ks`, quantize + one launch) against the exact
+    /// `ds_wo_a` on the same qdq'd activation, fp8 and fp4: the K-split bar.
+    #[test]
+    fn wo_ks_matches_exact() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        if k.exact {
+            return;
+        }
+        let s = Stream::blocking().unwrap();
+        let (gn, ol, gd) = (3usize, 64usize, 256usize);
+        let rows = gn * ol;
+        for fmt in [2i32, 3] {
+            for t in [1usize, 6, 8] {
+                let wb: Vec<u8> = (0..rows * gd / if fmt == 3 { 2 } else { 1 })
+                    .map(|i| {
+                        let b = (i * 2654435761 >> 11) as u8;
+                        if fmt == 2 && b & 0x7f == 0x7f {
+                            0x08
+                        } else {
+                            b
+                        }
+                    })
+                    .collect();
+                let ns = if fmt == 2 {
+                    rows.div_ceil(32) * gd / 32
+                } else {
+                    rows * gd / 32
+                };
+                let sb: Vec<u8> = (0..ns).map(|i| 120 + (i % 9) as u8).collect();
+                let (dw, ds) = (
+                    DevBuf::from_slice(&wb).unwrap(),
+                    DevBuf::from_slice(&sb).unwrap(),
+                );
+                let w = DsW {
+                    w: dw.ptr,
+                    s: ds.ptr,
+                    rows: rows as i32,
+                    cols: gd as i32,
+                    fmt,
+                    _pad: 0,
+                };
+                let o = DevBuf::from_slice(&data(t * gn * gd, 3, 2.0)).unwrap();
+                k.fp8_qdq(&s, o.ptr, t * gn * gd).unwrap();
+                let (a, b) = (
+                    DevBuf::alloc(t * rows * 4).unwrap(),
+                    DevBuf::alloc(t * rows * 4).unwrap(),
+                );
+                let (ti, gi, oli) = (t as i32, gn as i32, ol as i32);
+                unsafe {
+                    k.go(
+                        "ds_wo_a",
+                        ((gn * ol / 16) as u32, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![o.ptr, w, a.ptr, ti, gi, oli],
+                    )
+                    .unwrap()
+                };
+                assert!(k.wo_ks_ok(&w, t, gn, ol));
+                k.wo_ks(&s, &w, o.ptr, b.ptr, t, gn, ol).unwrap();
+                s.sync().unwrap();
+                let (want, got) = (
+                    a.read::<f32>(0, t * rows).unwrap(),
+                    b.read::<f32>(0, t * rows).unwrap(),
+                );
+                for (i, (x, y)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (x - y).abs() <= 1e-2 * (1.0 + y.abs()),
+                        "fmt {fmt} t {t} @{i}: {x} vs {y}"
+                    );
+                }
+            }
+        }
     }
 
     /// `ds_wo_a`'s fp8 fast path against its generic (wget) path on the same weights
