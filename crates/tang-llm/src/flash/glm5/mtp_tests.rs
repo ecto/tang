@@ -65,7 +65,7 @@ impl Drafter for Oracle {
 
 #[test]
 fn mtp_any_drafter_matches_plain_greedy() {
-    let _env = super::env_read();
+    let _env = crate::flash::glm5::env_read();
     let Some(p) = tiny() else { return };
     let n = 12;
     let want = plain(&p, n);
@@ -98,7 +98,7 @@ fn mtp_any_drafter_matches_plain_greedy() {
 /// never ran, so the same committed cells give the same draft twice.
 #[test]
 fn mtp_draft_is_side_effect_free() {
-    let _env = super::env_read();
+    let _env = crate::flash::glm5::env_read();
     let Some(p) = tiny() else { return };
     let mut e = Glm5Engine::open(Path::new(&p)).unwrap();
     let lg = e.window(&PROMPT).unwrap();

@@ -3004,7 +3004,7 @@ pub mod cuda {
     ///   --features cuda glm5::mla::cuda -- --nocapture` (release, nvcc present).
     #[test]
     fn cuda_naive_matches_cpu() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let Some(g) = Gpu::for_test() else { return };
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
@@ -3305,7 +3305,7 @@ pub mod cuda {
     /// the resident path never changes results vs the plain upload path.
     #[test]
     fn cuda_resident_flow_matches_upload() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let Some(g) = Gpu::for_test() else { return };
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
@@ -3542,7 +3542,7 @@ pub mod cuda {
     /// CONTENT must not.
     #[test]
     fn resident_pool_content_matches_a_fresh_pool() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let Some(g) = Gpu::for_test() else { return };
         let w = super::tests::weights_from_fixtures();
         let m = super::tests::load_meta();
@@ -3711,7 +3711,7 @@ mod tests {
 
     #[test]
     fn indexer_matches_hf() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
         let (b, s) = (m["B"].as_u64().unwrap(), m["S"].as_u64().unwrap());
@@ -3816,7 +3816,7 @@ mod tests {
 
     #[test]
     fn attention_matches_hf() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
         let (b, s) = (m["B"].as_u64().unwrap() as usize, m["S"].as_u64().unwrap() as usize);
@@ -3863,7 +3863,7 @@ mod tests {
 
     #[test]
     fn padded_batch_matches_hf() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
         let p = &m["padded"];
@@ -3941,7 +3941,7 @@ mod tests {
 
     #[test]
     fn dense_fast_path_is_noop() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         assert!(indexer_is_dense(2048, 2048));
         assert!(indexer_is_dense(130, 2048));
         assert!(!indexer_is_dense(2049, 2048));
@@ -3953,7 +3953,7 @@ mod tests {
     /// >budget path (the same shape as the real model's >2048 case, R7).
     #[test]
     fn indexer_long_context_matches_hf() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let mut d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("tests/fixtures/glm5/mla-long");
         let dir = d.to_str().unwrap().to_string();
@@ -4047,7 +4047,7 @@ mod tests {
     /// the HF module; the numbers are in meta.json under "real_indexer".
     #[test]
     fn real_indexer_saturation_is_recorded() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         assert!(m["real_indexer"]["2048"]["all_visible_up_to_2048+3"].as_bool().unwrap());
         assert!(!m["real_indexer"]["2100"]["all_visible_up_to_2048+3"].as_bool().unwrap());
@@ -4062,7 +4062,7 @@ mod absorbed_tests {
     /// same softmax, `Σ p·(W_v·lat) = W_v·(Σ p·lat)`. Sparse and dense paths.
     #[test]
     fn absorbed_matches_naive() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
         let (b, s) = (
@@ -4152,7 +4152,7 @@ mod absorbed_tests {
     /// reproduce `ref_attn_out` within the same 1e-5 bar on rows the selection covers.
     #[test]
     fn absorbed_matches_hf_sparse() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
         let t = m["B"].as_u64().unwrap() as usize * m["S"].as_u64().unwrap() as usize;

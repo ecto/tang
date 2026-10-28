@@ -1048,7 +1048,7 @@ mod tests {
     #[test]
     #[ignore]
     fn glm5_kda_layer_bench_real() {
-        let _env = super::super::env_write();
+        let _env = crate::flash::glm5::env_write();
         let Ok(path) = std::env::var("TANG_GLM5_BENCH_GGUF") else {
             eprintln!("SKIP: TANG_GLM5_BENCH_GGUF unset");
             return;
@@ -1169,7 +1169,7 @@ mod gemv8_tests {
 
     #[test]
     fn gemv8_matches_gemv_on_tiny_layer() {
-        let _env = super::super::env_read();
+        let _env = crate::flash::glm5::env_read();
         let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
         let Some(g) = Gpu::for_test() else {
             assert!(!required, "no CUDA device but TANG_REQUIRE_CUDA=1");
