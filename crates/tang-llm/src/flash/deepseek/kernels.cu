@@ -598,7 +598,9 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_mix_ks(const float* __re
     int nt = min(8, t - t0), k = k0 + tid;
     if (k < K) {
         int c = k / d, i = k - c * d;
-        for (int q = 0; q < nt; q++) {
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            if (q >= nt) break;
             int ti = t0 + q;
             const float* rr = res + (long long)ti * K;
             float v;
@@ -732,7 +734,7 @@ extern "C" __global__ void ds_hc_stage(const float* x, const float* mixes, float
 // sums as per-block partials; then a grid barrier (t <= 8, so one row of co-resident
 // blocks; cnt two zeroed ints, left consistent for the next launch), after which every
 // block scales its block-input chunk by rms(nw) (partials summed in a fixed order) and
-// block 0 runs the exact Sinkhorn (sinkhorn_warp, warp per token). Block 256 = hc copies x
+// block b < t runs token b's exact Sinkhorn (sinkhorn_warp). Block 256 = hc copies x
 // ci = 256 / hc dims; grid ceil(d / ci). part [t][np][rows + 2].
 extern "C" __global__ void __launch_bounds__(256) ds_hc_fused_ks(
     const float* __restrict__ h, const float* __restrict__ h2, const float* __restrict__ res,
@@ -842,19 +844,19 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_fused_ks(
         __threadfence();
     }
     __syncthreads();
-    // thread per (token, value): the partials summed in block order (block 0 all of them,
-    // the rest only the block input's square sum)
-    int nv = blockIdx.x == 0 ? R + 2 : 1;
-    for (int e = tid; e < nt * nv; e += 256) {
-        int q = e / nv, m = blockIdx.x == 0 ? e % nv : R + 1;
+    // thread per value, the partials summed in block order: every block the block inputs'
+    // square sums, block b < nt also token b's mixes and stream square sum
+    int own = blockIdx.x < nt ? R + 1 : 0;
+    for (int e = tid; e < nt + own; e += 256) {
+        int q = e < nt ? e : blockIdx.x, m = e < nt ? R + 1 : e - nt;
         const float* pp = part + (long long)(t0 + q) * np * (R + 2) + m;
         float v = 0.f;
-#pragma unroll 8
+#pragma unroll 16
         for (int b = 0; b < np; b++) v += __ldcg(pp + (long long)b * (R + 2));
         if (m < R)
-            sm[q][m] = v;
+            sm[0][m] = v;
         else if (m == R)
-            rx[q][0] = 1.f / sqrtf(v / K + neps);
+            rx[0][0] = 1.f / sqrtf(v / K + neps);
         else
             rs[q] = 1.f / sqrtf(v / d + reps);
     }
@@ -865,14 +867,14 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_fused_ks(
         for (int q = 0; q < 8; q++)
             if (q < nt) hin[(long long)(t0 + q) * d + i0 + tid] = bf(wv * (hv[q] * rs[q]));
     }
-    if (blockIdx.x == 0 && wp < nt) {
-        int ti = t0 + wp;
-        for (int m = lane; m < R; m += 32) sm[wp][m] = __fmul_rn(sm[wp][m], rx[wp][0]);
+    if (own && wp == 0) {
+        int ti = t0 + blockIdx.x;
+        for (int m = lane; m < R; m += 32) sm[0][m] = __fmul_rn(sm[0][m], rx[0][0]);
         __syncwarp();
         if (hc * hc <= 32)
-            sinkhorn_warp(sm[wp], scale, base, pre_o, post_o, comb_o, ti, hc, iters, eps);
+            sinkhorn_warp(sm[0], scale, base, pre_o, post_o, comb_o, ti, hc, iters, eps);
         else if (lane == 0)
-            sinkhorn_row(sm[wp], scale, base, pre_o, post_o, comb_o, ti, hc, iters, eps);
+            sinkhorn_row(sm[0], scale, base, pre_o, post_o, comb_o, ti, hc, iters, eps);
     }
 }
 
