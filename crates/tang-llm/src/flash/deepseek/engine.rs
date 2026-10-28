@@ -4550,10 +4550,12 @@ mod tests {
                 .decode_spec(tok, &ma, sp, &mut |_, _| {}, &mut pa)
                 .unwrap();
             let pos0 = sp + mb.len() / w;
-            let d = b
+            let mut d = b
                 .forward_spec_with(tok, &mb, sp, &mut |q: &[f32]| pb.draft(q))
                 .unwrap()
                 .unwrap();
+            // the window decode_spec verifies (DS_DRAFT_N / DS_DRAFT_CONF)
+            d.ids.truncate(1 + c.draft_keep(&d.conf));
             let snap = b.snapshot().unwrap();
             let (logits, mains) = b.forward_all(&d.ids, pos0).unwrap();
             let (k, tokens) =
