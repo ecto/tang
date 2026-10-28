@@ -689,22 +689,49 @@ fn profile_table(recs: &[super::obs::StepRec], o: &ProfileOpts, load_s: f64, u: 
     }
     let others: Vec<&obs::StepRec> = recs.iter().filter(|r| r.rank != 0).collect();
     if !others.is_empty() {
-        let _ = writeln!(s, "\nother ranks (mean per step):");
+        // per rank and step kind, so a slow rank shows (rank 0 also reads back and samples);
+        // the span sums are the top-level blocks of the layers, where the rank recorded any
+        let _ = writeln!(
+            s,
+            "\nother ranks (means over each kind's steps after the first): gpu | reduce_wait | launches | attn hc moe (ms)"
+        );
         let mut ranks: Vec<usize> = others.iter().map(|r| r.rank).collect();
         ranks.sort();
         ranks.dedup();
         for rk in ranks {
-            let rs: Vec<&&obs::StepRec> = others.iter().filter(|r| r.rank == rk).collect();
-            let n = rs.len() as f64;
-            let _ = writeln!(
-                s,
-                "  rank {rk}: {} steps, gpu {:.3} ms, wall {:.3} ms, reduce_wait {:.3} ms, launches {:.0}",
-                rs.len(),
-                rs.iter().map(|r| r.gpu_ms).sum::<f64>() / n,
-                rs.iter().map(|r| r.wall_ms).sum::<f64>() / n,
-                rs.iter().map(|r| r.reduce_wait_ms).sum::<f64>() / n,
-                rs.iter().map(|r| r.counts.launches as f64).sum::<f64>() / n,
-            );
+            for kind in ["prefill", "draft", "decode", "verify"] {
+                let rs: Vec<&&obs::StepRec> = others
+                    .iter()
+                    .filter(|r| r.rank == rk && r.kind == kind)
+                    .collect();
+                let rs: Vec<&&obs::StepRec> = if rs.len() > 1 { rs[1..].to_vec() } else { rs };
+                if rs.is_empty() {
+                    continue;
+                }
+                let n = rs.len() as f64;
+                let mean =
+                    |f: &dyn Fn(&obs::StepRec) -> f64| rs.iter().map(|r| f(r)).sum::<f64>() / n;
+                let span = |name: &str| {
+                    mean(&|r| {
+                        r.spans
+                            .iter()
+                            .filter(|p| p.name == name)
+                            .map(|p| p.gpu_ms)
+                            .sum::<f64>()
+                    })
+                };
+                let _ = writeln!(
+                    s,
+                    "  rank {rk} {kind:7} {:3} steps: {:8.3} | {:7.3} | {:6.0} | {:7.3} {:7.3} {:7.3}",
+                    rs.len(),
+                    mean(&|r| r.gpu_ms),
+                    mean(&|r| r.reduce_wait_ms),
+                    mean(&|r| r.counts.launches as f64),
+                    span("attn"),
+                    span("hc"),
+                    span("moe"),
+                );
+            }
         }
     }
     s
