@@ -143,6 +143,20 @@ MoE grouped kernels tuned for 132 SMs + router/route in one launch + reduce over
 fusion (one wo launch, q in 2, sparse_attn in 1), and prefill (grouped MoE and GEMM tiles for
 t > 8).
 
+Wave 6 merged so far (895f89b0, not yet measured on H200 — the pod stopped when the RunPod
+balance ran out; its /workspace volume keeps the model and the build): attention fusion (one
+grouped K-split launch for wo, 19 → 2 launches, 143 → 54 µs on a 3090; q + window_kv fused,
+the compressor/indexer key side batched over the window, ~150 → ~30 attention launches per
+compressing layer; every fast linear drops its copy + qdq launches), MoE (redundant quant
+passes gone, 7 fewer launches per layer; `DS_MOE_KS_ITEMS`/`DS_MOE_KS_S` grid knobs and the
+opt-in fused router `DS_MOE_GATE=1` to sweep on H200), the draft as one captured graph with a
+single read-back and device-side sampling that reproduces the host's draws bit for bit (66
+replay nodes vs 248 launches; an obs counter bug fixed), and prefill: tiled grouped MoE and a
+K-split path for raw linears at t > 8, the tiled attention chunked over rows (tiny fixture
+120-token prefill 23 → 13 ms, 3696 → 592 launches; bench at real shapes: wq_b 3.7 → 1.4 ms,
+wo_b 4.7 → 2.3 ms at t = 512). Still open: the relaxed-order mHC lane; the per-rank table
+(rank 0 was 66 ms vs 43 on the others); a real multi-token GEMM tile for prefill.
+
 Steady state after the host fixes: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a
 ~4 ms floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
 path (`moe.router` 28 ms and `moe.reduce` 10 ms per step are the next two line items), then
