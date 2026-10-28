@@ -139,6 +139,10 @@ pub struct Kernels {
     pub attn_fuse: bool,
     /// the split-K decode attention (`ds_attn_fd`); `DS_ATTN_FD=0` keeps the 3-pass tiled one
     pub attn_fd: bool,
+    /// `DS_ATTN_FD_S`: key splits per row of `ds_attn_fd` (0: about a wave of SMs)
+    attn_fd_s: usize,
+    /// `ds_attn_fdm` (tensor cores) for `ds_attn_fd`; `DS_ATTN_FDM=0` keeps the CUDA-core one
+    pub attn_fdm: bool,
     /// Every other kernel, by name, for [`Kernels::go`].
     more: std::collections::HashMap<&'static str, Func>,
 }
@@ -151,6 +155,7 @@ const MORE: &[&str] = &[
     "ds_comp_post",
     "ds_attn_spv",
     "ds_attn_fd",
+    "ds_attn_fdm",
     "ds_attn_fd_comb",
     "ds_copy",
     "ds_hc_scale",
@@ -375,6 +380,7 @@ impl Kernels {
                     "ds_moe_ks_tdown_f2",
                     "ds_moe_ks_tdown_f3",
                     "ds_attn_fd",
+                    "ds_attn_fdm",
                 ] {
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
@@ -392,6 +398,11 @@ impl Kernels {
             // slower than soft + pv on a 3090 (213 vs 164 us at t 6, k 646): opt-in
             attn_fuse: std::env::var("DS_ATTN_FUSE").is_ok_and(|v| v == "1"),
             attn_fd: std::env::var("DS_ATTN_FD").map_or(true, |v| v != "0"),
+            attn_fdm: std::env::var("DS_ATTN_FDM").map_or(true, |v| v != "0"),
+            attn_fd_s: std::env::var("DS_ATTN_FD_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             more: MORE
                 .iter()
                 .map(|&n| Ok((n, m.func(n)?)))
@@ -1466,11 +1477,25 @@ impl Kernels {
         let qtab = if r.q { r.tab } else { 0 };
         let ntile = k.div_ceil(16);
         let hg = h / 64;
-        let smem = (64 * 257 + 16 * 257 + 16 * 64 + 3 * 64 + 16) * 4;
+        let (fname, smem) = if self.attn_fdm {
+            (
+                "ds_attn_fdm",
+                (64 * 257 + 16 * 257 + 64 * 17 + 64 * 9 + 3 * 64 + 1024) * 4,
+            )
+        } else {
+            (
+                "ds_attn_fd",
+                (64 * 257 + 16 * 257 + 16 * 64 + 3 * 64 + 16) * 4,
+            )
+        };
         let mut t0 = 0;
         while t0 < t {
             let n0 = (t - t0).min(64);
-            let sp_n = self.sms.div_ceil(n0 * hg).clamp(1, ntile);
+            let sp_n = match self.attn_fd_s {
+                0 => self.sms.div_ceil(n0 * hg),
+                v => v,
+            }
+            .clamp(1, ntile);
             let n = n0.min(ATTN_SCRATCH / (sp_n * h * (d + 2))).max(1);
             let ns = sp_n as i32;
             let part = self.scratch.ptr;
@@ -1484,7 +1509,7 @@ impl Kernels {
             let (hi, di, ki) = (h as i32, d as i32, k as i32);
             unsafe {
                 super::obs::launch(
-                    self.more["ds_attn_fd"],
+                    self.more[fname],
                     ((n * hg * sp_n) as u32, 1, 1),
                     (256, 1, 1),
                     smem as u32,
@@ -1642,6 +1667,7 @@ impl Kernels {
         let sp = split.min(i32::MAX as usize) as i32;
         // rows per pass that fit the scratch (prefill: many passes, each row independent)
         let per_row = h * k * (d / 64 + 1) + h;
+        // ds_attn_fdm holds a split's indices (<= 1024) in shared memory: k <= 960 here
         if self.attn_tiled_ok(h, d, k) && self.attn_fd && d == 512 && h % 64 == 0 {
             return self.attn_fd(s, q, kv, sp, kv1, sink, idxs, o, t, h, d, k, scale, rope);
         }
@@ -4523,7 +4549,12 @@ mod tests {
             fmt: 1,
             _pad: 0,
         };
-        let (hci, di, it, eps, neps) = (hc as i32, d as i32, 20i32, 1e-6f32, 1e-6f32);
+        // DS_BENCH_HC_IT: the Sinkhorn iterations (the model's 20), to time that part
+        let it: i32 = std::env::var("DS_BENCH_HC_IT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let (hci, di, eps, neps) = (hc as i32, d as i32, 1e-6f32, 1e-6f32);
         for t in [1usize, 6, 13] {
             let ti = t as i32;
             let x = up(&data(t * hc * d, 1, 1.0));
