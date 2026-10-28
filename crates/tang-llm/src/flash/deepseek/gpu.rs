@@ -137,6 +137,8 @@ pub struct Kernels {
     /// The tiled attention's softmax fused into its PV kernel (`ds_attn_spv`, 2 launches;
     /// `DS_ATTN_FUSE=1`).
     pub attn_fuse: bool,
+    /// the split-K decode attention (`ds_attn_fd`); `DS_ATTN_FD=0` keeps the 3-pass tiled one
+    pub attn_fd: bool,
     /// Every other kernel, by name, for [`Kernels::go`].
     more: std::collections::HashMap<&'static str, Func>,
 }
@@ -148,6 +150,8 @@ const MORE: &[&str] = &[
     "ds_ring_last2",
     "ds_comp_post",
     "ds_attn_spv",
+    "ds_attn_fd",
+    "ds_attn_fd_comb",
     "ds_copy",
     "ds_hc_scale",
     "ds_hc_sinkhorn",
@@ -370,6 +374,7 @@ impl Kernels {
                     "ds_moe_ks_tgu_f3",
                     "ds_moe_ks_tdown_f2",
                     "ds_moe_ks_tdown_f3",
+                    "ds_attn_fd",
                 ] {
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
@@ -386,6 +391,7 @@ impl Kernels {
             exact: std::env::var("DS_EXACT").is_ok_and(|v| v == "1") || arch(&m)? < 800,
             // slower than soft + pv on a 3090 (213 vs 164 us at t 6, k 646): opt-in
             attn_fuse: std::env::var("DS_ATTN_FUSE").is_ok_and(|v| v == "1"),
+            attn_fd: std::env::var("DS_ATTN_FD").map_or(true, |v| v != "0"),
             more: MORE
                 .iter()
                 .map(|&n| Ok((n, m.func(n)?)))
@@ -1435,6 +1441,72 @@ impl Kernels {
         Ok(())
     }
 
+    /// The split-K decode attention (`ds_attn_fd` + `ds_attn_fd_comb`), in passes of rows
+    /// whose partials fit the scratch; splits per row to fill about two waves of SMs.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_fd(
+        &self,
+        s: &Stream,
+        q: u64,
+        kv: u64,
+        sp: i32,
+        kv1: u64,
+        sink: u64,
+        idxs: u64,
+        o: u64,
+        t: usize,
+        h: usize,
+        d: usize,
+        k: usize,
+        scale: f32,
+        rope: Option<AttnRope>,
+    ) -> Result<()> {
+        let r = rope.unwrap_or_default();
+        let (pp, rd, ps) = (r.p, r.rd, r.stride);
+        let qtab = if r.q { r.tab } else { 0 };
+        let ntile = k.div_ceil(16);
+        let hg = h / 64;
+        let smem = (64 * 257 + 16 * 257 + 16 * 64 + 3 * 64 + 16) * 4;
+        let mut t0 = 0;
+        while t0 < t {
+            let n0 = (t - t0).min(64);
+            let sp_n = self.sms.div_ceil(n0 * hg).clamp(1, ntile);
+            let n = n0.min(ATTN_SCRATCH / (sp_n * h * (d + 2))).max(1);
+            let ns = sp_n as i32;
+            let part = self.scratch.ptr;
+            let ml = part + (n * sp_n * h * d * 4) as u64;
+            let add = r.add + t0 as i32 * r.stride;
+            let (qo, io, oo) = (
+                q + (t0 * h * d * 4) as u64,
+                idxs + (t0 * k * 4) as u64,
+                o + (t0 * h * d * 4) as u64,
+            );
+            let (hi, di, ki) = (h as i32, d as i32, k as i32);
+            unsafe {
+                super::obs::launch(
+                    self.more["ds_attn_fd"],
+                    ((n * hg * sp_n) as u32, 1, 1),
+                    (256, 1, 1),
+                    smem as u32,
+                    s,
+                    tang_moe::args![
+                        qo, kv, sp, kv1, io, part, ml, hi, di, ki, scale, ns, qtab, pp, rd, add, ps
+                    ],
+                )?;
+                super::obs::launch(
+                    self.more["ds_attn_fd_comb"],
+                    ((n * h) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![part, ml, sink, oo, hi, di, ns, r.tab, pp, rd, add, ps],
+                )?;
+            }
+            t0 += n;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// The three tiled-attention launches over `t` rows (t * per-row scratch must fit).
     #[allow(clippy::too_many_arguments)]
@@ -1570,6 +1642,9 @@ impl Kernels {
         let sp = split.min(i32::MAX as usize) as i32;
         // rows per pass that fit the scratch (prefill: many passes, each row independent)
         let per_row = h * k * (d / 64 + 1) + h;
+        if self.attn_tiled_ok(h, d, k) && self.attn_fd && d == 512 && h % 64 == 0 {
+            return self.attn_fd(s, q, kv, sp, kv1, sink, idxs, o, t, h, d, k, scale, rope);
+        }
         if self.attn_tiled_ok(h, d, k) {
             let tc = ATTN_SCRATCH / per_row;
             let mut t0 = 0;
@@ -3213,10 +3288,13 @@ mod tests {
             k.exact = true;
             let want = run(&k, usize::MAX);
             k.exact = false;
+            k.attn_fd = false;
             k.attn_fuse = false;
             let three = run(&k, 134);
             k.attn_fuse = true;
             let got = run(&k, 134);
+            k.attn_fd = true;
+            let fd = run(&k, 134);
             // the fused soft+pv is the 3-kernel path bit for bit
             assert!(
                 got.iter()
@@ -3243,6 +3321,26 @@ mod tests {
             assert!(
                 eq as f64 >= 0.9 * got.len() as f64,
                 "attn t {t} k {kk}: {eq} equal"
+            );
+            // the split-K one: p unrounded (no global max to round against), so the outputs that
+            // cancel to near zero miss by a few of their own ulps: the same normwise error as
+            // the tiled path, ≥ 85% within an ulp
+            let eq = fd
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| {
+                    ((a.to_bits() >> 16) as i32 - (b.to_bits() >> 16) as i32).abs() <= 1
+                })
+                .count();
+            let r = rel(&fd, &want);
+            eprintln!(
+                "attn fd t {t} k {kk}: {:.2}% within 1 ulp, normwise rel {r:.2e}",
+                100.0 * eq as f64 / fd.len() as f64
+            );
+            assert!(r < 8e-3, "attn fd t {t} k {kk}: rel {r}");
+            assert!(
+                eq as f64 >= 0.85 * fd.len() as f64,
+                "attn fd t {t} k {kk}: {eq} within 1 ulp"
             );
         }
     }
@@ -4153,6 +4251,14 @@ mod tests {
         });
         eprintln!("attn_block_bench dg_sparse_attn t {t} k {kk}: {us:.1} us");
         k.exact = false;
+        let us = ev(&|| {
+            k.sparse_attn(
+                &s, q.ptr, kv0.ptr, win, kv1.ptr, sink.ptr, ix.ptr, ob.ptr, t, h, d, kk, scale,
+            )
+            .unwrap()
+        });
+        eprintln!("attn_block_bench split-K ds_attn_fd (2 launches) t {t} k {kk}: {us:.1} us");
+        k.attn_fd = false;
         k.attn_fuse = false;
         let us = ev(&|| {
             k.sparse_attn(

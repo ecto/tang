@@ -2106,3 +2106,176 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, co
         o[((long long)ti * h + hi) * d + col] = v;
     }
 }
+
+// ---- split-K decode attention (relaxed bar; d == 512, h % 32 == 0) -----------------------------
+//
+// ds_attn_fd: block per (t, 64-head group, key split s of S). q's 64 heads and the split's keys
+// (16-key tiles) sit in shared memory as bf16 pairs (both are bf16-valued, so exactly); per tile
+// the scores (thread: 2 heads x 2 keys), an online softmax per head (running max / sum,
+// p = exp(s - m) unrounded), and o += P kv (thread: a dim pair, all 64 heads in registers).
+// Out: part[t][S][h][d] (unnormalised) and ml[t][S][h][2] (running max, sum).
+// ds_attn_fd_comb: block per (t, head): the splits merged with the sink in the denominator,
+// o = bf(sum_s w_s part_s / den), the o rope (inverse) fused as ds_attn_pv's.
+#define FD_KT 16
+#define FD_QP 257
+#define FD_SMEM ((64 * FD_QP + FD_KT * FD_QP + FD_KT * 64 + 3 * 64 + FD_KT) * 4)
+__device__ __forceinline__ unsigned int fd_pack(float2 v) {
+    return (__float_as_uint(v.x) >> 16) | (__float_as_uint(v.y) & 0xffff0000u);
+}
+extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, const float* kv0, int split,
+                                                             const float* kv1, const int* idxs, float* part,
+                                                             float* ml, int h, int d, int k, float scale, int S,
+                                                             const float2* tab, const int* Pp, int rd, int add,
+                                                             int ps) {
+    extern __shared__ float fsm[];
+    unsigned int* Qs = (unsigned int*)fsm;  // [64][FD_QP]
+    unsigned int* Ks = Qs + 64 * FD_QP;     // [FD_KT][FD_QP]
+    float* Ps = (float*)(Ks + FD_KT * FD_QP);  // [FD_KT][64]
+    float* scal = Ps + FD_KT * 64;            // [64]
+    float* mrun = scal + 64;
+    float* lrun = mrun + 64;
+    int* Is = (int*)(lrun + 64);  // [FD_KT]
+    int hg = h / 64, b = blockIdx.x, tid = threadIdx.x;
+    int si = b % S, g = (b / S) % hg, ti = b / (S * hg);
+    for (int e = tid; e < 64 * 128; e += 256) {
+        int hh = e / 128, c4 = e % 128, col = 4 * c4;
+        const float* qr = q + ((long long)ti * h + g * 64 + hh) * d;
+        float4 v = *(const float4*)(qr + col);
+        if (tab && col >= d - rd) {
+            int pos = Pp[0] + add + ti * ps;
+            float a0 = ds_rope_at(v.x, v.y, col, d, rd, tab, pos, 0);
+            float a1 = ds_rope_at(v.x, v.y, col + 1, d, rd, tab, pos, 0);
+            float a2 = ds_rope_at(v.z, v.w, col + 2, d, rd, tab, pos, 0);
+            float a3 = ds_rope_at(v.z, v.w, col + 3, d, rd, tab, pos, 0);
+            v = make_float4(a0, a1, a2, a3);
+        }
+        Qs[hh * FD_QP + 2 * c4] = fd_pack(make_float2(v.x, v.y));
+        Qs[hh * FD_QP + 2 * c4 + 1] = fd_pack(make_float2(v.z, v.w));
+    }
+    if (tid < 64) {
+        mrun[tid] = -DS_INF;
+        lrun[tid] = 0.f;
+    }
+    int ntile = (k + FD_KT - 1) / FD_KT;
+    int t0 = (int)((long long)si * ntile / S), t1 = (int)((long long)(si + 1) * ntile / S);
+    const int* ix = idxs + (long long)ti * k;
+    float2 acc[64];
+#pragma unroll
+    for (int m = 0; m < 64; m++) acc[m] = make_float2(0.f, 0.f);
+    int hp = (tid >> 3) * 2, kp = (tid & 7) * 2;
+    for (int tt = t0; tt < t1; tt++) {
+        __syncthreads();
+        if (tid < FD_KT) {
+            int j = tt * FD_KT + tid;
+            Is[tid] = j < k ? ix[j] : -1;
+        }
+        __syncthreads();
+        for (int e = tid; e < FD_KT * 128; e += 256) {
+            int kk = e / 128, c4 = e % 128, r = Is[kk];
+            float4 v = r >= 0 ? *(const float4*)(DS_KROW(r) + 4 * c4) : make_float4(0.f, 0.f, 0.f, 0.f);
+            Ks[kk * FD_QP + 2 * c4] = fd_pack(make_float2(v.x, v.y));
+            Ks[kk * FD_QP + 2 * c4 + 1] = fd_pack(make_float2(v.z, v.w));
+        }
+        __syncthreads();
+        float sc[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+        const unsigned int *q0 = Qs + hp * FD_QP, *q1 = q0 + FD_QP;
+        const unsigned int *k0 = Ks + kp * FD_QP, *k1 = k0 + FD_QP;
+#pragma unroll 8
+        for (int jj = 0; jj < 256; jj++) {
+            unsigned int a = q0[jj], bq = q1[jj], c = k0[jj], e2 = k1[jj];
+            float a0 = __uint_as_float(a << 16), a1 = __uint_as_float(a & 0xffff0000u);
+            float b0 = __uint_as_float(bq << 16), b1 = __uint_as_float(bq & 0xffff0000u);
+            float c0 = __uint_as_float(c << 16), c1 = __uint_as_float(c & 0xffff0000u);
+            float e0 = __uint_as_float(e2 << 16), e1 = __uint_as_float(e2 & 0xffff0000u);
+            sc[0][0] = fmaf(a1, c1, fmaf(a0, c0, sc[0][0]));
+            sc[0][1] = fmaf(a1, e1, fmaf(a0, e0, sc[0][1]));
+            sc[1][0] = fmaf(b1, c1, fmaf(b0, c0, sc[1][0]));
+            sc[1][1] = fmaf(b1, e1, fmaf(b0, e0, sc[1][1]));
+        }
+        bool v0 = Is[kp] >= 0, v1 = Is[kp + 1] >= 0;
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+            float s0 = v0 ? sc[u][0] * scale : -DS_INF, s1 = v1 ? sc[u][1] * scale : -DS_INF;
+            float mt = fmaxf(s0, s1);
+            for (int o = 1; o < 8; o <<= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+            int hh = hp + u;
+            float mo = mrun[hh], mn = fmaxf(mo, mt);
+            float p0 = 0.f, p1 = 0.f, f = 1.f;
+            if (mn > -DS_INF) {
+                p0 = expf(s0 - mn);
+                p1 = expf(s1 - mn);
+                f = mo > -DS_INF ? expf(mo - mn) : 0.f;
+            }
+            float ls = p0 + p1;
+            for (int o = 1; o < 8; o <<= 1) ls += __shfl_xor_sync(0xffffffffu, ls, o);
+            Ps[kp * 64 + hh] = p0;
+            Ps[(kp + 1) * 64 + hh] = p1;
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                scal[hh] = f;
+                mrun[hh] = mn;
+                lrun[hh] = lrun[hh] * f + ls;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < 64; m += 4) {
+            float4 f = *(const float4*)(scal + m);
+            acc[m].x *= f.x, acc[m].y *= f.x;
+            acc[m + 1].x *= f.y, acc[m + 1].y *= f.y;
+            acc[m + 2].x *= f.z, acc[m + 2].y *= f.z;
+            acc[m + 3].x *= f.w, acc[m + 3].y *= f.w;
+        }
+        for (int kk = 0; kk < FD_KT; kk++) {
+            unsigned int kw = Ks[kk * FD_QP + tid];
+            float vx = __uint_as_float(kw << 16), vy = __uint_as_float(kw & 0xffff0000u);
+            const float* pr = Ps + kk * 64;
+#pragma unroll
+            for (int m = 0; m < 64; m += 4) {
+                float4 p = *(const float4*)(pr + m);
+                acc[m].x = fmaf(p.x, vx, acc[m].x), acc[m].y = fmaf(p.x, vy, acc[m].y);
+                acc[m + 1].x = fmaf(p.y, vx, acc[m + 1].x), acc[m + 1].y = fmaf(p.y, vy, acc[m + 1].y);
+                acc[m + 2].x = fmaf(p.z, vx, acc[m + 2].x), acc[m + 2].y = fmaf(p.z, vy, acc[m + 2].y);
+                acc[m + 3].x = fmaf(p.w, vx, acc[m + 3].x), acc[m + 3].y = fmaf(p.w, vy, acc[m + 3].y);
+            }
+        }
+    }
+    __syncthreads();
+    long long base = ((long long)ti * S + si) * h + g * 64;
+#pragma unroll
+    for (int m = 0; m < 64; m++) *(float2*)(part + (base + m) * d + 2 * tid) = acc[m];
+    if (tid < 64) {
+        ml[(base + tid) * 2] = mrun[tid];
+        ml[(base + tid) * 2 + 1] = lrun[tid];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* part, const float* ml,
+                                                                  const float* sink, float* o, int h, int d,
+                                                                  int S, const float2* tab, const int* Pp, int rd,
+                                                                  int add, int ps) {
+    int b = blockIdx.x, hi = b % h, ti = b / h, tid = threadIdx.x;
+    float M = -DS_INF;
+    for (int s = 0; s < S; s++) M = fmaxf(M, ml[(((long long)ti * S + s) * h + hi) * 2]);
+    M = fmaxf(M, -1e30f);
+    float den = expf(sink[hi] - M);
+    float2 a = make_float2(0.f, 0.f);
+    for (int s = 0; s < S; s++) {
+        long long r = ((long long)ti * S + s) * h + hi;
+        float m = ml[r * 2];
+        float w = m > -DS_INF ? expf(m - M) : 0.f;
+        den += w * ml[r * 2 + 1];
+        float2 v = *(const float2*)(part + r * d + 2 * tid);
+        a.x = fmaf(w, v.x, a.x);
+        a.y = fmaf(w, v.y, a.y);
+    }
+    int col = 2 * tid;
+    float x = bf(a.x / den), y = bf(a.y / den);
+    if (tab && col >= d - rd) {
+        int pos = Pp[0] + add + ti * ps;
+        float x2 = ds_rope_at(x, y, col, d, rd, tab, pos, 1);
+        y = ds_rope_at(x, y, col + 1, d, rd, tab, pos, 1);
+        x = x2;
+    }
+    *(float2*)(o + ((long long)ti * h + hi) * d + col) = make_float2(x, y);
+}
