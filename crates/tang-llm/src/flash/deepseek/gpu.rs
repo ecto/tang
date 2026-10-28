@@ -132,12 +132,20 @@ pub struct Kernels {
     /// `DS_EXACT=1`: the bit-exact kernels (`ds_lin_*`, `ds_sparse_attn`) instead of the
     /// K-split GEMV and the tiled attention.
     pub exact: bool,
+    /// The tiled attention's softmax fused into its PV kernel (`ds_attn_spv`, 2 launches;
+    /// `DS_ATTN_FUSE=1`).
+    pub attn_fuse: bool,
     /// Every other kernel, by name, for [`Kernels::go`].
     more: std::collections::HashMap<&'static str, Func>,
 }
 
 /// The kernels launched through [`Kernels::go`].
 const MORE: &[&str] = &[
+    "ds_qkv_post",
+    "ds_comp_pool",
+    "ds_ring_last2",
+    "ds_comp_post",
+    "ds_attn_spv",
     "ds_copy",
     "ds_hc_scale",
     "ds_hc_sinkhorn",
@@ -335,6 +343,8 @@ impl Kernels {
             },
             // the mma path needs sm_80 (an arch-less NVRTC build may target less)
             exact: std::env::var("DS_EXACT").is_ok_and(|v| v == "1") || arch(&m)? < 800,
+            // slower than soft + pv on a 3090 (213 vs 164 us at t 6, k 646): opt-in
+            attn_fuse: std::env::var("DS_ATTN_FUSE").is_ok_and(|v| v == "1"),
             more: MORE
                 .iter()
                 .map(|&n| Ok((n, m.func(n)?)))
@@ -745,17 +755,13 @@ impl Kernels {
             }
         }
         let (rows, cols) = (w.rows as usize, w.cols as usize);
-        let gu = w3.is_some() as usize;
-        let out = if gu == 1 { 8 } else { 16 };
         let pitch = cols.div_ceil(128) * 128 + 32;
         let nch = cols / 32;
         if 8 * pitch + 8 * nch * 4 > self.smem_max || cols > 16384 {
             // too wide to stage: the exact kernels
             return self.linear_exact(s, w, w3, x, y, t, round, qdq, rw, lim);
         }
-        let r = round as i32;
         let _ = qdq; // quantized either way (idempotent on a quantized activation)
-        let f = self.ks[w.fmt as usize - 2][gu];
         let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
         let mut t0 = 0;
         while t0 < t {
@@ -772,42 +778,104 @@ impl Kernels {
                     tang_moe::args![xo, codes, scales, ng],
                 )?
             }
-            let smem = n * pitch + n * nch * 4;
-            let (sp, br, mut sb) = ks_split(rows.div_ceil(out), nch, self.sms);
-            if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
-                sb = 1;
-            }
-            let mut per_sm = 0i32;
-            unsafe {
-                gpu::check(
-                    cudarc::driver::sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &mut per_sm,
-                        f,
-                        256,
-                        smem,
-                    ),
-                    "occupancy",
-                )?
-            };
-            let grid = (br * sb).min(self.sms * per_sm.max(1) as usize);
-            let (wv, w3v) = (*w, *w3.unwrap_or(w));
-            let (yo, ni) = (y + (t0 * rows * 4) as u64, n as i32);
+            let yo = y + (t0 * rows * 4) as u64;
             let rwo = if rw == 0 { 0 } else { rw + (t0 * 4) as u64 };
-            let (si, sbi, bri) = (sp as i32, sb as i32, br as i32);
-            let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
-            unsafe {
-                super::obs::launch(
-                    f,
-                    (grid as u32, 1, 1),
-                    (256, 1, 1),
-                    smem as u32,
-                    s,
-                    tang_moe::args![
-                        wv, w3v, codes, scales, yo, ni, r, rwo, lim, si, sbi, bri, part, cnt
-                    ],
-                )?
-            }
+            self.ks_gemv(s, w, w3, codes, scales, yo, n, round, rwo, lim)?;
             t0 += n;
+        }
+        Ok(())
+    }
+
+    /// Whether [`Kernels::linear_ks`] runs `w` on the K-split GEMV (rather than falling back to
+    /// the exact kernels), so its activation needs no separate `fp8_qdq`.
+    pub fn ks_ok(&self, w: &DsW) -> bool {
+        if self.exact || !Self::fast_ok(w) {
+            return false;
+        }
+        let cols = w.cols as usize;
+        let pitch = cols.div_ceil(128) * 128 + 32;
+        8 * pitch + 8 * (cols / 32) * 4 <= self.smem_max && cols <= 16384
+    }
+
+    /// `ks_x`'s (codes, scales): [`Kernels::linear_ks`]'s quantized activation.
+    pub fn ks_x_ptrs(&self) -> (u64, u64) {
+        (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64)
+    }
+
+    /// `wo_x`'s (codes, scales): a second quantized-activation buffer (8 × 32768).
+    pub fn wo_x_ptrs(&self) -> (u64, u64) {
+        (self.wo_x.ptr, self.wo_x.ptr + (8 * WO_X_COLS) as u64)
+    }
+
+    /// `ds_ks_quant` of `n` values at `x` (a multiple of 32) into (codes, scales).
+    pub fn ks_quant_to(&self, s: &Stream, x: u64, codes: u64, scales: u64, n: usize) -> Result<()> {
+        let ng = (n / 32) as i32;
+        unsafe {
+            super::obs::launch(
+                self.ks_quant,
+                blocks(n, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![x, codes, scales, ng],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The K-split GEMV of [`Kernels::linear_ks`] on an already quantized activation (codes
+    /// [n][cols], scales [n][cols / 32]), `n` <= 8 tokens. [`Kernels::ks_ok`] first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ks_gemv(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        w3: Option<&DsW>,
+        codes: u64,
+        scales: u64,
+        y: u64,
+        n: usize,
+        round: bool,
+        rw: u64,
+        lim: f32,
+    ) -> Result<()> {
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        let gu = w3.is_some() as usize;
+        let out = if gu == 1 { 8 } else { 16 };
+        let pitch = cols.div_ceil(128) * 128 + 32;
+        let nch = cols / 32;
+        let f = self.ks[w.fmt as usize - 2][gu];
+        let smem = n * pitch + n * nch * 4;
+        let (sp, br, mut sb) = ks_split(rows.div_ceil(out), nch, self.sms);
+        if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
+            sb = 1;
+        }
+        let mut per_sm = 0i32;
+        unsafe {
+            gpu::check(
+                cudarc::driver::sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &mut per_sm,
+                    f,
+                    256,
+                    smem,
+                ),
+                "occupancy",
+            )?
+        };
+        let grid = (br * sb).min(self.sms * per_sm.max(1) as usize);
+        let (wv, w3v) = (*w, *w3.unwrap_or(w));
+        let (ni, r) = (n as i32, round as i32);
+        let (si, sbi, bri) = (sp as i32, sb as i32, br as i32);
+        let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
+        unsafe {
+            super::obs::launch(
+                f,
+                (grid as u32, 1, 1),
+                (256, 1, 1),
+                smem as u32,
+                s,
+                tang_moe::args![wv, w3v, codes, scales, y, ni, r, rw, lim, si, sbi, bri, part, cnt],
+            )?;
         }
         Ok(())
     }
@@ -1168,6 +1236,28 @@ impl Kernels {
                     s,
                     tang_moe::args![q, kv, sp, kv1, idxs, part, hi, di, ki],
                 )?;
+                if self.attn_fuse {
+                    // soft + pv in one launch: dsb slices a block, as few as keep ~all SMs busy
+                    let nds = d / 64;
+                    let mut dsb = nds;
+                    while dsb > 1 && t * (h / 8) * (nds / dsb) < self.sms {
+                        dsb -= 1;
+                        while nds % dsb != 0 {
+                            dsb -= 1;
+                        }
+                    }
+                    let dsbi = dsb as i32;
+                    let f = self.more["ds_attn_spv"];
+                    super::obs::launch(
+                        f,
+                        ((t * (h / 8) * (nds / dsb)) as u32, 1, 1),
+                        (256, 1, 1),
+                        (9 * k * 4) as u32,
+                        s,
+                        tang_moe::args![part, sink, kv, sp, kv1, idxs, o, hi, di, ki, scale, dsbi],
+                    )?;
+                    return Ok(());
+                }
                 super::obs::launch(
                     self.attn_soft,
                     blocks(t * h * 32, 256),
@@ -2452,8 +2542,17 @@ mod tests {
             k.exact = true;
             let want = run(&k, usize::MAX);
             k.exact = false;
+            k.attn_fuse = false;
+            let three = run(&k, 134);
+            k.attn_fuse = true;
             let got = run(&k, 134);
-            k.exact = false;
+            // the fused soft+pv is the 3-kernel path bit for bit
+            assert!(
+                got.iter()
+                    .zip(&three)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "attn t {t} k {kk}: ds_attn_spv != soft + pv"
+            );
             // Reordered sums flip bf(p) of a few keys by an ulp, and outputs that cancel to
             // near zero then miss by more than an ulp of themselves: ≥ 99% equal, normwise within
             // two ulps of the largest output.
@@ -3110,6 +3209,163 @@ mod tests {
             .filter(|(a, b)| (*a - *b).abs() > 1e-2 * (1.0 + b.abs()))
             .count();
         assert_eq!(bad, 0, "grouped wo_a vs per-group K-split");
+        // q + window kv: wq_a 5120 -> 1280, wkv 5120 -> 512, wq_b 1280 -> 64 × 512 (fp8)
+        let fp8w = |rows: usize, cols: usize, seed: usize| {
+            let mut wb: Vec<u8> = (0..rows * cols)
+                .map(|i| ((i + seed) * 2654435761 >> 13) as u8)
+                .collect();
+            wb.iter_mut()
+                .filter(|b| **b & 0x7f == 0x7f)
+                .for_each(|b| *b = 0x10);
+            let sb: Vec<u8> = (0..rows.div_ceil(32) * cols / 32)
+                .map(|i| 118 + ((i + seed) % 8) as u8)
+                .collect();
+            let (w, sc) = (
+                DevBuf::from_slice(&wb).unwrap(),
+                DevBuf::from_slice(&sb).unwrap(),
+            );
+            let v = DsW {
+                w: w.ptr,
+                s: sc.ptr,
+                rows: rows as i32,
+                cols: cols as i32,
+                fmt: 2,
+                _pad: 0,
+            };
+            (w, sc, v)
+        };
+        let (dm, ql, rd, win) = (5120usize, 1280usize, 64usize, 128usize);
+        let (_a0, _a1, wqa) = fp8w(ql, dm, 1);
+        let (_b0, _b1, wkv) = fp8w(d, dm, 2);
+        let (_c0, _c1, wqb) = fp8w(h * d, ql, 3);
+        let f32w = |n: usize, seed: u64| {
+            let b = DevBuf::from_slice(&data(n, seed, 1.0)).unwrap();
+            let v = DsW {
+                w: b.ptr,
+                s: 0,
+                rows: 1,
+                cols: n as i32,
+                fmt: 0,
+                _pad: 0,
+            };
+            (b, v)
+        };
+        let ((_qn, qn), (_kn, kn)) = (f32w(ql, 12), f32w(d, 13));
+        let pos0 = 2000usize;
+        let tabv: Vec<f32> = (0..4096 * rd)
+            .map(|i| {
+                let (p, j) = ((i / rd) as f32, (i % rd) / 2);
+                let a = p * 10000f32.powf(-(j as f32) / (rd / 2) as f32);
+                if i % 2 == 0 {
+                    a.cos()
+                } else {
+                    a.sin()
+                }
+            })
+            .collect();
+        let tab = DevBuf::from_slice(&tabv).unwrap();
+        let pdev = DevBuf::from_slice(&[pos0 as i32]).unwrap();
+        let x = DevBuf::from_slice(&data(t * dm, 14, 1.0)).unwrap();
+        let xq = DevBuf::alloc(t * dm * 4).unwrap();
+        let (qr, kvb, qb) = (
+            DevBuf::alloc(t * ql * 4).unwrap(),
+            DevBuf::alloc(t * d * 4).unwrap(),
+            DevBuf::alloc(t * h * d * 4).unwrap(),
+        );
+        let qrq = DevBuf::alloc(t * ql * 4).unwrap();
+        let ring = DevBuf::from_slice(&data(win * d, 15, 1.0)).unwrap();
+        let all = DevBuf::alloc((win + t) * d * 4).unwrap();
+        let cp = |dst: u64, src: u64, n: usize| unsafe {
+            let nn = n as i64;
+            k.go(
+                "ds_copy",
+                blocks(n, 256),
+                (256, 1, 1),
+                0,
+                &s,
+                tang_moe::args![dst, src, nn],
+            )
+            .unwrap()
+        };
+        // before: lin = copy + fp8_qdq + ks_quant + GEMV, each norm/rope/qdq its own launch
+        let lin_old = |w: &DsW, x: u64, xq: u64, y: u64, n: usize| {
+            cp(xq, x, t * n);
+            k.fp8_qdq(&s, xq, t * n).unwrap();
+            k.linear_fast(&s, w, None, xq, y, t, true, false, 0, 0.0)
+                .unwrap();
+        };
+        let q_old = || {
+            lin_old(&wqa, x.ptr, xq.ptr, qr.ptr, dm);
+            k.rms(&s, qr.ptr, &qn, t, 1e-6).unwrap();
+            lin_old(&wqb, qr.ptr, qrq.ptr, qb.ptr, ql);
+            k.rope(&s, qb.ptr, tab.ptr, t, h, d, rd, pos0, 1, None, false)
+                .unwrap();
+        };
+        let kv_old = || {
+            lin_old(&wkv, x.ptr, xq.ptr, kvb.ptr, dm);
+            k.rms(&s, kvb.ptr, &kn, t, 1e-6).unwrap();
+            k.rope(&s, kvb.ptr, tab.ptr, t, 1, d, rd, pos0, 1, None, false)
+                .unwrap();
+            k.fp8_qdq(&s, kvb.ptr, t * d).unwrap();
+            cp(all.ptr, ring.ptr, win * d);
+            cp(all.ptr + (win * d * 4) as u64, kvb.ptr, t * d);
+            cp(ring.ptr + ((pos0 % win) * d * 4) as u64, kvb.ptr, t * d); // ring_write
+        };
+        let us = ev(&q_old);
+        eprintln!("attn_block_bench q before (8 launches) t {t}: {us:.1} us");
+        let us = ev(&kv_old);
+        eprintln!("attn_block_bench window_kv before (10 launches) t {t}: {us:.1} us");
+        s.sync().unwrap();
+        let ring0 = DevBuf::from_slice(&ring.read::<f32>(0, win * d).unwrap()).unwrap();
+        q_old();
+        kv_old();
+        s.sync().unwrap();
+        let (kv_want, all_want) = (
+            kvb.read::<f32>(0, t * d).unwrap(),
+            all.read::<f32>(0, (win + t) * d).unwrap(),
+        );
+        let qr_want = qr.read::<f32>(0, t * ql).unwrap();
+        let (xc, xs) = k.ks_x_ptrs();
+        let (qc, qs) = k.wo_x_ptrs();
+        let fused = || {
+            k.ks_quant_to(&s, x.ptr, xc, xs, t * dm).unwrap();
+            k.ks_gemv(&s, &wqa, None, xc, xs, qr.ptr, t, true, 0, 0.0)
+                .unwrap();
+            k.ks_gemv(&s, &wkv, None, xc, xs, kvb.ptr, t, true, 0, 0.0)
+                .unwrap();
+            cp(all.ptr, ring.ptr, win * d);
+            let (rdi, wi, eps) = (rd as i32, win as i32, 1e-6f32);
+            unsafe {
+                k.go(
+                    "ds_qkv_post",
+                    (t as u32, 2, 1),
+                    (1024, 1, 1),
+                    0,
+                    &s,
+                    tang_moe::args![
+                        qr.ptr, qn, qc, qs, kvb.ptr, kn, tab.ptr, rdi, pdev.ptr, ring.ptr, wi,
+                        all.ptr, eps
+                    ],
+                )
+                .unwrap()
+            };
+            k.ks_gemv(&s, &wqb, None, qc, qs, qb.ptr, t, true, 0, 0.0)
+                .unwrap();
+            k.rope(&s, qb.ptr, tab.ptr, t, h, d, rd, pos0, 1, None, false)
+                .unwrap();
+        };
+        let us = ev(&fused);
+        eprintln!("attn_block_bench q + window_kv fused (7 launches) t {t}: {us:.1} us");
+        // one more from the same ring as the reference run: kv, qr and the window bit-equal
+        cp(ring.ptr, ring0.ptr, win * d);
+        fused();
+        s.sync().unwrap();
+        assert!(kvb.read::<f32>(0, t * d).unwrap() == kv_want, "fused kv");
+        assert!(qr.read::<f32>(0, t * ql).unwrap() == qr_want, "fused qr");
+        assert!(
+            all.read::<f32>(0, (win + t) * d).unwrap() == all_want,
+            "fused window"
+        );
         // sparse attention: window 128 + 6 chunk rows, then 512 compressed rows
         let (win, kc) = (128 + t, 512usize);
         let kk = win + kc;
@@ -3145,13 +3401,22 @@ mod tests {
         });
         eprintln!("attn_block_bench dg_sparse_attn t {t} k {kk}: {us:.1} us");
         k.exact = false;
+        k.attn_fuse = false;
         let us = ev(&|| {
             k.sparse_attn(
                 &s, q.ptr, kv0.ptr, win, kv1.ptr, sink.ptr, ix.ptr, ob.ptr, t, h, d, kk, scale,
             )
             .unwrap()
         });
-        eprintln!("attn_block_bench tiled sparse_attn t {t} k {kk}: {us:.1} us");
+        eprintln!("attn_block_bench tiled sparse_attn (3 launches) t {t} k {kk}: {us:.1} us");
+        k.attn_fuse = true;
+        let us = ev(&|| {
+            k.sparse_attn(
+                &s, q.ptr, kv0.ptr, win, kv1.ptr, sink.ptr, ix.ptr, ob.ptr, t, h, d, kk, scale,
+            )
+            .unwrap()
+        });
+        eprintln!("attn_block_bench tiled sparse_attn fused soft+pv (2 launches) t {t} k {kk}: {us:.1} us");
         // indexer at pos 2000, ratio 4: 64 heads × 128, width 500, top-512
         let (nh, ihd, r, wmax, kmax) = (64usize, 128usize, 4usize, 4096usize, 512usize);
         let qi = DevBuf::from_slice(&data(t * nh * ihd, 9, 1.0)).unwrap();
