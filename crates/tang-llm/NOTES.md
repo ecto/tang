@@ -4,6 +4,41 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — fused mHC 45 -> 13 µs per pass, decode 58.3 -> 68.8 tok/s, bit-identical (branch claude/glm5-mhc2)
+
+What was wrong: `mhcf_finish` was one block of 256 threads running the 20-iteration
+Sinkhorn on lane 0 (serial IEEE divides), a 25-thread chunk reduction over global memory,
+and a strided x collapse + f64 sum of squares one after the other. `mhcf_part` was 48 blocks
+of 128 threads (n = 6144) on a 148-SM part. Evidence (nsys `--cuda-graph-trace=node`, B300, B
+flags, haiku -n 32, 83b3ab92): finish avg 36.9 µs × 90/token = 3.3 ms, part 8.2 µs × 91 =
+0.75 ms, of a ~16.4 ms token.
+
+Fixes, all keeping every serial sum in its old order, so x/post/comb are bit-identical:
+1. c827d76c: `mhcf_part` blocks own 32 features (lane = feature) with 8 warps splitting the 25
+   partials (same per-feature fmaf order, same warp tree). The finish adds 4 warp partials per
+   old 128-feature chunk first. Grid 192 × t. The Sinkhorn runs on 16 lanes: each sum gathers
+   its 4 terms by shuffle in the serial order.
+2. e54280aa: the finish uses 1024 threads, stages the part partials and the collapsed x in
+   dynamic smem (max(n, ch·25) floats, ≤ 46 KiB checked in `new`), and prefetches r + the
+   norm weight into registers. The f64 sum of squares (256 owners, same i = o + k·256 order,
+   now on warps 1..8) overlaps the warp-0 Sinkhorn, because `pre` only needs the sigmoid.
+   clock64 phase split before this step (cycles): Sinkhorn 7.4k, f64 sum 5.4k, normalize 4.0k,
+   part copy 3.4k, reduce 2.0k, f64 divide 1.6k. A one-thread register Sinkhorn measured
+   27.5 µs (its divides serialize), so the shuffle version stays.
+
+| step | finish µs | part µs | -n 128 tok/s | md5 | -n 512 tok/s | md5 |
+|---|---|---|---|---|---|---|
+| base 641540d2 | 36.9 | 8.2 | 58.28 | 7174cdd6 | 58.48 | 1453cf0e |
+| 1 c827d76c | 21.7 | 4.2 | 63.88 | (not captured) | 64.90 | 1453cf0e |
+| 1 + PTX memo 0ecdbbbc | — | — | 68.02 | 7174cdd6 | 67.98 | 1453cf0e |
+| 2 e54280aa | 9.0 | 4.2 | **68.80** | 7174cdd6 | **70.26** | 1453cf0e |
+
+(The 68.0 row is step 1 re-run after cherry-picking the NVRTC PTX memo. The jump from 63.9 is
+that tree and pod state, not an mHC change. An intermediate 1024-thread smem finish without the
+overlap measured 13.0 µs, 67.97 / 68.37 tok/s, same md5s.) Haiku oracle gate OK on every run.
+mew tiny suite `flash::glm5` 83 passed / 0 failed on e54280aa. Not done: folding the finish
+into the part kernel's last block, and merging layer l's post with l+1's pre. The remaining
+finish floor is the serial f64 chain (B300 FP64 is slow) and the Sinkhorn divide chain.
 ## 2026-10-28 — MoE fast path on B300: word-wide headers, hoisted activations, down-row L2 prefetch; +0.4–1.2 tok/s, ids unchanged (branch claude/glm5-moe2)
 
 What was wrong: per layer (T=1, `real_layers_fast_matches_cpu`, `TANG_GLM5_MOE_SPLIT=1`, traced µs) g5f_gu
