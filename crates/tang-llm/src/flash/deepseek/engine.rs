@@ -161,7 +161,7 @@ pub struct GpuModel {
     /// Set by the forward loop: the next block's prefix when it reads this block's stream
     /// as is, so the last post-mix also computes its attention mixes (`pend_mixes`).
     next_hc: Option<String>,
-    pend_mixes: Option<Buf>,
+    pend_mixes: Option<(Buf, i32)>,
     sh_ckv: usize,
     sh_idxk: usize,
     /// The last index source's selection: [t][k] positions (offset into the attention's
@@ -1817,7 +1817,7 @@ impl GpuModel {
         t: usize,
         p: &str,
         kind: &str,
-    ) -> Result<(Buf, Buf)> {
+    ) -> Result<(Buf, (Buf, i32))> {
         let (hc, d) = (self.cpu.cfg.hc_mult, self.cpu.cfg.dim);
         let w = self.dw(&format!("{p}.hc_{kind}_fn"))?;
         let out = match m {
@@ -1825,9 +1825,25 @@ impl GpuModel {
             None => res,
         };
         let (post, comb) = m.map_or((0, 0), |m| (m.post.ptr, m.comb.ptr));
-        let mixes = self.fbuf(t * w.v.rows as usize)?;
         let (ti, hci, di) = (t as i32, hc as i32, d as i32);
         let (h2, wv) = (h2.map_or(0, |b| b.ptr), w.v);
+        if !self.k.exact {
+            // the K-split GEMM (relaxed bar): fixed-order partials ds_hc_stage sums
+            let np = (hc * d).div_ceil(256);
+            let part = self.fbuf(t * np * w.v.rows as usize)?;
+            unsafe {
+                self.k.go(
+                    "ds_hc_mix_ks",
+                    (np as u32, t.div_ceil(8) as u32, 1),
+                    B256,
+                    0,
+                    &self.s,
+                    args![h.ptr, h2, res.ptr, post, comb, out.ptr, wv, part.ptr, ti, hci, di],
+                )?
+            };
+            return Ok((out, (part, np as i32)));
+        }
+        let mixes = self.fbuf(t * w.v.rows as usize)?;
         unsafe {
             self.k.go(
                 "ds_hc_post_mix",
@@ -1838,7 +1854,7 @@ impl GpuModel {
                 args![h.ptr, h2, res.ptr, post, comb, out.ptr, wv, mixes.ptr, ti, hci, di],
             )?
         };
-        Ok((out, mixes))
+        Ok((out, (mixes, 1)))
     }
 
     /// An mHC stage after its mixes GEMM, in one launch: the Sinkhorn of `mixes` (this
@@ -1849,7 +1865,7 @@ impl GpuModel {
         p: &str,
         kind: &str,
         x: Buf,
-        mixes: Buf,
+        (mixes, np): (Buf, i32),
         pre: Buf,
         t: usize,
         norm: &str,
@@ -1877,7 +1893,7 @@ impl GpuModel {
                 &self.s,
                 args![
                     x.ptr, mixes.ptr, neps, scp, bp, m.pre.ptr, m.post.ptr, m.comb.ptr, hci, it,
-                    eps, pre.ptr, out.ptr, nv, di, neps
+                    eps, pre.ptr, out.ptr, nv, di, neps, np
                 ],
             )?
         };
