@@ -154,6 +154,8 @@ const MORE: &[&str] = &[
     "ds_hc_pre",
     "ds_hc_post",
     "ds_hc_post_mix",
+    "ds_hc_mix_ks",
+    "ds_hc_fused_ks",
     "ds_hc_stage",
     "ds_embed",
     "ds_mean_hc",
@@ -4276,7 +4278,7 @@ mod tests {
             _pad: 0,
         };
         let (hci, di, it, eps, neps) = (hc as i32, d as i32, 20i32, 1e-6f32, 1e-6f32);
-        for t in [1usize, 6] {
+        for t in [1usize, 6, 13] {
             let ti = t as i32;
             let x = up(&data(t * hc * d, 1, 1.0));
             let pre0 = up(&data(t * hc, 2, 1.0));
@@ -4420,7 +4422,7 @@ mod tests {
                         s,
                         tang_moe::args![
                             x.ptr, b[0].ptr, neps, scale.ptr, base.ptr, b[1].ptr, b[2].ptr,
-                            b[3].ptr, hci, it, eps, pre0.ptr, b[4].ptr, w0, di, neps
+                            b[3].ptr, hci, it, eps, pre0.ptr, b[4].ptr, w0, di, neps, 1i32
                         ],
                     )?;
                     k.go(
@@ -4442,7 +4444,120 @@ mod tests {
                         s,
                         tang_moe::args![
                             b[5].ptr, b[6].ptr, neps, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
-                            b[9].ptr, hci, it, eps, b[1].ptr, b[10].ptr, w0, di, neps
+                            b[9].ptr, hci, it, eps, b[1].ptr, b[10].ptr, w0, di, neps, 1i32
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_post",
+                        blocks(t * hc * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            y.ptr, sh.ptr, b[5].ptr, b[8].ptr, b[9].ptr, b[11].ptr, ti, hci, di
+                        ],
+                    )?;
+                }
+                Ok(())
+            };
+            // the default path: ds_hc_mix_ks (K-split partials) into ds_hc_stage
+            let g3 = mk();
+            let npk = (hc * d).div_ceil(256);
+            let (pa, pf) = (a(t * npk * mix), a(t * npk * mix));
+            let ks = |s: &Stream| -> Result<()> {
+                let b = &g3;
+                let (w0, w1, wa) = (nv, fw(1), fw(0));
+                let (gx, gy, np) = (npk as u32, t.div_ceil(8) as u32, npk as i32);
+                unsafe {
+                    k.go(
+                        "ds_hc_mix_ks",
+                        (gx, gy, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, pa.ptr, ti, hci, di
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_stage",
+                        (ti as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            x.ptr, pa.ptr, neps, scale.ptr, base.ptr, b[1].ptr, b[2].ptr, b[3].ptr,
+                            hci, it, eps, pre0.ptr, b[4].ptr, w0, di, neps, np
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_mix_ks",
+                        (gx, gy, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            ha.ptr, 0u64, x.ptr, b[2].ptr, b[3].ptr, b[5].ptr, w1, pf.ptr, ti, hci,
+                            di
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_stage",
+                        (ti as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            b[5].ptr, pf.ptr, neps, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
+                            b[9].ptr, hci, it, eps, b[1].ptr, b[10].ptr, w0, di, neps, np
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_post",
+                        blocks(t * hc * d, 256),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            y.ptr, sh.ptr, b[5].ptr, b[8].ptr, b[9].ptr, b[11].ptr, ti, hci, di
+                        ],
+                    )?;
+                }
+                Ok(())
+            };
+            // ds_hc_fused_ks: one launch per stage (in the model the closing post-mix also
+            // carries the next block's attention stage: 2 launches/layer)
+            let g4 = mk();
+            let gxf = d.div_ceil(256 / hc);
+            let (qa, qf) = (a(t * gxf * (mix + 2)), a(t * gxf * (mix + 2)));
+            let cnt = DevBuf::from_slice(&[0i32; 1024]).unwrap();
+            let fk = |s: &Stream| -> Result<()> {
+                let b = &g4;
+                let (w0, w1, wa) = (nv, fw(1), fw(0));
+                let g = (gxf as u32, t.div_ceil(8) as u32, 1);
+                unsafe {
+                    k.go(
+                        "ds_hc_fused_ks",
+                        g,
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, qa.ptr, pre0.ptr, b[4].ptr,
+                            w0, scale.ptr, base.ptr, b[1].ptr, b[2].ptr, b[3].ptr, cnt.ptr, ti,
+                            hci, di, it, eps, neps, neps
+                        ],
+                    )?;
+                    k.go(
+                        "ds_hc_fused_ks",
+                        g,
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            ha.ptr, 0u64, x.ptr, b[2].ptr, b[3].ptr, b[5].ptr, w1, qf.ptr,
+                            b[1].ptr, b[10].ptr, w0, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
+                            b[9].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps
                         ],
                     )?;
                     k.go(
@@ -4460,7 +4575,42 @@ mod tests {
             };
             old(&s).unwrap();
             new(&s).unwrap();
+            ks(&s).unwrap();
+            // ds_hc_fused_ks's grid barrier wants one row of blocks (t <= 8)
+            let one = t <= 8;
+            if one {
+                fk(&s).unwrap();
+            }
             s.sync().unwrap();
+            // the relaxed bar against the exact glue: every element within ~1 bf16 ulp
+            // (the mixes themselves are partials on this path, not compared)
+            for (i, (&n, gb)) in sizes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, n)| [(i, (n, &g3)), (i, (n, &g4))])
+            {
+                if !one && std::ptr::eq(gb, &g4) {
+                    continue;
+                }
+                if i == 0 || i == 6 {
+                    continue;
+                }
+                let (u, v) = (
+                    o[i].read::<f32>(0, t * n).unwrap(),
+                    gb[i].read::<f32>(0, t * n).unwrap(),
+                );
+                // 1 bf16 ulp of the element, floored at the buffer's scale (cancellation)
+                let fl = u.iter().fold(0f32, |m, a| m.max(a.abs())) / 4096.0;
+                let (mut bad, mut ne) = (0, 0);
+                for (a, b) in u.iter().zip(&v) {
+                    ne += (a.to_bits() != b.to_bits()) as usize;
+                    bad += ((a - b).abs() > a.abs().max(b.abs()) / 128.0 + fl) as usize;
+                }
+                assert_eq!(bad, 0, "ks t {t} buffer {i}: {bad} of {} past 1 ulp", t * n);
+                if bench {
+                    eprintln!("ks t {t} buffer {i}: {ne} of {} not bit-equal", t * n);
+                }
+            }
             for (i, &n) in sizes.iter().enumerate() {
                 let (u, v) = (
                     o[i].read::<f32>(0, t * n).unwrap(),
@@ -4483,7 +4633,12 @@ mod tests {
                     &old as &dyn Fn(&Stream) -> Result<()>,
                 ),
                 ("fused (5 launches/layer)", &new),
+                ("ks (5 launches/layer)", &ks),
+                ("fused ks (3 launches/layer)", &fk),
             ] {
+                if !one && name.starts_with("fused ks") {
+                    continue;
+                }
                 let gr = gpu::Graph::capture(&s, |s| {
                     for _ in 0..40 {
                         body(s).unwrap();
@@ -4512,6 +4667,7 @@ mod tests {
         }
     }
 
+    /// Also the default (K-split) glue against the exact one, to the relaxed bar.
     #[test]
     fn hc_glue_fused_exact() {
         hc_glue(false);

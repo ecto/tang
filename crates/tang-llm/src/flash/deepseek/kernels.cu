@@ -582,6 +582,65 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_post_mix(const float* __
     if (lane == 0) y[(long long)ti * w.rows + n] = s;
 }
 
+// The relaxed (default-path) ds_hc_post_mix: the same stream (bit for bit) and the next
+// mixes GEMM split over K, as fixed-order partials part[t][np][rows] (np = gridDim.x) that
+// ds_hc_stage sums. Block (256-wide chunk of k = c d + i, up to 8 tokens): each thread makes
+// one stream element per token into shared memory, then warp per mix row n reduces the chunk.
+// Grid (ceil(hc d / 256), ceil(t / 8)), block 256. post null: the GEMM alone on res.
+extern "C" __global__ void __launch_bounds__(256) ds_hc_mix_ks(const float* __restrict__ h,
+                                                               const float* __restrict__ h2,
+                                                               const float* __restrict__ res,
+                                                               const float* __restrict__ post,
+                                                               const float* __restrict__ comb, float* __restrict__ out,
+                                                               DsW w, float* __restrict__ part, int t, int hc, int d) {
+    __shared__ float xs[8][256];
+    int K = hc * d, k0 = blockIdx.x * 256, t0 = blockIdx.y * 8, tid = threadIdx.x;
+    int nt = min(8, t - t0), k = k0 + tid;
+    if (k < K) {
+        int c = k / d, i = k - c * d;
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            if (q >= nt) break;
+            int ti = t0 + q;
+            const float* rr = res + (long long)ti * K;
+            float v;
+            if (post) {
+                float acc = 0.f;
+                for (int j = 0; j < hc; j++) acc += comb[((long long)ti * hc + j) * hc + c] * rr[(long long)j * d + i];
+                long long hi = (long long)ti * d + i;
+                float hv = h2 ? bf(h[hi] + h2[hi]) : h[hi];
+                v = bf(post[ti * hc + c] * hv + acc);
+                out[(long long)ti * K + k] = v;
+            } else {
+                v = rr[k];
+            }
+            xs[q][tid] = v;
+        }
+    } else {
+        for (int q = 0; q < nt; q++) xs[q][tid] = 0.f;
+    }
+    __syncthreads();
+    int lane = tid & 31, np = gridDim.x;
+    for (int n = tid / 32; n < w.rows; n += 8) {
+        float acc[8];
+#pragma unroll
+        for (int q = 0; q < 8; q++) acc[q] = 0.f;
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            int kk = lane + 32 * u;
+            float wv = k0 + kk < K ? wget(w, n, k0 + kk) : 0.f;
+#pragma unroll
+            for (int q = 0; q < 8; q++) acc[q] = fmaf(xs[q][kk], wv, acc[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            float s = acc[q];
+            for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (lane == 0 && q < nt) part[((long long)(t0 + q) * np + blockIdx.x) * w.rows + n] = s;
+        }
+    }
+}
+
 // sinkhorn_row on one warp, bit for bit: lane l holds comb element l (hc * hc <= 32); every
 // row / column sum is taken in sinkhorn_row's order (each lane redoing its own row's or
 // column's sum from shuffles). All 32 lanes call it.
@@ -617,7 +676,8 @@ __device__ __forceinline__ void sinkhorn_warp(const float* m, const float* scale
 // ds_hc_pre(x, pre_i) then ds_rms(w) (1024 threads, its reduction order) -> out.
 extern "C" __global__ void ds_hc_stage(const float* x, const float* mixes, float neps, const float* scale,
                                        const float* base, float* pre_o, float* post, float* comb, int hc, int iters,
-                                       float eps, const float* pre_i, float* out, DsW w, int d, float reps) {
+                                       float eps, const float* pre_i, float* out, DsW w, int d, float reps,
+                                       int np) {
     __shared__ float ra[32], rb[32], sm[80];
     int mix = (2 + hc) * hc, n = hc * d, tid = threadIdx.x;
     const float* r = x + (long long)blockIdx.x * n;
@@ -653,12 +713,169 @@ extern "C" __global__ void ds_hc_stage(const float* x, const float* mixes, float
         float a = 0.f;
         for (int q = 0; q < 8; q++) a += ra[q];
         float rr = 1.f / sqrtf(a / n + neps);
-        for (int m = tid; m < mix; m += 32) sm[m] = __fmul_rn(mixes[(long long)blockIdx.x * mix + m], rr);
+        for (int m = tid; m < mix; m += 32) {
+            // np == 1: the exact GEMM's row as is; else its K-split partials, in order
+            const float* mp = mixes + (long long)blockIdx.x * np * mix + m;
+            float mv = mp[0];
+#pragma unroll 8
+            for (int q = 1; q < np; q++) mv += mp[(long long)q * mix];
+            sm[m] = __fmul_rn(mv, rr);
+        }
         __syncwarp();
         if (hc * hc <= 32)
             sinkhorn_warp(sm, scale, base, pre_o, post, comb, blockIdx.x, hc, iters, eps);
         else if (tid == 0)
             sinkhorn_row(sm, scale, base, pre_o, post, comb, blockIdx.x, hc, iters, eps);
+    }
+}
+
+// A whole relaxed mHC stage in one launch: ds_hc_post (post null: the stream res as is),
+// the stage's mixes GEMM K-split, hc_pre(stream, pre_i) and the stream / block-input square
+// sums as per-block partials; then a grid barrier (t <= 8, so one row of co-resident
+// blocks; cnt two zeroed ints, left consistent for the next launch), after which every
+// block scales its block-input chunk by rms(nw) (partials summed in a fixed order) and
+// block b runs the exact Sinkhorn (sinkhorn_warp) of tokens b + np j. Block 256 = hc copies x
+// ci = 256 / hc dims; grid ceil(d / ci). part [t][np][rows + 2].
+extern "C" __global__ void __launch_bounds__(256) ds_hc_fused_ks(
+    const float* __restrict__ h, const float* __restrict__ h2, const float* __restrict__ res,
+    const float* __restrict__ post, const float* __restrict__ comb, float* __restrict__ xo, DsW w,
+    float* part, const float* __restrict__ pre_i, float* hin, DsW nw, const float* __restrict__ scale,
+    const float* __restrict__ base, float* __restrict__ pre_o, float* __restrict__ post_o,
+    float* __restrict__ comb_o, int* cnt, int t, int hc, int d, int iters, float eps, float neps, float reps) {
+    __shared__ float xs[8][256];
+    __shared__ float rx[8][8], ro[8][8], sm[8][80], rs[8];
+    int ci = 256 / hc, tid = threadIdx.x, lane = tid & 31, wp = tid / 32;
+    int i0 = blockIdx.x * ci, t0 = blockIdx.y * 8, nt = min(8, t - t0), np = gridDim.x;
+    int c = tid / ci, i = i0 + tid % ci, R = w.rows, K = hc * d;
+    bool ok = c < hc && i < d;
+    float sx[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        float v = 0.f;
+        if (ok && q < nt) {
+            int ti = t0 + q;
+            const float* rr = res + (long long)ti * K;
+            if (post) {
+                float acc = 0.f;
+                for (int j = 0; j < hc; j++) acc += comb[((long long)ti * hc + j) * hc + c] * rr[(long long)j * d + i];
+                long long hi = (long long)ti * d + i;
+                float hv = h2 ? bf(h[hi] + h2[hi]) : h[hi];
+                v = bf(post[ti * hc + c] * hv + acc);
+                xo[(long long)ti * K + (long long)c * d + i] = v;
+            } else {
+                v = rr[(long long)c * d + i];
+            }
+        }
+        xs[q][tid] = v;
+        sx[q] = v * v;
+    }
+    __syncthreads();
+    // hc_pre on the chunk (threads < ci), and the square sums
+    float so[8], hv[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        so[q] = 0.f;
+        hv[q] = 0.f;
+        if (tid < ci && i0 + tid < d && q < nt) {
+            int ti = t0 + q;
+            float v = 0.f;
+            for (int cc = 0; cc < hc; cc++) v += pre_i[ti * hc + cc] * xs[q][cc * ci + tid];
+            v = bf(v);
+            hv[q] = v;
+            so[q] = v * v;
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        float a = sx[q], b = so[q];
+        for (int o = 16; o; o >>= 1) {
+            a += __shfl_xor_sync(0xffffffffu, a, o);
+            b += __shfl_xor_sync(0xffffffffu, b, o);
+        }
+        if (lane == 0) {
+            rx[q][wp] = a;
+            ro[q][wp] = b;
+        }
+    }
+    // the mixes GEMM on the chunk: warp per row
+    for (int n = wp; n < R; n += 8) {
+        float acc[8];
+#pragma unroll
+        for (int q = 0; q < 8; q++) acc[q] = 0.f;
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            int e = lane + 32 * u, cc = e / ci, ii = i0 + e % ci;
+            float wv = cc < hc && ii < d ? wget(w, n, cc * d + ii) : 0.f;
+#pragma unroll
+            for (int q = 0; q < 8; q++) acc[q] = fmaf(xs[q][e], wv, acc[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            float s = acc[q];
+            for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (lane == 0 && q < nt) part[((long long)(t0 + q) * np + blockIdx.x) * (R + 2) + n] = s;
+        }
+    }
+    __syncthreads();
+    if (tid < nt) {
+        float a = 0.f, b = 0.f;
+        for (int q = 0; q < 8; q++) {
+            a += rx[tid][q];
+            b += ro[tid][q];
+        }
+        float* pp = part + ((long long)(t0 + tid) * np + blockIdx.x) * (R + 2) + R;
+        pp[0] = a;
+        pp[1] = b;
+    }
+    // grid barrier (t <= 8: one row of blocks, all co-resident): cnt[0] arrivals, cnt[1]
+    // the generation
+    __syncthreads();
+    if (tid == 0) {
+        volatile int* gen = cnt + 1;
+        int g0 = *gen;
+        __threadfence();
+        if (atomicAdd(cnt, 1) == np - 1) {
+            cnt[0] = 0;
+            __threadfence();
+            atomicAdd(cnt + 1, 1);
+        } else {
+            while (*gen == g0) __nanosleep(64);
+        }
+        __threadfence();
+    }
+    __syncthreads();
+    // thread per value, the partials summed in block order: every block the block inputs'
+    // square sums, block b also the mixes and stream square sums of tokens b + np j
+    int own = blockIdx.x < nt ? (nt - 1 - blockIdx.x) / np + 1 : 0;
+    for (int e = tid; e < nt + own * (R + 1); e += 256) {
+        int q = e < nt ? e : blockIdx.x + np * ((e - nt) / (R + 1));
+        int m = e < nt ? R + 1 : (e - nt) % (R + 1);
+        const float* pp = part + (long long)(t0 + q) * np * (R + 2) + m;
+        float v = 0.f;
+#pragma unroll 16
+        for (int b = 0; b < np; b++) v += __ldcg(pp + (long long)b * (R + 2));
+        if (m < R)
+            sm[q][m] = v;
+        else if (m == R)
+            rx[q][0] = 1.f / sqrtf(v / K + neps);
+        else
+            rs[q] = 1.f / sqrtf(v / d + reps);
+    }
+    __syncthreads();
+    if (tid < ci && i0 + tid < d) {
+        float wv = wget(nw, 0, i0 + tid);
+#pragma unroll
+        for (int q = 0; q < 8; q++)
+            if (q < nt) hin[(long long)(t0 + q) * d + i0 + tid] = bf(wv * (hv[q] * rs[q]));
+    }
+    if (wp < own) {
+        int q = blockIdx.x + np * wp, ti = t0 + q;
+        for (int m = lane; m < R; m += 32) sm[q][m] = __fmul_rn(sm[q][m], rx[q][0]);
+        __syncwarp();
+        if (hc * hc <= 32)
+            sinkhorn_warp(sm[q], scale, base, pre_o, post_o, comb_o, ti, hc, iters, eps);
+        else if (lane == 0)
+            sinkhorn_row(sm[q], scale, base, pre_o, post_o, comb_o, ti, hc, iters, eps);
     }
 }
 

@@ -217,7 +217,9 @@ pub struct GpuModel {
     /// Set by the forward loop: the next block's prefix when it reads this block's stream
     /// as is, so the last post-mix also computes its attention mixes (`pend_mixes`).
     next_hc: Option<String>,
-    pend_mixes: Option<Buf>,
+    pend_mixes: Option<(Buf, i32)>,
+    /// As `pend_mixes` on the K-split path: the next block's whole attention stage.
+    pend_stage: Option<(Mix, Buf)>,
     sh_ckv: usize,
     sh_idxk: usize,
     /// The last index source's selection: [t][k] positions (offset into the attention's
@@ -261,6 +263,10 @@ pub struct GpuModel {
     /// steps of <= 8 tokens with every expert resident; `DS_MOE_LOOP=1` keeps the per-expert
     /// loop. Bit-identical either way.
     pub moe_grouped: bool,
+    /// The mHC mixes GEMMs bit-exact with the CPU (`ds_hc_post_mix`), as under `DS_EXACT=1`;
+    /// otherwise K-split (`ds_hc_fused_ks` / `ds_hc_mix_ks`, the linears' relaxed bar).
+    /// `DS_HC_EXACT=1` sets it.
+    pub hc_exact: bool,
     moe_tabs: RefCell<HashMap<usize, Option<Rc<MoeTab>>>>,
     /// `moe_reduce` only enqueues on the stream (no host sync, no allocation), so a step
     /// that has one can be captured with it (NCCL's all-reduce becomes a graph node). Every
@@ -279,6 +285,8 @@ pub struct GpuModel {
     side: Stream,
     fork: Event,
     join: Event,
+    /// `ds_hc_fused_ks`'s grid barrier: arrivals (zero between launches) and generation.
+    hc_cnt: DevBuf,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -359,6 +367,7 @@ impl GpuModel {
             side: Stream::new()?,
             fork: Event::new(false)?,
             join: Event::new(false)?,
+            hc_cnt: DevBuf::from_slice(&[0i32; 2])?,
             _g: g,
             w: RefCell::new(HashMap::new()),
             experts: RefCell::new(ExpertCache::default()),
@@ -383,6 +392,7 @@ impl GpuModel {
             sh: Cell::new(None),
             next_hc: None,
             pend_mixes: None,
+            pend_stage: None,
             sh_ckv: 0,
             sh_idxk: 0,
             topk: None,
@@ -406,6 +416,7 @@ impl GpuModel {
             moe_reduce: None,
             moe_grouped: std::env::var("DS_MOE_LOOP").map_or(true, |v| v != "1"),
             moe_tabs: RefCell::new(HashMap::new()),
+            hc_exact: std::env::var("DS_HC_EXACT").is_ok_and(|v| v == "1"),
             reduce_graphable: false,
             skip_readback: false,
             last: None,
@@ -2225,7 +2236,7 @@ impl GpuModel {
         t: usize,
         p: &str,
         kind: &str,
-    ) -> Result<(Buf, Buf)> {
+    ) -> Result<(Buf, (Buf, i32))> {
         let (hc, d) = (self.cpu.cfg.hc_mult, self.cpu.cfg.dim);
         let w = self.dw(&format!("{p}.hc_{kind}_fn"))?;
         let out = match m {
@@ -2233,9 +2244,25 @@ impl GpuModel {
             None => res,
         };
         let (post, comb) = m.map_or((0, 0), |m| (m.post.ptr, m.comb.ptr));
-        let mixes = self.fbuf(t * w.v.rows as usize)?;
         let (ti, hci, di) = (t as i32, hc as i32, d as i32);
         let (h2, wv) = (h2.map_or(0, |b| b.ptr), w.v);
+        if !self.hc_exact && !self.k.exact {
+            // the K-split GEMM (relaxed bar): fixed-order partials ds_hc_stage sums
+            let np = (hc * d).div_ceil(256);
+            let part = self.fbuf(t * np * w.v.rows as usize)?;
+            unsafe {
+                self.k.go(
+                    "ds_hc_mix_ks",
+                    (np as u32, t.div_ceil(8) as u32, 1),
+                    B256,
+                    0,
+                    &self.s,
+                    args![h.ptr, h2, res.ptr, post, comb, out.ptr, wv, part.ptr, ti, hci, di],
+                )?
+            };
+            return Ok((out, (part, np as i32)));
+        }
+        let mixes = self.fbuf(t * w.v.rows as usize)?;
         unsafe {
             self.k.go(
                 "ds_hc_post_mix",
@@ -2246,7 +2273,69 @@ impl GpuModel {
                 args![h.ptr, h2, res.ptr, post, comb, out.ptr, wv, mixes.ptr, ti, hci, di],
             )?
         };
-        Ok((out, mixes))
+        Ok((out, (mixes, 1)))
+    }
+
+    /// A whole mHC stage in one launch on the K-split path (`ds_hc_fused_ks`): the post-mix
+    /// of `h` (+ `h2`) into `res` by `m` (no `m`: the stream `res` as is), then this stage's
+    /// mixes, Sinkhorn and `rms(hc_pre(stream, pre), norm)`. The stream, the coefficients
+    /// and the block input.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_fused(
+        &self,
+        h: Buf,
+        h2: Option<Buf>,
+        res: Buf,
+        m: Option<&Mix>,
+        t: usize,
+        p: &str,
+        kind: &str,
+        pre: Buf,
+        norm: &str,
+    ) -> Result<(Buf, Mix, Buf)> {
+        let c = &self.cpu.cfg;
+        let (hc, d) = (c.hc_mult, c.dim);
+        let w = self.dw(&format!("{p}.hc_{kind}_fn"))?;
+        let rows = w.v.rows as usize;
+        assert!(
+            rows <= 80 && 256 % hc == 0,
+            "ds_hc_fused_ks: <= 80 mixes, hc | 256"
+        );
+        let xo = match m {
+            Some(_) => self.fbuf(t * hc * d)?,
+            None => res,
+        };
+        let (post, comb) = m.map_or((0, 0), |m| (m.post.ptr, m.comb.ptr));
+        let gx = d.div_ceil(256 / hc);
+        let part = self.fbuf(t * gx * (rows + 2))?;
+        let o = Mix {
+            pre: self.fbuf(t * hc)?,
+            post: self.fbuf(t * hc)?,
+            comb: self.fbuf(t * hc * hc)?,
+        };
+        let hin = self.fbuf(t * d)?;
+        let sc = self.dw(&format!("{p}.hc_{kind}_scale"))?;
+        let base = self.dw(&format!("{p}.hc_{kind}_base"))?;
+        let nw = self.dw(norm)?;
+        let (ti, hci, di) = (t as i32, hc as i32, d as i32);
+        let (it, eps, neps) = (c.hc_sinkhorn_iters as i32, c.hc_eps, c.norm_eps);
+        let (h2, wv, nv, scp, bp) = (h2.map_or(0, |b| b.ptr), w.v, nw.v, sc.v.w, base.v.w);
+        let cnt = self.hc_cnt.ptr;
+        unsafe {
+            self.k.go(
+                "ds_hc_fused_ks",
+                (gx as u32, t.div_ceil(8) as u32, 1),
+                B256,
+                0,
+                &self.s,
+                args![
+                    h.ptr, h2, res.ptr, post, comb, xo.ptr, wv, part.ptr, pre.ptr, hin.ptr, nv,
+                    scp, bp, o.pre.ptr, o.post.ptr, o.comb.ptr, cnt, ti, hci, di, it, eps, neps,
+                    neps
+                ],
+            )?
+        };
+        Ok((xo, o, hin))
     }
 
     /// An mHC stage after its mixes GEMM, in one launch: the Sinkhorn of `mixes` (this
@@ -2257,7 +2346,7 @@ impl GpuModel {
         p: &str,
         kind: &str,
         x: Buf,
-        mixes: Buf,
+        (mixes, np): (Buf, i32),
         pre: Buf,
         t: usize,
         norm: &str,
@@ -2285,7 +2374,7 @@ impl GpuModel {
                 &self.s,
                 args![
                     x.ptr, mixes.ptr, neps, scp, bp, m.pre.ptr, m.post.ptr, m.comb.ptr, hci, it,
-                    eps, pre.ptr, out.ptr, nv, di, neps
+                    eps, pre.ptr, out.ptr, nv, di, neps, np
                 ],
             )?
         };
@@ -2352,6 +2441,9 @@ impl GpuModel {
         pre_mix: Buf,
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
+        if !self.hc_exact && !self.k.exact && t <= 8 {
+            return self.block_ks(p, lid, x, t, sp, pre_mix, attn);
+        }
         let s = self.span("hc");
         let next = self.next_hc.take();
         let mixes = match self.pend_mixes.take() {
@@ -2385,6 +2477,63 @@ impl GpuModel {
             Some(np) => {
                 let (x, m) = self.hc_post_mix(h, sh, x, Some(&fm), t, &np, "attn")?;
                 self.pend_mixes = Some(m);
+                x
+            }
+            None => self.hc_post2(h, sh, x, &fm, t)?,
+        };
+        self.end(s);
+        Ok((x, fm.pre))
+    }
+
+    /// [`GpuModel::block_fused`] on the K-split path: one launch per mHC stage
+    /// ([`GpuModel::hc_fused`]), the last post-mix carrying the next block's attention stage.
+    #[allow(clippy::too_many_arguments)]
+    fn block_ks(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+        sp: usize,
+        pre_mix: Buf,
+        attn: Attn,
+    ) -> Result<(Buf, Buf)> {
+        let s = self.span("hc");
+        let next = self.next_hc.take();
+        let norm = format!("{p}.attn_norm.weight");
+        let (am, h) = match self.pend_stage.take() {
+            Some(st) => st,
+            None => {
+                let (_, am, h) = self.hc_fused(x, None, x, None, t, p, "attn", pre_mix, &norm)?;
+                (am, h)
+            }
+        };
+        self.end(s);
+        let s = self.span("attn");
+        let h = match attn {
+            Attn::Main => self.attention(p, lid, h, t, sp)?,
+            Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
+        };
+        self.end(s);
+        let s = self.span("hc");
+        let norm = format!("{p}.ffn_norm.weight");
+        let (x, fm, h) = self.hc_fused(h, None, x, Some(&am), t, p, "ffn", am.pre, &norm)?;
+        self.end(s);
+        let s = self.span("moe");
+        self.defer_sh.set(true);
+        self.sh.set(None);
+        let r = self.moe(p, h, t, lid);
+        self.defer_sh.set(false);
+        let h = r?;
+        let sh = self.sh.take();
+        self.end(s);
+        let s = self.span("hc");
+        let x = match next {
+            Some(np) => {
+                let norm = format!("{np}.attn_norm.weight");
+                let (x, nm, nh) =
+                    self.hc_fused(h, sh, x, Some(&fm), t, &np, "attn", fm.pre, &norm)?;
+                self.pend_stage = Some((nm, nh));
                 x
             }
             None => self.hc_post2(h, sh, x, &fm, t)?,
@@ -2759,6 +2908,7 @@ impl GpuModel {
         let mut pre_mix = inp.one_hot;
         let mut mains: Vec<Buf> = Vec::new();
         self.pend_mixes = None;
+        self.pend_stage = None;
         for i in 0..c.n_layers {
             let p = format!("layers.{i}");
             let sp_layer = self.obs.span(&self.s, "layer", Some(i));
@@ -3592,6 +3742,72 @@ mod tests {
             a.moe_tabs.borrow().values().any(|t| t.is_some()),
             "grouped path never taken"
         );
+    }
+
+    /// The K-split mHC glue (default path) against the exact one (`hc_exact`), on the
+    /// fixture's teacher-forced steps (prefill, then decode): every layer's hidden within
+    /// rel 2e-2, the same argmax, logits KL < 1e-3 (bit for bit under DS_EXACT=1).
+    #[test]
+    fn gpu_tiny_hc_ks_matches_exact() {
+        let Some((mut a, meta)) = open() else { return };
+        let mut b = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+        b.hc_exact = true;
+        let exact = a.k.exact;
+        let n_layers = a.cpu.cfg.n_layers;
+        let mut worst = 0f32;
+        for (s, step) in meta["steps"].as_array().unwrap().iter().enumerate() {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            let force: Vec<(Vec<f32>, Vec<f32>)> = (0..n_layers)
+                .map(|i| {
+                    (
+                        load_ref(&format!("step{s}_in{i}")).unwrap(),
+                        load_ref(&format!("step{s}_pm{i}")).unwrap(),
+                    )
+                })
+                .collect();
+            let mut run = |m: &mut GpuModel| {
+                m.force = Some(force.clone());
+                let mut got: HashMap<String, Vec<f32>> = HashMap::new();
+                let mut hook = |n: &str, t: &[f32]| {
+                    got.insert(n.to_string(), t.to_vec());
+                };
+                let (l, _) = m.forward(&ids, sp, Some(&mut hook)).unwrap();
+                (l, got)
+            };
+            let (la, ga) = run(&mut a);
+            let (lb, gb) = run(&mut b);
+            if exact {
+                assert_eq!(la, lb, "step {s}");
+                continue;
+            }
+            let rels: Vec<f32> = (0..n_layers)
+                .map(|i| {
+                    let k = format!("layer{i}");
+                    rel(&ga[&k], &gb[&k])
+                })
+                .collect();
+            let k = kl(&lb, &la);
+            eprintln!(
+                "step {s}: [{}] KL {k:.1e}",
+                rels.iter()
+                    .map(|r| format!("{r:.1e}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert_eq!(argmax(&la), argmax(&lb), "step {s} argmax");
+            assert!(k < 1e-3, "step {s}: KL {k}");
+            for (i, r) in rels.iter().enumerate() {
+                assert!(*r < 2e-2, "step {s} layer {i}: rel {r}");
+                worst = worst.max(*r);
+            }
+        }
+        eprintln!("worst layer rel {worst:.1e}");
     }
 
     /// Free-running on the device, prefill then greedy decode; informational past top-1.
