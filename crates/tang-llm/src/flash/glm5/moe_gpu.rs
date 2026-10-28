@@ -60,7 +60,7 @@ struct Pool {
     bufs: Vec<Option<DevBuf>>,
     stream: Option<Stream>,
     /// dynamic-smem opt-in already set on g5f_gu / g5f_down (bytes)
-    smem_set: [u32; 3],
+    smem_set: [u32; 5],
     /// u32s of P_CNT known zero (g5f_route resets its counters on exit)
     cnt_zero: usize,
 }
@@ -101,6 +101,18 @@ pub struct Kernels {
     f_gun: Func,
     f_down_splitn: Func,
     f_gux: Func,
+    f_gu4: Func,
+    f_down4: Func,
+    /// Round-4 gate|up / down (`g5f_gu4` / `g5f_down4`, `TANG_GLM5_MOE_K4`, default on):
+    /// activation-resident lane-contiguous rows, NOT bit-identical to `g5f_gux` /
+    /// `g5f_down_splitn` (summation order); `TANG_GLM5_MOE_K4=0` restores those.
+    pub k4: bool,
+    /// Rows a block of `g5f_gu4` / `g5f_down4` (`TANG_GLM5_MOE_K4R` / `_K4DR`).
+    k4r: usize,
+    k4dr: usize,
+    k4nr: usize,
+    k4dnr: usize,
+    k4ns: usize,
     /// Rows a block in `g5f_gux` (`TANG_GLM5_MOE_GUX`, 1..16, default 4; 0 = `g5f_gun` / `g5f_gu`).
     pub gux: usize,
     /// Rows a warp in `g5f_gun` (`TANG_GLM5_MOE_GUR`; 0 = `g5f_gu`, one row a warp).
@@ -166,11 +178,21 @@ impl Kernels {
         // TANG_GLM5_MOE_GUX: rows a block of the activation-resident gate|up (0 = off)
         let gux = rows("TANG_GLM5_MOE_GUX", 4).min(16);
         // TANG_GLM5_MOE_SEL2=0: the previous top-k select (smem scan, per-round global stores)
-        let sel2 = i32::from(env_on("TANG_GLM5_MOE_SEL2", true));
+        // (2, default: the select rounds as warp reductions — same choices, same float ops)
+        let sel2 = std::env::var("TANG_GLM5_MOE_SEL2").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(2);
         // TANG_GLM5_MOE_LDU: unroll of the 8-weight row loop (Q8_0 shared / dense rows; same order)
         let ldu = rows("TANG_GLM5_MOE_LDU", 4).min(16);
+        // TANG_GLM5_MOE_K4R / _K4NR / _K4DR / _K4DNR / _K4MINB: g5f_gu4 / g5f_down4 rows a block,
+        // rows in flight a thread, min blocks per SM
+        let k4r = rows("TANG_GLM5_MOE_K4R", 8).clamp(1, 64);
+        let k4nr = rows("TANG_GLM5_MOE_K4NR", 4).clamp(1, 4);
+        let k4dr = rows("TANG_GLM5_MOE_K4DR", 8).clamp(1, 64);
+        let k4dnr = rows("TANG_GLM5_MOE_K4DNR", 4).clamp(1, 8);
+        let k4minb = rows("TANG_GLM5_MOE_K4MINB", 4).clamp(1, 16);
+        let k4ns = rows("TANG_GLM5_MOE_K4NS", 3).clamp(2, 8);
+        let rrel = i32::from(env_on("TANG_GLM5_MOE_ROUTE_REL", true));
         let src = format!(
-            "#define G5F_GUX_R {}\n#define G5F_SEL2 {sel2}\n#define G5F_LDU {ldu}\n#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
+            "#define G5F_K4_R {k4r}\n#define G5F_K4_NR {k4nr}\n#define G5F_K4_DR {k4dr}\n#define G5F_K4_DNR {k4dnr}\n#define G5F_K4_MINB {k4minb}\n#define G5F_K4_NS {k4ns}\n#define G5F_GUX_R {}\n#define G5F_SEL2 {sel2}\n#define G5F_ROUTE_REL {rrel}\n#define G5F_LDU {ldu}\n#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
             gux.max(1),
             gur.max(1),
             dnr.max(2),
@@ -198,6 +220,14 @@ impl Kernels {
             f_gun: m.func("g5f_gun")?,
             f_down_splitn: m.func("g5f_down_splitn")?,
             f_gux: m.func("g5f_gux")?,
+            f_gu4: m.func("g5f_gu4")?,
+            f_down4: m.func("g5f_down4")?,
+            k4: env_on("TANG_GLM5_MOE_K4", true),
+            k4r,
+            k4dr,
+            k4nr,
+            k4dnr,
+            k4ns,
             gux,
             gur,
             dnr,
@@ -346,11 +376,16 @@ fn repacked_row_bytes(ty: u32, k: usize) -> usize {
     raw.next_multiple_of(16)
 }
 
-/// `TANG_GLM5_MOE_REPACK` (default off: the B300 A/B was 35.02 off vs 33.51 on; `1` opts in): repack the FFN's Q8_0 / Q6_K
-/// weights at upload.
+/// `TANG_GLM5_MOE_REPACK`: repack the FFN's Q8_0 / Q6_K weights at upload. Default: on with the
+/// round-4 kernels (`TANG_GLM5_MOE_K4`, default on; g5f_gu4 / g5f_down4 take Q8_0 / Q6_K only
+/// repacked), off with `TANG_GLM5_MOE_K4=0` (the B300 A/B with the round-2 kernels was 35.02 off
+/// vs 33.51 on).
 fn repack_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TANG_GLM5_MOE_REPACK").map_or(false, |v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("TANG_GLM5_MOE_REPACK") {
+        Ok(v) => v == "1",
+        Err(_) => !std::env::var("TANG_GLM5_MOE_K4").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")),
+    })
 }
 
 /// [`upload`] for the MoE / dense FFN weights: Q8_0 (k % 32 == 0) and Q6_K (k % 256 == 0) are
@@ -686,6 +721,38 @@ fn smem_for(k: &Kernels, pool: &mut Pool, which: usize, f: Func, r16: usize, pai
     Ok((r16 as i32, bytes))
 }
 
+/// Dynamic shared memory of g5f_gu4 / g5f_down4 (moe_cuda.cuh `g5f_k4_smem`): the cp.async ring
+/// of the largest K4-eligible view (`(view, k)`), opted in past 48 KB. `m` matrices a batch.
+fn k4_smem(k: &Kernels, pool: &mut Pool, which: usize, f: Func, views: &[(G5W, usize)], m: usize, nr: usize) -> Result<u32> {
+    // gate|up (m == 2) keeps Q8_0r rows on the g5f_gux row code (moe_cuda.cuh g5f_k4_ok)
+    let ok = |w: &G5W, kk: usize| {
+        let nb = kk / 256;
+        w.base != 0
+            && (w.base | w.estride | w.row_bytes as u64) % 16 == 0
+            && kk % 256 == 0
+            && (1..=16).contains(&nb)
+            && nb.is_power_of_two()
+            && (matches!(w.ty, 12 | 13 | 114) || (w.ty == 108 && m == 1))
+    };
+    let bytes = views
+        .iter()
+        .filter(|(w, kk)| ok(w, *kk))
+        .map(|(w, kk)| (k.k4ns * m * (4096 / kk) * nr * w.row_bytes as usize) as u32)
+        .max()
+        .unwrap_or(0);
+    ensure!(bytes <= k.smem_optin, "g5f K4: {bytes} B of shared memory > opt-in {}", k.smem_optin);
+    if bytes > 48 * 1024 && pool.smem_set[which] < bytes {
+        gpu::check(
+            unsafe {
+                cu::cuFuncSetAttribute(f, cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32)
+            },
+            "cuFuncSetAttribute(g5f K4 smem)",
+        )?;
+        pool.smem_set[which] = bytes;
+    }
+    Ok(bytes)
+}
+
 fn nan_fill(ptr: u64, n_f32: usize, s: &Stream) -> Result<()> {
     Ok(gpu::check(
         unsafe { cu::cuMemsetD32Async(ptr, 0x7fc0_0000, n_f32, s.0) },
@@ -854,7 +921,17 @@ fn ffn_fast(
     let dn_b = t64 * hid as u64 * (nr64 * rb(down) + rb(sd));
     unsafe {
         gpu::trace::bytes(gu_b);
-        if k.gux > 0 && smg == 0 {
+        if k.k4 && smg == 0 {
+            let sm4 = k4_smem(k, pool, 3, k.f_gu4, &[(gate, hid), (up, hid), (sg, hid), (su, hid)], 2, k.k4nr)?;
+            gpu::launch(
+                k.f_gu4,
+                (hs.div_ceil(k.k4r) as u32, slots as u32, t as u32),
+                blk,
+                sm4,
+                s,
+                tang_moe::args![gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims],
+            )?;
+        } else if k.gux > 0 && smg == 0 {
             gpu::launch(
                 k.f_gux,
                 (hs.div_ceil(k.gux) as u32, slots as u32, t as u32),
@@ -895,7 +972,17 @@ fn ffn_fast(
         gpu::trace::bytes(dn_b);
         if split {
             let yp = pool.get(P_YP, t * slots * hid * 4)?;
-            if k.dnr > 0 && smd == 0 {
+            if k.k4 && smd == 0 {
+                let sm4 = k4_smem(k, pool, 4, k.f_down4, &[(down, ff), (sd, ffs)], 1, k.k4dnr)?;
+                gpu::launch(
+                    k.f_down4,
+                    (hid.div_ceil(k.k4dr) as u32, slots as u32, t as u32),
+                    blk,
+                    sm4,
+                    s,
+                    tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi],
+                )?;
+            } else if k.dnr > 0 && smd == 0 {
                 gpu::launch(
                     k.f_down_splitn,
                     (hid.div_ceil(4 * k.dnr) as u32, slots as u32, t as u32),

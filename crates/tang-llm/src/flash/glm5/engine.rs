@@ -196,6 +196,15 @@ impl GpuFfn {
             .map_err(|e| anyhow::anyhow!("head read: {e}"))
     }
 
+    /// The last device LM head's logits row (TANG_GLM5_GPU_HEAD=1; `TANG_GLM5_LOGITS_DUMP`).
+    pub fn last_head_logits(&self, nv: usize) -> Result<Option<Vec<f32>>> {
+        let Some(hd) = self.head_dev.as_ref() else {
+            return Ok(None);
+        };
+        self.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+        hd.out.read::<f32>(0, nv).map(Some).map_err(|e| anyhow::anyhow!("head read: {e}"))
+    }
+
     /// The KDA layers resident (tests: the wiring regression guards).
     #[cfg(test)]
     pub(crate) fn kda_resident(&self) -> usize {
@@ -2356,11 +2365,26 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         ensure!(v.len() == 2, "TANG_GLM5_WINDIFF=S,T");
         return windiff(&mut e, gen, v[0], v[1]);
     }
+    // TANG_GLM5_LOGITS_DUMP=path: the f32 logits of every decode step (device LM head,
+    // TANG_GLM5_GPU_HEAD=1), n_vocab floats each, appended in order (numerics A/B)
+    let mut dump = match std::env::var("TANG_GLM5_LOGITS_DUMP") {
+        Ok(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        Err(_) => None,
+    };
     let t2 = Instant::now();
     while gen.len() < n {
         cur = e.step(cur)?;
         gen.push(cur);
+        #[cfg(feature = "cuda")]
+        if let Some(w) = dump.as_mut() {
+            let nv = e.m.hp.n_vocab;
+            let l = e.gpu.as_ref().map(|g| g.last_head_logits(nv)).transpose()?.flatten();
+            let l = l.context("TANG_GLM5_LOGITS_DUMP needs TANG_GLM5_GPU_HEAD=1")?;
+            use std::io::Write;
+            w.write_all(&l.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
     }
+    drop(dump);
     let decode_s = t2.elapsed().as_secs_f64();
     println!(
         "prompt: {} tokens, prefill {:.2} s ({:.1} tok/s)",

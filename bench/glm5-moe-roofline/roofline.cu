@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 #include <vector>
 #include <cuda_runtime.h>
 #ifndef G5F_MINB
@@ -148,7 +150,143 @@ void run_gux(const unsigned* ids) {
                                      WITH_SH ? FF : 0, HID, 1e30f, 1e30f);
 }
 
+void run_gu4(const unsigned* ids) {
+    G5W g{(unsigned long long)G, (unsigned long long)FF * RB, RB, 12}, u{(unsigned long long)U, (unsigned long long)FF * RB, RB, 12};
+    const G5W none{0, 0, 0, 0};
+    const int S = K + (WITH_SH ? 1 : 0);
+    const unsigned sm = g5f_k4_smem(RB, HID, 2, G5F_K4_NR);
+    static bool once = false;
+    if (!once) { CK(cudaFuncSetAttribute(g5f_gu4, cudaFuncAttributeMaxDynamicSharedMemorySize, sm)); once = true; }
+    g5f_gu4<<<dim3(FF / G5F_K4_R, S, 1), 128, sm>>>(g, u, WITH_SH ? SG : none, WITH_SH ? SU : none, ids, K, NE, XF, XQ, NO_X2 ? nullptr : XQ2, XD, H, FF, FF,
+                                     WITH_SH ? FF : 0, HID, 1e30f, 1e30f);
+}
+
+// g5f_route as one routed layer at T=1 (F32 router 288 x 4096, sigmoid + bias top-8, q8x2 of x)
+static void route_bench() {
+    const int NE_ = 288;
+    float *w, *x, *s, *bias, *xd, *wts; unsigned char *xq, *xq2; unsigned *ids, *cnt;
+    CK(cudaMalloc(&w, (size_t)NE_ * HID * 4 * 16)); CK(cudaMalloc(&x, HID * 4)); CK(cudaMalloc(&s, NE_ * 4));
+    CK(cudaMalloc(&bias, NE_ * 4)); CK(cudaMalloc(&xd, HID / 32 * 4)); CK(cudaMalloc(&wts, 64));
+    CK(cudaMalloc(&xq, HID)); CK(cudaMalloc(&xq2, HID)); CK(cudaMalloc(&ids, 64)); CK(cudaMalloc(&cnt, 64));
+    {
+        std::vector<float> h((size_t)NE_ * HID * 16), hx(HID), hb(NE_);
+        unsigned st = 3;
+        for (auto& v : h) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f - 0.5f) * 0.05f; }
+        for (auto& v : hx) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f - 0.5f); }
+        for (auto& v : hb) { st = st * 1664525u + 1013904223u; v = ((st >> 8) / 16777216.0f - 0.5f) * 0.01f; }
+        CK(cudaMemcpy(w, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(x, hx.data(), HID * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(bias, hb.data(), NE_ * 4, cudaMemcpyHostToDevice));
+    }
+    CK(cudaMemset(cnt, 0, 64));
+    cudaEvent_t a, b;
+    cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int cold = 0; cold < 2; cold++) {
+        const int reps = 64;
+        unsigned long long ph[4] = {0, 0, 0, 0};
+        float tot = 0;
+        for (int r = 0; r < reps; r++) {
+            G5W g{(unsigned long long)(w + (size_t)(cold ? r % 16 : 0) * NE_ * HID), 0, HID * 4, 0};
+            cudaEventRecord(a);
+            g5f_route<<<dim3(NE_, 1), 128>>>(g, x, s, NE_, HID, xq, xq2, xd, bias, ids, wts, 8, 1, 2.5f, cnt);
+            cudaEventRecord(b);
+            CK(cudaEventSynchronize(b));
+            float ms; cudaEventElapsedTime(&ms, a, b); tot += ms;
+#ifdef G5F_ROUTE_TS
+            std::vector<unsigned long long> ts(4 * 1024);
+            CK(cudaMemcpyFromSymbol(ts.data(), g5f_route_ts, ts.size() * 8));
+            unsigned long long t0 = ~0ull, t1 = 0, t2 = 0, t3 = 0, d0 = ~0ull;
+            for (int e = 0; e < NE_; e++) { t0 = std::min(t0, ts[4 * e]); t1 = std::max(t1, ts[4 * e + 1]); d0 = std::min(d0, ts[4 * e + 1]);
+                if (ts[4 * e + 3] >= ts[4 * e + 2] && ts[4 * e + 2] > t2) { t2 = ts[4 * e + 2]; t3 = ts[4 * e + 3]; } }
+            unsigned long long tmax0 = 0; for (int e = 0; e < NE_; e++) tmax0 = std::max(tmax0, ts[4 * e]);
+            ph[0] += tmax0 - t0; ph[1] += t1 - t0; ph[2] += t2 - t1; ph[3] += t3 - t2;
+            std::vector<unsigned long long> z(4 * 1024, 0); CK(cudaMemcpyToSymbol(g5f_route_ts, z.data(), z.size() * 8));
+#endif
+        }
+        printf("route %s: %.2f us/call (events)", cold ? "cold" : "warm", tot * 1e3f / reps);
+#ifdef G5F_ROUTE_TS
+        printf(" | last block start %.2f, all dots done %.2f, -> select start +%.2f, select +%.2f us",
+               ph[0] / 1e3 / reps, ph[1] / 1e3 / reps, ph[2] / 1e3 / reps, ph[3] / 1e3 / reps);
+#endif
+        printf("\n");
+    }
+}
+
+// down as one routed layer at T=1: 8 experts x hid 4096 rows x ff 2048 (Q5_K 1408 B / Q6_Kr 1680 B
+// rows), 16 disjoint expert sets (L2-cold), + the shared Q8_0r slot; down_splitn vs down4
+static void down_bench(int ty) {
+    const int DH = HID, DK = FF, DNE = 128;
+    const unsigned rb = ty == 13 ? DK / 256 * 176 : DK / 256 * 210;
+    const size_t per = (size_t)DNE * DH * rb;
+    unsigned char* W;
+    CK(cudaMalloc(&W, per));
+    {
+        std::vector<unsigned char> h(per);
+        unsigned st = 5;
+        for (size_t i = 0; i < per; i++) { st = st * 1664525u + 1013904223u; h[i] = st >> 24; }
+        const int nb = DK / 256;
+        for (size_t r = 0; r < per / rb; r++)
+            for (int b = 0; b < nb; b++) {
+                unsigned char* q = h.data() + r * rb;
+                if (ty == 13) { q[b * 176 + 0] = 0; q[b * 176 + 1] = 0x20; q[b * 176 + 2] = 0; q[b * 176 + 3] = 0x20; }
+                else { q[nb * 208 + 2 * b] = 0; q[nb * 208 + 2 * b + 1] = 0x20; }
+            }
+        CK(cudaMemcpy(W, h.data(), per, cudaMemcpyHostToDevice));
+    }
+    const unsigned SRB = DK + DK / 16;  // Q8_0r
+    unsigned char* sd; CK(cudaMalloc(&sd, (size_t)DH * SRB)); CK(cudaMemset(sd, 0, (size_t)DH * SRB));
+    const int S = K + 1, hs = DK;
+    unsigned char *hq, *hq2; float *hd, *hf, *yp, *wts;
+    CK(cudaMalloc(&hq, S * hs)); CK(cudaMalloc(&hq2, S * hs)); CK(cudaMalloc(&hd, S * hs / 32 * 4)); CK(cudaMalloc(&hf, S * hs * 4));
+    CK(cudaMalloc(&yp, (size_t)S * DH * 4)); CK(cudaMalloc(&wts, K * 4));
+    {
+        std::vector<unsigned char> q(S * hs); std::vector<float> d(S * hs / 32), w(K, 0.125f);
+        unsigned st = 9;
+        for (auto& v : q) { st = st * 1664525u + 1013904223u; v = (st >> 24) % 255 - 127; }
+        for (size_t i = 0; i < d.size(); i++) d[i] = 0.01f * (1 + i % 5);
+        CK(cudaMemcpy(hq, q.data(), q.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(hq2, q.data(), q.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(hd, d.data(), d.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(wts, w.data(), K * 4, cudaMemcpyHostToDevice));
+    }
+    std::vector<unsigned*> sets;
+    for (int s_ = 0; s_ < 16; s_++) {
+        unsigned hid_[K];
+        for (int j = 0; j < K; j++) hid_[j] = (unsigned)((s_ * K + j * 37) % DNE);
+        unsigned* d; CK(cudaMalloc(&d, sizeof hid_)); CK(cudaMemcpy(d, hid_, sizeof hid_, cudaMemcpyHostToDevice));
+        sets.push_back(d);
+    }
+    const G5W dw{(unsigned long long)W, (unsigned long long)DH * rb, rb, (unsigned)(ty == 13 ? 13 : 14)};
+    const G5W dwr{(unsigned long long)W, (unsigned long long)DH * rb, rb, (unsigned)(ty == 13 ? 13 : 114)};
+    const G5W sdw{(unsigned long long)sd, 0, SRB, 108};
+    const unsigned sm = g5f_k4_smem(rb, DK, 1, G5F_K4_DNR);
+    CK(cudaFuncSetAttribute(g5f_down4, cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
+    const double bytes = (double)K * DH * rb + (double)DH * SRB;
+    auto run = [&](int which, const unsigned* ids) {
+        if (which < 2)
+            g5f_down_splitn<<<dim3(DH / (4 * G5F_DNR), S, 1), 128>>>(which == 0 ? dw : dwr, sdw, ids, wts, K, DNE, hf, hq, hq2, hd, hs, yp, DK, DK, DH);
+        else
+            g5f_down4<<<dim3(DH / G5F_K4_DR, S, 1), 128, sm>>>(dwr, sdw, ids, wts, K, DNE, hf, hq, hq2, hd, hs, yp, DK, DK, DH);
+    };
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    std::vector<float> ref;
+    for (int which = 0; which < 3; which++) {
+        run(which, sets[0]); CK(cudaDeviceSynchronize());
+        cudaEventRecord(a);
+        for (int r = 0; r < 64; r++) run(which, sets[r % 16]);
+        cudaEventRecord(b); CK(cudaEventSynchronize(b));
+        float ms; cudaEventElapsedTime(&ms, a, b);
+        run(which, sets[3]); CK(cudaDeviceSynchronize());
+        std::vector<float> y((size_t)S * DH); CK(cudaMemcpy(y.data(), yp, y.size() * 4, cudaMemcpyDeviceToHost));
+        double md = 0, mx = 0;
+        if (which == 1) ref = y;
+        if (!ref.empty()) for (size_t i = 0; i < y.size(); i++) { mx = fmax(mx, fabs(ref[i])); md = fmax(md, fabs((double)y[i] - ref[i])); }
+        printf("down ty %d %-22s cold %7.2f us %6.0f GB/s | max |dy| %.3e of %.3e\n", ty, which == 0 ? "down_splitn (raw)" : which == 1 ? "down_splitn (repacked)" : "down4",
+               ms * 1e3f / 64, bytes / (ms * 1e3f / 64) / 1e3, md, mx);
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && argv[1][0] == 'd') { down_bench(13); down_bench(14); return 0; }
+    if (argc > 1 && argv[1][0] == 'r') { route_bench(); return 0; }
     const size_t per = (size_t)NE * FF * RB;
     CK(cudaMalloc(&G, per)); CK(cudaMalloc(&U, per));
     // random bytes, but Q4_K d / dmin as small finite halves (0x2000 ~ 2^-7) so the math is not NaN
@@ -204,6 +342,21 @@ int main(int argc, char** argv) {
     rep("rows R2 W2 WPB4 MINB8", run_rows<2, 2, 4, 8>);
     rep("rows R4 W4 WPB4 MINB8", run_rows<4, 4, 4, 8>);
 gun:
+    if (argc > 1 && argv[1][0] == '4') {
+        rep("gu4 routed only", run_gu4);
+        WITH_SH = true;
+        rep("gu4 + shared Q8_0", run_gu4);
+        SG.ty = SU.ty = 108;
+        rep("gu4 + shared Q8_0r (108)", run_gu4);
+        rep("gux + shared Q8_0r (108)", run_gux);
+        SG.ty = SU.ty = 8;
+        WITH_SH = false;
+        rep("gux routed only", run_gux);
+        NO_X2 = true;
+        rep("gu4 routed only, no residual x2", run_gu4);
+        NO_X2 = false;
+        goto cmp;
+    }
     rep("gunlite loads only, no x, unr1", run_lite<0, 1>);
     rep("gunlite loads + x, unr1", run_lite<1, 1>);
     rep("gunlite loads + x, unr4", run_lite<1, 4>);
@@ -220,6 +373,24 @@ gun:
     SG.ty = SU.ty = 8;
     WITH_SH = false; NO_X2 = true;
     rep("gun (routed only, no residual x2)", run_gun);
+cmp:
+    {   // gu4 vs gun: max |dh| relative to max |h| (summation order differs)
+        std::vector<unsigned char> xq(HID), x2(HID); std::vector<float> xd(HID / 32);
+        unsigned st = 7;
+        for (int i = 0; i < HID; i++) { st = st * 1664525u + 1013904223u; xq[i] = (st >> 24) % 255 - 127; x2[i] = (st >> 16) % 255 - 127; }
+        for (int i = 0; i < HID / 32; i++) xd[i] = 0.01f * (1 + i % 7);
+        cudaMemcpy(XQ, xq.data(), HID, cudaMemcpyHostToDevice); cudaMemcpy(XQ2, x2.data(), HID, cudaMemcpyHostToDevice);
+        cudaMemcpy(XD, xd.data(), HID / 32 * 4, cudaMemcpyHostToDevice);
+        WITH_SH = true; NO_X2 = false;
+        std::vector<float> a(9 * FF), b(9 * FF);
+        run_gun(sets[3]); cudaMemcpy(a.data(), H, a.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemset(H, 0xff, a.size() * 4);
+        run_gu4(sets[3]); CK(cudaDeviceSynchronize()); cudaMemcpy(b.data(), H, b.size() * 4, cudaMemcpyDeviceToHost);
+        double mx = 0, md = 0; int nan = 0;
+        for (size_t i = 0; i < a.size(); i++) { mx = fmax(mx, fabs(a[i])); if (b[i] != b[i]) nan++; else md = fmax(md, fabs(a[i] - b[i])); }
+        printf("gu4 vs gun: max |dh| %.3e, max |h| %.3e, nan %d\n", md, mx, nan);
+        if (argc > 1) return 0;
+    }
     {   // bit-identity gux vs gun (random Q4_K rows, nonzero activations, + shared Q8_0)
         std::vector<unsigned char> xq(HID), x2(HID); std::vector<float> xd(HID / 32);
         unsigned st = 7;
