@@ -154,8 +154,15 @@ single read-back and device-side sampling that reproduces the host's draws bit f
 replay nodes vs 248 launches; an obs counter bug fixed), and prefill: tiled grouped MoE and a
 K-split path for raw linears at t > 8, the tiled attention chunked over rows (tiny fixture
 120-token prefill 23 → 13 ms, 3696 → 592 launches; bench at real shapes: wq_b 3.7 → 1.4 ms,
-wo_b 4.7 → 2.3 ms at t = 512). Still open: the relaxed-order mHC lane; the per-rank table
-(rank 0 was 66 ms vs 43 on the others); a real multi-token GEMM tile for prefill.
+wo_b 4.7 → 2.3 ms at t = 512). The mHC lane landed last (852e2eb6): the mixes' GEMV on the K-split path
+with the post-mix folded in and the whole stage in one launch behind a grid barrier — 2 glue
+launches per layer at t ≤ 8, 155 → ~50 µs/layer on the 3090; `DS_HC_EXACT=1` (or `DS_EXACT=1`)
+keeps the bit-exact kernels, which `gpu_tiny_free_running` now pins (the tiny random fixture
+amplifies ulp drift over free-running steps: 6/10 top-1 relaxed, 10/10 exact; the relaxed path
+is held by `gpu_tiny_hc_ks_matches_exact`, KL 0 and argmax unchanged teacher-forced). The real
+model's draft acceptance rate is the check that matters for that choice. Full GPU suite on
+mew at b178b8a2: 12 engine, 2 EP, 14 kernel tests. Still open: the per-rank table (rank 0 was
+66 ms vs 43 on the others); a real multi-token GEMM tile for prefill.
 
 Steady state after the host fixes: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a
 ~4 ms floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
