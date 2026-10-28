@@ -1738,6 +1738,49 @@ DS_KS(3, 1)
 DS_MOE_KS(2)
 DS_MOE_KS(3)
 
+// The grouped K-split MoE with the shared expert as one more slot (blockIdx.y == gridDim.y - 1
+// when sh != 0): every token routed to it at weight 1 (no rw), its own format SF (the shared
+// expert is fp8 where the routed ones are fp4), GU over x's codes in token order into
+// h[n + ti], down from hc rows n.. into part[n + ti] for ds_moe_reduce's `sh` term. The
+// routed slots are ds_moe_ks_*_f F's exactly.
+#define DS_MOE_KS_SH(F, SF)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_gu_f##F##_s##SF(                              \
+        const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
+        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr, DsW s1, DsW s3, int t, \
+        int n) {                                                                                                \
+        if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
+            lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * s1.rows, t, 1, 0, lim, S, 1, nbr, 0, 0, 0);     \
+            return;                                                                                             \
+        }                                                                                                       \
+        int e = elist[blockIdx.y];                                                                              \
+        if (e < 0) return;                                                                                      \
+        int o = off[e], m = off[e + 1] - o;                                                                     \
+        if (m <= 0) return;                                                                                     \
+        DsW w = w1s[e];                                                                                         \
+        lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, m, 1, rw + o, lim, S, 1, nbr, 0, 0,       \
+                      rows + o);                                                                                \
+    }                                                                                                           \
+    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_down_f##F##_s##SF(                            \
+        const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
+        float* part, int S, int nbr, DsW s2, int t, int n) {                                                    \
+        if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
+            lin_mma<SF, 0>(s2, s2, hc + (long long)n * s2.cols, hsc + (long long)n * (s2.cols / 32),           \
+                           part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                    \
+            return;                                                                                             \
+        }                                                                                                       \
+        int e = elist[blockIdx.y];                                                                              \
+        if (e < 0) return;                                                                                      \
+        int o = off[e], m = off[e + 1] - o;                                                                     \
+        if (m <= 0) return;                                                                                     \
+        DsW w = w2s[e];                                                                                         \
+        lin_mma<F, 0>(w, w, hc + (long long)o * w.cols, hsc + (long long)o * (w.cols / 32),                    \
+                      part + (long long)o * w.rows, m, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                          \
+    }
+DS_MOE_KS_SH(3, 2)
+DS_MOE_KS_SH(2, 2)
+DS_MOE_KS_SH(3, 3)
+DS_MOE_KS_SH(2, 3)
+
 // wo_a on the K-split path in one launch: block-diagonal over blockIdx.y = group gi (ol rows of
 // w, its gd = w.cols columns of the token-major activation [t][g * gd]), quantized once by
 // ds_ks_quant over the whole row (gd % 32 == 0, so the 32-groups are the per-group ones), into

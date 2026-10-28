@@ -277,9 +277,10 @@ extern "C" __global__ void ds_moe_plan_tiles(const int* elist, const int* off, i
 }
 
 // y [t][d] = Σ over token ti's local experts in ascending id of part[slot] (slot = the token's
-// CSR position under that expert): the per-expert loop's scatter order, from 0.
-extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
-                                         const int* mask, int t, int k, int d) {
+// CSR position under that expert): the per-expert loop's scatter order, from 0. ds_moe_reduce_sh
+// then adds the shared expert's row part[t * k + ti] (moe_finish's routed + shared, unrounded).
+__device__ __forceinline__ void moe_reduce_at(float* y, const float* part, const int* ids, const int* off,
+                                              const int* rows, const int* mask, int t, int k, int d, int sh) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * d) return;
     int ti = (int)(i / d), c = (int)(i % d);
@@ -301,7 +302,16 @@ extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int*
             }
         s += part[(long long)p * d + c];
     }
+    if (sh) s += part[((long long)t * k + ti) * d + c];
     y[i] = s;
+}
+extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
+                                         const int* mask, int t, int k, int d) {
+    moe_reduce_at(y, part, ids, off, rows, mask, t, k, d, 0);
+}
+extern "C" __global__ void ds_moe_reduce_sh(float* y, const float* part, const int* ids, const int* off,
+                                            const int* rows, const int* mask, int t, int k, int d, int sh) {
+    moe_reduce_at(y, part, ids, off, rows, mask, t, k, d, sh);
 }
 
 // n ints set to v (a verify window's [t][k] selection, -1 = no entry).
