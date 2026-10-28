@@ -76,7 +76,7 @@ pub(super) struct Resident {
     /// One eager resident token has run since the last host window (every buffer the
     /// step touches is allocated): the step graph may be captured.
     warm: bool,
-    /// `TANG_GLM5_STEP_GRAPH=1`: the captured segments (see [`Glm5Engine::step_resident`]).
+    /// The step graph (default on, `TANG_GLM5_STEP_GRAPH=0` off): the captured segments (see [`Glm5Engine::step_resident`]).
     pub(super) graphs: Option<Vec<tang_moe::gpu::Graph>>,
 }
 
@@ -163,7 +163,7 @@ impl Glm5Engine {
     /// One greedy decode token on the resident step, or `None` when it doesn't apply
     /// (the caller runs the host path).
     ///
-    /// `TANG_GLM5_STEP_GRAPH=1`: after one eager token (every buffer allocated), the step
+    /// The step graph (default on; `TANG_GLM5_STEP_GRAPH=0` = eager): after one eager token (every buffer allocated), the step
     /// is captured as `n_dsa + 1` graph segments split at the DSA attention cores, which
     /// stay eager between the segment launches (their `pos0`/`kv_len`/cache-row pointers
     /// move every token). Any host window drops the segments ([`Self::drop_step_graph`]):
@@ -197,7 +197,8 @@ impl Glm5Engine {
         } else {
             None
         };
-        let graph_on = std::env::var("TANG_GLM5_STEP_GRAPH").is_ok_and(|v| v == "1");
+        // default on; `TANG_GLM5_STEP_GRAPH=0` runs the resident step eagerly
+        let graph_on = !std::env::var("TANG_GLM5_STEP_GRAPH").is_ok_and(|v| v == "0");
         let g = self.gpu.as_mut().context("resident step without a GPU")?;
         g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         if let Some(w) = norm_w {

@@ -3152,13 +3152,14 @@ mod tests {
             }
             out
         };
+        // eager resident step first (the step graph is the default; =0 opts out)
+        std::env::set_var("TANG_GLM5_STEP_GRAPH", "0");
         let a = run(&mut host, false);
         let b = run(&mut res, true);
-        // the step graph (TANG_GLM5_STEP_GRAPH=1): warm-up token eager, then segments
-        std::env::set_var("TANG_GLM5_STEP_GRAPH", "1");
+        // the step graph (default on): warm-up token eager, then segments
+        std::env::remove_var("TANG_GLM5_STEP_GRAPH");
         let mut gr = mk();
         let c = run(&mut gr, true);
-        std::env::remove_var("TANG_GLM5_STEP_GRAPH");
         let segs = gr.gpu.as_ref().unwrap().resident.as_ref().and_then(|r| r.graphs.as_ref()).map_or(0, |g| g.len());
         eprintln!("step graph: {segs} segments, ids {}", if c == a { "= host" } else { "DIFFER" });
         assert_eq!(segs, gr.m.hp.is_kda.iter().filter(|&&k| !k).count() + 1, "step graph segments");
