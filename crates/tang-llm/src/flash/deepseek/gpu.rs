@@ -229,6 +229,17 @@ const ATTN_SCRATCH: usize = 6 << 20;
 /// A rope fused into the tiled attention ([`Kernels::sparse_attn_r`]): row r's position is
 /// `P[0] + add + r * stride` (`dg_rope`'s `At::Dev` with no fixed row), table `tab`, the last
 /// `rd` of each head.
+/// The attention's index rows built inside `ds_attn_fdm` ([`Kernels::attn_fd_win_ok`]): the
+/// window columns as `dg_win_idx` `mode` (1 decode, 3 verify window) at `P[0]` (the rope's
+/// `p`), then the top-k rows `src` [t][kc] (`ds_idx_cat`'s).
+#[derive(Clone, Copy, Debug)]
+pub struct WinIdx {
+    pub mode: i32,
+    pub win: i32,
+    pub src: u64,
+    pub kc: i32,
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct AttnRope {
     pub tab: u64,
@@ -1633,9 +1644,17 @@ impl Kernels {
         k: usize,
         scale: f32,
         rope: Option<AttnRope>,
+        widx: Option<WinIdx>,
     ) -> Result<()> {
         let r = rope.unwrap_or_default();
         let (pp, rd, ps) = (r.p, r.rd, r.stride);
+        if widx.is_some() {
+            anyhow::ensure!(
+                self.attn_fdm && pp != 0,
+                "attn_fd: in-kernel indices want ds_attn_fdm and P"
+            );
+        }
+        let (wm, ww, wsrc, wkc) = widx.map_or((0, 0, 0, 0), |w| (w.mode, w.win, w.src, w.kc));
         let qtab = if r.q { r.tab } else { 0 };
         let ntile = k.div_ceil(16);
         let hg = h / 64;
@@ -1663,6 +1682,7 @@ impl Kernels {
             let part = self.scratch.ptr;
             let ml = part + (n * sp_n * h * d * 4) as u64;
             let add = r.add + t0 as i32 * r.stride;
+            let (wsrc_o, r0) = (wsrc + (t0 * wkc as usize * 4) as u64, t0 as i32);
             let (qo, io, oo) = (
                 q + (t0 * h * d * 4) as u64,
                 idxs + (t0 * k * 4) as u64,
@@ -1677,7 +1697,8 @@ impl Kernels {
                     smem as u32,
                     s,
                     tang_moe::args![
-                        qo, kv, sp, kv1, io, part, ml, hi, di, ki, scale, ns, qtab, pp, rd, add, ps
+                        qo, kv, sp, kv1, io, part, ml, hi, di, ki, scale, ns, qtab, pp, rd, add,
+                        ps, wm, ww, wsrc_o, wkc, r0
                     ],
                 )?;
                 super::obs::launch(
@@ -1798,6 +1819,55 @@ impl Kernels {
         self.sparse_attn_r(s, q, kv, split, kv1, sink, idxs, o, t, h, d, k, scale, None)
     }
 
+    /// Whether [`Kernels::attn_fd_win`] applies: `ds_attn_fdm` building its own index rows.
+    pub fn attn_fd_win_ok(&self, h: usize, d: usize, k: usize) -> bool {
+        self.attn_tiled_ok(h, d, k) && self.attn_fd && self.attn_fdm && d == 512 && h % 64 == 0
+    }
+
+    /// [`Kernels::sparse_attn_r`] on `ds_attn_fdm` with the index rows built in the kernel
+    /// (no `idxs`): one launch fewer. [`Kernels::attn_fd_win_ok`] first; `rope.p` is `P`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_fd_win(
+        &self,
+        s: &Stream,
+        q: u64,
+        kv: u64,
+        split: usize,
+        kv1: u64,
+        sink: u64,
+        o: u64,
+        t: usize,
+        h: usize,
+        d: usize,
+        k: usize,
+        scale: f32,
+        rope: AttnRope,
+        widx: WinIdx,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.attn_fd_win_ok(h, d, k),
+            "attn_fd_win: shape h {h} d {d} k {k}"
+        );
+        let sp = split.min(i32::MAX as usize) as i32;
+        self.attn_fd(
+            s,
+            q,
+            kv,
+            sp,
+            kv1,
+            sink,
+            0,
+            o,
+            t,
+            h,
+            d,
+            k,
+            scale,
+            Some(rope),
+            Some(widx),
+        )
+    }
+
     /// Whether [`Kernels::sparse_attn`] takes the tiled path (and so [`AttnRope`]).
     pub fn attn_tiled_ok(&self, h: usize, d: usize, k: usize) -> bool {
         let per_row = h * k * (d / 64 + 1) + h;
@@ -1831,7 +1901,9 @@ impl Kernels {
         let per_row = h * k * (d / 64 + 1) + h;
         // ds_attn_fdm holds a split's indices (<= 1024) in shared memory: k <= 960 here
         if self.attn_tiled_ok(h, d, k) && self.attn_fd && d == 512 && h % 64 == 0 {
-            return self.attn_fd(s, q, kv, sp, kv1, sink, idxs, o, t, h, d, k, scale, rope);
+            return self.attn_fd(
+                s, q, kv, sp, kv1, sink, idxs, o, t, h, d, k, scale, rope, None,
+            );
         }
         if self.attn_tiled_ok(h, d, k) {
             let tc = ATTN_SCRATCH / per_row;
@@ -3611,6 +3683,120 @@ mod tests {
                     .count();
                 assert_eq!(bad, 0, "t {t} k {kk} fuse {fuse}: {bad} differ");
             }
+        }
+    }
+
+    /// `ds_attn_fdm` building its own index rows (`attn_fd_win`) is `sparse_attn_r` on the
+    /// rows dg_win_idx + ds_idx_cat build, bit for bit (decode and verify-window modes).
+    #[test]
+    fn attn_fd_win_matches_rows() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (h, d, rd, win, kc) = (64, 512, 64, 128usize, 512usize);
+        if !k.attn_fd_win_ok(h, d, win + kc) {
+            return;
+        }
+        let tabv: Vec<f32> = (0..2048 * rd / 2)
+            .flat_map(|e| {
+                let (pos, j) = ((e / (rd / 2)) as f32, (e % (rd / 2)) as f32);
+                let th = pos * 10000f32.powf(-2.0 * j / rd as f32);
+                [th.cos(), th.sin()]
+            })
+            .collect();
+        let tab = DevBuf::from_slice(&tabv).unwrap();
+        for (mode, t, sp, kc) in [
+            (1, 1, 37usize, kc),
+            (1, 1, 300, 0),
+            (3, 6, 20, kc),
+            (3, 5, 900, kc),
+        ] {
+            let k_all = win + kc;
+            let [q, kv, sink, _] = attn_case(t, k_all);
+            let pbuf = DevBuf::from_slice(&[sp as i32]).unwrap();
+            let src: Vec<i32> = (0..t * kc.max(1))
+                .map(|i| ((i * 31 + 7) % 3000) as i32 + 200)
+                .collect();
+            let srcb = DevBuf::from_slice(&src).unwrap();
+            // the rows on the host, as dg_win_idx (modes 1 / 3) then ds_idx_cat
+            let mut ix = vec![0i32; t * k_all];
+            for r in 0..t {
+                for j in 0..win {
+                    ix[r * k_all + j] = if mode == 1 {
+                        let i = (sp % win + 1 + j) % win;
+                        if i > sp {
+                            -1
+                        } else {
+                            i as i32
+                        }
+                    } else {
+                        let qq = sp + r;
+                        let cnt = win.min(qq + 1);
+                        let pos = qq + 1 - cnt + j;
+                        if j >= cnt {
+                            -1
+                        } else if pos < sp {
+                            (pos % win) as i32
+                        } else {
+                            (win + pos - sp) as i32
+                        }
+                    };
+                }
+                for j in 0..kc {
+                    ix[r * k_all + win + j] = src[r * kc + j];
+                }
+            }
+            let ixb = DevBuf::from_slice(&ix).unwrap();
+            let split = if mode == 1 { win } else { win + t };
+            let kv1 = kv.ptr + (split * d * 4) as u64;
+            let rope = AttnRope {
+                tab: tab.ptr,
+                p: pbuf.ptr,
+                rd: rd as i32,
+                add: 0,
+                stride: 1,
+                q: true,
+            };
+            let scale = (d as f32).powf(-0.5);
+            let o = DevBuf::alloc(t * h * d * 4).unwrap();
+            k.sparse_attn_r(
+                &s,
+                q.ptr,
+                kv.ptr,
+                split,
+                kv1,
+                sink.ptr,
+                ixb.ptr,
+                o.ptr,
+                t,
+                h,
+                d,
+                k_all,
+                scale,
+                Some(rope),
+            )
+            .unwrap();
+            s.sync().unwrap();
+            let want = o.read::<f32>(0, t * h * d).unwrap();
+            let w = WinIdx {
+                mode,
+                win: win as i32,
+                src: srcb.ptr,
+                kc: kc as i32,
+            };
+            k.attn_fd_win(
+                &s, q.ptr, kv.ptr, split, kv1, sink.ptr, o.ptr, t, h, d, k_all, scale, rope, w,
+            )
+            .unwrap();
+            s.sync().unwrap();
+            let got = o.read::<f32>(0, t * h * d).unwrap();
+            let bad = got
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(bad, 0, "mode {mode} t {t} sp {sp} kc {kc}: {bad} differ");
         }
     }
 

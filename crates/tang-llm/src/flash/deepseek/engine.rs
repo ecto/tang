@@ -30,7 +30,7 @@
 //! (`reduce_graphable`), so it is captured as a graph node with the step.
 
 use super::forward::{Model, SpecPick, SpecSampler, SpecStep};
-use super::gpu::{blocks, AttnRope, DevW, DsW, Kernels};
+use super::gpu::{blocks, AttnRope, DevW, DsW, Kernels, WinIdx};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
 use anyhow::{bail, Context, Result};
@@ -179,6 +179,13 @@ struct Mix {
     pre: Buf,
     post: Buf,
     comb: Buf,
+}
+
+/// The attention's key index rows: built ([`Buf`] [t][k]) or left to `ds_attn_fdm`.
+#[derive(Clone, Copy)]
+enum Ix {
+    Rows(Buf),
+    Win(WinIdx),
 }
 
 /// Where RoPE reads a row's position: from the host, or from `P[0] + add` on the device.
@@ -803,7 +810,17 @@ impl GpuModel {
             self.idx_cat(idx, tk, t, kc, nw + kc, nw)?;
         }
         self.end(s);
-        self.attn_out(p, q, true, (kv, t, kv1), idx, t, nw + kc, lid, at0)
+        self.attn_out(
+            p,
+            q,
+            true,
+            (kv, t, kv1),
+            Ix::Rows(idx),
+            t,
+            nw + kc,
+            lid,
+            at0,
+        )
     }
 
     /// The decode step's q and window kv on the K-split path, in 6 launches: x quantized once,
@@ -937,6 +954,31 @@ impl GpuModel {
             kv1 = self.ckv[&src].ptr;
             self.end(s);
         }
+        let (src, ki) = match kc {
+            0 => (0, 0),
+            _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
+        };
+        let rd = c.rope_head_dim;
+        if rd % 2 == 0 && rd <= hd && self.k.attn_fd_win_ok(h, hd, win + kc) {
+            // ds_attn_fdm builds the index rows itself
+            let w = WinIdx {
+                mode: mode as i32,
+                win: win as i32,
+                src,
+                kc: ki,
+            };
+            return self.attn_out(
+                p,
+                q,
+                false,
+                (kv0, split, kv1),
+                Ix::Win(w),
+                t,
+                win + kc,
+                lid,
+                at,
+            );
+        }
         let s = self.span("sparse_attn");
         let idx = self.fbuf(t * (win + kc))?;
         let (ti, st, ni, mi, pp, wi) = (
@@ -947,11 +989,6 @@ impl GpuModel {
             self.p.ptr,
             win as i32,
         );
-        // the top-k columns in the same launch (ds_idx_cat's)
-        let (src, ki) = match kc {
-            0 => (0, 0),
-            _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
-        };
         unsafe {
             self.gk.go(
                 "dg_win_idx",
@@ -963,7 +1000,17 @@ impl GpuModel {
             )?
         };
         self.end(s);
-        self.attn_out(p, q, false, (kv0, split, kv1), idx, t, win + kc, lid, at)
+        self.attn_out(
+            p,
+            q,
+            false,
+            (kv0, split, kv1),
+            Ix::Rows(idx),
+            t,
+            win + kc,
+            lid,
+            at,
+        )
     }
 
     fn idx_cat(&self, idx: Buf, src: Buf, t: usize, k: usize, st: usize, col: usize) -> Result<()> {
@@ -1059,7 +1106,7 @@ impl GpuModel {
         q: Buf,
         q_roped: bool,
         kv: (Buf, usize, u64),
-        di: Buf,
+        di: Ix,
         t: usize,
         k: usize,
         lid: usize,
@@ -1092,9 +1139,16 @@ impl GpuModel {
         if !q_roped && rope.is_none() {
             self.rope(q, t, h, hd, lid, at, false)?;
         }
-        self.k.sparse_attn_r(
-            &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale, rope,
-        )?;
+        match (di, rope) {
+            (Ix::Rows(di), _) => self.k.sparse_attn_r(
+                &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale,
+                rope,
+            )?,
+            (Ix::Win(w), Some(r)) => self.k.attn_fd_win(
+                &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
+            )?,
+            (Ix::Win(_), None) => bail!("attn_out: in-kernel indices want the fused rope"),
+        }
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
         self.end(s);
         let s = self.span("wo");
@@ -3274,7 +3328,17 @@ impl GpuModel {
         let all = self.fbuf((win + bl) * hd)?;
         self.copy(all.ptr, ring.ptr, win * hd)?;
         self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, bl * hd)?;
-        self.attn_out(p, q, false, (all, win + bl, 0), idx, bl, nk, lid, dev(t))
+        self.attn_out(
+            p,
+            q,
+            false,
+            (all, win + bl, 0),
+            Ix::Rows(idx),
+            bl,
+            nk,
+            lid,
+            dev(t),
+        )
     }
 
     /// As [`Model::forward_spec`]: greedy drafts, drawn on the device.
