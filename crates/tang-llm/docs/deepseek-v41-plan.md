@@ -181,6 +181,15 @@ tok/s (noise), acceptance 152/235 unchanged. Launch count alone buys little here
 kernels are latency-bound in themselves (~45 µs a sparse_attn span for ~8 MB of keys).
 `DS_ATTN_FUSE=1` (soft+pv in one launch) measured no better (3.84 ms) and stays opt-in.
 
+Wave 7 attn3, kernel speed (5e153ea2, df2b224a, 8× H100): split-K decode attention
+(`ds_attn_fd` → `ds_attn_fdm` on bf16 mma, one block per row × 64 heads × key split, online
+softmax, `ds_attn_fd_comb` merge + o rope; `DS_ATTN_FD=0` / `DS_ATTN_FDM=0` fall back) and
+`sinkhorn_warp` unrolled for hc = 4 (bit for bit). Bench t 6 k 646: attention 85 → 34 µs; hc
+glue 57.6 → 48.0 µs/layer. In the model: greedy 125.2/133.5 → 138.9/148.5 tok/s, verify direct
+31.6 → 29.3 ms, `sparse_attn` 3.51 → 1.99 ms, `layer.hc` 4.33 → 3.76 ms, acceptance 158/225
+(text differs from the 152/235 run). Still 25 µs per sparse_attn span: the per-block Q load
+(128 KB) and the split partials (t × S × h × d) now dominate, not the math.
+
 Wave 6 as merged (895f89b0 → bab5bcfc): attention fusion (one
 grouped K-split launch for wo, 19 → 2 launches, 143 → 54 µs on a 3090; q + window_kv fused,
 the compressor/indexer key side batched over the window, ~150 → ~30 attention launches per
