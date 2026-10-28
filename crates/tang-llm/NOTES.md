@@ -4,6 +4,47 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (gputime) — first per-kernel GPU profile of the resident token on the B300: mHC finish 3.3 ms, MoE 7.4 ms of 16.5 (branch frog/glm5-forward)
+
+The ncu shipped in the runpod image (Nsight Compute 2025.1.1) cannot profile the B300 (compute
+10.3): `==WARNING== No kernels were profiled` after a 400 s run. Installed nsight-systems-2026.3.2
+and nsight-compute-2026.3.1 from the CUDA apt repo; `nsys profile -t cuda --cuda-graph-trace=node`
+sees every graph node. Binary 83b3ab92, B flags, segment graph, haiku prompt -n 32 (8 prompt
+tokens, so per-token counts are ≈ instances/32 and the max values are prefill instances).
+Full csv: `bench/glm5-prof/b300-83b3ab92-n32-kern_sum.csv`. Total 526.9 ms GPU = **16.47 ms/token**,
+consistent with 58 tok/s being all kernel time.
+
+| kernel | inst/32 tok | avg µs | med µs | ~ms/token |
+|---|---|---|---|---|
+| mhcf_finish | 2880 | 36.9 | 36.9 | 3.32 |
+| g5f_gu | 1440 | 58.2 | 40.3 | 2.62 |
+| g5f_gemv | 2316 | 30.4 | 10.8 | 2.20 |
+| g5f_down_split | 1344 | 39.8 | 25.5 | 1.67 |
+| k5_qgemv9 | 1054 | 30.5 | 30.5 | 1.01 |
+| k5d_tail | 1054 | 26.5 | 26.4 | 0.87 |
+| mla_fold_q2 | 352 | 74.3 | 73.1 | 0.82 |
+| mhcf_part | 2912 | 8.2 | 8.3 | 0.75 |
+| mla_attn_abs2 | 352 | 57.1 | 56.4 | 0.63 |
+| g5f_route | 1344 | 13.3 | 12.9 | 0.56 |
+| k5_qgemv17 | 1054 | 16.2 | 16.3 | 0.53 |
+| k5_gemv8 | 51 | 254.6 | 254.5 | 0.41 |
+| k5_gemv | 68 | 94.4 | 93.6 | 0.20 |
+| g5f_down | 96 | 51.4 | 42.3 | 0.15 |
+| g5f_q8 | 2592 | 1.6 | 1.5 | 0.13 |
+| kda_pf_state | 34 | 92.7 | 92.6 | 0.10 |
+| k5_gated_norm | 34 | 91.2 | 91.2 | 0.10 |
+
+Reading: `mhcf_finish` (one block, 20 serial Sinkhorn iterations) is the single largest kernel
+at 37 µs × 90/token; `mhcf_part` + finish = 4.1 ms. The MoE `g5f_*` family is ~7.4 ms/token
+against a ~0.45 ms bytes floor (top-8 × 45 layers ≈ 3–4 GB at 8 TB/s) — underfilled grids
+for t = 1. KDA (`k5_qgemv9` + `k5d_tail` + `k5_qgemv17`) ≈ 2.5 ms, DSA (`mla_fold_q2` +
+`mla_attn_abs2`) ≈ 1.5 ms. Also from this run's log: model open is 504 s, of which the 34 KDA
+layers' resident upload is 462 s (13.5 s/layer) while all 45 FFNs upload in 30 s — an
+iteration-speed problem, not a decode one.
+
+Work farmed out from this profile: claude/glm5-mhc2 (finish kernel), claude/glm5-moe2 (g5f
+grids), claude/glm5-kda-load (open time).
+
 ## 2026-10-28 (integration round 4) — merged on B300: whole-step graph default, 58.5 tok/s; MTP host draft is 6 s/pass (branch frog/glm5-forward)
 
 Pod: fresh B300 SXM6 (US-WA-2, 275 GB, CUDA 12.8 image, container disk). `scripts/glm5-bench.sh`
