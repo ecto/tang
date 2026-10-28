@@ -835,7 +835,7 @@ mod tests {
     /// without the env var.
     #[test]
     fn kda_quant_real_bench() {
-        let _env = super::super::env_read();
+        let _env = super::super::env_write();
         let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;
