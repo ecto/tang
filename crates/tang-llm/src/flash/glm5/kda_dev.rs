@@ -420,6 +420,12 @@ impl DevLayer {
         self.read_back_at(0, conv, state)
     }
 
+    /// Slot `slot`'s device KDA state regions (conv history, recurrent state) as
+    /// `(device ptr, bytes)`.
+    pub fn state_regions(&self, slot: usize) -> [(u64, usize); 2] {
+        self.core.slot_state_regions(slot)
+    }
+
     /// [`Self::read_back`] of sequence `slot`'s state.
     pub fn read_back_at(&self, slot: usize, conv: &mut ConvState, state: &mut KdaState) -> Result<()> {
         self.s.sync()?;

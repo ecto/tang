@@ -977,6 +977,13 @@ pub mod cuda {
             Ok(())
         }
 
+        /// Slot `slot`'s device state as `[(conv history ptr, bytes), (recurrent state ptr,
+        /// bytes)]` (the resident MTP window checkpoints / restores them D2D).
+        pub fn slot_state_regions(&self, slot: usize) -> [(u64, usize); 2] {
+            let (h0, st) = self.slot_state_ptrs(slot);
+            [(h0, self.ch_dim * self.d_conv_m1 * 4), (st, self.nh * self.hd * self.hd * 4)]
+        }
+
         /// This slot's conv-history / recurrent-state base pointers (the state layout is
         /// `[slot][...]`, so the pointers just offset into the one allocation).
         fn slot_state_ptrs(&self, slot: usize) -> (u64, u64) {

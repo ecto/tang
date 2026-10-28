@@ -3505,6 +3505,93 @@ mod tests {
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }
 
+    /// The resident MTP verify window ([`Glm5Engine::window_resident`], t = 3) against the
+    /// host window of the same rows (KDA rows exact via WIN_STEP): identical per-row greedy
+    /// ids, normed h rows within 1e-3 of scale; the state after it continues like the host's;
+    /// and a device rewind to 1 kept row followed by the remaining rows gives the same ids
+    /// (the KDA checkpoints + DSA watermarks). Sets process env: run alone.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn engine_gpu_resident_window_matches_host() {
+        let _env = crate::flash::glm5::env_write();
+        use std::sync::atomic::Ordering;
+        if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("fixture/GPU");
+            return;
+        }
+        for (k, v) in [("TANG_GLM5_MOE", "fast"), ("TANG_GLM5_KDA_PF2", "1"), ("TANG_GLM5_KDA_GRAPH", "1"), ("TANG_GLM5_GEMV8", "1")] {
+            std::env::set_var(k, v);
+        }
+        let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let mk = || {
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            assert!(e.use_gpu().unwrap(), "GPU did not load");
+            let (m, hp) = (&e.m, e.m.hp.clone());
+            let gf = e.gpu.as_mut().unwrap();
+            gf.enable_mla_resident(&m.g, &|l| m.mla_weights(l)).unwrap();
+            if gf.mhc_f.is_none() {
+                gf.enable_mhc_fused(&m.g, &hp).unwrap();
+            }
+            e
+        };
+        let ws = super::super::mtp::WIN_STEP_DEFAULT.load(Ordering::Relaxed);
+        super::super::mtp::WIN_STEP_DEFAULT.store(4, Ordering::Relaxed);
+        let (pre, win, rest) = (&ids2[..4], &ids2[4..7], &ids2[7..10]);
+        // host
+        std::env::set_var("TANG_GLM5_RESIDENT", "0");
+        let mut a = mk();
+        let (n, nv) = (a.m.hp.n_embd, a.m.hp.n_vocab);
+        a.prefill(pre, 64).unwrap();
+        let la = a.window(win).unwrap();
+        let ha = a.last_h.clone();
+        let ga: Vec<u32> = (0..3).map(|j| argmax(&la[j * nv..(j + 1) * nv])).collect();
+        let lr = a.window(rest).unwrap();
+        let gr: Vec<u32> = (0..3).map(|j| argmax(&lr[j * nv..(j + 1) * nv])).collect();
+        // host, kept row 0 then the remaining rows: the rewind reference
+        let mut a2 = mk();
+        a2.prefill(pre, 64).unwrap();
+        a2.window(&win[..1]).unwrap();
+        let tail: Vec<u32> = win[1..].iter().chain(&rest[..1]).copied().collect();
+        let lt = a2.window(&tail).unwrap();
+        let gt: Vec<u32> = (0..3).map(|j| argmax(&lt[j * nv..(j + 1) * nv])).collect();
+        std::env::remove_var("TANG_GLM5_RESIDENT");
+        // resident
+        let mut b = mk();
+        b.prefill(pre, 64).unwrap();
+        let (gb, hb) = b.window_resident(win).unwrap().expect("resident window did not run");
+        let scale = ha.iter().fold(1f32, |m, x| m.max(x.abs()));
+        let dh = ha.iter().zip(&hb).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!("resident window t=3: ids host {ga:?} res {gb:?}; h max abs {dh:.3e} (scale {scale:.2})");
+        let (gb2, _) = b.window_resident(rest).unwrap().expect("second resident window");
+        eprintln!("resident window next t=3: ids host {gr:?} res {gb2:?}");
+        // rewind: keep row 0, then the rest
+        let mut c = mk();
+        c.prefill(pre, 64).unwrap();
+        c.window_resident(win).unwrap().unwrap();
+        c.rewind_resident(3, 1).unwrap();
+        assert_eq!(c.tokens.len(), pre.len() + 1, "tokens after rewind");
+        let (gc, _) = c.window_resident(&tail).unwrap().unwrap();
+        eprintln!("after rewind: ids host {gt:?} res {gc:?}");
+        // a host window after the resident windows still agrees (mirrors refreshed)
+        std::env::set_var("TANG_GLM5_RESIDENT", "0");
+        let lb = b.window(&ids2[10..14]).unwrap();
+        let la2 = a.window(&ids2[10..14]).unwrap();
+        std::env::remove_var("TANG_GLM5_RESIDENT");
+        let flips = (0..4).filter(|&p| argmax(&la2[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv])).count();
+        super::super::mtp::WIN_STEP_DEFAULT.store(ws, Ordering::Relaxed);
+        for k in ["TANG_GLM5_MOE", "TANG_GLM5_KDA_PF2", "TANG_GLM5_KDA_GRAPH", "TANG_GLM5_GEMV8"] {
+            std::env::remove_var(k);
+        }
+        assert_eq!(hb.len(), 3 * n);
+        assert_eq!(ga, gb, "resident window vs host window ids");
+        assert!(dh <= 1e-3 * scale, "h rows max abs {dh}");
+        assert_eq!(gr, gb2, "the window after");
+        assert_eq!(gt, gc, "after a device rewind");
+        assert_eq!(flips, 0, "host window after resident windows");
+    }
+
     /// `TANG_GLM5_TRACE` is transparent: the same windows traced and untraced give the
     /// same logits bit for bit, and the trace saw the GPU (launches, timed kernels by name,
     /// copies) under the layer-family spans.

@@ -172,6 +172,27 @@ pub(super) struct Resident {
     /// The GGUF `token_embd` table on the device and its row bytes / `rs_embed` type, for
     /// the whole graph's embed gather (`None` until first use, or the type is unsupported).
     embd: Option<Option<(DevBuf, u64, u32)>>,
+    /// The resident verify window's buffers ([`Glm5Engine::window_resident`]).
+    win: Option<WinBufs>,
+    /// Resident windows run / rewinds applied (tests, the MTP report).
+    pub(super) win_count: [usize; 2],
+}
+
+/// [`Glm5Engine::window_resident`]'s device buffers, sized for `cap` rows: the KDA rows'
+/// input / output (each KDA layer runs its t=1 decode once per row), the FFN rows, the
+/// normed head rows, the per-row argmax ids, and per KDA layer `cap - 1` state checkpoints
+/// (conv history + recurrent state after each row but the last) for the rewind.
+struct WinBufs {
+    cap: usize,
+    kx: DevBuf,
+    ky: DevBuf,
+    fx: DevBuf,
+    fy: DevBuf,
+    hn: DevBuf,
+    ids: DevBuf,
+    /// Per layer (`None` for DSA): `cap - 1` checkpoints of `ck_bytes[l]` bytes each.
+    ck: Vec<Option<DevBuf>>,
+    ck_bytes: Vec<usize>,
 }
 
 impl Resident {
@@ -205,6 +226,8 @@ impl Resident {
             whole_replays: [0, 0],
             dev_tp: None,
             embd: None,
+            win: None,
+            win_count: [0, 0],
         })
     }
 }
@@ -409,6 +432,263 @@ impl Glm5Engine {
         self.slot_tokens_mut(slot).push(tok);
         super::super::trace::window_end(tr_root, 1, pos0);
         Ok(Some(next))
+    }
+
+    /// The MTP verify window on the resident path: `toks` (t rows, `t <= ` the fused mHC's
+    /// window cap) run as ONE pass over the layers, every weight read once per stage except
+    /// the KDA layers, whose t=1 decode runs once per row (bit-identical to the decode step,
+    /// as the host window's WIN_STEP path is). DSA attends the t rows causally over the cache
+    /// (`MlaProj::window_dev` at `t`), the FFN routes all t rows in one `ffn_async`, the LM
+    /// head + argmax run per row (the t=1 head numerics). Each KDA layer's state after every
+    /// row but the last is checkpointed on the device for [`Self::rewind_resident`].
+    /// Returns the per-row greedy ids and the normed h rows `[t][n]` (also `last_h`), or
+    /// `None` when the resident path does not apply (the caller runs [`Self::window`]).
+    /// The tokens are appended to slot 0.
+    pub(crate) fn window_resident(&mut self, toks: &[u32]) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        let slot = 0;
+        let t = toks.len();
+        if t == 0 || std::env::var("TANG_GLM5_RES_WINDOW").is_ok_and(|v| v == "0") || !self.resident_ready(slot) {
+            return Ok(None);
+        }
+        let hp = self.m.hp.clone();
+        let (n, hc, nv) = (hp.n_embd, hp.hc, hp.n_vocab);
+        for &tk in toks {
+            ensure!((tk as usize) < nv, "token {tk} out of range");
+        }
+        let pos0 = self.slot_tokens(slot).len();
+        let mut mla_w: Vec<Option<std::sync::Arc<MlaWeights>>> = vec![None; hp.n_layer];
+        for l in 0..hp.n_layer {
+            if !hp.is_kda[l] {
+                mla_w[l] = Some(self.mla_weights(l)?);
+            }
+        }
+        let norm_w = if self.gpu.as_ref().is_some_and(|g| g.resident.is_none()) {
+            Some(self.m.vec("output_norm.weight")?)
+        } else {
+            None
+        };
+        let embd = self.m.g.info("token_embd.weight")?;
+        let mut r = vec![0f32; t * hc * n];
+        for (i, &tk) in toks.iter().enumerate() {
+            let e = self.m.g.rows(embd, tk as usize, 1)?;
+            for c in 0..hc {
+                r[(i * hc + c) * n..(i * hc + c + 1) * n].copy_from_slice(&e);
+            }
+        }
+        let g = self.gpu.as_mut().context("resident window without a GPU")?;
+        if g.mhc_f.as_ref().is_none_or(|f| f.max_t() < t) {
+            return Ok(None);
+        }
+        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        if let Some(w) = norm_w {
+            let own = g.head_dev.is_none();
+            g.resident = Some(Resident::new(&g.devs[0].0, &self.m.g, &w, own)?);
+        }
+        let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident window: {e}");
+        let mut res = g.resident.take().unwrap();
+        // (re)size the window buffers
+        if res.win.as_ref().is_none_or(|w| w.cap < t) {
+            let cap = t.max(4);
+            let f4 = |k: usize| DevBuf::zeroed_elems::<f32>(k).map_err(ge);
+            let mut ck = Vec::with_capacity(hp.n_layer);
+            let mut ck_bytes = Vec::with_capacity(hp.n_layer);
+            for l in 0..hp.n_layer {
+                match g.kda_l[l].as_ref().filter(|_| hp.is_kda[l]) {
+                    Some(k) => {
+                        let b: usize = k.state_regions(0).iter().map(|r| r.1).sum();
+                        ck.push(Some(DevBuf::alloc(b * (cap - 1)).map_err(ge)?));
+                        ck_bytes.push(b);
+                    }
+                    None => {
+                        ck.push(None);
+                        ck_bytes.push(0);
+                    }
+                }
+            }
+            res.win = Some(WinBufs {
+                cap,
+                kx: f4(cap * n)?,
+                ky: f4(cap * n)?,
+                fx: f4(cap * n)?,
+                fy: f4(cap * n)?,
+                hn: f4(cap * n)?,
+                ids: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
+                ck,
+                ck_bytes,
+            });
+        }
+        let mut f = g.mhc_f.take().unwrap();
+        let s = std::mem::ManuallyDrop::new(tang_moe::gpu::Stream(f.stream().0));
+        let dsa = &mut self.dsa[slot];
+        let out = (|| -> Result<(Vec<u32>, Vec<f32>)> {
+            use tang_moe::gpu::copy_d2d_async as d2d;
+            res.dev_tp = None;
+            // a DSA regrow moves the cache bases the whole-step graphs baked in
+            for l in (0..hp.n_layer).filter(|&l| !hp.is_kda[l]) {
+                let cu = g.mla_k[l].as_ref().context("mla not resident")?;
+                cu.set_seq(0);
+                if !cu.rows_fit(pos0 + t) {
+                    res.whole = [None, None];
+                    res.whole_cap = 0;
+                }
+            }
+            let wb = res.win.as_ref().unwrap();
+            let rb = n * 4;
+            f.begin_async(&r)?;
+            for l in 0..hp.n_layer {
+                let mh = g.mhc_g[l].as_ref().context("mhc not resident")?;
+                if hp.is_kda[l] {
+                    f.pre_dev(mh, l, 0, wb.kx.ptr)?;
+                    let k = g.kda_l[l].as_mut().context("kda not resident")?;
+                    let regs = k.state_regions(0);
+                    for i in 0..t {
+                        d2d(k.x_ptr(), wb.kx.ptr + (i * rb) as u64, rb, &s).map_err(ge)?;
+                        k.decode_dev(&s)?;
+                        d2d(wb.ky.ptr + (i * rb) as u64, k.y_ptr(), rb, &s).map_err(ge)?;
+                        if i + 1 < t {
+                            let base = wb.ck[l].as_ref().unwrap().ptr + (i * wb.ck_bytes[l]) as u64;
+                            d2d(base, regs[0].0, regs[0].1, &s).map_err(ge)?;
+                            d2d(base + regs[0].1 as u64, regs[1].0, regs[1].1, &s).map_err(ge)?;
+                        }
+                    }
+                    f.post_dev(wb.ky.ptr)?;
+                } else {
+                    let (cu, p) = (g.mla_k[l].as_ref().unwrap(), g.mla_p[l].as_ref().context("mla not resident")?);
+                    f.pre_dev(mh, l, 0, p.x_ptr(t)?)?;
+                    let w = mla_w[l].as_ref().unwrap();
+                    cu.set_seq(0);
+                    let c = &mut dsa[l];
+                    let (dl, idd) = (w.kv_lora, w.idx_dim);
+                    ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
+                    let kv_len = pos0 + t;
+                    if !cu.rows_fit(kv_len) {
+                        if let Some(from) = c.stale_from.take().filter(|&fr| fr < pos0) {
+                            cu.refresh_mirrors(from, pos0 - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
+                                .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
+                        }
+                    }
+                    c.lat16.resize(kv_len * dl, 0);
+                    c.idx_k.resize(kv_len * idd, 0.0);
+                    c.idx_g.resize(kv_len * idd, 0.0);
+                    c.valid.resize(kv_len, 0);
+                    c.stale_from = Some(c.stale_from.map_or(pos0, |s| s.min(pos0)));
+                    let y = p.window_dev(cu, w, t, pos0, &c.lat16, &c.idx_k, &c.idx_g, &c.valid, &s)?;
+                    f.post_dev(y)?;
+                }
+                let mh = g.mhc_g[l].as_ref().unwrap();
+                f.pre_dev(mh, l, 1, wb.fx.ptr)?;
+                let m = g.layers[l].as_ref().context("FFN not resident")?;
+                super::super::moe::gpu::ffn_async(&g.devs[0].1, &s, m, wb.fx.ptr, wb.fy.ptr, t)?;
+                f.post_dev(wb.fy.ptr)?;
+            }
+            let h = f.end_dev()?;
+            let nf = res.m.func("rs_norm").map_err(ge)?;
+            let af = res.m.func("rs_argmax").map_err(ge)?;
+            let (nw, ni, eps) = (res.norm_w.ptr, n as i32, hp.eps);
+            for i in 0..t {
+                let hi = h + (i * rb) as u64;
+                let (xf, logits) = unsafe {
+                    if let Some(hd) = g.head_dev.as_ref() {
+                        let xf = hd.xf.ptr;
+                        launch(nf, (1, 1, 1), (1024, 1, 1), 0, &s, args![hi, nw, xf, ni, eps])?;
+                        launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, &s, args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32])?;
+                        launch(
+                            hd.k5.gemv8,
+                            (nv.div_ceil(K5_WARPS) as u32, 1, 1),
+                            (128, 1, 1),
+                            (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                            &s,
+                            args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
+                                nv as u32, 1u32, nv as u32, n as u32],
+                        )?;
+                        (xf, hd.out.ptr)
+                    } else {
+                        let (dw, k5, xb, ob) = res.head.as_ref().context("resident: no LM head")?;
+                        let xf = xb.ptr;
+                        launch(nf, (1, 1, 1), (1024, 1, 1), 0, &s, args![hi, nw, xf, ni, eps])?;
+                        launch(
+                            k5.gemv,
+                            (nv.div_ceil(128) as u32, 1, 1),
+                            (128, 1, 1),
+                            0,
+                            &s,
+                            args![dw.w, 0u32, xb.ptr, ob.ptr, nv as u32, 1u32, nv as u32, n as u32],
+                        )?;
+                        (xf, ob.ptr)
+                    }
+                };
+                d2d(wb.hn.ptr + (i * rb) as u64, xf, rb, &s).map_err(ge)?;
+                let (nvi, tp, inc) = (nv as i32, wb.ids.ptr + 4 * i as u64, 0i32);
+                unsafe { launch(af, (1, 1, 1), (1024, 1, 1), 0, &s, args![logits, nvi, tp, inc])? };
+            }
+            s.sync().map_err(ge)?;
+            let ids = wb.ids.read::<u32>(0, t).map_err(ge)?;
+            let hn = wb.hn.read::<f32>(0, t * n).map_err(ge)?;
+            Ok((ids, hn))
+        })();
+        if out.is_err() {
+            // the mHC state machine may be mid-window
+            let _ = f.set_window(0);
+        }
+        res.win_count[0] += 1;
+        g.mhc_f = Some(f);
+        g.resident = Some(res);
+        let (ids, hn) = out?;
+        // the host's view of the DSA device watermarks (window_dev advanced them)
+        self.slot_tokens_mut(slot).extend_from_slice(toks);
+        self.last_h.clear();
+        self.last_h.extend_from_slice(&hn);
+        Ok(Some((ids, hn)))
+    }
+
+    /// After a [`Self::window_resident`] of `t` rows: keep only the first `keep` (1..=t).
+    /// The KDA layers restore the device checkpoint after row `keep - 1` (D2D), the DSA
+    /// layers drop their device watermarks (latent / indexer rows, pools) and host mirrors
+    /// back to the kept position, and slot 0's tokens are truncated. Nothing re-runs.
+    pub(crate) fn rewind_resident(&mut self, t: usize, keep: usize) -> Result<()> {
+        ensure!(keep >= 1 && keep <= t, "rewind_resident: keep {keep} of {t}");
+        if keep == t {
+            return Ok(());
+        }
+        let hp = self.m.hp.clone();
+        let pos = self.tokens.len() - t + keep;
+        let mut kpool = vec![0usize; hp.n_layer];
+        for l in 0..hp.n_layer {
+            if !hp.is_kda[l] {
+                kpool[l] = self.mla_weights(l)?.kpool;
+            }
+        }
+        let g = self.gpu.as_mut().context("rewind_resident without a GPU")?;
+        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident rewind: {e}");
+        let f = g.mhc_f.as_ref().context("fused mHC: no instance")?;
+        let s = f.stream();
+        let res = g.resident.as_mut().context("rewind_resident: no resident window")?;
+        let wb = res.win.as_ref().context("rewind_resident: no window buffers")?;
+        ensure!(wb.cap >= t, "rewind_resident: window cap {}", wb.cap);
+        for l in 0..hp.n_layer {
+            if hp.is_kda[l] {
+                let k = g.kda_l[l].as_ref().context("kda not resident")?;
+                let regs = k.state_regions(0);
+                let base = wb.ck[l].as_ref().unwrap().ptr + ((keep - 1) * wb.ck_bytes[l]) as u64;
+                tang_moe::gpu::copy_d2d_async(regs[0].0, base, regs[0].1, s).map_err(ge)?;
+                tang_moe::gpu::copy_d2d_async(regs[1].0, base + regs[0].1 as u64, regs[1].1, s).map_err(ge)?;
+            } else {
+                let cu = g.mla_k[l].as_ref().context("mla not resident")?;
+                cu.set_seq(0);
+                cu.append_done(pos, 0);
+                cu.set_pool_upto(cu.pool_upto().min(pos / kpool[l].max(1)));
+            }
+        }
+        s.sync().map_err(ge)?;
+        res.dev_tp = None;
+        res.win_count[1] += 1;
+        let (kl, idd) = (hp.kv_lora_rank, hp.idx_dim);
+        for c in &mut self.dsa[0] {
+            c.truncate_rows(pos, kl, idd);
+        }
+        self.tokens.truncate(pos);
+        Ok(())
     }
 
     /// Drop the captured step segments (any host window: it may reallocate their scratch).
