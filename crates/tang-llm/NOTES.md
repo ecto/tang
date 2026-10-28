@@ -4,6 +4,28 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — KDA Q4_K requant re-measured on the B300 at f45a2883: +1-2 tok/s, quality holds (branch claude/glm5-kda-q4-eval)
+
+GGUF: /workspace/glm53-kdaq4/ on the B300 pod (tools/glm5-kda-requant.py q4_k, llama.cpp 9b56ccf's
+libggml-base; shards 1 and 6 symlinked). 204 tensors in 34 KDA layers, 4.886 GB Q8_0 -> 2.587 GB.
+Flags: the full B set (MOE=fast GEMV8 KDA_PF2 MHC_FUSED MLA_RESIDENT GPU_HEAD KDA_G5F=2 KDA_FUSED KDA_GRAPH).
+
+| GGUF | decode -n 128 | -n 512 | ids md5 128 / 512 | haiku oracle |
+|---|---|---|---|---|
+| base (scripts/glm5-bench.sh) | 73.50 | 75.51 | 7174cdd6 / 1453cf0e | OK |
+| KDA Q4_K (by hand, same prompt) | 75.67 | 76.31 | e569ada9 / 8ad0bbc1 | OK (785 1196 6801 264 6386 38038 911 279) |
+
+nsys (-n 64, graph nodes), µs a launch, 2142 launches each: base k5_qgemv9 23.3 / k5_qgemv17 11.7;
+Q4 k5_qgemv_q4k5 19.7 / k5_qgemv_q4k9 9.9 — 35.0 -> 29.6 µs a layer, ~0.18 ms/token. Far from the
+~2x the bytes promise: the Q4_K kernels sit at ~1.4 TB/s (q|k|v|f_a|g_a) — they are not read-bound.
+Tried and reverted (commits 01862b1e / 396b28ad): (1) the k5_qgemv9-style direct read (each lane
+ld.global.cs its sub-blocks' 16 B header + 32 B nibbles, no smem, 4 warps): 19.3 / 11.1 µs, ids
+identical, mew 83/0 — net slower; (2) that plus 2 rows a warp for q4k5: 25.0 µs. The next suspect is
+the per-sub-block dequant arithmetic (6-bit scale unpack + 16 dp4a per 32 values), not the loads.
+
+Quality (llama-perplexity, eval.txt, -c 512, 6 chunks, experts on CPU): PPL 3.4825 -> 3.5041,
+ratio 1.0062 ± 0.0089, KLD 0.0449, same top-1 92.7 %, RMS Δp 7.0 % (H200 run: 1.016 / 0.043).
+
 ## 2026-10-28 — DSA attend 128 -> ~39 µs per layer, decode 70.9 -> 75.8 tok/s, bit-identical (branch claude/glm5-dsa2)
 
 What was wrong: `mla_fold_q2` and `mla_attn_abs2`'s W_v step are per-head GEMVs over f32 weights
