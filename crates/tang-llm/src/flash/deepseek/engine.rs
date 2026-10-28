@@ -1480,7 +1480,10 @@ impl GpuModel {
         } else {
             None
         };
-        let fused = Kernels::moe_gate_ok(&gw.v, t, ne, topk);
+        // DS_MOE_GATE=1: the one-launch router (bit-identical; slower than the three launches
+        // on the 3090 bench so far, so opt-in for sweeping on H200)
+        let fused = std::env::var("DS_MOE_GATE").is_ok_and(|v| v == "1")
+            && Kernels::moe_gate_ok(&gw.v, t, ne, topk);
         let mut elist = None;
         if fused {
             // gate GEMV + router + CSR (+ the grouped plan) in one launch
