@@ -170,24 +170,100 @@ impl Block {
     }
 }
 
+/// `y = W x` over `W`'s nonzero entries only (compressed rows): the compiled layers emitted by
+/// `tang-chip` are ~0.05% dense, so this is what the emitter's weights run as. Same sums as
+/// [`Block`] on the circuit's (exact) arithmetic.
+#[derive(Clone, Debug)]
+pub struct Csr {
+    pub rows: usize,
+    pub cols: usize,
+    /// Row `r`'s entries are `idx[ptr[r]..ptr[r + 1]]`, `val[..]`.
+    pub ptr: Vec<u32>,
+    pub idx: Vec<u32>,
+    pub val: Vec<f32>,
+}
+
+impl Csr {
+    pub fn from_sparse(s: &tang_chip::Sparse) -> Self {
+        let mut ptr = vec![0u32; s.rows + 1];
+        for &(r, _, _) in &s.entries {
+            ptr[r as usize + 1] += 1;
+        }
+        for r in 0..s.rows {
+            ptr[r + 1] += ptr[r];
+        }
+        Self {
+            rows: s.rows,
+            cols: s.cols,
+            ptr,
+            idx: s.entries.iter().map(|e| e.1).collect(),
+            val: s.entries.iter().map(|e| e.2).collect(),
+        }
+    }
+
+    pub fn apply(&self, x: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(x.len(), self.cols);
+        (0..self.rows)
+            .map(|r| {
+                let (a, b) = (self.ptr[r] as usize, self.ptr[r + 1] as usize);
+                self.idx[a..b]
+                    .iter()
+                    .zip(&self.val[a..b])
+                    .map(|(&c, &w)| w * x[c as usize])
+                    .sum()
+            })
+            .collect()
+    }
+}
+
+/// A layer matrix: a dense nonzero block (the checkpoint's tensors) or compressed rows (the
+/// emitter's).
+#[derive(Clone, Debug)]
+pub enum Mat {
+    Block(Block),
+    Csr(Csr),
+}
+
+impl Mat {
+    pub fn apply(&self, x: &[f32]) -> Vec<f32> {
+        match self {
+            Mat::Block(b) => b.apply(x),
+            Mat::Csr(c) => c.apply(x),
+        }
+    }
+    /// Multiply-adds per application.
+    pub fn macs(&self) -> usize {
+        match self {
+            Mat::Block(b) => b.macs(),
+            Mat::Csr(c) => c.val.len(),
+        }
+    }
+}
+
+impl From<Block> for Mat {
+    fn from(b: Block) -> Self {
+        Mat::Block(b)
+    }
+}
+
 /// One Qwen3.5 `linear_attention` decoder layer, norms with the +1 folded in.
 pub struct Layer {
     pub in_norm: Vec<f32>,
-    pub qkv: Block,
-    pub z: Block,
-    pub a: Block,
-    pub b: Block,
+    pub qkv: Mat,
+    pub z: Mat,
+    pub a: Mat,
+    pub b: Mat,
     /// `[conv_dim][d_conv]`, tap `d_conv − 1` is the current token.
     pub conv: Vec<f32>,
     pub dt_bias: Vec<f32>,
     /// `−exp(A_log)`.
     pub a_neg: Vec<f32>,
     pub gnorm: Vec<f32>,
-    pub out: Block,
+    pub out: Mat,
     pub post_norm: Vec<f32>,
-    pub gate: Block,
-    pub up: Block,
-    pub down: Block,
+    pub gate: Mat,
+    pub up: Mat,
+    pub down: Mat,
 }
 
 impl Layer {
@@ -199,6 +275,44 @@ impl Layer {
         .iter()
         .map(|m| m.macs())
         .sum()
+    }
+}
+
+impl Layer {
+    /// A layer emitted by `tang-chip` (HF's zero-centred norms get their `+ 1` here).
+    pub fn from_compiled(w: &tang_chip::LayerWeights) -> Self {
+        let m = |s: &tang_chip::Sparse| Mat::Csr(Csr::from_sparse(s));
+        let plus1 = |v: &[f32]| v.iter().map(|x| 1.0 + x).collect();
+        Layer {
+            in_norm: plus1(&w.input_layernorm),
+            qkv: m(&w.in_proj_qkv),
+            z: m(&w.in_proj_z),
+            a: m(&w.in_proj_a),
+            b: m(&w.in_proj_b),
+            conv: w.conv1d.clone(),
+            dt_bias: w.dt_bias.clone(),
+            a_neg: w.a_log.iter().map(|v| -v.exp()).collect(),
+            gnorm: w.norm.clone(),
+            out: m(&w.out_proj),
+            post_norm: plus1(&w.post_attention_layernorm),
+            gate: m(&w.gate_proj),
+            up: m(&w.up_proj),
+            down: m(&w.down_proj),
+        }
+    }
+}
+
+impl Shape {
+    /// The layer shape of an emitted chip stack.
+    pub fn of_compiled(c: &tang_chip::Compiled) -> Shape {
+        Shape {
+            hidden: c.hidden,
+            k_heads: c.shape.k_heads,
+            v_heads: c.shape.v_heads,
+            d_state: c.shape.d_state,
+            d_conv: c.shape.d_conv,
+            inter: c.shape.inter,
+        }
     }
 }
 
@@ -346,6 +460,8 @@ enum Embed {
         n_vocab: usize,
     },
     Dense(Vec<f32>),
+    /// Rows for the tokens a run uses (the emitter's rows), by model token id.
+    Rows(std::collections::HashMap<usize, Vec<f32>>),
 }
 
 fn to_f32(t: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
@@ -382,10 +498,10 @@ impl ChipModel {
         let layers = (0..n_layer)
             .map(|l| -> Result<Layer> {
                 let p = format!("model.layers.{l}.");
-                let mat = |n: &str, rows: usize, cols: usize| -> Result<Block> {
+                let mat = |n: &str, rows: usize, cols: usize| -> Result<Mat> {
                     let (sh, w) = get(&format!("{p}{n}"))?;
                     ensure!(sh == [rows, cols], "{p}{n}: {sh:?} != [{rows}, {cols}]");
-                    Ok(Block::from_dense(rows, cols, &w))
+                    Ok(Block::from_dense(rows, cols, &w).into())
                 };
                 let vec1 = |n: &str, len: usize, plus_one: bool| -> Result<Vec<f32>> {
                     let (_, w) = get(&format!("{p}{n}"))?;
@@ -445,6 +561,20 @@ impl ChipModel {
         }
     }
 
+    /// An emitted chip stack with embedding rows for the tokens `rows` names.
+    pub fn from_compiled(
+        c: &tang_chip::Compiled,
+        eps: f32,
+        rows: std::collections::HashMap<usize, Vec<f32>>,
+    ) -> Self {
+        Self {
+            shape: Shape::of_compiled(c),
+            eps,
+            layers: c.layers.iter().map(Layer::from_compiled).collect(),
+            embed: Embed::Rows(rows),
+        }
+    }
+
     pub fn embed(&self, tok: usize) -> Vec<f32> {
         let h = self.shape.hidden;
         match &self.embed {
@@ -462,6 +592,10 @@ impl ChipModel {
                     .collect()
             }
             Embed::Dense(e) => e[tok * h..(tok + 1) * h].to_vec(),
+            Embed::Rows(r) => r
+                .get(&tok)
+                .unwrap_or_else(|| panic!("token {tok} has no row"))
+                .clone(),
         }
     }
 
@@ -659,16 +793,16 @@ mod tests {
         for c in 0..ch {
             conv[c * sh.d_conv + sh.d_conv - 1] = 1.0;
         }
-        let zero = |r, c| Block::from_dense(r, c, &vec![0f32; r * c]);
+        let zero = |r, c| -> Mat { Block::from_dense(r, c, &vec![0f32; r * c]).into() };
         let mut b = vec![0f32; sh.v_heads * h];
         b[3] = 1.0; // β logit = 128 · dim 3 (the write enable)
         b.iter_mut().for_each(|v| *v *= 128.0);
         let layer = Layer {
             in_norm: vec![1.0; h],
-            qkv: Block::from_dense(ch, h, &qkv),
+            qkv: Block::from_dense(ch, h, &qkv).into(),
             z: zero(sh.value_dim(), h),
             a: zero(sh.v_heads, h),
-            b: Block::from_dense(sh.v_heads, h, &b),
+            b: Block::from_dense(sh.v_heads, h, &b).into(),
             conv,
             dt_bias: vec![-110.0; sh.v_heads],
             a_neg: vec![-1.0; sh.v_heads],
@@ -796,14 +930,21 @@ mod tests {
     /// reference math, driven like the author's driver over put("a.txt", 5 tokens), get, list:
     /// every fed token (forced call tokens, chip records, circuit-printed text) must equal the
     /// reproduction's, and after each op every store head's state must equal the dumped one.
-    fn milestone1(num: Numerics, tol: f32) {
+    fn milestone1(num: Numerics, tol: f32, emitted: bool) {
         let Some((dir, traces)) = dirs() else {
             eprintln!("chip milestone 1: checkpoint or traces missing, skipped");
             return;
         };
         let t0 = std::time::Instant::now();
-        let model =
+        let mut model =
             ChipModel::open(&dir.join("chip.safetensors"), Shape::QWENPUTER_4B, 12, 1e-6).unwrap();
+        if emitted {
+            // milestone 2: the layers tang-chip emits for these shapes replace the checkpoint's
+            let g = tang_chip::store_program().unwrap();
+            let c = tang_chip::emit(&g, &tang_chip::ChipShape::QWEN35_4B).unwrap();
+            assert_eq!(Shape::of_compiled(&c), Shape::QWENPUTER_4B);
+            model.layers = c.layers.iter().map(Layer::from_compiled).collect();
+        }
         eprintln!(
             "loaded in {:?}; {:.1} M MACs/token in nonzero blocks",
             t0.elapsed(),
@@ -877,12 +1018,201 @@ mod tests {
     #[test]
     #[ignore = "needs the 9 GB checkpoint slice; run with --ignored"]
     fn chip_milestone1_bf16() {
-        milestone1(Numerics::Bf16, 0.0);
+        milestone1(Numerics::Bf16, 0.0, false);
     }
 
     #[test]
     #[ignore = "needs the 9 GB checkpoint slice; run with --ignored"]
     fn chip_milestone1_f32() {
-        milestone1(Numerics::F32, 1e-3);
+        milestone1(Numerics::F32, 1e-3, false);
+    }
+
+    /// Milestone 2: the same trace through the layers `tang-chip` emits (sparse) in place of the
+    /// checkpoint's; tokens and store states bitwise as in milestone 1.
+    #[test]
+    #[ignore = "needs the 9 GB checkpoint slice; run with --ignored"]
+    fn chip_milestone2_emitted_bf16() {
+        milestone1(Numerics::Bf16, 0.0, true);
+    }
+
+    // --- milestone 2: retarget -------------------------------------------------------------
+
+    /// Coder-Next-like shapes: hidden 2048 with the chip dims appended (auto-sized), 16 k / 32 v
+    /// heads, d 128, the circuit's 12 layers, chip tokens at a different vocabulary offset. The
+    /// put/get/list trace (as IR features, bundled in tang-chip) runs through the emitted layers
+    /// from zero state with no prompt and no injected tables (the store needs neither): every
+    /// fed token and every store head's state must equal the reproduction's, and the host's dims
+    /// and the v heads the circuit does not use must stay untouched.
+    #[test]
+    fn chip_retarget_coder_next() {
+        let t0 = std::time::Instant::now();
+        let g = tang_chip::store_program().unwrap();
+        let shape = tang_chip::ChipShape {
+            hidden_base: 2048,
+            hidden_chip: None,
+            ballast: None,
+            k_heads: 16,
+            v_heads: 32,
+            d_state: 128,
+            d_conv: 4,
+            inter: 9216,
+            n_layers: g.n_layers(),
+            vocab_offset: 262_144,
+        };
+        let c = tang_chip::emit(&g, &shape).unwrap();
+        assert_eq!(
+            (c.hidden, c.layout.m),
+            (3968, 62),
+            "1920 chip dims: 62 ballast + tau + 1806 slots + 51 spare"
+        );
+        let fx: serde_json::Value =
+            serde_json::from_str(&tang_chip::gunzip(tang_chip::TRACE_PUT_GET_LIST).unwrap())
+                .unwrap();
+        let v0_old = fx["v0"].as_u64().unwrap() as u32;
+        let remap = |t: u32| {
+            if t >= v0_old {
+                t - v0_old + shape.vocab_offset
+            } else {
+                t
+            }
+        };
+        // embedding rows: the host part a fixed pseudo-random pattern (must survive untouched)
+        let host =
+            |t: u32, i: usize| ((t as usize * 7919 + i * 104_729) % 2001) as f32 / 1000.0 - 1.0;
+        let mut rows = HashMap::new();
+        for (t, feats) in fx["rows"].as_object().unwrap() {
+            let t: u32 = t.parse().unwrap();
+            let f: Vec<(u32, f64)> = feats
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (p[0].as_u64().unwrap() as u32, p[1].as_f64().unwrap()))
+                .collect();
+            let mut r = c.embedding_row(&f).unwrap();
+            for (i, v) in r[..shape.hidden_base].iter_mut().enumerate() {
+                *v = round_bf16(host(t, i));
+            }
+            rows.insert(remap(t) as usize, r);
+        }
+        let model = ChipModel::from_compiled(&c, 1e-6, rows);
+        let d = &fx["decoder"];
+        let dec = Decoder {
+            nfam: d["nfam"].as_u64().unwrap() as usize,
+            families: d["families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| match f["kind"].as_str().unwrap() {
+                    "q" => Family::Q,
+                    "control" => Family::Control(f["token"].as_u64().unwrap() as u32),
+                    _ => Family::Range {
+                        base: f["base"].as_u64().unwrap() as u32,
+                        size: f["size"].as_u64().unwrap() as u32,
+                    },
+                })
+                .collect(),
+            printable: d["printable"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect(),
+            v0: shape.vocab_offset,
+            code_dims: c.code_dims.clone(),
+            id_code_dims: c.id_code_dims.clone(),
+        };
+        eprintln!("emitted in {:?}, {} MACs/token", t0.elapsed(), model.macs());
+        let sh = model.shape;
+        let r = sh.v_heads / sh.k_heads;
+        let mut drv = Driver {
+            model: &model,
+            dec: &dec,
+            num: Numerics::Bf16,
+            state: model.state(),
+        };
+        // heads the store uses, and every head any circuit node uses
+        let mut used = std::collections::HashSet::new();
+        for (l, lw) in c.layers.iter().enumerate() {
+            for &(row, _, _) in &lw.in_proj_qkv.entries {
+                if let Some(v) = (row as usize).checked_sub(2 * sh.key_dim()) {
+                    used.insert((l, v / sh.d_state));
+                }
+            }
+        }
+        // no layer writes a host dim or reads one
+        for lw in &c.layers {
+            let hb = shape.hidden_base as u32;
+            assert!(lw.out_proj.entries.iter().all(|e| e.0 >= hb));
+            assert!(lw.down_proj.entries.iter().all(|e| e.0 >= hb));
+            for m in [&lw.in_proj_qkv, &lw.in_proj_z, &lw.in_proj_a, &lw.in_proj_b] {
+                assert!(m.entries.iter().all(|e| e.1 >= hb));
+            }
+            assert!(lw
+                .gate_proj
+                .entries
+                .iter()
+                .chain(&lw.up_proj.entries)
+                .all(|e| e.1 >= hb));
+        }
+        let store = fx["store_heads"].as_object().unwrap();
+        for op in fx["ops"].as_array().unwrap() {
+            let label = op["op"].as_str().unwrap();
+            let want: Vec<u32> = op["tokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| remap(v.as_u64().unwrap() as u32))
+                .collect();
+            let nf = op["forced"].as_u64().unwrap() as usize;
+            let fed = drv.op(&want[..nf]).unwrap();
+            assert_eq!(fed, want, "{label}: fed tokens differ");
+            // the host dims come out as embedded (checked on the op's last token; the weights
+            // below show it holds for every token)
+            let t = *fed.last().unwrap() as usize;
+            let mut st = drv.state.clone();
+            let hc = model.step(t, &mut st, Numerics::Bf16);
+            assert_eq!(
+                &hc[..shape.hidden_base],
+                &model.embed(t)[..shape.hidden_base]
+            );
+            let mut n_rows = 0;
+            for (name, h) in store {
+                let (l, kh) = (
+                    h["layer"].as_u64().unwrap() as usize,
+                    h["key_head"].as_u64().unwrap() as usize,
+                );
+                let nvh = h["value_heads"].as_array().unwrap().len();
+                for x in 0..nvh {
+                    let st = &fx["states"][label][name][x];
+                    let mut want = vec![0f32; sh.d_state * sh.d_state];
+                    for (i, rr) in st["rows"].as_array().unwrap().iter().enumerate() {
+                        let rr = rr.as_u64().unwrap() as usize;
+                        for (j, v) in st["vals"][i].as_array().unwrap().iter().enumerate() {
+                            want[rr * sh.d_state + j] = v.as_f64().unwrap() as f32;
+                        }
+                        n_rows += 1;
+                    }
+                    let ours = drv.state.head(&sh, l, kh * r + x);
+                    assert!(
+                        ours.iter()
+                            .zip(&want)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{label} {name} v{x}: store state differs"
+                    );
+                }
+            }
+            for l in 0..model.layers.len() {
+                for vh in 0..sh.v_heads {
+                    if !used.contains(&(l, vh)) {
+                        assert!(drv.state.head(&sh, l, vh).iter().all(|&v| v == 0.0));
+                    }
+                }
+            }
+            eprintln!(
+                "{label}: {} tokens, store heads exact ({n_rows} rows)",
+                fed.len()
+            );
+        }
+        eprintln!("retarget run in {:?}", t0.elapsed());
     }
 }
