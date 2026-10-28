@@ -1328,4 +1328,316 @@ mod tests {
             }
         }
     }
+
+    /// Exact-RAM v heads in [`GdnMachine`]: v groups 0 and 1. Heads `GDN_EXACT_HV..` are noisy.
+    const GDN_EXACT_HV: usize = 2 * GDN_HK;
+
+    /// A register machine run through `gdn_step` (see [`gdn_free_run_stays_exact`]): it builds
+    /// each window's inputs and advances two references in lockstep, the integer register file
+    /// for the exact heads and an op-order model of the kernel for the noisy ones.
+    struct GdnMachine {
+        /// `[GDN_EXACT_HV][row][col]` integer registers.
+        regs: Vec<u32>,
+        /// `[noisy head][i * d + j]` f32 state.
+        model: Vec<Vec<f32>>,
+        n: usize,
+        dt: Vec<f32>,
+        ssm_a: Vec<f32>,
+        norm: Vec<f32>,
+    }
+
+    impl GdnMachine {
+        const EPS: f32 = 1e-6;
+
+        fn new() -> Self {
+            Self {
+                regs: vec![0; GDN_EXACT_HV * GDN_D * GDN_D],
+                model: vec![vec![0f32; GDN_D * GDN_D]; GDN_HV - GDN_EXACT_HV],
+                n: 0,
+                dt: vec![0.0; GDN_HV],
+                ssm_a: vec![-1.0; GDN_HV],
+                norm: vec![1.0; GDN_D],
+            }
+        }
+
+        fn noisy(n: usize) -> bool {
+            n % 8 == 5
+        }
+
+        fn dst(n: usize, hk: usize) -> usize {
+            (n * 37 + hk * 11) % GDN_D
+        }
+
+        fn src(n: usize, hk: usize) -> usize {
+            (n * 53 + hk * 5 + 1) % GDN_D
+        }
+
+        /// The next `t` tokens' `(h, proj, expected y)`, advancing both references.
+        fn window(&mut self, t: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let d = GDN_D;
+            let mut h = vec![0f32; t * GDN_CONV];
+            let mut proj = vec![0f32; t * GDN_PROJ];
+            let mut y = vec![0f32; t * GDN_V];
+            for tt in 0..t {
+                let n = self.n;
+                let p = &mut proj[tt * GDN_PROJ..(tt + 1) * GDN_PROJ];
+                let hh = &mut h[tt * GDN_CONV..(tt + 1) * GDN_CONV];
+                for hk in 0..GDN_HK {
+                    hh[hk * d + Self::src(n, hk)] = 1.0; // q reads src
+                    hh[GDN_HK * d + hk * d + Self::dst(n, hk)] = 1.0; // k writes dst
+                }
+                for hv in 0..GDN_HV {
+                    let hk = hv % GDN_HK;
+                    let (src, dst) = (Self::src(n, hk), Self::dst(n, hk));
+                    for j in 0..d {
+                        p[GDN_Z + hv * d + j] = 40.0;
+                    }
+                    let vo = 2 * GDN_HK * d + hv * d;
+                    if hv < GDN_EXACT_HV {
+                        // g = β = 1: dst ← lcg(src) mod 2^20, one register file per head
+                        p[GDN_A + hv] = -30.0;
+                        p[GDN_B + hv] = 40.0;
+                        let r = &mut self.regs[hv * d * d..(hv + 1) * d * d];
+                        let new: Vec<u32> = (0..d)
+                            .map(|j| {
+                                ((r[src * d + j] as u64 * 1_103_515_245 + 12_345 + (n + j) as u64)
+                                    % (1 << 20)) as u32
+                            })
+                            .collect();
+                        for j in 0..d {
+                            hh[vo + j] = new[j] as f32;
+                            r[dst * d + j] = new[j];
+                        }
+                        let o: Vec<f32> =
+                            (0..d).map(|j| r[src * d + j] as f32 * INV_SQRT_D).collect();
+                        let ss: f32 = o.iter().map(|x| x * x).sum();
+                        let rs = 1.0 / (ss / d as f32 + Self::EPS).sqrt();
+                        for j in 0..d {
+                            y[tt * GDN_V + hv * d + j] = o[j] * rs * self.norm[j] * sigmoid(40.0);
+                        }
+                        continue;
+                    }
+                    // noisy head: integer writes, with a realistic gate and β every 8th token
+                    if Self::noisy(n) {
+                        p[GDN_A + hv] = 0.3 + hv as f32 * 0.01;
+                        p[GDN_B + hv] = 0.7 - hv as f32 * 0.01;
+                    } else {
+                        p[GDN_A + hv] = -30.0;
+                        p[GDN_B + hv] = 40.0;
+                    }
+                    for j in 0..d {
+                        hh[vo + j] = ((n * 31 + j * 7 + hv) % 4096) as f32 - 2048.0;
+                    }
+                    // the kernel's op order, verbatim
+                    let a = p[GDN_A + hv] + self.dt[hv];
+                    let sp = if a > 20.0 { a } else { a.exp().ln_1p() };
+                    let g = (sp * self.ssm_a[hv]).exp();
+                    let beta = sigmoid(p[GDN_B + hv]);
+                    let (q, k, v) = (
+                        &hh[hk * d..(hk + 1) * d],
+                        &hh[GDN_HK * d + hk * d..GDN_HK * d + (hk + 1) * d],
+                        &hh[vo..vo + d],
+                    );
+                    let grouped = |s: &[f32], vec: &[f32], j: usize| {
+                        let mut parts = [0f32; 4];
+                        for (rg, part) in parts.iter_mut().enumerate() {
+                            let mut acc = 0f32;
+                            for r in 0..32 {
+                                let i = rg * 32 + r;
+                                acc = s[i * d + j].mul_add(vec[i], acc);
+                            }
+                            *part = acc;
+                        }
+                        ((parts[0] + parts[1]) + parts[2]) + parts[3]
+                    };
+                    let s = &mut self.model[hv - GDN_EXACT_HV];
+                    for x in s.iter_mut() {
+                        *x *= g;
+                    }
+                    let mut o = vec![0f32; d];
+                    for j in 0..d {
+                        let sk = grouped(s, k, j);
+                        let dj = (v[j] - sk) * beta;
+                        for i in 0..d {
+                            s[i * d + j] = k[i].mul_add(dj, s[i * d + j]);
+                        }
+                        o[j] = grouped(s, q, j) * INV_SQRT_D;
+                    }
+                    let ss: f32 = o.iter().map(|x| x * x).sum();
+                    let rs = 1.0 / (ss / d as f32 + Self::EPS).sqrt();
+                    for j in 0..d {
+                        y[tt * GDN_V + hv * d + j] = o[j] * rs * self.norm[j] * sigmoid(40.0);
+                    }
+                }
+                self.n += 1;
+            }
+            (h, proj, y)
+        }
+
+        /// Asserts `state` is both references, bitwise, for every head.
+        fn check_state(&self, state: &[f32]) {
+            let d = GDN_D;
+            for hv in 0..GDN_HV {
+                for i in 0..d {
+                    for j in 0..d {
+                        let got = state[(i * GDN_HV + hv) * d + j].to_bits();
+                        let want = if hv < GDN_EXACT_HV {
+                            (self.regs[(hv * d + i) * d + j] as f32).to_bits()
+                        } else {
+                            self.model[hv - GDN_EXACT_HV][i * d + j].to_bits()
+                        };
+                        assert_eq!(got, want, "step {} head {hv} row {i} col {j}", self.n);
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_bits_eq(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "{what}[{i}]: {g} vs {w}");
+        }
+    }
+
+    /// Qwenputer's free run (divagr.com/blog/qwenputer ran 18M instructions without error) in
+    /// this GDN spec: `gdn_step` driven as a register machine for many windows of
+    /// [`MAX_T`] tokens. Each token, per k head, a one-hot q reads row `src` and a one-hot k
+    /// writes row `dst`; the 32 exact v heads (gate and β exactly 1) store
+    /// `lcg(row src) mod 2^20`, and the state and every output are checked bitwise after each
+    /// window. Default 512 tokens (~20 s in debug); `TANG_GDN_FREERUN_TOKENS` sets the count.
+    ///
+    /// What holds, bitwise, for all tokens:
+    /// - g = β = 1, one-hot k, integer values below 2^24: the state is exactly the integer
+    ///   register file (each write stores `v`, no other row moves), and the output for a one-hot
+    ///   q is the read row · 128^-½ through the rms norm, with no drift over the run;
+    /// - realistic g and β (the 16 noisy heads, every 8th token, with integer writes between):
+    ///   the state matches a plain model with the kernel's op order (`S *= g` on all rows, then
+    ///   per column `sk` grouped, `d = (v − sk)·β`, `S[i][j] = fma(k_i, d, S[i][j])`), bitwise.
+    ///
+    /// What does not: those noisy heads are not RAM. `S *= g` scales every row by a non-power-of-
+    /// two, rows stop being integers, and later g = 1 writes onto them are off by roundings
+    /// (`v − s` is inexact), so the integer register model fails for them; asserted below.
+    #[test]
+    fn gdn_free_run_stays_exact() {
+        let tokens: usize = std::env::var("TANG_GDN_FREERUN_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let mut m = GdnMachine::new();
+        let mut state = vec![0f32; crate::flash::GDN_STATE];
+        let t = MAX_T;
+        for _ in 0..tokens.div_ceil(t) {
+            let (h, proj, want) = m.window(t);
+            let y = gdn_step(
+                &mut state,
+                &h,
+                &proj,
+                GDN_PROJ,
+                (&m.dt, &m.ssm_a, &m.norm),
+                t,
+                t,
+                true,
+                GdnMachine::EPS,
+            );
+            assert_bits_eq(&y, &want, "y");
+            m.check_state(&state);
+        }
+        // the noisy heads really left integer RAM
+        let fractional = m
+            .model
+            .iter()
+            .flatten()
+            .filter(|x| x.fract() != 0.0)
+            .count();
+        assert!(fractional > 0, "noisy heads stayed integral");
+        eprintln!("gdn free run: {} tokens exact", m.n);
+    }
+
+    /// The device path: `ComputeDevice::gdn_step` on the CPU device, `ReadOnly` then
+    /// `Commit { win }` with `N_KEEP` < t, matches the direct call bitwise (state and outputs),
+    /// and `ReadOnly` leaves the state alone, on [`GdnMachine`] windows (inputs only:
+    /// the device state is checked against the direct call, not the machine's references).
+    #[test]
+    fn gdn_device_read_then_commit_matches_direct() {
+        use crate::device::ComputeDevice;
+        use crate::flash::{GdnMode, GdnParams, Win};
+        let dev = crate::CpuDevice::new();
+        let mut m = GdnMachine::new();
+        let mut state = vec![0f32; crate::flash::GDN_STATE];
+        let t = MAX_T;
+        let conv = dev.upload_f32(&[0.0]);
+        let (dt, ssm_a, norm) = (
+            dev.upload_f32(&m.dt),
+            dev.upload_f32(&m.ssm_a),
+            dev.upload_f32(&m.norm),
+        );
+        let p = GdnParams {
+            conv: &conv,
+            dt_bias: &dt,
+            ssm_a: &ssm_a,
+            norm: &norm,
+        };
+        let mut dstate = dev.upload_f32(&state);
+        for w in 0..32 {
+            let keep = 1 + w % t; // commit a varying prefix, as speculative decode does
+            let (h, proj, _) = m.window(t);
+            let (hb, pb) = (dev.upload_f32(&h), dev.upload_f32(&proj));
+            let mut y_read = dev.alloc_f32(t * GDN_V);
+            dev.gdn_step(
+                &mut dstate,
+                &hb,
+                &pb,
+                GDN_PROJ,
+                &p,
+                &mut y_read,
+                None,
+                t,
+                GdnMode::ReadOnly,
+                GdnMachine::EPS,
+            );
+            assert_bits_eq(&dev.download(&dstate), &state, "state after ReadOnly");
+            let y_direct = gdn_step(
+                &mut state.clone(),
+                &h,
+                &proj,
+                GDN_PROJ,
+                (&m.dt, &m.ssm_a, &m.norm),
+                t,
+                t,
+                false,
+                GdnMachine::EPS,
+            );
+            assert_bits_eq(&dev.download(&y_read), &y_direct, "ReadOnly y");
+
+            let win = dev.upload_f32(&[0.0, f32::from_bits(keep as u32), 0.0][..Win::WORDS]);
+            let mut y_commit = dev.alloc_f32(t * GDN_V);
+            dev.gdn_step(
+                &mut dstate,
+                &hb,
+                &pb,
+                GDN_PROJ,
+                &p,
+                &mut y_commit,
+                None,
+                t,
+                GdnMode::Commit { win: &win },
+                GdnMachine::EPS,
+            );
+            let _ = gdn_step(
+                &mut state,
+                &h,
+                &proj,
+                GDN_PROJ,
+                (&m.dt, &m.ssm_a, &m.norm),
+                t,
+                keep,
+                true,
+                GdnMachine::EPS,
+            );
+            assert_bits_eq(&dev.download(&dstate), &state, "state after Commit");
+            let n = keep * GDN_V;
+            assert_bits_eq(&dev.download(&y_commit)[..n], &y_direct[..n], "Commit y");
+        }
+    }
 }
