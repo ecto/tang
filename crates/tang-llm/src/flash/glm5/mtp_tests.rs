@@ -3,7 +3,6 @@
 
 use super::engine::Glm5Engine;
 use super::mtp::{generate, Drafter, Mtp, MtpDrafter};
-use crate::gguf::Gguf;
 use anyhow::Result;
 use std::path::Path;
 
@@ -35,10 +34,10 @@ fn plain(p: &str, n: usize) -> Vec<u32> {
 /// Proposes fixed junk.
 struct Junk(u32);
 impl Drafter for Junk {
-    fn observe(&mut self, _: &Gguf, _: &[f32], _: &[u32]) -> Result<()> {
+    fn observe(&mut self, _: &Glm5Engine, _: &[f32], _: &[u32]) -> Result<()> {
         Ok(())
     }
-    fn draft(&mut self, _: &Gguf, k: usize) -> Result<Vec<u32>> {
+    fn draft(&mut self, _: &Glm5Engine, k: usize) -> Result<Vec<u32>> {
         self.0 = self.0.wrapping_mul(31).wrapping_add(7) % 200;
         Ok(vec![self.0; k])
     }
@@ -50,7 +49,7 @@ struct Oracle {
     done: usize,
 }
 impl Drafter for Oracle {
-    fn observe(&mut self, _: &Gguf, _: &[f32], next: &[u32]) -> Result<()> {
+    fn observe(&mut self, _: &Glm5Engine, _: &[f32], next: &[u32]) -> Result<()> {
         if self.done == 0 {
             self.done = 1; // the prefill's token
         } else {
@@ -58,7 +57,7 @@ impl Drafter for Oracle {
         }
         Ok(())
     }
-    fn draft(&mut self, _: &Gguf, k: usize) -> Result<Vec<u32>> {
+    fn draft(&mut self, _: &Glm5Engine, k: usize) -> Result<Vec<u32>> {
         Ok(self.want[self.done..].iter().take(k).copied().collect())
     }
 }
@@ -107,11 +106,63 @@ fn mtp_draft_is_side_effect_free() {
     let mut nexts = PROMPT[1..].to_vec();
     nexts.push(cur);
     let mut dr = MtpDrafter::new(Mtp::load(&e).unwrap());
-    dr.observe(&e.m.g, &e.last_h, &nexts).unwrap();
+    dr.observe(&e, &e.last_h, &nexts).unwrap();
     let len = dr.mtp.len();
-    let a = dr.draft(&e.m.g, 3).unwrap();
+    let a = dr.draft(&e, 3).unwrap();
     assert_eq!(dr.mtp.len(), len);
-    let b = dr.draft(&e.m.g, 3).unwrap();
+    let b = dr.draft(&e, 3).unwrap();
     assert_eq!(a, b);
     assert_eq!(a.len(), 3);
+}
+
+/// The device MTP block computes what the host reference computes: a GPU engine decodes
+/// 64 greedy tokens one window at a time; after each, both blocks run the same
+/// teacher-forced cell (h, next). The cell outputs `hn` must agree to bf16-latent noise
+/// (rel l2 < 2e-2) and the draft ids must be identical wherever the host's top-2 logit
+/// margin is clear of that noise (> 0.05; the tiny random-weight head is near-flat, so
+/// near-ties flip on any reordering — the real-weight gate is the pod's debug log).
+#[cfg(feature = "cuda")]
+#[test]
+fn mtp_device_draft_matches_host() {
+    let _env = crate::flash::glm5::env_read();
+    let Some(p) = tiny() else { return };
+    let mut e = Glm5Engine::open(Path::new(&p)).unwrap();
+    if !e.use_gpu().unwrap() {
+        assert!(std::env::var("TANG_REQUIRE_CUDA").is_err(), "no GPU");
+        return;
+    }
+    let mut dm = Mtp::load(&e).unwrap();
+    assert!(dm.on_device(), "device MTP block not built");
+    let mut hm = Mtp::load(&e).unwrap().host_only();
+    let nv = e.m.hp.n_vocab;
+    let lg = e.window(&PROMPT).unwrap();
+    let mut cur = super::engine::argmax(&lg[(PROMPT.len() - 1) * nv..]);
+    let mut nexts = PROMPT[1..].to_vec();
+    nexts.push(cur);
+    let mut h = e.last_h.clone();
+    let (mut clear, mut same, mut worst) = (0, 0, 0f64);
+    for i in 0..64 {
+        let (a, b) = (dm.cells(&e, &h, &nexts).unwrap(), hm.cells(&e, &h, &nexts).unwrap());
+        assert_eq!(dm.len(), hm.len());
+        let num: f64 = a.h.iter().zip(&b.h).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+        let den: f64 = b.h.iter().map(|y| (*y as f64).powi(2)).sum();
+        let rel = (num / den.max(1e-30)).sqrt();
+        worst = worst.max(rel);
+        let n = b.h.len() / nexts.len();
+        let lgh = hm.host_logits(&b.h[b.h.len() - n..]);
+        let top = super::engine::argmax(&lgh) as usize;
+        let second = lgh.iter().enumerate().filter(|(j, _)| *j != top).map(|(_, v)| *v).fold(f32::MIN, f32::max);
+        let (da, db) = (*a.top.last().unwrap(), *b.top.last().unwrap());
+        if lgh[top] - second > 0.05 {
+            clear += 1;
+            assert_eq!(da, db, "token {i}: clear margin {} but device {da} != host {db}", lgh[top] - second);
+        }
+        same += usize::from(da == db);
+        let lg = e.window(&[cur]).unwrap();
+        cur = super::engine::argmax(&lg[..nv]);
+        h = e.last_h.clone();
+        nexts = vec![cur];
+    }
+    eprintln!("mtp device vs host: {same}/64 drafts identical, {clear} with a clear margin (all equal), worst hn rel {worst:.2e}");
+    assert!(worst < 2e-2, "device hn rel {worst}");
 }
