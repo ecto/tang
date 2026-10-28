@@ -347,3 +347,193 @@ extern "C" __global__ void ds_spark_pick(const float* row, int v, int* ids, int 
     if (memb)
         for (int j = tid; j < rank; j += blockDim.x) memb[j] = tab[(long long)pick * rank + j];
 }
+
+// Block-wide exclusive scan of v over 128 threads (4 warps); returns the total in *tot.
+__device__ __forceinline__ int gate_scan128(int v, int* wsum, int* tot) {
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    int inc = v;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int u = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += u;
+    }
+    if (lane == 31) wsum[wid] = inc;
+    __syncthreads();
+    int base = 0;
+    for (int q = 0; q < wid; q++) base += wsum[q];
+    *tot = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    __syncthreads();
+    return base + inc - v;
+}
+
+#define GATE_NE 512   // experts at most (16 a lane)
+#define GATE_N 128    // t * k routes at most
+
+// The decode router in one launch (t <= 8, k <= 16, ne <= 512, 128 threads a block):
+// 1. the gate GEMV raw [t][ne] = x · wᵀ, warp per expert row with ds_linear_t8's per-lane
+//    order and shuffle tree (so raw is bit-identical to ds_linear / ds_linear_t8);
+// 2. the last block to arrive (cnt, left at zero) runs ds_router per token (warp per token,
+//    scores in registers; the same score math, ties to the lower id, the weight sum serial in
+//    selection order), then ds_route's CSR (counts, off, rows ascending within an expert, rw)
+//    with a block scan, then (elist non-null) ds_moe_plan's live local expert list.
+extern "C" __global__ void __launch_bounds__(128) ds_moe_gate(DsW w, const float* __restrict__ x, float* raw,
+                                                             const float* __restrict__ bias, int* ids, float* wts,
+                                                             int* counts, int* off, int* rows, float* rw,
+                                                             const int* __restrict__ mask, int* elist, int cap, int t,
+                                                             int ne, int k, int norm, float route_scale, int* cnt) {
+    __shared__ int sid[GATE_N];
+    __shared__ float swt[GATE_N];
+    __shared__ int soff[GATE_NE + 1];
+    __shared__ int wsum[4];
+    __shared__ int last;
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    {
+        int n = blockIdx.x * 4 + wid;
+        if (n < w.rows) {
+            float s[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) s[i] = 0.f;
+            int kk = lane;
+            if (w.fmt <= 1) {
+                const int U = 8;
+                for (; kk + 32 * (U - 1) < w.cols; kk += 32 * U) {
+                    float wv[U];
+#pragma unroll
+                    for (int u = 0; u < U; u++) wv[u] = wget(w, n, kk + 32 * u);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        if (i >= t) break;
+                        const float* xr = x + (long long)i * w.cols + kk;
+                        float xv[U];
+#pragma unroll
+                        for (int u = 0; u < U; u++) xv[u] = xr[32 * u];
+#pragma unroll
+                        for (int u = 0; u < U; u++) s[i] = fmaf(xv[u], wv[u], s[i]);
+                    }
+                }
+            }
+            for (; kk < w.cols; kk += 32) {
+                float wv = wget(w, n, kk);
+#pragma unroll
+                for (int i = 0; i < 8; i++)
+                    if (i < t) s[i] = fmaf(x[(long long)i * w.cols + kk], wv, s[i]);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (i >= t) break;
+                float v = s[i];
+                for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                if (lane == 0) raw[(long long)i * w.rows + n] = v;
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(cnt, 1) == (int)gridDim.x - 1;
+        if (last) *cnt = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    // router: warp per token, lane holds experts lane + 32 j
+    for (int ti = wid; ti < t; ti += 4) {
+        const float* r = raw + (long long)ti * ne;
+        float sv[GATE_NE / 32];
+        unsigned used = 0;
+#pragma unroll
+        for (int j = 0; j < GATE_NE / 32; j++) {
+            int e = lane + 32 * j;
+            sv[j] = 0.f;
+            if (e < ne) {
+                float xv = __ldcg(r + e);
+                float sc = sqrtf(xv > 20.f ? xv : log1pf(expf(xv)));
+                sv[j] = sc + bias[e];
+            }
+        }
+        int sel_l = -1;  // lane j holds selection j
+        for (int j = 0; j < k; j++) {
+            int be = -1;
+            float bv = 0.f;
+#pragma unroll
+            for (int q = 0; q < GATE_NE / 32; q++) {
+                int e = lane + 32 * q;
+                if (e < ne && !(used >> q & 1) && router_better(sv[q], e, bv, be)) { be = e; bv = sv[q]; }
+            }
+            for (int o = 16; o; o >>= 1) {
+                float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                int oe = __shfl_xor_sync(0xffffffffu, be, o);
+                if (router_better(ov, oe, bv, be)) { be = oe; bv = ov; }
+            }
+            if (be >= 0 && (be & 31) == lane) used |= 1u << (be >> 5);
+            if (lane == j) sel_l = be;
+        }
+        // gather selections to every lane, weights serial in lane 0
+        int selv[16];
+#pragma unroll
+        for (int j = 0; j < 16; j++) selv[j] = __shfl_sync(0xffffffffu, sel_l, j);
+        if (lane == 0) {
+            float wl[16], sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (j >= k) break;
+                float xv = __ldcg(r + selv[j]);
+                wl[j] = sqrtf(xv > 20.f ? xv : log1pf(expf(xv)));
+                sum += wl[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (j >= k) break;
+                float v = (norm && k > 1) ? wl[j] / (sum + 1e-20f) : wl[j];
+                ids[ti * k + j] = selv[j];
+                wts[ti * k + j] = v * route_scale;
+                sid[ti * k + j] = selv[j];
+                swt[ti * k + j] = v * route_scale;
+            }
+        }
+    }
+    __syncthreads();
+    // route: counts, exclusive offsets (each thread a run of consecutive experts), rows
+    int n = t * k, per = (ne + 127) / 128, e0 = threadIdx.x * per;
+    int loc = 0;
+    for (int e = e0; e < min(ne, e0 + per); e++) {
+        int c = 0;
+        for (int i = 0; i < n; i++) c += sid[i] == e;
+        counts[e] = c;
+        soff[e] = c;
+        loc += c;
+    }
+    int tot;
+    int base = gate_scan128(loc, wsum, &tot);
+    for (int e = e0; e < min(ne, e0 + per); e++) {
+        int c = soff[e];
+        soff[e] = base;
+        off[e] = base;
+        base += c;
+    }
+    if (threadIdx.x == 0) off[ne] = tot;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        int e = sid[i], p = soff[e];
+        for (int j = 0; j < i; j++) p += sid[j] == e;
+        rows[p] = i / k;
+        rw[p] = swt[i];
+    }
+    if (!elist) return;
+    // plan: live local experts ascending, then -1
+    int lv = 0;
+    for (int e = e0; e < min(ne, e0 + per); e++) {
+        int c = (e + 1 < ne ? soff[e + 1] : tot) - soff[e];
+        lv += c > 0 && mask[e];
+    }
+    int nl;
+    int j = gate_scan128(lv, wsum, &nl);
+    for (int e = e0; e < min(ne, e0 + per); e++) {
+        int c = (e + 1 < ne ? soff[e + 1] : tot) - soff[e];
+        if (c > 0 && mask[e]) {
+            if (j < cap) elist[j] = e;
+            j++;
+        }
+    }
+    for (int q = min(nl, cap) + threadIdx.x; q < cap; q += blockDim.x) elist[q] = -1;
+}

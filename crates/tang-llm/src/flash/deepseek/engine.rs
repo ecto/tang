@@ -1394,7 +1394,12 @@ impl GpuModel {
             let (w1, w3) = (self.dw(&n1)?, self.dw(&n3)?);
             if Kernels::fast_ok(&w1.v) && Kernels::fast_ok(&w3.v) {
                 let h = self.fbuf(n * w1.v.rows as usize)?;
-                let xq = self.qdq(x, n * w1.v.cols as usize)?;
+                // the K-split GEMV quantizes the activation itself: skip the qdq pass
+                let xq = if self.k.ks_takes(&w1.v) {
+                    x
+                } else {
+                    self.qdq(x, n * w1.v.cols as usize)?
+                };
                 self.k.linear_fast(
                     &self.s,
                     &w1.v,
@@ -1407,6 +1412,13 @@ impl GpuModel {
                     w,
                     self.cpu.cfg.swiglu_limit,
                 )?;
+                let w2 = self.dw(&format!("{p}.w2.weight"))?;
+                if self.k.ks_takes(&w2.v) {
+                    let y = self.fbuf(n * w2.v.rows as usize)?;
+                    self.k
+                        .linear_fast(&self.s, &w2.v, None, h.ptr, y.ptr, n, true, false, 0, 0.0)?;
+                    return Ok(y);
+                }
                 return self.lin(h, n, &format!("{p}.w2.weight"));
             }
         }
@@ -1458,38 +1470,72 @@ impl GpuModel {
         let c = &self.cpu.cfg;
         let (ne, topk) = c.moe(lid);
         let d = c.dim;
-        let s = self.span("router");
-        let raw = self.raw(x.ptr, t, &format!("{p}.ffn.gate.weight"))?;
+        let gw = self.dw(&format!("{p}.ffn.gate.weight"))?;
         let bias = self.dw(&format!("{p}.ffn.gate.bias"))?;
         let (ids, wts) = (self.fbuf(t * topk)?, self.fbuf(t * topk)?);
-        self.k.router(
-            &self.s,
-            raw.ptr,
-            bias.v.w,
-            ids.ptr,
-            wts.ptr,
-            t,
-            ne,
-            topk,
-            c.norm_topk_prob,
-            c.route_scale,
-        )?;
-        self.end(s);
-        // per-expert CSR on the device
-        let s = self.span("route");
         let (counts, off) = (self.fbuf(ne)?, self.fbuf(ne + 1)?);
         let (rows, rw) = (self.fbuf(t * topk)?, self.fbuf(t * topk)?);
-        self.k.route(
-            &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
-        )?;
         let tab = if self.moe_grouped && self.expert_slots == 0 && t <= 8 {
             self.moe_tab(p, lid, ne)?
         } else {
             None
         };
-        self.end(s);
+        let fused = Kernels::moe_gate_ok(&gw.v, t, ne, topk);
+        let mut elist = None;
+        if fused {
+            // gate GEMV + router + CSR (+ the grouped plan) in one launch
+            let s = self.span("router");
+            let raw = self.fbuf(t * ne)?;
+            let plan = match &tab {
+                Some(tb) => {
+                    let el = self.fbuf((t * topk).min(tb.local))?;
+                    elist = Some(el);
+                    (tb.mask.ptr, el.ptr, (t * topk).min(tb.local))
+                }
+                None => (0, 0, 0),
+            };
+            self.k.moe_gate(
+                &self.s,
+                &gw.v,
+                x.ptr,
+                raw.ptr,
+                bias.v.w,
+                ids.ptr,
+                wts.ptr,
+                (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                plan,
+                t,
+                topk,
+                c.norm_topk_prob,
+                c.route_scale,
+            )?;
+            self.end(s);
+        } else {
+            let s = self.span("router");
+            let raw = self.raw(x.ptr, t, &format!("{p}.ffn.gate.weight"))?;
+            self.k.router(
+                &self.s,
+                raw.ptr,
+                bias.v.w,
+                ids.ptr,
+                wts.ptr,
+                t,
+                ne,
+                topk,
+                c.norm_topk_prob,
+                c.route_scale,
+            )?;
+            self.end(s);
+            // per-expert CSR on the device
+            let s = self.span("route");
+            self.k.route(
+                &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+            )?;
+            self.end(s);
+        }
         if let Some(tab) = tab {
-            let y = self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?;
+            let y =
+                self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw, elist)?;
             return self.moe_finish(p, x, t, y);
         }
         // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
@@ -1575,31 +1621,46 @@ impl GpuModel {
         off: Buf,
         rows: Buf,
         rw: Buf,
+        planned: Option<Buf>,
     ) -> Result<Buf> {
         let d = self.cpu.cfg.dim;
         let (n, inter) = (t * topk, tab.inter);
         let slots = n.min(tab.local);
         let s = self.span("grouped_gu");
-        let elist = self.fbuf(slots)?;
-        let (nei, ci) = (ne as i32, slots as i32);
-        unsafe {
-            self.k.go(
-                "ds_moe_plan",
-                (1, 1, 1),
-                (32, 1, 1),
-                0,
-                &self.s,
-                args![counts.ptr, tab.mask.ptr, elist.ptr, nei, ci],
-            )?
+        let elist = match planned {
+            Some(e) => e,
+            None => {
+                let elist = self.fbuf(slots)?;
+                let (nei, ci) = (ne as i32, slots as i32);
+                unsafe {
+                    self.k.go(
+                        "ds_moe_plan",
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &self.s,
+                        args![counts.ptr, tab.mask.ptr, elist.ptr, nei, ci],
+                    )?
+                };
+                elist
+            }
         };
-        let xq = self.qdq(x, t * d)?;
+        // the K-split kernels quantize their activation themselves (idempotent on a
+        // quantized one), so the fp8 qdq passes are only for the exact kernels
+        let xq = if self.k.moe_ks_takes(t, d, t) {
+            x
+        } else {
+            self.qdq(x, t * d)?
+        };
         let h = self.fbuf(n * inter)?;
         let lim = self.cpu.cfg.swiglu_limit;
         self.k.moe_gu(
             &self.s, tab.fmt, tab.w1.ptr, tab.w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, xq.ptr,
             h.ptr, t, slots, inter, d, lim,
         )?;
-        self.k.fp8_qdq(&self.s, h.ptr, n * inter)?;
+        if !self.k.moe_ks_takes(t, inter, n) {
+            self.k.fp8_qdq(&self.s, h.ptr, n * inter)?;
+        }
         self.end(s);
         let s = self.span("grouped_down");
         let part = self.fbuf(n * d)?;

@@ -117,6 +117,12 @@ pub struct Kernels {
     /// The quantized activation for the K-split GEMV: e4m3 codes [t][K], then scales.
     ks_x: DevBuf,
     ks_quant: Func,
+    /// `ds_moe_gate`'s block arrival counter (left at zero by the last block).
+    gate_cnt: DevBuf,
+    /// `DS_MOE_KS_ITEMS` / `DS_MOE_KS_S`: row groups a grouped K-split block strides and K
+    /// slices a block (0 = auto), for sweeping the grid on a new GPU.
+    moe_items: usize,
+    moe_s: usize,
     /// SM count and the opt-in dynamic shared memory limit per block.
     sms: usize,
     smem_max: usize,
@@ -168,6 +174,7 @@ const MORE: &[&str] = &[
     "ds_spark_pick",
     "ds_moe_plan",
     "ds_moe_reduce",
+    "ds_moe_gate",
 ];
 
 /// Floats of attention scratch: partial scores [t][d/64][h][k], then P [t][h][k] and den
@@ -181,6 +188,10 @@ const KS_CNT: usize = 1 << 13;
 const KS_X: usize = 8 * 16384 * 2;
 /// Row groups each grouped K-split block takes (blockIdx.x strides them).
 const MOE_KS_ITEMS: usize = 4;
+
+fn env_usize(k: &str) -> Option<usize> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
+}
 
 /// `__CUDA_ARCH__` the module was built for.
 fn arch(m: &Module) -> Result<i32> {
@@ -279,6 +290,11 @@ impl Kernels {
             ks_cnt: DevBuf::from_slice(&vec![0i32; KS_CNT])?,
             ks_x: DevBuf::alloc(KS_X)?,
             ks_quant: m.func("ds_ks_quant")?,
+            gate_cnt: DevBuf::from_slice(&[0i32])?,
+            moe_items: env_usize("DS_MOE_KS_ITEMS").unwrap_or(MOE_KS_ITEMS).max(1),
+            moe_s: env_usize("DS_MOE_KS_S")
+                .filter(|s| [1, 2, 4, 8].contains(s))
+                .unwrap_or(0),
             sms: g.attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             )? as usize,
@@ -469,6 +485,56 @@ impl Kernels {
                 (ne * 5) as u32,
                 s,
                 tang_moe::args![raw, bias, ids, wts, ti, nei, ki, ni, scale],
+            )
+        }
+    }
+
+    /// Whether [`Kernels::moe_gate`] takes this shape: `t` <= 8, `k` <= 16, `ne` <= 512.
+    pub fn moe_gate_ok(w: &DsW, t: usize, ne: usize, k: usize) -> bool {
+        (1..=8).contains(&t) && (1..=16).contains(&k) && ne <= 512 && w.rows as usize == ne
+    }
+
+    /// The decode router in one launch: the gate GEMV `raw` [t][ne] = `x` · `w`ᵀ (bit-identical
+    /// to [`Kernels::linear`] unrounded), [`Kernels::router`] and [`Kernels::route`] (bit for
+    /// bit), and with `elist` != 0 `ds_moe_plan`'s list of `cap` slots over `mask`. See
+    /// [`Kernels::moe_gate_ok`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gate(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        x: u64,
+        raw: u64,
+        bias: u64,
+        ids: u64,
+        wts: u64,
+        csr: (u64, u64, u64, u64),
+        plan: (u64, u64, usize),
+        t: usize,
+        k: usize,
+        norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        let ne = w.rows as usize;
+        if !Self::moe_gate_ok(w, t, ne, k) {
+            bail!("moe_gate: t {t} ne {ne} k {k}");
+        }
+        let (counts, off, rows, rw) = csr;
+        let (mask, elist, cap) = plan;
+        let (wv, ci, ti, nei, ki, ni) =
+            (*w, cap as i32, t as i32, ne as i32, k as i32, norm as i32);
+        let cnt = self.gate_cnt.ptr;
+        unsafe {
+            self.go(
+                "ds_moe_gate",
+                (ne.div_ceil(4) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                s,
+                tang_moe::args![
+                    wv, x, raw, bias, ids, wts, counts, off, rows, rw, mask, elist, ci, ti, nei,
+                    ki, ni, scale, cnt
+                ],
             )
         }
     }
@@ -747,6 +813,24 @@ impl Kernels {
             && t * pitch + t * (cols / 32) * 4 <= self.smem_max
     }
 
+    /// Whether [`Kernels::moe_gu`] / [`Kernels::moe_down`] take the K-split path for `t`
+    /// tokens an expert over `cols`, `n` activation rows (they then quantize the activation
+    /// themselves: no fp8 qdq pass needed before).
+    pub fn moe_ks_takes(&self, t: usize, cols: usize, n: usize) -> bool {
+        !self.exact && self.moe_ks_ok(t, cols, n)
+    }
+
+    /// Whether [`Kernels::linear_fast`] of `w` runs the K-split GEMV, which quantizes its
+    /// activation itself (so the caller's fp8 qdq pass is redundant).
+    pub fn ks_takes(&self, w: &DsW) -> bool {
+        let cols = w.cols as usize;
+        let pitch = cols.div_ceil(128) * 128 + 32;
+        !self.exact
+            && Self::fast_ok(w)
+            && 8 * pitch + 8 * (cols / 32) * 4 <= self.smem_max
+            && cols <= 16384
+    }
+
     /// `ds_ks_quant` of `n` rows × `cols` at `x` into `ks_x`: (codes, scales).
     fn ks_quantize(&self, s: &Stream, x: u64, n: usize, cols: usize) -> Result<(u64, u64)> {
         let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
@@ -767,14 +851,17 @@ impl Kernels {
     /// The grouped K-split shape for one expert's `rows` × `cols` (`out` rows a warp tile):
     /// S K-slices a block (≥ 8 groups a warp), its nbr row groups, and the blocks per slot,
     /// each striding over ~4 row groups so the staged activation amortizes over weights.
-    fn moe_ks_grid(rows: usize, out: usize, cols: usize) -> (usize, usize, usize) {
+    fn moe_ks_grid(&self, rows: usize, out: usize, cols: usize) -> (usize, usize, usize) {
         let nch = cols / 32;
         let mut sp = 1;
         while sp < 8 && nch >= sp * 2 * 8 {
             sp *= 2;
         }
+        if self.moe_s > 0 {
+            sp = self.moe_s;
+        }
         let nbr = rows.div_ceil(out).div_ceil(8 / sp).max(1);
-        (sp, nbr, nbr.div_ceil(MOE_KS_ITEMS))
+        (sp, nbr, nbr.div_ceil(self.moe_items))
     }
 
     /// Grouped MoE gate/up + SwiGLU for every routed expert of a layer in one launch (see
@@ -804,7 +891,7 @@ impl Kernels {
         if !self.exact && self.moe_ks_ok(t, d, t) {
             let f = self.moe_ks[fmt as usize - 2][0];
             let (codes, scales) = self.ks_quantize(s, xq, t, d)?;
-            let (sp, nbr, gx) = Self::moe_ks_grid(inter, 8, d);
+            let (sp, nbr, gx) = self.moe_ks_grid(inter, 8, d);
             let (si, nbri) = (sp as i32, nbr as i32);
             unsafe {
                 super::obs::launch(
@@ -857,7 +944,7 @@ impl Kernels {
         if !self.exact && self.moe_ks_ok(t, inter, n) {
             let f = self.moe_ks[fmt as usize - 2][1];
             let (codes, scales) = self.ks_quantize(s, hq, n, inter)?;
-            let (sp, nbr, gx) = Self::moe_ks_grid(d, 16, inter);
+            let (sp, nbr, gx) = self.moe_ks_grid(d, 16, inter);
             let (si, nbri) = (sp as i32, nbr as i32);
             unsafe {
                 super::obs::launch(
@@ -1806,7 +1893,9 @@ mod tests {
                     slots, inter, d, 10.0,
                 )
                 .unwrap();
-                k.fp8_qdq(&s, h.ptr, n * inter).unwrap();
+                if !k.moe_ks_takes(t, inter, n) {
+                    k.fp8_qdq(&s, h.ptr, n * inter).unwrap();
+                }
                 k.moe_down(
                     &s, 3, w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d, inter, topk,
                 )
@@ -2540,6 +2629,236 @@ mod tests {
             )
             .unwrap();
         });
+        time("gate+router+route (3 launches)", &|| {
+            k.linear(&s, &w, x.ptr, raw.ptr, t, false).unwrap();
+            k.router(
+                &s, raw.ptr, bias.ptr, ids.ptr, wts.ptr, t, ne, topk, true, 1.5,
+            )
+            .unwrap();
+            k.route(
+                &s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+            )
+            .unwrap();
+        });
+        let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
+        let elist = DevBuf::alloc(t * topk * 4).unwrap();
+        time("ds_moe_gate (fused, + plan)", &|| {
+            k.moe_gate(
+                &s,
+                &w,
+                x.ptr,
+                raw.ptr,
+                bias.ptr,
+                ids.ptr,
+                wts.ptr,
+                (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                (mask.ptr, elist.ptr, t * topk),
+                t,
+                topk,
+                true,
+                1.5,
+            )
+            .unwrap();
+        });
+    }
+
+    /// `ds_moe_gate` (gate GEMV + router + route + plan in one launch) against the separate
+    /// `linear`, `ds_router`, `ds_route` and `ds_moe_plan` launches, bit for bit.
+    #[test]
+    fn moe_gate_matches_separate() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let d = 512usize;
+        for (t, ne, kk, norm, coarse) in [
+            (1, 8, 1, true, false),
+            (1, 384, 6, true, false),
+            (6, 384, 6, true, true),
+            (6, 384, 6, true, false),
+            (5, 256, 8, false, true),
+            (8, 512, 16, true, false),
+            (3, 100, 4, true, true),
+        ] {
+            let mut wf = data(ne * d, (ne * 3 + t) as u64, 0.05);
+            if coarse {
+                // many equal logits: rows share weights
+                for e in 0..ne {
+                    let src = (e % 7) * d;
+                    for c in 0..d {
+                        wf[e * d + c] = wf[src + c];
+                    }
+                }
+            }
+            let wb: Vec<u16> = wf.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+            let wdev = DevBuf::from_slice(&wb).unwrap();
+            let w = DsW {
+                w: wdev.ptr,
+                s: 0,
+                rows: ne as i32,
+                cols: d as i32,
+                fmt: 1,
+                _pad: 0,
+            };
+            let x = DevBuf::from_slice(&data(t * d, 7 + t as u64, 1.0)).unwrap();
+            let mut bias = data(ne, 11, 0.5);
+            if coarse {
+                bias.iter_mut().for_each(|v| *v = (*v * 4.0).round() / 4.0);
+            }
+            let bias = DevBuf::from_slice(&bias).unwrap();
+            let mask: Vec<i32> = (0..ne).map(|e| (e % 3 != 1) as i32).collect();
+            let mask = DevBuf::from_slice(&mask).unwrap();
+            let n = t * kk;
+            let cap = n.min(ne);
+            let bufs = || {
+                (
+                    DevBuf::alloc(t * ne * 4).unwrap(),
+                    DevBuf::alloc(n * 4).unwrap(),
+                    DevBuf::alloc(n * 4).unwrap(),
+                    DevBuf::alloc(ne * 4).unwrap(),
+                    DevBuf::alloc((ne + 1) * 4).unwrap(),
+                    DevBuf::alloc(n * 4).unwrap(),
+                    DevBuf::alloc(n * 4).unwrap(),
+                    DevBuf::alloc(cap * 4).unwrap(),
+                )
+            };
+            let a = bufs();
+            k.linear(&s, &w, x.ptr, a.0.ptr, t, false).unwrap();
+            k.router(
+                &s, a.0.ptr, bias.ptr, a.1.ptr, a.2.ptr, t, ne, kk, norm, 1.5,
+            )
+            .unwrap();
+            k.route(
+                &s, a.1.ptr, a.2.ptr, a.3.ptr, a.4.ptr, a.5.ptr, a.6.ptr, t, kk, ne,
+            )
+            .unwrap();
+            let (nei, ci) = (ne as i32, cap as i32);
+            unsafe {
+                k.go(
+                    "ds_moe_plan",
+                    (1, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &s,
+                    tang_moe::args![a.3.ptr, mask.ptr, a.7.ptr, nei, ci],
+                )
+                .unwrap();
+            }
+            let b = bufs();
+            for _ in 0..2 {
+                // twice: the arrival counter resets itself
+                k.moe_gate(
+                    &s,
+                    &w,
+                    x.ptr,
+                    b.0.ptr,
+                    bias.ptr,
+                    b.1.ptr,
+                    b.2.ptr,
+                    (b.3.ptr, b.4.ptr, b.5.ptr, b.6.ptr),
+                    (mask.ptr, b.7.ptr, cap),
+                    t,
+                    kk,
+                    norm,
+                    1.5,
+                )
+                .unwrap();
+            }
+            s.sync().unwrap();
+            let what = format!("t{t} ne{ne} k{kk}");
+            let u = |x: &DevBuf, n: usize| x.read::<u32>(0, n).unwrap();
+            assert_eq!(u(&a.0, t * ne), u(&b.0, t * ne), "{what} raw");
+            assert_eq!(u(&a.1, n), u(&b.1, n), "{what} ids");
+            assert_eq!(u(&a.2, n), u(&b.2, n), "{what} wts");
+            assert_eq!(u(&a.3, ne), u(&b.3, ne), "{what} counts");
+            assert_eq!(u(&a.4, ne + 1), u(&b.4, ne + 1), "{what} off");
+            assert_eq!(u(&a.5, n), u(&b.5, n), "{what} rows");
+            assert_eq!(u(&a.6, n), u(&b.6, n), "{what} rw");
+            assert_eq!(u(&a.7, cap), u(&b.7, cap), "{what} elist");
+        }
+    }
+
+    /// The shared expert MLP at the real shape (fp8 w1/w3 [2304, 5120], w2 [5120, 2304], t 6)
+    /// through `linear_fast`, as `mlp` runs it (manual: `--ignored --nocapture
+    /// shared_expert_bench`): with and without the redundant fp8 qdq passes.
+    #[test]
+    #[ignore]
+    fn shared_expert_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (d, inter) = (5120usize, 2304usize);
+        let mut keep = Vec::new();
+        let w1 = rand_w(2, inter, d, 1, &mut keep);
+        let w3 = rand_w(2, inter, d, 2, &mut keep);
+        let w2 = rand_w(2, d, inter, 3, &mut keep);
+        let bytes = (2 * inter * d + d * inter) as f64 * (1.0 + 1.0 / 1024.0);
+        for t in [1usize, 6] {
+            let x = DevBuf::from_slice(&data(t * d, 3, 1.0)).unwrap();
+            let xq = DevBuf::alloc(t * d * 4).unwrap();
+            let h = DevBuf::alloc(t * inter * 4).unwrap();
+            let hq = DevBuf::alloc(t * inter * 4).unwrap();
+            let y = DevBuf::alloc(t * d * 4).unwrap();
+            let ev = |f: &dyn Fn()| -> f64 {
+                f();
+                s.sync().unwrap();
+                let n = 200;
+                let (a, b) = (
+                    gpu::Event::new(true).unwrap(),
+                    gpu::Event::new(true).unwrap(),
+                );
+                a.record(&s).unwrap();
+                for _ in 0..n {
+                    f();
+                }
+                b.record(&s).unwrap();
+                s.sync().unwrap();
+                b.since(&a).unwrap() as f64 * 1e3 / n as f64
+            };
+            let old = ev(&|| {
+                let nn = (t * d) as i64;
+                unsafe {
+                    k.go(
+                        "ds_copy",
+                        blocks(t * d, 256),
+                        (256, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![xq.ptr, x.ptr, nn],
+                    )
+                    .unwrap()
+                };
+                k.fp8_qdq(&s, xq.ptr, t * d).unwrap();
+                k.linear_fast(&s, &w1, Some(&w3), xq.ptr, h.ptr, t, true, false, 0, 10.0)
+                    .unwrap();
+                let nn = (t * inter) as i64;
+                unsafe {
+                    k.go(
+                        "ds_copy",
+                        blocks(t * inter, 256),
+                        (256, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![hq.ptr, h.ptr, nn],
+                    )
+                    .unwrap()
+                };
+                k.fp8_qdq(&s, hq.ptr, t * inter).unwrap();
+                k.linear_fast(&s, &w2, None, hq.ptr, y.ptr, t, true, false, 0, 0.0)
+                    .unwrap();
+            });
+            let new = ev(&|| {
+                k.linear_fast(&s, &w1, Some(&w3), x.ptr, h.ptr, t, true, false, 0, 10.0)
+                    .unwrap();
+                k.linear_fast(&s, &w2, None, h.ptr, y.ptr, t, true, false, 0, 0.0)
+                    .unwrap();
+            });
+            eprintln!(
+                "shared_expert_bench t {t}: with qdq passes {old:.1} us, without {new:.1} us ({:.0} GB/s)",
+                bytes / new / 1e3
+            );
+        }
     }
 
     /// `ds_router` against the CPU router math on exact ties (coarse raw values shared by
