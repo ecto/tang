@@ -3013,6 +3013,7 @@ mod tests {
     /// at engine load (layer construction), so they are set around the loads only.
     #[cfg(feature = "cuda")]
     fn gpu_slots_case(ids: &[u32], moe: &str) {
+        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let load = |slots: usize| {
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // the batched KDA rows need it
             std::env::set_var("TANG_GLM5_MOE", moe);
@@ -3116,6 +3117,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cuda")]
     fn engine_gpu_resident_step_matches_host() {
+        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;

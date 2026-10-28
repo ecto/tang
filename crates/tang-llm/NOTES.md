@@ -33,13 +33,16 @@ Verified:
 - mew tiny: `engine_gpu_resident_step_matches_host` now also runs graph=2. Host = resident =
   graph=1 = graph=2 greedy ids over 40 decode tokens across the dense->sparse switch (graph=2
   replays: 11 dense, 28 sparse). Passes alone.
-- mew tiny, flash::glm5 suite: 77 passed / 1 failed / 2 ignored with the trace test skipped. The
-  failure is this resident test in parallel: the graph=1 segment-count assert (engine.rs:3164),
-  before the graph=2 part. Likely an env-var race: other tests set and remove `TANG_GLM5_MOE` /
-  `KDA_PF2` while it runs. Not confirmed. The trace test passes alone.
-- H200 gate (flags as given, including `TANG_GLM5_GPU_FFN=0`): `785 1196 6801 264 6386 38038 911 279`
-  for graph=1 and graph=2. But `GPU_FFN=0` left 0 of 45 FFNs on the GPU, so the resident step never
-  ran (0.17 tok/s). This gate does not exercise either graph.
+- mew tiny, flash::glm5 suite: 78 passed / 0 failed / 2 ignored, with the trace test skipped (it
+  passes alone). The parallel failure of the resident test was an env-var race. Fix:
+  `glm5::ENV_LOCK`, held by the resident test and `gpu_slots_case` (which sets / removes
+  `TANG_GLM5_MOE` / `KDA_PF2`).
+- H200 gate with the flags as given (`TANG_GLM5_GPU_FFN=0`): ids = oracle for graph=1 and graph=2.
+  But 0 of 45 FFNs were on the GPU, so the resident step never ran, and neither graph did.
+- H200 with `GPU_FFN` unset (all FFNs on the GPU): the load OOMs at layer 31's FFN
+  (`CUDA_ERROR_OUT_OF_MEMORY`, 24 of 45 uploaded), so every gate and bench failed. The resident
+  step needs every FFN on one GPU, and this single H200 (141 GB) cannot hold them with this tree's
+  footprint. The real-weights check needs the B300 or a multi-GPU box.
 
 Not verified:
 - Real weights with the FFNs on the GPU: the gate, the -n 512 md5 vs graph=1, the bench table.

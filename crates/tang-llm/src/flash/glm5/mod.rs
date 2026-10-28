@@ -477,3 +477,8 @@ mod tests {
         assert!(hp.is_dense(0));
     }
 }
+
+/// Tests that set / remove `TANG_GLM5_*` env vars hold this (the test harness runs them in
+/// parallel and the engine reads the env per call).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
