@@ -91,6 +91,13 @@ fn feed_chunked(
     Ok(out.unwrap())
 }
 
+/// `DS_SERVE_PROFILE`, when set to anything but "0": "direct" or the graph path.
+fn serve_profile() -> Option<String> {
+    std::env::var("DS_SERVE_PROFILE")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+}
+
 /// Tokens per prefill forward (`DS_PREFILL_CHUNK`, default 1024).
 fn prefill_chunk() -> usize {
     std::env::var("DS_PREFILL_CHUNK")
@@ -166,6 +173,13 @@ impl DsServe {
     /// means a single GPU.
     pub fn load_on(dir: &Path, devices: &[usize]) -> Result<Self> {
         let t = Instant::now();
+        // `DS_SERVE_PROFILE=1` prints deepseek-profile's table after every request (`=direct`
+        // forces the direct path so the steps' interiors are timed; see docs/observability.md)
+        if let Some(mode) = serve_profile() {
+            super::obs::set(2, 1, mode == "direct");
+            super::obs::quiet(true);
+            super::obs::collect(true);
+        }
         let m = Engine::open(dir, devices)?;
         let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
@@ -466,6 +480,18 @@ impl Backend for DsServe {
         }
         if called && finish == Finish::Stop {
             finish = Finish::ToolCalls;
+        }
+        if let Some(mode) = serve_profile() {
+            let recs = super::obs::take();
+            super::obs::collect(true);
+            let o = ProfileOpts {
+                steps: 0,
+                prompt_tokens: ids.len(),
+                direct: mode == "direct",
+                graph_debug: false,
+                spec: spec,
+            };
+            eprintln!("{}", profile_table(&recs, &o, 0.0, &usage));
         }
         Ok((finish, usage))
     }
