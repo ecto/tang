@@ -2,8 +2,9 @@
 //! template, `tokenizer.json`, the device forward, and DeepSeek's DSML tool calls.
 //!
 //! Deliberately minimal, like GLM's first serve glue:
-//! - One sequence at a time. Each request prefills its whole prompt in one chunk at position
-//!   0 and then decodes; there is no prefix reuse across requests yet.
+//! - One sequence at a time. Each request prefills its prompt from position 0 in chunks of
+//!   `DS_PREFILL_CHUNK` tokens (1024) and then decodes; there is no prefix reuse across
+//!   requests yet.
 //! - Requests decode speculatively with DSpark (`DS_SPEC=0` turns it off): each forward
 //!   verifies the sampled token and its drafts as one window ([`forward::generate`]). Greedy
 //!   gives the same tokens as plain greedy decoding; sampled requests use speculative
@@ -69,6 +70,36 @@ impl Engine {
     }
 }
 
+/// Prefill `ids` from position `sp` through `forward` at most [`prefill_chunk`] tokens at a
+/// time, returning the last chunk's outputs. A step's scratch grows with its token count
+/// (the indexer scores every position against every compressed slot), so a 10k-token prompt
+/// in one forward runs out of device memory where ten 1k-token ones don't; the chunks produce
+/// the same state (`gpu_tiny_chunk_and_rewind_exact`).
+fn feed_chunked(
+    ids: &[usize],
+    sp: usize,
+    mut forward: impl FnMut(&[usize], usize) -> Result<(Vec<f32>, Vec<f32>)>,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let chunk = prefill_chunk();
+    if ids.len() <= chunk {
+        return forward(ids, sp);
+    }
+    let mut out = None;
+    for (i, c) in ids.chunks(chunk).enumerate() {
+        out = Some(forward(c, sp + i * chunk)?);
+    }
+    Ok(out.unwrap())
+}
+
+/// Tokens per prefill forward (`DS_PREFILL_CHUNK`, default 1024).
+fn prefill_chunk() -> usize {
+    std::env::var("DS_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1024)
+}
+
 impl Decoder for Engine {
     fn config(&self) -> &Config {
         match self {
@@ -78,11 +109,11 @@ impl Decoder for Engine {
         }
     }
     fn feed(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
-        match self {
+        feed_chunked(ids, sp, |ids, sp| match self {
             Engine::Single(m) => m.forward(ids, sp, None),
             #[cfg(feature = "ep")]
             Engine::Ep(g) => g.forward(ids, sp),
-        }
+        })
     }
     fn seed_drafter(&mut self, main: &[f32]) -> Result<()> {
         match self {
@@ -187,7 +218,7 @@ impl Decoder for GpuModel {
         &self.cpu.cfg
     }
     fn feed(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
-        self.forward(ids, sp, None)
+        feed_chunked(ids, sp, |ids, sp| self.forward(ids, sp, None))
     }
     fn seed_drafter(&mut self, main: &[f32]) -> Result<()> {
         self.forward_spec(0, main, 0).map(|_| ())

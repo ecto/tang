@@ -178,6 +178,16 @@ impl EpGroup {
                             Cmd::Reset => m.reset().map(|_| Reply::Done),
                             Cmd::Misses => Ok(Reply::Misses(m.expert_misses())),
                         };
+                        if let Err(e) = &r {
+                            // the peers are in (or heading into) this step's collectives and
+                            // would wait forever: say what happened, then stop the process
+                            eprintln!("tang-llm: deepseek ep rank {rank} failed: {e:#}");
+                            #[cfg(feature = "ep")]
+                            if matches!(backend, Backend::Nccl) {
+                                eprintln!("tang-llm: exiting: the other ranks block in NCCL");
+                                std::process::exit(3);
+                            }
+                        }
                         if rtx.send(r).is_err() {
                             return;
                         }
