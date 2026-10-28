@@ -4,6 +4,35 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 (integration) — batcher + kda-gemv + moe + bench + step-graph merged: B300 30.8 tok/s decode (branch claude/glm5-integrate)
+
+Merged onto frog/glm5-forward 66aa4b5e: frog/glm5-batcher, claude/glm5-kda-gemv, claude/glm5-moe,
+claude/glm5-bench, claude/glm5-step-graph (NOT claude/glm5-mtp). Conflicts: NOTES.md (every entry
+kept); kda_dev.rs (whitespace around `Ok(Self {` vs gemv's `Self { .. }.with_seg_tables()`: gemv's);
+kda_decode.rs (gemv's G5F if/else around the proj launches; `mark(1)` after the proj stage as at
+66aa4b5e — the batcher's own merge had moved it before). moe_cuda.cuh / moe_gpu.rs auto-merged (gemv
+never touched moe_cuda.cuh; its qgemv9/17 handles are in). Fixup: `kda_g5f_real_bench` passes the
+batcher's new `slots` arg to `new_gguf` (cuda test build failed without it).
+
+Verified: local `cargo test -p tang-llm --lib flash::glm5` 40/0. mew (TANG_REQUIRE_CUDA=1, tiny):
+76 passed, 1 failed, 2 ignored — the failure is `engine_gpu_trace_is_transparent` ("a trace report"
+None), which fails the same way in the parallel suite at 66aa4b5e and at base+batcher, and passes
+run alone on the merged tree: pre-existing parallel-test flake, not a merge regression.
+
+B300 (scripts/glm5-bench.sh, src md5 matched, bin 31e14c85, all 45 FFNs on GPU, -n 128 on the
+238-token prompt). Base = `MOE=fast GEMV8=1 KDA_PF2=1 MHC_FUSED=1 MLA_RESIDENT=1 GPU_HEAD=1`.
+Every gate printed `785 1196 6801 264 6386 38038 911 279`. Stage = wall ms per decode token.
+
+| config | decode tok/s | trace wall/token | launches | kda | ffn | dsa | mhc_pre attn+ffn | head |
+|---|---|---|---|---|---|---|---|---|
+| base (was 22.87 at 66aa4b5e) | 25.19 | 35.5 ms | 1153 | 12.93 | 6.99 | 6.72 | 3.83+3.89 | 0.52 |
+| + KDA_G5F=2 (was 25.60) | 27.39 | 32.8 ms | 1017 | 10.31 | 7.00 | 6.72 | 3.82+3.81 | 0.53 |
+| + G5F=2 FUSED=1 GRAPH=1 | 30.85 | 29.9 ms | 647 | 6.88 | 7.10 | 6.80 | 3.96+3.90 | 0.59 |
+| same, repeat | 30.77 | 30.0 ms | 647 | 6.92 | 7.11 | 6.81 | 4.02+3.90 | 0.54 |
+
+Repeat spread 0.08 tok/s (0.3%). The KDA stage is now ~equal to ffn and dsa; dsa's o_proj
+(5.3 ms, sync+D2H per layer) and kda's sync+read are the remaining host waits.
+
 ## 2026-10-27 (late) — batched KDA decode: conv-slot offset fix, real-weights gate (H200, branch frog/glm5-batcher)
 
 Bug: a slot's conv history is `[chan][d_conv−1]` = conv_dim·(d_conv−1) floats (kda.rs
