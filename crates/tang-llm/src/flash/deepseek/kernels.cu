@@ -2141,7 +2141,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, con
                                                              const float* kv1, const int* idxs, float* part,
                                                              float* ml, int h, int d, int k, float scale, int S,
                                                              const float2* tab, const int* Pp, int rd, int add,
-                                                             int ps) {
+                                                             int ps, int, int, const int*, int, int) {
     extern __shared__ float fsm[];
     unsigned int* Qs = (unsigned int*)fsm;  // [64][FD_QP]
     unsigned int* Ks = Qs + 64 * FD_QP;     // [FD_KT][FD_QP]
@@ -2315,7 +2315,8 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
                                                               const float* kv1, const int* idxs, float* part,
                                                               float* ml, int h, int d, int k, float scale, int S,
                                                               const float2* tab, const int* Pp, int rd, int add,
-                                                              int ps) {
+                                                              int ps, int wmode, int win, const int* wsrc, int kc,
+                                                              int r0) {
     extern __shared__ float fsm[];
     unsigned int* Qs = (unsigned int*)fsm;       // [64][FD_QP]
     unsigned int* Ks = Qs + 64 * FD_QP;          // [FD_KT][FD_QP]
@@ -2351,8 +2352,25 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
     int t0 = (int)((long long)si * ntile / S), t1 = (int)((long long)(si + 1) * ntile / S);
     const int* ix = idxs + (long long)ti * k;
     for (int e = tid; e < (t1 - t0) * FD_KT; e += 256) {
-        int j = t0 * FD_KT + e;
-        Is[e] = j < k ? ix[j] : -1;
+        int j = t0 * FD_KT + e, v = -1;
+        if (j < k) {
+            if (!wmode) {
+                v = ix[j];
+            } else if (j >= win) {
+                v = wsrc[(long long)ti * kc + j - win];  // the top-k columns (ds_idx_cat's)
+            } else {
+                // the window columns, as dg_win_idx modes 1 / 3 at sp = P[0]
+                int sp = Pp[0];
+                if (wmode == 1) {
+                    int i = (sp % win + 1 + j) % win;
+                    v = i > sp ? -1 : i;
+                } else {
+                    int qq = sp + r0 + ti, cnt = min(win, qq + 1), pos = qq + 1 - cnt + j;
+                    v = j >= cnt ? -1 : (pos < sp ? pos % win : win + pos - sp);
+                }
+            }
+        }
+        Is[e] = v;
     }
     __syncthreads();
     // the next tile's keys in registers while this one computes (thread: 2 float4)
