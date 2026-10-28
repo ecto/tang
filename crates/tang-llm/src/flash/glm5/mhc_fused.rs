@@ -133,22 +133,44 @@ extern "C" __global__ void mhcf_part(float* r, const float* y, const float* post
 // pre/post/comb + Sinkhorn exactly as mhc.rs's mhc_pre (lane 0, serial), collapse
 // x = sum_s pre[s] r[s], and if nw != 0 the weighted RMSNorm x <- x * rsqrt(mean x^2 + eps)
 // * nw (f64 sum of squares, the CPU's rms_norm_mul).
-extern "C" __global__ void mhcf_finish(const float* r, const float* part, int ch,
-                                       const float* base, const float* scale, const float* nw,
-                                       float* x, float* post, float* comb, int n, int iters,
-                                       float hc_eps, float rms_eps, float norm_eps) {
-    const int t = blockIdx.x, tid = threadIdx.x;
+extern "C" __global__ void __launch_bounds__(1024) mhcf_finish(
+        const float* r, const float* part, int ch, const float* base, const float* scale,
+        const float* nw, float* x, float* post, float* comb, int n, int iters, float hc_eps,
+        float rms_eps, float norm_eps) {
+    // Block 1024 threads (>= OW + 32), dynamic smem max(n, ch*NP) floats. Every serial sum
+    // keeps the old one-block kernel's order exactly: the chunk reduction (25 threads), the
+    // Sinkhorn (one thread's registers, the old lane-0 loop) and the f64 sum of squares
+    // (owner o < OW sums i = o + k*OW, k ascending, then the warp tree and warps in order).
+    // The Sinkhorn (warp 0) runs concurrently with the sum of squares (warps 1..OW/32):
+    // pre needs only the sigmoid, not the doubly-stochastic comb.
+    extern __shared__ float sm[];
+    const int t = blockIdx.x, tid = threadIdx.x, bd = blockDim.x;
     const int hn = HC * n;
     __shared__ float sp[NP];
     __shared__ float pre[4];
+    __shared__ float sinv_s;
     __shared__ double red[32];
-    __shared__ float sinv;
+    const float* rt = r + (size_t)t * hn;
+    // prefetch this thread's r and norm weight (i = tid + k*bd, k < RK) so their DRAM
+    // latency overlaps the reductions; anything past RK*bd is read late below
+    #define RK 6
+    float q[RK][4], g[RK];
+    #pragma unroll
+    for (int k = 0; k < RK; k++) {
+        const int i = tid + k * bd;
+        #pragma unroll
+        for (int s = 0; s < 4; s++) q[k][s] = i < n ? rt[(size_t)s * n + i] : 0.f;
+        g[k] = (nw && i < n) ? nw[i] : 0.f;
+    }
+    const float* pt = part + (size_t)t * ch * NP;
+    for (int i = tid; i < ch * NP; i += bd) sm[i] = pt[i];
+    __syncthreads();
     if (tid < NP) {
         // ch counts 32-feature warp partials; 4 of them make one old 128-feature chunk,
         // summed first in warp order (the old block's order), then chunk by chunk.
         float s = 0.f;
         for (int c = 0; c < ch; c += 4) {
-            const float* pc = part + ((size_t)t * ch + c) * NP + tid;
+            const float* pc = sm + c * NP + tid;
             float b = 0.f;
             b += pc[0];
             b += pc[NP];
@@ -159,16 +181,43 @@ extern "C" __global__ void mhcf_finish(const float* r, const float* part, int ch
         sp[tid] = s;
     }
     __syncthreads();
+    const float inv = 1.0f / sqrtf(sp[24] / (float)hn + rms_eps);
+    if (tid < 4) {
+        pre[tid] = sigm_f((sp[tid] * inv) * scale[0] + base[tid]) + hc_eps;
+        post[(size_t)t * 4 + tid] = 2.0f * sigm_f((sp[4 + tid] * inv) * scale[1] + base[4 + tid]);
+    }
+    __syncthreads();   // pre visible; sp no longer written, sm (the part copy) free
+    float* xt = x + (size_t)t * n;
+    const float p0 = pre[0], p1 = pre[1], p2 = pre[2], p3 = pre[3];
+    #pragma unroll
+    for (int k = 0; k < RK; k++) {
+        const int i = tid + k * bd;
+        if (i < n) {
+            float a = 0.f;
+            a = fmaf(p0, q[k][0], a);
+            a = fmaf(p1, q[k][1], a);
+            a = fmaf(p2, q[k][2], a);
+            a = fmaf(p3, q[k][3], a);
+            sm[i] = a;
+            if (!nw) xt[i] = a;
+        }
+    }
+    for (int i = tid + RK * bd; i < n; i += bd) {
+        float a = 0.f;
+        a = fmaf(p0, rt[i], a);
+        a = fmaf(p1, rt[(size_t)n + i], a);
+        a = fmaf(p2, rt[(size_t)2 * n + i], a);
+        a = fmaf(p3, rt[(size_t)3 * n + i], a);
+        sm[i] = a;
+        if (!nw) xt[i] = a;
+    }
+    __syncthreads();
+    #define OW 256
     if (tid < 32) {
         // lane i (mod 16) owns comb[i] = cb[s*4+d]; every sum gathers its 4 terms by
-        // shuffle and adds them in the serial reference's order, so the result is
-        // bit-identical to the old lane-0 loop.
+        // shuffle and adds them in the old serial loop's order (bit-identical; a
+        // one-thread register loop is ~2x slower: its divides serialize)
         const int i = tid & 15, s = i >> 2, d = i & 3;
-        const float inv = 1.0f / sqrtf(sp[24] / (float)hn + rms_eps);
-        if (tid < 4) {
-            pre[tid] = sigm_f((sp[tid] * inv) * scale[0] + base[tid]) + hc_eps;
-            post[(size_t)t * 4 + tid] = 2.0f * sigm_f((sp[4 + tid] * inv) * scale[1] + base[4 + tid]);
-        }
         const float e = expf((sp[8 + i] * inv) * scale[2] + base[8 + i]);
         const unsigned F = 0xffffffffu;
         float z = 0.f;
@@ -190,30 +239,31 @@ extern "C" __global__ void mhcf_finish(const float* r, const float* part, int ch
         }
         if (tid < 16) comb[(size_t)t * 16 + i] = cb;
     }
-    __syncthreads();
-    const float* rt = r + (size_t)t * hn;
-    float* xt = x + (size_t)t * n;
-    double ss = 0.0;
-    for (int i = tid; i < n; i += blockDim.x) {
-        float a = 0.f;
-        #pragma unroll
-        for (int s = 0; s < 4; s++) a = fmaf(pre[s], rt[(size_t)s * n + i], a);
-        xt[i] = a;
-        ss += (double)a * (double)a;
+    if (!nw) return;   // uniform (after the comb: warp 0 owns it)
+    const int o = tid - 32;   // owners are warps 1..OW/32
+    if (o >= 0 && o < OW) {
+        double ss = 0.0;
+        for (int i = o; i < n; i += OW) {
+            const float a = sm[i];
+            ss += (double)a * (double)a;
+        }
+        ss = wsum_d(ss);
+        if ((o & 31) == 0) red[o >> 5] = ss;
     }
-    if (!nw) return;   // uniform
-    ss = wsum_d(ss);
-    const int lane = tid & 31, wid = tid >> 5, nwarp = blockDim.x >> 5;
-    if (lane == 0) red[wid] = ss;
     __syncthreads();
-    if (tid == 0) {
+    if (tid == 32) {
         double s = 0.0;
-        for (int w = 0; w < nwarp; w++) s += red[w];
-        sinv = 1.0f / sqrtf((float)(s / (double)n) + norm_eps);
+        for (int w = 0; w < OW / 32; w++) s += red[w];
+        sinv_s = 1.0f / sqrtf((float)(s / (double)n) + norm_eps);
     }
     __syncthreads();
-    const float rr = sinv;
-    for (int i = tid; i < n; i += blockDim.x) xt[i] = xt[i] * rr * nw[i];
+    const float rr = sinv_s;
+    #pragma unroll
+    for (int k = 0; k < RK; k++) {
+        const int i = tid + k * bd;
+        if (i < n) xt[i] = sm[i] * rr * g[k];
+    }
+    for (int i = tid + RK * bd; i < n; i += bd) xt[i] = sm[i] * rr * nw[i];
 }
 "#;
 
@@ -375,6 +425,9 @@ impl MhcFused {
             bail!("mhc fused: norm weights not {n} wide");
         }
         let ch = n.div_ceil(128) * 4;
+        if n.max(ch * 25) * 4 > 46 * 1024 {
+            bail!("mhc fused: n {n} needs more than 46 KiB of mhcf_finish shared memory");
+        }
         let f4 = |k: usize| DevBuf::alloc(k * 4);
         let norm = norms
             .iter()
@@ -504,8 +557,8 @@ impl MhcFused {
             tang_moe::gpu::launch(
                 f,
                 (self.t as u32, 1, 1),
-                (256, 1, 1),
-                0,
+                (1024, 1, 1),
+                (self.n.max(self.ch * 25) * 4) as u32,
                 &self.s,
                 tang_moe::args![r, part, ch, base, scale, nw, x, post, comb, n, it, hc_eps, rms_eps, ne],
             )
