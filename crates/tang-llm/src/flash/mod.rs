@@ -22,6 +22,7 @@ pub mod mtp;
 pub mod mtp_gpu;
 #[cfg(feature = "mtp-train")]
 pub mod mtp_train;
+pub mod memserve;
 pub mod memstore;
 pub mod ngram;
 pub mod pack;
