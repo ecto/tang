@@ -103,6 +103,8 @@ pub struct Kernels {
     /// `ds_moe_{gu,down}_f{fmt}_t{tm}`, the grouped MoE projections, by (fmt - 2, log2 tm,
     /// down).
     moe: [[[Func; 2]; 4]; 2],
+    /// `ds_moe_ks_{gu,down}_f{fmt}`, the grouped MoE on the K-split path, by (fmt - 2, down).
+    moe_ks: [[Func; 2]; 2],
     attn_qk: Func,
     attn_soft: Func,
     attn_pv: Func,
@@ -169,6 +171,8 @@ const KS_PART: usize = 1 << 21;
 const KS_CNT: usize = 1 << 13;
 /// Bytes for the quantized activation: 8 tokens × 16384 columns, codes and scales.
 const KS_X: usize = 8 * 16384 * 2;
+/// Row groups each grouped K-split block takes (blockIdx.x strides them).
+const MOE_KS_ITEMS: usize = 4;
 
 /// `__CUDA_ARCH__` the module was built for.
 fn arch(m: &Module) -> Result<i32> {
@@ -251,6 +255,10 @@ impl Kernels {
             sinkhorn: m.func("ds_sinkhorn")?,
             fast: lin_table(&m, "ds_lin")?,
             moe: moe_table(&m)?,
+            moe_ks: [
+                [m.func("ds_moe_ks_gu_f2")?, m.func("ds_moe_ks_down_f2")?],
+                [m.func("ds_moe_ks_gu_f3")?, m.func("ds_moe_ks_down_f3")?],
+            ],
             ks: [
                 [m.func("ds_ks_f2_g0")?, m.func("ds_ks_f2_g1")?],
                 [m.func("ds_ks_f3_g0")?, m.func("ds_ks_f3_g1")?],
@@ -270,7 +278,16 @@ impl Kernels {
                 let mx = g.attribute(
                     cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
                 )?;
-                for n in ["ds_ks_f2_g0", "ds_ks_f2_g1", "ds_ks_f3_g0", "ds_ks_f3_g1"] {
+                for n in [
+                    "ds_ks_f2_g0",
+                    "ds_ks_f2_g1",
+                    "ds_ks_f3_g0",
+                    "ds_ks_f3_g1",
+                    "ds_moe_ks_gu_f2",
+                    "ds_moe_ks_gu_f3",
+                    "ds_moe_ks_down_f2",
+                    "ds_moe_ks_down_f3",
+                ] {
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
                             m.func(n)?,
@@ -644,6 +661,47 @@ impl Kernels {
         Ok(())
     }
 
+    /// Whether the grouped K-split kernels take `t` <= 8 tokens per expert over `cols`
+    /// columns, with `n` activation rows to quantize into `ks_x`.
+    fn moe_ks_ok(&self, t: usize, cols: usize, n: usize) -> bool {
+        let pitch = cols.div_ceil(128) * 128 + 32;
+        (1..=8).contains(&t)
+            && cols % 32 == 0
+            && cols > 0
+            && n * cols <= 8 * 16384
+            && t * pitch + t * (cols / 32) * 4 <= self.smem_max
+    }
+
+    /// `ds_ks_quant` of `n` rows × `cols` at `x` into `ks_x`: (codes, scales).
+    fn ks_quantize(&self, s: &Stream, x: u64, n: usize, cols: usize) -> Result<(u64, u64)> {
+        let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
+        let ng = (n * cols / 32) as i32;
+        unsafe {
+            super::obs::launch(
+                self.ks_quant,
+                blocks(n * cols, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![x, codes, scales, ng],
+            )?
+        }
+        Ok((codes, scales))
+    }
+
+    /// The grouped K-split shape for one expert's `rows` × `cols` (`out` rows a warp tile):
+    /// S K-slices a block (≥ 8 groups a warp), its nbr row groups, and the blocks per slot,
+    /// each striding over ~4 row groups so the staged activation amortizes over weights.
+    fn moe_ks_grid(rows: usize, out: usize, cols: usize) -> (usize, usize, usize) {
+        let nch = cols / 32;
+        let mut sp = 1;
+        while sp < 8 && nch >= sp * 2 * 8 {
+            sp *= 2;
+        }
+        let nbr = rows.div_ceil(out).div_ceil(8 / sp).max(1);
+        (sp, nbr, nbr.div_ceil(MOE_KS_ITEMS))
+    }
+
     /// Grouped MoE gate/up + SwiGLU for every routed expert of a layer in one launch (see
     /// `DS_MOE` in kernels.cu): `w1s`/`w3s` device arrays of [`DsW`] per expert (format
     /// `fmt`, `inter` rows), `elist` [slots] from `ds_moe_plan`, the CSR of [`Kernels::route`],
@@ -665,8 +723,28 @@ impl Kernels {
         t: usize,
         slots: usize,
         inter: usize,
+        d: usize,
         lim: f32,
     ) -> Result<()> {
+        if !self.exact && self.moe_ks_ok(t, d, t) {
+            let f = self.moe_ks[fmt as usize - 2][0];
+            let (codes, scales) = self.ks_quantize(s, xq, t, d)?;
+            let (sp, nbr, gx) = Self::moe_ks_grid(inter, 8, d);
+            let (si, nbri) = (sp as i32, nbr as i32);
+            unsafe {
+                super::obs::launch(
+                    f,
+                    (gx as u32, slots.max(1) as u32, 1),
+                    (256, 1, 1),
+                    (t * (d.div_ceil(128) * 128 + 32) + t * (d / 32) * 4) as u32,
+                    s,
+                    tang_moe::args![
+                        w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri
+                    ],
+                )?
+            }
+            return Ok(());
+        }
         let f = self.moe[fmt as usize - 2][tm_index(t)?][0];
         let grid = (inter.div_ceil(2).div_ceil(4) as u32, slots.max(1) as u32, 1);
         unsafe {
@@ -697,7 +775,27 @@ impl Kernels {
         t: usize,
         slots: usize,
         d: usize,
+        inter: usize,
+        topk: usize,
     ) -> Result<()> {
+        let n = t * topk;
+        if !self.exact && self.moe_ks_ok(t, inter, n) {
+            let f = self.moe_ks[fmt as usize - 2][1];
+            let (codes, scales) = self.ks_quantize(s, hq, n, inter)?;
+            let (sp, nbr, gx) = Self::moe_ks_grid(d, 16, inter);
+            let (si, nbri) = (sp as i32, nbr as i32);
+            unsafe {
+                super::obs::launch(
+                    f,
+                    (gx as u32, slots.max(1) as u32, 1),
+                    (256, 1, 1),
+                    (t * (inter.div_ceil(128) * 128 + 32) + t * (inter / 32) * 4) as u32,
+                    s,
+                    tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri],
+                )?
+            }
+            return Ok(());
+        }
         let f = self.moe[fmt as usize - 2][tm_index(t)?][1];
         let grid = (d.div_ceil(4).div_ceil(4) as u32, slots.max(1) as u32, 1);
         unsafe {
@@ -1305,6 +1403,184 @@ mod tests {
         }
     }
 
+    /// [`check`]'s bar for random weights, where a sum can cancel to far below its terms:
+    /// ≤ 0.5% of elements differ, each a bf16 neighbour or within 2^-8 of the output's scale
+    /// (the K-split's reduction order against the exact kernels').
+    fn check_abs(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len());
+        let m = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let mut diff = 0;
+        for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+            if a.to_bits() == b.to_bits() {
+                continue;
+            }
+            diff += 1;
+            let (ua, ub) = ((a.to_bits() >> 16) as i32, (b.to_bits() >> 16) as i32);
+            let near =
+                (a.signum() == b.signum() && (ua - ub).abs() == 1) || (a - b).abs() <= m / 256.0;
+            assert!(near, "{what}: [{i}] {a} vs {b} (scale {m})");
+        }
+        assert!(
+            diff as f64 <= 0.005 * got.len() as f64,
+            "{what}: {diff} of {} differ",
+            got.len()
+        );
+    }
+
+    /// Random fp8 (fmt 2) or fp4 (fmt 3) weight [rows, cols], kept alive in `keep`.
+    fn rand_w(fmt: i32, rows: usize, cols: usize, seed: u64, keep: &mut Vec<DevBuf>) -> DsW {
+        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let mut rb = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let mut wb = rb(if fmt == 3 {
+            rows * cols / 2
+        } else {
+            rows * cols
+        });
+        if fmt == 2 {
+            for b in &mut wb {
+                if *b & 0x7f == 0x7f {
+                    *b = 0x10; // no NaN codes
+                }
+            }
+        }
+        let ns = if fmt == 3 {
+            rows * cols / 32
+        } else {
+            rows.div_ceil(32) * cols / 32
+        };
+        let sb: Vec<u8> = rb(ns).iter().map(|b| 118 + b % 8).collect();
+        let (w, sc) = (
+            DevBuf::from_slice(&wb).unwrap(),
+            DevBuf::from_slice(&sb).unwrap(),
+        );
+        let v = DsW {
+            w: w.ptr,
+            s: sc.ptr,
+            rows: rows as i32,
+            cols: cols as i32,
+            fmt,
+            _pad: 0,
+        };
+        keep.push(w);
+        keep.push(sc);
+        v
+    }
+
+    /// The grouped K-split MoE kernels against the grouped exact ones (bit-identical to the
+    /// per-expert loop), h and the down partials, under the fast-path bar, for fp8 and fp4,
+    /// decode and verify widths, distinct and shared experts.
+    #[test]
+    fn moe_grouped_ks_matches_exact() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let mut k = Kernels::new(&g).unwrap();
+        if k.exact {
+            eprintln!("exact build: nothing to compare");
+            return;
+        }
+        let s = Stream::blocking().unwrap();
+        let (ne, topk, d, inter) = (32usize, 4usize, 1024usize, 512usize);
+        for fmt in [2, 3] {
+            let mut keep = Vec::new();
+            let (mut w1, mut w3, mut w2) = (vec![], vec![], vec![]);
+            for e in 0..ne as u64 {
+                w1.push(rand_w(fmt, inter, d, 3 * e + 1, &mut keep));
+                w3.push(rand_w(fmt, inter, d, 3 * e + 2, &mut keep));
+                w2.push(rand_w(fmt, d, inter, 3 * e + 3, &mut keep));
+            }
+            let (w1, w3, w2) = (
+                DevBuf::from_slice(&w1).unwrap(),
+                DevBuf::from_slice(&w3).unwrap(),
+                DevBuf::from_slice(&w2).unwrap(),
+            );
+            let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
+            for t in [1, 2, 3, 6, 8] {
+                for shared in [false, true] {
+                    let n = t * topk;
+                    let ids: Vec<i32> = (0..n)
+                        .map(|i| {
+                            let (ti, j) = (i / topk, i % topk);
+                            if shared {
+                                (j * 5 + 1) as i32
+                            } else {
+                                ((ti * 7 + j * 3 + 2) % ne) as i32
+                            }
+                        })
+                        .collect();
+                    let wts = DevBuf::from_slice(&data(n, 9 + t as u64, 1.0)).unwrap();
+                    let ids = DevBuf::from_slice(&ids).unwrap();
+                    let (counts, off) = (
+                        DevBuf::alloc(ne * 4).unwrap(),
+                        DevBuf::alloc((ne + 1) * 4).unwrap(),
+                    );
+                    let (rows, rw) = (DevBuf::alloc(n * 4).unwrap(), DevBuf::alloc(n * 4).unwrap());
+                    k.route(
+                        &s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+                    )
+                    .unwrap();
+                    let x = DevBuf::from_slice(&data(t * d, 3 + t as u64, 2.0)).unwrap();
+                    k.fp8_qdq(&s, x.ptr, t * d).unwrap();
+                    let slots = n.min(ne);
+                    let elist = DevBuf::alloc(slots * 4).unwrap();
+                    let (nei, ci) = (ne as i32, slots as i32);
+                    unsafe {
+                        k.go(
+                            "ds_moe_plan",
+                            (1, 1, 1),
+                            (32, 1, 1),
+                            0,
+                            &s,
+                            tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+                        )
+                        .unwrap();
+                    }
+                    let mut gu = |exact: bool| -> Vec<f32> {
+                        k.exact = exact;
+                        let h = DevBuf::from_slice(&vec![0f32; n * inter]).unwrap();
+                        k.moe_gu(
+                            &s, fmt, w1.ptr, w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, x.ptr,
+                            h.ptr, t, slots, inter, d, 10.0,
+                        )
+                        .unwrap();
+                        s.sync().unwrap();
+                        h.read::<f32>(0, n * inter).unwrap()
+                    };
+                    let (he, hk) = (gu(true), gu(false));
+                    // down from the same (exact, quantized) h on both paths
+                    let hx = DevBuf::from_slice(&he).unwrap();
+                    k.fp8_qdq(&s, hx.ptr, n * inter).unwrap();
+                    let mut down = |exact: bool| -> Vec<f32> {
+                        k.exact = exact;
+                        let part = DevBuf::from_slice(&vec![0f32; n * d]).unwrap();
+                        k.moe_down(
+                            &s, fmt, w2.ptr, elist.ptr, off.ptr, hx.ptr, part.ptr, t, slots, d,
+                            inter, topk,
+                        )
+                        .unwrap();
+                        s.sync().unwrap();
+                        part.read::<f32>(0, n * d).unwrap()
+                    };
+                    let (pe, pk) = (down(true), down(false));
+                    k.exact = false;
+                    let what = format!("fmt {fmt} t {t} shared {shared}");
+                    check_abs(&hk, &he, &format!("{what} gu"));
+                    check_abs(&pk, &pe, &format!("{what} down"));
+                    assert!(he.iter().any(|&v| v != 0.0) && pe.iter().any(|&v| v != 0.0));
+                }
+            }
+            eprintln!("fmt {fmt}: grouped K-split within the fast-path bar");
+        }
+    }
+
     /// One layer's routed MoE by the grouped kernels at the real shapes (384 experts, top-6,
     /// d = 5120, inter = 2304, fp4) with random weights: plan, GU, h quant, down, reduce
     /// (manual: `--ignored --nocapture moe_grouped_bench`). Bytes = the live experts' weights
@@ -1314,7 +1590,7 @@ mod tests {
     fn moe_grouped_bench() {
         let Some(g) = Gpu::for_test() else { return };
         g.bind().unwrap();
-        let k = Kernels::new(&g).unwrap();
+        let mut k = Kernels::new(&g).unwrap();
         let s = Stream::blocking().unwrap();
         let peak: f64 = std::env::var("DS_PEAK_GBS")
             .ok()
@@ -1376,7 +1652,7 @@ mod tests {
         );
         let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
         eprintln!(
-            "\n| t | routing | live experts | µs | GB/s | % of {peak} |\n|---|---|---|---|---|---|"
+            "\n| t | routing | live experts | exact µs | exact GB/s | K-split µs | K-split GB/s | % of {peak} |\n|---|---|---|---|---|---|---|---|"
         );
         for (t, label) in [(1, "6 experts"), (6, "36 distinct"), (6, "6 shared")] {
             let n = t * topk;
@@ -1410,7 +1686,8 @@ mod tests {
                 DevBuf::alloc(t * d * 4).unwrap(),
             );
             let slots = n;
-            let run = || {
+            let mut run = |exact: bool| {
+                k.exact = exact;
                 let (nei, ci) = (ne as i32, slots as i32);
                 let (ti, ki, di) = (t as i32, topk as i32, d as i32);
                 unsafe {
@@ -1426,12 +1703,12 @@ mod tests {
                 }
                 k.moe_gu(
                     &s, 3, w1.ptr, w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, x.ptr, h.ptr, t,
-                    slots, inter, 10.0,
+                    slots, inter, d, 10.0,
                 )
                 .unwrap();
                 k.fp8_qdq(&s, h.ptr, n * inter).unwrap();
                 k.moe_down(
-                    &s, 3, w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d,
+                    &s, 3, w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d, inter, topk,
                 )
                 .unwrap();
                 unsafe {
@@ -1448,20 +1725,27 @@ mod tests {
                     .unwrap();
                 }
             };
-            run();
-            s.sync().unwrap();
-            let iters = 20;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                run();
-            }
-            s.sync().unwrap();
-            let sec = t0.elapsed().as_secs_f64() / iters as f64;
-            let gbs = (live * per) as f64 / sec / 1e9;
+            let mut time = |exact: bool| {
+                run(exact);
+                s.sync().unwrap();
+                let iters = 20;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    run(exact);
+                }
+                s.sync().unwrap();
+                t0.elapsed().as_secs_f64() / iters as f64
+            };
+            let (te, tk) = (time(true), time(false));
+            let (ge, gk) = (
+                (live * per) as f64 / te / 1e9,
+                (live * per) as f64 / tk / 1e9,
+            );
             eprintln!(
-                "| {t} | {label} | {live} | {:.0} | {gbs:.0} | {:.0}% |",
-                sec * 1e6,
-                100.0 * gbs / peak
+                "| {t} | {label} | {live} | {:.0} | {ge:.0} | {:.0} | {gk:.0} | {:.0}% |",
+                te * 1e6,
+                tk * 1e6,
+                100.0 * gk / peak
             );
         }
     }

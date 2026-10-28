@@ -1531,14 +1531,15 @@ impl GpuModel {
         let lim = self.cpu.cfg.swiglu_limit;
         self.k.moe_gu(
             &self.s, tab.fmt, tab.w1.ptr, tab.w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, xq.ptr,
-            h.ptr, t, slots, inter, lim,
+            h.ptr, t, slots, inter, d, lim,
         )?;
         self.k.fp8_qdq(&self.s, h.ptr, n * inter)?;
         self.end(s);
         let s = self.span("grouped_down");
         let part = self.fbuf(n * d)?;
         self.k.moe_down(
-            &self.s, tab.fmt, tab.w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d,
+            &self.s, tab.fmt, tab.w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d, inter,
+            topk,
         )?;
         let y = self.fbuf(t * d)?;
         let (ti, ki, di) = (t as i32, topk as i32, d as i32);
@@ -2578,8 +2579,10 @@ mod tests {
         assert!(b.expert_misses() > a.expert_misses());
     }
 
-    /// The grouped MoE kernels give the per-expert loop's logits and hiddens bit for bit, on
-    /// decode steps and 6-token verify windows (prefill takes the loop in both).
+    /// The grouped MoE kernels against the per-expert loop (exact `ds_linear_csr`), on decode
+    /// steps and 6-token verify windows (prefill takes the loop in both): bit for bit under
+    /// DS_EXACT=1; on the K-split path (one bf16 ulp in rare elements per GEMV, compounding
+    /// through the layers) the same argmax, logits KL < 1e-3 and hiddens rel < 2e-2.
     #[test]
     fn gpu_tiny_moe_grouped_matches_loop() {
         let Some((_, meta)) = open() else { return };
@@ -2589,6 +2592,23 @@ mod tests {
         a.moe_grouped = true;
         b.moe_grouped = false;
         let (v, n) = (a.cpu.cfg.vocab_size, ids.len());
+        let exact = a.k.exact;
+        let same = |la: &[f32], lb: &[f32], ma: &[f32], mb: &[f32], what: &str| {
+            if exact {
+                assert_eq!(la, lb, "{what}");
+                assert_eq!(ma, mb, "{what} hiddens");
+                return;
+            }
+            let rh = rel(ma, mb);
+            let mut kd = 0f64;
+            for (pa, pb) in la.chunks(v).zip(lb.chunks(v)) {
+                assert_eq!(argmax(pa), argmax(pb), "{what} argmax");
+                kd = kd.max(kl(pb, pa));
+            }
+            eprintln!("{what}: logits KL {kd:.2e}, hiddens rel {rh:.2e}");
+            assert!(kd < 1e-3, "{what}: KL {kd:e}");
+            assert!(rh < 2e-2, "{what}: hiddens rel {rh:e}");
+        };
         let (la, _) = a.forward(&ids, 0, None).unwrap();
         let (lb, _) = b.forward(&ids, 0, None).unwrap();
         assert_eq!(la, lb, "prefill");
@@ -2597,8 +2617,7 @@ mod tests {
         for i in 0..6 {
             let (la, ma) = a.forward(&[tok], pos, None).unwrap();
             let (lb, mb) = b.forward(&[tok], pos, None).unwrap();
-            assert_eq!(la, lb, "decode step {i}");
-            assert_eq!(ma, mb, "decode step {i} hiddens");
+            same(&la, &lb, &ma, &mb, &format!("decode step {i}"));
             tok = argmax(&la);
             pos += 1;
         }
@@ -2606,8 +2625,7 @@ mod tests {
             let win: Vec<usize> = (0..6).map(|i| (tok + 31 * i + round) % v).collect();
             let (la, ma) = a.forward_all(&win, pos).unwrap();
             let (lb, mb) = b.forward_all(&win, pos).unwrap();
-            assert_eq!(la, lb, "verify window {round}");
-            assert_eq!(ma, mb, "verify window {round} hiddens");
+            same(&la, &lb, &ma, &mb, &format!("verify window {round}"));
             pos += 6;
             tok = argmax(&la[5 * v..]);
         }

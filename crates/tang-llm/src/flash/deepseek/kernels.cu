@@ -751,7 +751,7 @@ template <int FMT, int GU>
 __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __restrict__ xc,
                                         const float* __restrict__ xsc, float* __restrict__ y, int t, int round,
                                         const float* __restrict__ rw, float lim, int S, int SB, int nbr, float* part,
-                                        int* cnt) {
+                                        int* cnt, const int* __restrict__ xi) {
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ float red[8][4][32];
     __shared__ int last;
@@ -761,9 +761,14 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
     const float POW = (FMT == 3 ? 16384.f : 256.f) * 256.f;
     for (int e = threadIdx.x; e < t * cols / 16; e += blockDim.x) {
         int ti = e / (cols / 16), c = e % (cols / 16);
-        *(uint4*)(xs + ti * P + c * 16) = __ldg((const uint4*)(xc + (long long)ti * cols) + c);
+        long long xr = xi ? __ldg(xi + ti) : ti;
+        *(uint4*)(xs + ti * P + c * 16) = __ldg((const uint4*)(xc + xr * cols) + c);
     }
-    for (int e = threadIdx.x; e < t * nch; e += blockDim.x) sx[e] = __ldg(xsc + e) * POW;
+    for (int e = threadIdx.x; e < t * nch; e += blockDim.x) {
+        int ti = e / nch, c = e % nch;
+        long long xr = xi ? __ldg(xi + ti) : ti;
+        sx[e] = __ldg(xsc + xr * nch + c) * POW;
+    }
     __syncthreads();
     int wib = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
     int RW = 8 / S, rwi = wib / S, si = wib % S;
@@ -892,12 +897,43 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
     extern "C" __global__ void __launch_bounds__(256) ds_ks_f##F##_g##G(                                        \
         DsW w, DsW w3, const unsigned char* xc, const float* xsc, float* y, int t, int round, const float* rw,  \
         float lim, int S, int SB, int nbr, float* part, int* cnt) {                                             \
-        lin_mma<F, G>(w, w3, xc, xsc, y, t, round, rw, lim, S, SB, nbr, part, cnt);                             \
+        lin_mma<F, G>(w, w3, xc, xsc, y, t, round, rw, lim, S, SB, nbr, part, cnt, 0);                           \
     }
 DS_KS(2, 0)
 DS_KS(3, 0)
 DS_KS(2, 1)
 DS_KS(3, 1)
+
+// Grouped MoE on the K-split path: the DS_MOE contract (blockIdx.y a slot of `elist`, expert
+// e's rows its CSR segment off[e]..off[e+1], at most 8) with lin_mma per slot, SB = 1 (no
+// cross-block partials: the slots give the parallelism) and blockIdx.x striding the expert's
+// nbr row groups. The activation codes/scales come from ds_ks_quant: GU gathers the token rows
+// of xc [t][d] through `rows`; down reads hq's codes [t*k][inter] at the segment.
+#define DS_MOE_KS(F)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_gu_f##F(                                       \
+        const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
+        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) {                      \
+        int e = elist[blockIdx.y];                                                                              \
+        if (e < 0) return;                                                                                      \
+        int o = off[e], n = off[e + 1] - o;                                                                     \
+        if (n <= 0) return;                                                                                     \
+        DsW w = w1s[e];                                                                                         \
+        lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, n, 1, rw + o, lim, S, 1, nbr, 0, 0,       \
+                      rows + o);                                                                                \
+    }                                                                                                           \
+    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_down_f##F(                                     \
+        const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
+        float* part, int S, int nbr) {                                                                          \
+        int e = elist[blockIdx.y];                                                                              \
+        if (e < 0) return;                                                                                      \
+        int o = off[e], n = off[e + 1] - o;                                                                     \
+        if (n <= 0) return;                                                                                     \
+        DsW w = w2s[e];                                                                                         \
+        lin_mma<F, 0>(w, w, hc + (long long)o * w.cols, hsc + (long long)o * (w.cols / 32),                    \
+                      part + (long long)o * w.rows, n, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                          \
+    }
+DS_MOE_KS(2)
+DS_MOE_KS(3)
 
 // ---- tiled sparse attention (default; DS_EXACT=1 selects ds_sparse_attn) ---------------------
 //
