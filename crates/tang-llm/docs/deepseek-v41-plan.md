@@ -189,6 +189,13 @@ tok/s (noise), acceptance 152/235 unchanged. Launch count alone buys little here
 kernels are latency-bound in themselves (~45 µs a sparse_attn span for ~8 MB of keys).
 `DS_ATTN_FUSE=1` (soft+pv in one launch) measured no better (3.84 ms) and stays opt-in.
 
+Wave 7a merged (sample + attn3 first step, 15a7af70) on the **1017 weights** (swapped in
+2026-10-28 20:18 UTC; the Oct 16 `chat_template.jinja` copied over), 8× H100, 200 tokens:
+greedy **134.9 / 134.2** tok/s (47 steps, 152/230), sampled T=0.6 **131.7 / 132.0** (45–46
+steps, 156–157/220–225), sampled T=1.0 top-p 1.0 (DeepSeek's recommendation) 122.2 (49 steps,
+152/240), direct path greedy 101.6; prefill 460–475 tok/s. Full GPU suite green on mew (19
+engine/EP/forward + 17 kernel tests).
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
