@@ -189,6 +189,15 @@ tok/s (noise), acceptance 152/235 unchanged. Launch count alone buys little here
 kernels are latency-bound in themselves (~45 µs a sparse_attn span for ~8 MB of keys).
 `DS_ATTN_FUSE=1` (soft+pv in one launch) measured no better (3.84 ms) and stays opt-in.
 
+Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
+continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
+byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
+speed numbers carry over. DeepSeek reports better reasoning/coding/agentic scores and shorter
+outputs; recommended sampling T=1.0, top-p 1.0. Packaging differs: no `chat_template.jinja` (the
+formatting lives in `encoding/encoding.py` with test vectors under `encoding/tests/`, worth
+using as conformance vectors for the Rust formatter). Not yet on the pod: its 700 GB volume
+holds the Oct 16 weights (476 GB) and cannot hold both.
+
 Wave 6 as merged (895f89b0 → bab5bcfc): attention fusion (one
 grouped K-split launch for wo, 19 → 2 launches, 143 → 54 µs on a 3090; q + window_kv fused,
 the compressor/indexer key side batched over the window, ~150 → ~30 attention launches per
