@@ -279,29 +279,27 @@ impl Model {
         // DeepSeek's repo ships its runtime config as inference/config.json (the top-level one
         // is in Hugging Face's format); the tiny fixture writes it at the top
         let inf = dir.join("inference/config.json");
-        let mut cfg = Config::load(&if inf.exists() {
+        let cfg = Config::load(&if inf.exists() {
             inf
         } else {
             dir.join("config.json")
         })?;
-        if let Some(n) = std::env::var("DS41_CTX").ok().and_then(|v| v.parse().ok()) {
-            cfg.max_seq_len = n;
-        }
-        let st = St::open(dir)?;
+        let mut st = St::open(dir)?;
         let engram = if cfg.engram_layer_ids.is_empty() {
             None
         } else {
-            // the tables stay on the host and are read by row per step: warm them now
-            // (`DS_ENGRAM_PREFAULT=0` skips it), or every cold row is a disk/network read
-            if std::env::var("DS_ENGRAM_PREFAULT").map_or(true, |v| v != "0") {
+            // the tables stay on the host and are read by row per step: copy them into memory
+            // now (`DS_ENGRAM_PIN=0` leaves them memory-mapped), or every cold row is a
+            // disk/network read
+            if std::env::var("DS_ENGRAM_PIN").map_or(true, |v| v != "0") {
                 let t0 = std::time::Instant::now();
                 for &l in &cfg.engram_layer_ids {
                     for w in ["weight", "scale"] {
-                        st.prefault(&format!("layers.{l}.engram.embed.{w}"))?;
+                        st.pin(&format!("layers.{l}.engram.embed.{w}"))?;
                     }
                 }
                 eprintln!(
-                    "deepseek: engram tables faulted in {:.1} s",
+                    "deepseek: engram tables pinned in {:.1} s",
                     t0.elapsed().as_secs_f64()
                 );
             }

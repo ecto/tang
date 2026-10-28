@@ -107,7 +107,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let s =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Ok(serde_json::from_str(&s)?)
+        let mut cfg: Self = serde_json::from_str(&s)?;
+        if let Some(n) = std::env::var("DS41_CTX").ok().and_then(|v| v.parse().ok()) {
+            cfg.max_seq_len = n;
+        }
+        Ok(cfg)
     }
 
     /// Routed experts and how many a token picks, for layer `lid` (DSpark stages have their own).

@@ -8,7 +8,8 @@
 use anyhow::{bail, ensure, Context, Result};
 use memmap2::Mmap;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use super::quant::{e4m3_to_f32, e8m0_to_f32, fp4_to_f32};
 
@@ -54,9 +55,16 @@ pub struct Info {
 }
 
 pub struct St {
+    files: Vec<PathBuf>,
     maps: Vec<Mmap>,
     index: HashMap<String, Info>,
+    /// Tensors copied out of the maps into anonymous memory (see [`St::pin`]).
+    pinned: HashMap<String, Arc<[u8]>>,
 }
+
+/// Pinned tensors, shared by every `St` of the process over the same file (the expert-parallel
+/// ranks each open the checkpoint): keyed by (file, tensor).
+static PINNED: Mutex<Option<HashMap<(PathBuf, String), Arc<[u8]>>>> = Mutex::new(None);
 
 impl St {
     /// Every `*.safetensors` in `dir`.
@@ -117,7 +125,12 @@ impl St {
             }
             maps.push(map);
         }
-        Ok(Self { maps, index })
+        Ok(St {
+            files,
+            maps,
+            index,
+            pinned: HashMap::new(),
+        })
     }
 
     /// Every tensor name, unordered.
@@ -136,8 +149,54 @@ impl St {
     }
 
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
+        if let Some(p) = self.pinned.get(name) {
+            return Ok(p);
+        }
         let i = self.info(name)?;
         Ok(&self.maps[i.file][i.start..i.end])
+    }
+
+    /// Copy a tensor out of its map into anonymous memory, so later reads never go back to the
+    /// file. For tables read a few random rows at a time (Engram's, 100 GB each): on a network
+    /// mount a cold row is a round trip (~2 ms on RunPod's MooseFS), and the page cache that
+    /// `prefault` fills is evicted again within the hour there. One copy per (file, tensor) per
+    /// process, shared by every `St` over the same checkpoint. The copy reads in parallel.
+    pub fn pin(&mut self, name: &str) -> Result<()> {
+        if self.pinned.contains_key(name) {
+            return Ok(());
+        }
+        let i = self.info(name)?.clone();
+        let key = (self.files[i.file].clone(), name.to_string());
+        let mut g = PINNED.lock().unwrap();
+        let cache = g.get_or_insert_with(HashMap::new);
+        let p = match cache.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let src = &self.maps[i.file][i.start..i.end];
+                let mut v: Vec<u8> = Vec::with_capacity(src.len());
+                // Safety: every byte is written below before the Vec is read.
+                #[allow(clippy::uninit_vec)]
+                unsafe {
+                    v.set_len(src.len())
+                };
+                let threads = std::thread::available_parallelism().map_or(16, |n| n.get().min(64));
+                let chunk = src
+                    .len()
+                    .div_ceil(threads)
+                    .next_multiple_of(1 << 20)
+                    .max(1 << 20);
+                std::thread::scope(|sc| {
+                    for (dst, s) in v.chunks_mut(chunk).zip(src.chunks(chunk)) {
+                        sc.spawn(move || dst.copy_from_slice(s));
+                    }
+                });
+                let p: Arc<[u8]> = v.into();
+                cache.insert(key, p.clone());
+                p
+            }
+        };
+        self.pinned.insert(name.to_string(), p);
+        Ok(())
     }
 
     /// Fault every page of a tensor into the page cache, in parallel. For tables read a few
