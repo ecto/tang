@@ -126,6 +126,23 @@ the serial debug kernel —, wo_a one warp per row, the indexer batched over the
 count, the draft as a captured graph with device-side draws, head on the K-split path with
 device-side verification.
 
+Wave 5 merged (attention: sparse_attn onto the tiled path, wo_a one warp per row then K-split
+per group, the indexer batched over the window; mHC glue fused to 4–5 launches/layer; the greedy
+DSpark draft on the device with one read-back; bf16 head at ~88% of bandwidth and the verify
+reading back 24 bytes of argmaxes instead of 3.1 MB of logits; the quadratic stop check fixed):
+**57.0 tok/s greedy / 42.4 sampled** on the graph path (from 42.9 / 22.8), same prompt. Direct
+verify 90 → 66 ms: attention 53.5 → 23.8 (wo 8.1, compress 5.1, sparse_attn 4.0, q 3.2,
+window_kv 2.2), head 1.6 → 0.5, host 3.2 → 0.03 ms. Not improved: `layer.hc` 18.5 ms (the
+bit-exact post-mix is load-latency bound: 150 µs per 5120×24 GEMV), `layer.moe` 20.6 (reduce
+9.2 of it, which is rank 0 waiting: ranks 1–3 report 43 ms per step against rank 0's 66 and
+2323 launches against 3354), and on the graph path the draft takes 20.9 ms with 6.9 syncs
+(7.8 ms / 2 syncs on the direct path — the device draft isn't taken after a graph verify).
+Prefill is 28–53 tok/s (a 17k-token frog turn is minutes). Wave 6 lanes: draft as a graph +
+device sampling, mHC with a relaxed reduction order (DS_EXACT=1 keeps the exact kernels),
+MoE grouped kernels tuned for 132 SMs + router/route in one launch + reduce overlap, attention
+fusion (one wo launch, q in 2, sparse_attn in 1), and prefill (grouped MoE and GEMM tiles for
+t > 8).
+
 Steady state after the host fixes: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a
 ~4 ms floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
 path (`moe.router` 28 ms and `moe.reduce` 10 ms per step are the next two line items), then
