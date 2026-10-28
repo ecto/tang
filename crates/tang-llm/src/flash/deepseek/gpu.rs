@@ -2884,6 +2884,8 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "fp8 path != f32 path"
         );
+    }
+
     /// The fused mHC glue of one layer (ds_hc_stage, ds_hc_post_mix, ds_hc_post with the
     /// shared add) against the unfused kernels, bit for bit, at the real shapes.
     fn hc_glue(bench: bool) {
