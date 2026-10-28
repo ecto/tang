@@ -201,6 +201,11 @@ weights, 8× H100, 200 tokens: greedy **147.0 / 147.0** tok/s (46 steps, 158/225
 141.3 / **152.7** (43–45 steps, 157–158/210–220), sampled T=1.0 145.8, direct greedy 109.6,
 prefill 460–470.
 
+Wave 7c merged (+ moe3: shared expert folded into the grouped launches, route+plan+quant in
+one launch, `MOE_KS_ITEMS` 4 → 2; 4854062f), 1017 weights, 8× H100, 200 tokens: greedy
+**147.3 / 147.2** (48 steps, 153/235; 28.3 ms per step vs 29.6 at 7b — the step got faster, the
+run took two more steps), sampled T=0.6 **148.4 / 150.2**, T=1.0 146.1, direct greedy 109.7.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
