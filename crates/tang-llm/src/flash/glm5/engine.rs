@@ -1102,7 +1102,15 @@ impl Glm5Engine {
         if let Some(g) = self.gpu.as_mut() {
             g.clear_dev_fresh(0);
         }
+        // MTP vs the resident step: the clear above makes `resident_ready` false until a
+        // host window re-seeds the KDA device state, and the step graphs (the segments and
+        // the whole-step `[tok, pos]` / cache-capacity state) are dropped here so nothing
+        // replays across a rewind. MTP itself only calls `window()`.
+        #[cfg(feature = "cuda")]
+        self.drop_step_graph();
         for c in &mut self.dsa[0] {
+            // rows past the rewind point are dropped, not refreshed
+            c.stale_from = c.stale_from.filter(|&f| f < pos);
             c.latent.truncate(pos * kl);
             c.lat16.truncate(pos * kl);
             c.idx_k.truncate(pos * idd);
@@ -2623,11 +2631,6 @@ mod tests {
         tang_verify::skip_or_fail(reason)
     }
 
-    /// Serialises the tests that set load-time env knobs around an engine load (the test
-    /// harness runs in parallel; an unguarded set/remove leaks into another test's load).
-    #[cfg(feature = "cuda")]
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn seq1() -> Option<Vec<u32>> {
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").ok()?;
         let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
@@ -2647,6 +2650,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_real_weights_gpu_matches_cpu() {
+        let _env = super::super::env_write();
         let Some(real) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;
@@ -2699,6 +2703,7 @@ mod tests {
     /// Chunked prefill + token-by-token decode equals one full reference forward.
     #[test]
     fn engine_matches_reference_forward() {
+        let _env = super::super::env_read();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             eprintln!("skip: tiny fixture absent");
             return;
@@ -2734,6 +2739,7 @@ mod tests {
     /// Greedy continuation through the engine equals re-running the reference each step.
     #[test]
     fn engine_greedy_matches_reference() {
+        let _env = super::super::env_read();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             eprintln!("skip: tiny fixture absent");
             return;
@@ -2766,6 +2772,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_matches_cpu() {
+        let _env = super::super::env_read();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
             return;
@@ -2834,6 +2841,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_fused_mhc_matches_cpu() {
+        let _env = super::super::env_read();
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;
@@ -2895,6 +2903,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn mhc_gpu_pre_block1_matches_cpu_block1() {
+        let _env = super::super::env_read();
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;
@@ -2965,6 +2974,7 @@ mod tests {
     /// per-layer instances are distinct objects.
     #[test]
     fn mla_resident_is_per_layer() {
+        let _env = super::super::env_read();
         // no fixture dependency: the invariant is checked inside engine_gpu_mla_matches_cpu
         // on the tiny model (one DSA layer, so it only guards construction) AND here via
         // the engine's own accounting on any loaded model. The load-log line
@@ -2992,6 +3002,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_mla_matches_cpu() {
+        let _env = super::super::env_read();
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;
@@ -3080,6 +3091,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_mla_resident_matches_naive() {
+        let _env = super::super::env_read();
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;
@@ -3123,6 +3135,7 @@ mod tests {
     /// batching changes nothing), and the round-robin `window_slot` path must too.
     #[test]
     fn engine_slots_batch_matches_separate() {
+        let _env = super::super::env_read();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             eprintln!("skip: tiny fixture absent");
             return;
@@ -3187,6 +3200,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_slots_batch_matches_single() {
+        let _env = super::super::env_write();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
             return;
@@ -3207,9 +3221,7 @@ mod tests {
     /// at engine load (layer construction), so they are set around the loads only.
     #[cfg(feature = "cuda")]
     fn gpu_slots_case(ids: &[u32], moe: &str) {
-        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let load = |slots: usize| {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // the batched KDA rows need it
             std::env::set_var("TANG_GLM5_MOE", moe);
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
@@ -3274,6 +3286,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_win_step_window_matches_steps() {
+        let _env = super::super::env_write();
         use std::sync::atomic::Ordering;
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
@@ -3284,7 +3297,6 @@ mod tests {
             return;
         }
         let load = || {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // WIN_STEP lives on the PF2 core
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
             let ok = e.use_gpu().unwrap();
@@ -3332,6 +3344,7 @@ mod tests {
     /// reset() gives a fresh sequence.
     #[test]
     fn engine_reset() {
+        let _env = super::super::env_read();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             return;
         };
@@ -3347,6 +3360,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_reset_gpu() {
+        let _env = super::super::env_read();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
             return;
@@ -3374,7 +3388,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cuda")]
     fn engine_gpu_resident_step_matches_host() {
-        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = super::super::env_write();
         if !Path::new(TINY).exists() || tang_moe::gpu::Gpu::for_test().is_none() {
             skip_or_fail("fixture/GPU");
             return;
@@ -3460,6 +3474,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_gpu_trace_is_transparent() {
+        let _env = super::super::env_write();
         let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
             skip_or_fail("tiny fixture absent");
             return;
@@ -3527,6 +3542,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_resident_layers_are_constructed() {
+        let _env = super::super::env_read();
         if !Path::new(TINY).exists() {
             return;
         }
@@ -3548,6 +3564,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_kda_window_routes_through_resident_layer() {
+        let _env = super::super::env_read();
         if !Path::new(TINY).exists() {
             return;
         }

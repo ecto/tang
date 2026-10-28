@@ -167,6 +167,7 @@ fn route_err(ids: &[u32], wts: &[f32], want_ids: &[u32], want_wts: &[f32], k: us
 
 #[test]
 fn router_matches_hf() {
+    let _env = super::super::env_read();
     let x = f("x");
     let (ids, wts) = route(&base(10.0), x, x.len() / HID).unwrap();
     let err = route_err(
@@ -182,6 +183,7 @@ fn router_matches_hf() {
 
 #[test]
 fn group_limited_router_matches_hf() {
+    let _env = super::super::env_read();
     let p = MoeParams {
         n_group: 4,
         topk_group: 2,
@@ -232,6 +234,7 @@ fn experts_err(gu: &str, down: &str, out: &str, limit: f32) -> f32 {
 
 #[test]
 fn experts_match_hf() {
+    let _env = super::super::env_read();
     let err = experts_err(
         "experts.gate_up_proj",
         "experts.down_proj",
@@ -247,6 +250,7 @@ fn experts_match_hf() {
 
 #[test]
 fn clamped_experts_match_hf() {
+    let _env = super::super::env_read();
     let err = experts_err(
         "experts_l1.gate_up_proj",
         "experts_l1.down_proj",
@@ -269,6 +273,7 @@ fn clamped_experts_match_hf() {
 
 #[test]
 fn shared_expert_matches_hf() {
+    let _env = super::super::env_read();
     let p = MoeParams {
         ff_shexp: 64,
         sh_gate: Some(W::F32(f("shared.gate_proj"))),
@@ -287,6 +292,7 @@ fn shared_expert_matches_hf() {
 
 #[test]
 fn full_moe_matches_hf() {
+    let _env = super::super::env_read();
     let x = f("x");
     let err = max_err(
         &ffn(&full_moe_params(), x, x.len() / HID).unwrap(),
@@ -301,6 +307,7 @@ fn full_moe_matches_hf() {
 
 #[test]
 fn dense_ffn_matches_hf() {
+    let _env = super::super::env_read();
     let x = f("x");
     for (tag, limit) in [("dense", 10.0), ("dense_l1", 1.0)] {
         let err = max_err(
@@ -314,6 +321,7 @@ fn dense_ffn_matches_hf() {
 
 #[test]
 fn sentinel_expert_is_skipped() {
+    let _env = super::super::env_read();
     let p = experts_params("experts.gate_up_proj", "experts.down_proj", 10.0);
     let x = f("x");
     let t_len = x.len() / HID;
@@ -346,6 +354,7 @@ fn sentinel_expert_is_skipped() {
 /// The CUDA decoders are checked on the same bytes by scripts/glm5_moe_cuda_host.sh.
 #[test]
 fn decoders_match_expected() {
+    let _env = super::super::env_read();
     for name in ["f16", "q8_0", "q5_0", "q4_k", "q5_k", "q6_k"] {
         let id = entry(&format!("quant_{name}_raw"))["ggml_type"]
             .as_u64()
@@ -370,6 +379,7 @@ fn decoders_match_expected() {
 /// tang's K-quant block geometry at the real shapes.
 #[test]
 fn ud_q4_k_xl_expert_bytes() {
+    let _env = super::super::env_read();
     let (e, ff, hid) = (288u64, 2048usize, 4096usize);
     let mat =
         |ty: GgmlType, row: usize, rows: usize| ty.bytes_for(row).unwrap() as u64 * rows as u64 * e;
@@ -397,6 +407,7 @@ fn tiny(file: &str) -> Option<&'static Gguf> {
 
 #[test]
 fn tiny_gguf_layers_match_hf() {
+    let _env = super::super::env_read();
     let Some(g) = tiny("glm5-tiny-f32.gguf") else {
         return;
     };
@@ -445,6 +456,7 @@ fn tiny_gguf_layers_match_hf() {
 /// (not a parity gate; a sanity bound that the decoders feed the experts correctly).
 #[test]
 fn tiny_quantised_gguf_layers_close_to_hf() {
+    let _env = super::super::env_read();
     let x = f("tiny_x");
     for (file, tol) in [
         ("glm5-tiny-q8_0.gguf", 0.02),
@@ -518,11 +530,13 @@ mod cuda {
 
     #[test]
     fn gpu_full_moe_matches_cpu() {
+        let _env = super::super::env_read();
         check("full moe", &full_moe_params(), f("x"), 1e-5);
     }
 
     #[test]
     fn gpu_clamped_experts_match_cpu() {
+        let _env = super::super::env_read();
         // router + limit-1 experts, no shared expert
         check(
             "limit-1 experts",
@@ -534,6 +548,7 @@ mod cuda {
 
     #[test]
     fn gpu_group_router_moe_matches_cpu() {
+        let _env = super::super::env_read();
         let p = MoeParams {
             n_group: 4,
             topk_group: 2,
@@ -546,6 +561,7 @@ mod cuda {
 
     #[test]
     fn gpu_dense_matches_cpu() {
+        let _env = super::super::env_read();
         check("dense", &dense_params("dense", 10.0), f("x"), 1e-5);
         check(
             "dense limit 1",
@@ -558,6 +574,7 @@ mod cuda {
     /// Q8_0 / Q4_K / Q5_K / Q6_K weights decoded on the GPU vs tang's CPU decoders (same GGUF).
     #[test]
     fn gpu_tiny_quantised_gguf_matches_cpu() {
+        let _env = super::super::env_read();
         for (file, tol_fast) in [
             ("glm5-tiny-f32.gguf", 1e-4),
             ("glm5-tiny-q8_0.gguf", 3e-2),
@@ -642,6 +659,7 @@ mod cuda {
     /// Q4_K/Q6_K); `TANG_GLM5_MOE_BENCH_T` (default 1,8).
     #[test]
     fn real_layers_fast_matches_cpu() {
+        let _env = super::super::env_read();
         let Some(path) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;
@@ -809,6 +827,7 @@ mod cuda {
     /// rows), T = 1, 3, 9 (9 spans two token tiles), staged and unstaged, q8x2 and q8.
     #[test]
     fn gpu_gemv_fast_matches_cpu() {
+        let _env = super::super::env_read();
         let Some(g) = Gpu::for_test() else { return };
         g.bind().unwrap();
         let mut k = Kernels5::new(&g).unwrap();
@@ -870,6 +889,7 @@ mod cuda {
     /// moebench's per-call wall time with a sync (q8 of x included for g5f / k5).
     #[test]
     fn real_kda_gemv_bench() {
+        let _env = super::super::env_read();
         let Some(path) = std::env::var("TANG_GLM5_REAL_GGUF").ok() else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;

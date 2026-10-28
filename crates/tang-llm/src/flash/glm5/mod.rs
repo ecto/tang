@@ -481,7 +481,24 @@ mod tests {
     }
 }
 
-/// Tests that set / remove `TANG_GLM5_*` env vars hold this (the test harness runs them in
-/// parallel and the engine reads the env per call).
+/// The process env (and the trace's global switch) as seen by the glm5 tests. The harness
+/// runs tests in parallel and the engine reads `TANG_GLM5_*` at load and per call, so a
+/// `set_var` in one test leaks into another's run. Every glm5 test holds one guard for its
+/// whole body: [`env_write`] if it sets / removes env vars (or toggles the trace), else
+/// [`env_read`]. Readers still run in parallel with each other. One guard per test: never
+/// take a second one inside (no re-entrancy).
 #[cfg(test)]
-pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Exclusive: this test mutates process env (poison-tolerant: a failed test must not fail
+/// every later one).
+#[cfg(test)]
+pub(crate) fn env_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+    ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Shared: this test only reads the ambient env.
+#[cfg(test)]
+pub(crate) fn env_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    ENV_LOCK.read().unwrap_or_else(|e| e.into_inner())
+}

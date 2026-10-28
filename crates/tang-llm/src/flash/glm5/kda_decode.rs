@@ -482,6 +482,7 @@ mod tests {
     /// step kernel's sync race, so the bar is 1e-5 relative.
     #[test]
     fn kda_fused_decode_matches_naive() {
+        let _env = super::super::env_read();
         let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
         if !Path::new(TINY).exists() {
             assert!(!required, "TANG_REQUIRE_CUDA=1 but the tiny fixture is absent");
@@ -556,6 +557,7 @@ mod tests {
     /// the engine's `kda mixer` stage pays per layer). Skips without the env var.
     #[test]
     fn kda_decode_real_bench() {
+        let _env = super::super::env_read();
         let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;
@@ -656,6 +658,7 @@ mod tests {
     /// (d) fused per-stage µs per G5F mode. Skips without the env var.
     #[test]
     fn kda_g5f_real_bench() {
+        let _env = super::super::env_write();
         let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;
@@ -895,6 +898,7 @@ mod tail_tests {
     /// launches — bit-equal output, state and conv.
     #[test]
     fn kda_tail_real_bench() {
+        let _env = super::super::env_read();
         let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
             eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
             return;
