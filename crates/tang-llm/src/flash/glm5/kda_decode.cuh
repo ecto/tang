@@ -183,8 +183,8 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     k5d_stage(wf, (const unsigned char*)(fb.base + (unsigned long long)h * D * fb.row_bytes), D * K5D_RB, x, D, &df);
     k5d_stage(wg, (const unsigned char*)(gb.base + (unsigned long long)h * D * gb.row_bytes), D * K5D_RB, x, D, &dg);
     k5d_stage(wb, (const unsigned char*)(bp.base + (unsigned long long)h * bp.row_bytes), HID / 32 * 34, x, D, &db);
-    g1s[x] = G1[h * D + x];
-    g2s[x] = G2A[h * D + x];
+    g1s[x] = G1[x]; // f_a / g_a outputs are hd wide, shared by every head
+    g2s[x] = G2A[x];
     // the state column this thread owns, read once (independent loads, all in flight)
     float sr[KDA_D];
 #pragma unroll

@@ -916,6 +916,7 @@ mod tail_tests {
         let new: Vec<(&str, &K)> = vec![("k5_q8 x", &q8x), ("k5_qgemv q|k|v|f_a|g_a", &qx), ("k5d_tail", &tail), ("k5_qgemv o", &qo)];
         let mut outs = Vec::new();
         let mut states = Vec::new();
+        let mut taps: Vec<[Vec<f32>; 5]> = Vec::new();
         for (form, seq) in [("old", &old), ("tail", &new)] {
             let d = mk();
             let ev: Vec<Event> = (0..=seq.len()).map(|_| Event::new(true).unwrap()).collect();
@@ -930,6 +931,10 @@ mod tail_tests {
                 }
                 d.s.sync().unwrap();
                 ys.push(d.outb.read::<f32>(0, hidden).unwrap());
+                if i == 0 {
+                    taps.push([d.bb.read::<f32>(0, nh).unwrap(), d.gb_out.read::<f32>(0, di).unwrap(),
+                        d.g2b.read::<f32>(0, di).unwrap(), d.ob.read::<f32>(0, di).unwrap(), d.yb.read::<f32>(0, di).unwrap()]);
+                }
                 if i >= 8 {
                     for j in 0..seq.len() {
                         per[j].push(ev[j + 1].since(&ev[j]).unwrap() * 1e3);
@@ -950,6 +955,13 @@ mod tail_tests {
             d.read_back(&mut conv, &mut st).unwrap();
             outs.push(ys);
             states.push((conv, st));
+        }
+        for (ti, name) in ["beta", "g", "g2", "o", "y"].iter().enumerate() {
+            let a = &taps[0][ti];
+            let b = &taps[1][ti];
+            let n = a.iter().zip(b).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let m = a.iter().zip(b).map(|(a, b)| ((a - b).abs() / a.abs().max(1e-30)) as f64).fold(0.0, f64::max);
+            eprintln!("tail tap step 0 {name}: {n}/{} differ, max rel {m:.2e}", a.len());
         }
         // the production entry: decode_fast eager and graph (tail on unless TANG_GLM5_KDA_TAIL=0)
         for mode in [Mode::Fused, Mode::Graph] {
