@@ -173,6 +173,14 @@ f32 sampler). The greedy path's remaining gap to 1000 tok/s (~4 ms per token-ste
 count and per-layer glue: 1386 launches for 26 ms of graph replay on 8 H100s, where the
 bytes per rank (experts/8 + dense) put the bandwidth floor near 3 ms.
 
+Wave 7 sample lane (same pod, 200 tokens): sampled T=0.6 now **130.1 / 134.1 tok/s** (46 steps,
+154–156/225 accepted) against greedy 126.0 / 132.8 on the same binary; graph draft 4.7 ms gpu
+(was 13.2), graph verify 26.3 ms with ~0.05 ms host. `ds_spark_sample` buckets w by exponent in
+one pass and sorts only the smallest bucket holding the top-p mass (<= 2048 tokens; the old
+key search is the fallback), drawing bit for bit as `SpecSampler`; the verify's rejection walk
+runs on the device (`ds_spec_dist` per row + `ds_spec_walk`, one small read-back,
+`DS_SPEC_HOST=1` for the host walk), also bit-exact against `verify_rows`.
+
 Wave 6 as merged (895f89b0 → bab5bcfc): attention fusion (one
 grouped K-split launch for wo, 19 → 2 launches, 143 → 54 µs on a 3090; q + window_kv fused,
 the compressor/indexer key side batched over the window, ~150 → ~30 attention launches per
