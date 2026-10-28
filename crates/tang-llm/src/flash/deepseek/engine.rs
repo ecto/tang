@@ -1115,6 +1115,7 @@ impl GpuModel {
         let c = &self.cpu.cfg;
         let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
         let s = self.span("sparse_attn");
+        let mut wo_pre = false;
         let sink = self.dw(&format!("{p}.attn.attn_sink"))?;
         let o = self.fbuf(t * h * hd)?;
         // the tiled kernels at the real shapes (see `Kernels::sparse_attn`), else the exact one
@@ -1133,6 +1134,7 @@ impl GpuModel {
                 add: add as i32,
                 stride: stride as i32,
                 q: !q_roped,
+                wo_quant: false,
             }),
             _ => None,
         };
@@ -1144,9 +1146,15 @@ impl GpuModel {
                 &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale,
                 rope,
             )?,
-            (Ix::Win(w), Some(r)) => self.k.attn_fd_win(
-                &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
-            )?,
+            (Ix::Win(w), Some(mut r)) => {
+                // the merge also quantizes o for wo_ks (one launch fewer)
+                let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
+                r.wo_quant = self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol);
+                wo_pre = r.wo_quant;
+                self.k.attn_fd_win(
+                    &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
+                )?
+            }
             (Ix::Win(_), None) => bail!("attn_out: in-kernel indices want the fused rope"),
         }
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
@@ -1159,7 +1167,11 @@ impl GpuModel {
         let mid = self.fbuf(t * g * ol)?;
         if self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol) {
             // the quantize is ds_ks_quant's (bit-identical to ds_fp8_qdq)
-            self.k.wo_ks(&self.s, &wo_a.v, o.ptr, mid.ptr, t, g, ol)?;
+            if wo_pre {
+                self.k.wo_ks_pre(&self.s, &wo_a.v, mid.ptr, t, g, ol)?;
+            } else {
+                self.k.wo_ks(&self.s, &wo_a.v, o.ptr, mid.ptr, t, g, ol)?;
+            }
         } else {
             self.k.fp8_qdq(&self.s, o.ptr, t * h * hd)?;
             self.wo_a(o, &wo_a.v, mid, t, g, ol)?;

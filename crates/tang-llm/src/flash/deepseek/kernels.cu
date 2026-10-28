@@ -2322,7 +2322,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, con
 extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* part, const float* ml,
                                                                   const float* sink, float* o, int h, int d,
                                                                   int S, const float2* tab, const int* Pp, int rd,
-                                                                  int add, int ps) {
+                                                                  int add, int ps, unsigned char* qc, float* qs) {
     int b = blockIdx.x, hi = b % h, ti = b / h, tid = threadIdx.x;
     float M = -DS_INF;
     for (int s = 0; s < S; s++) M = fmaxf(M, ml[(((long long)ti * S + s) * h + hi) * 2]);
@@ -2346,7 +2346,18 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* p
         y = ds_rope_at(x, y, col + 1, d, rd, tab, pos, 1);
         x = x2;
     }
-    *(float2*)(o + ((long long)ti * h + hi) * d + col) = make_float2(x, y);
+    long long oi = ((long long)ti * h + hi) * d + col;
+    *(float2*)(o + oi) = make_float2(x, y);
+    if (qc) {
+        // ds_ks_quant of o (wo_a's input) in the same pass: 16 threads a 32-group
+        float a = fmaxf(fabsf(x), fabsf(y));
+#pragma unroll
+        for (int f = 8; f; f >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, f));
+        float sc = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
+        qc[oi] = (unsigned char)e4m3_byte(round_e4m3(fminf(fmaxf(x / sc, -448.f), 448.f)));
+        qc[oi + 1] = (unsigned char)e4m3_byte(round_e4m3(fminf(fmaxf(y / sc, -448.f), 448.f)));
+        if ((tid & 15) == 0) qs[oi / 32] = sc;
+    }
 }
 
 // ds_attn_fd on the tensor cores (bf16 mma, f32 accumulate), same blocks and outputs: per
