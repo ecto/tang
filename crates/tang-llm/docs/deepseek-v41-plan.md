@@ -106,6 +106,26 @@ caching across turns (the KV is tiny: window ring + compressed) and a faster pre
 indexer scores every chunk position against the whole compressed cache, so long prompts slow
 down as they grow).
 
+Per-request tables from the wave-4 server (`DS_SERVE_PROFILE=1`, greedy 200, 4× H200): 42.9
+tok/s on the graph path (verify 80 ms, draft 9.1 ms with 7 host syncs, decode-iteration host
+3.4 ms), 37.7 on the direct path, whose 6-token verify step (90 ms, 3295 launches) splits as:
+
+| op | ms/step | note |
+|---|---|---|
+| layer.attn | 53.5 | wo 19.1 (0.48/layer), sparse_attn 18.8 (80 launches), compress 9.8 (indexer 6.6, 48 launches), q 3.0, window_kv 1.8 |
+| layer.hc | 16.9 | 123 mixes × 137 µs: launch latency, not math |
+| layer.moe | 15.2 | grouped_gu 4.7, down 2.3, shared 3.1, reduce 2.4, router 2.2 |
+| head | 1.6 | plus 3.1 MB of logits read back and ~3 ms of host verification per step |
+
+So after wave 4 the step is attention + glue latency, and the launch count (3.3k nodes, each
+~2–4 µs of front-end time even in a graph) is a 6–12 ms floor of its own: 1000 tok/s (≈ 4 ms
+per iteration) needs the per-layer work fused into a handful of launches, not faster versions
+of 80 kernels. Wave 5 lanes: attention block (sparse_attn onto the tiled path — it was running
+the serial debug kernel —, wo_a one warp per row, the indexer batched over the window's rows:
+1378 → 159, 923 → 381, 254 → 76 µs/layer on a 3090, bit-exact), mHC glue fusion and launch
+count, the draft as a captured graph with device-side draws, head on the K-split path with
+device-side verification.
+
 Steady state after the host fixes: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a
 ~4 ms floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
 path (`moe.router` 28 ms and `moe.reduce` 10 ms per step are the next two line items), then
