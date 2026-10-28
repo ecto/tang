@@ -4,6 +4,48 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (later) — `TANG_GLM5_STEP_GRAPH=2`: the whole decode token as one graph replay (branch claude/glm5-stepgraph2)
+
+On top of claude/glm5-resident 5c024107. Code: `resident.rs` (`step_whole`, `rs_embed`), `mla.rs`
+(`*_p` kernels, `MlaCuda::{row_cap, reserve_pool, stage_ape, *_pos}`), `mla_dev.rs` (`window_dev_pos`).
+- Position counter: `Resident::tok` is now `[token, pos]` u32. `rs_argmax(..., inc)` writes the
+  token and, in the whole graph, advances `pos`. The DSA kernels read `pos` (`kv_len = pos + 1`):
+  `mla_lat_norm_bf16_p` / `mla_idx_ln_p` write cache row `pos` from the cache BASE (the wk / gate
+  GEMVs now go to scratch `yk`/`yg`, the LN kernel copies them in), `idx_pool_keys_p` computes the
+  pool this token completes (grid 1, early exit), `idx_select_p` (grid 1, smem at the topk/kp cap),
+  `mla_attn_abs2_p` (width = pos + 1 dense or `select_width`; smem sized to max(topk, select_width),
+  which bounds the dense width because dense only holds while kv_len <= topk). The eager kernels
+  call the same `__device__` bodies.
+- Dense/sparse: two captured graphs `[dense, sparse]`, picked on the host from the cached `pos0`
+  (one compare, no transfer). Before a sparse replay the eager incremental `idx_pool` catches up
+  pools no replay computed (the dense graph skips the indexer); a no-op once caught up.
+- Capacity: the graphs bake the DSA cache bases, so they are valid while `pos0 + 1 <= min row_cap`.
+  Past it both drop, the token runs eagerly (regrows), the next token recaptures. Pools are
+  reserved for `cap / kpool + 1` before capture; a pool realloc drops the other graph.
+- Embed: `rs_embed` gathers row `tok[0]` of the GGUF `token_embd` (uploaded once, own quant type:
+  F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K) with `_rn` ops in the host's evaluation order (no FMA
+  contraction), broadcast to the hc streams in `MhcFused::r`. Other types: host gather + upload.
+- Host per token: (8-byte upload only when `[tok, pos]` is out of step: after an eager token or a
+  host window), graph launch, the DSA watermarks / mirror sizes, sync, 4-byte read.
+- `TANG_GLM5_STEP_GRAPH=1` is unchanged; default unchanged.
+
+Verified:
+- mew tiny: `engine_gpu_resident_step_matches_host` now also runs graph=2. Host = resident =
+  graph=1 = graph=2 greedy ids over 40 decode tokens across the dense->sparse switch (graph=2
+  replays: 11 dense, 28 sparse). Passes alone.
+- mew tiny, flash::glm5 suite: 77 passed / 1 failed / 2 ignored with the trace test skipped. The
+  failure is this resident test in parallel: the graph=1 segment-count assert (engine.rs:3164),
+  before the graph=2 part. Likely an env-var race: other tests set and remove `TANG_GLM5_MOE` /
+  `KDA_PF2` while it runs. Not confirmed. The trace test passes alone.
+- H200 gate (flags as given, including `TANG_GLM5_GPU_FFN=0`): `785 1196 6801 264 6386 38038 911 279`
+  for graph=1 and graph=2. But `GPU_FFN=0` left 0 of 45 FFNs on the GPU, so the resident step never
+  ran (0.17 tok/s). This gate does not exercise either graph.
+
+Not verified:
+- Real weights with the FFNs on the GPU: the gate, the -n 512 md5 vs graph=1, the bench table.
+- The capacity-regrow / recapture path (the tiny run stays inside its 72-row cap).
+- Embed bit-exactness on the real `token_embd` type.
+
 ## 2026-10-28 — device-resident decode step: B300 35.8 -> 47.7 tok/s, step graph 56.2 (branch claude/glm5-resident)
 
 The residual stream stays on the device for the whole decode token. Code: `glm5/resident.rs`, a
