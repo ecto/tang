@@ -4,6 +4,55 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MTP draft on the device (6.6 s -> ~10 ms/pass); verify windows made exact; MTP still 4x slower than plain (branch claude/glm5-mtp-dev)
+
+What was wrong: (1) the NextN block (blk.45) ran entirely on the host: ~6.6 s per draft pass
+(integration round 4 entry). (2) `--mtp 1` and `--mtp 2` drifted from plain greedy at token 29
+(baced18e vs 7174cdd6), although WIN_STEP was supposed to make the verify exact.
+
+Evidence for (2): `TANG_GLM5_WINDIFF=28,2 TANG_GLM5_KDA_WIN_STEP=3`, B flags, bench prompt:
+first difference l00 attn_out (KDA) row 0 rel 9.9e-5 with attn_in identical; row 0 logits
+window-vs-step rel 3.86e-2, step margin 81217 vs 489 = 0.0984. Plain decode with
+`TANG_GLM5_RESIDENT=0` (host t=1 windows) md5 7174cdd6 = resident, so t=1 windows equal the
+resident step and the batched t>1 KDA projections are what differ (the mtp-bisect entry's
+bit-identity was H200, older flags).
+
+Fix:
+- mtp.rs: `Mtp` gets a device home (`MtpDev`, `TANG_GLM5_MTP_DEV=0` to disable): its own
+  `MlaCuda` + `MlaProj` + `DsaCache` (rewind = `DsaCache::truncate_rows`), the blk.45 FFN as a
+  resident `DevMoe` (`ffn_host`), logits on the trunk's GPU head (`GpuFfn::head_logits`). eh_proj
+  and the norms stay host. `Drafter` now takes `&Glm5Engine`.
+- engine.rs `kda_mixer`: a window with 1 < t <= win_step runs the resident KDA layer row by row
+  (t calls at t=1). Windiff after: every tap and both logit rows 0.0.
+
+Verification: mew 3090 `flash::glm5` 84 passed / 0 failed / 2 ignored (83 + new
+`mtp_device_draft_matches_host`: teacher-forced device vs host cells, 64/64 drafts identical,
+hn rel 1.9e-3). B300 (shared pod), B flags, haiku `--mtp 2 -n 8` = oracle. Bench prompt,
+`decode tok/s` for MTP = tokens / (draft s + trunk s) from the report line:
+
+| run | -n | accept d1/d2/d3 | tok/pass | draft s | trunk s (passes) | tok/s | ids md5 |
+|---|---|---|---|---|---|---|---|
+| plain | 128 | | | | | 75.65 | 7174cdd6 |
+| K=1 | 128 | 89.6% | 1.716 | 0.5 | 6.1 (67+7) | 19.2 | 7174cdd6 |
+| K=2 | 128 | 88.2/72.7% | 1.841 | 0.6 | 5.9 (51+18) | 19.5 | 7174cdd6 |
+| K=3 | 128 | 88.4/76.3/62.1% | 1.868 | 0.6 | 5.8 (43+25) | 19.8 | 7174cdd6 |
+| plain | 512 | | | | | 75.87 | 1453cf0e |
+| K=1 | 512 | 80.9% | 1.516 | 1.1 | 26.7 (283+54) | 18.4 | 1453cf0e |
+| K=2 | 512 | 77.3/60.2% | 1.456 | 1.5 | 27.6 (229+122) | 17.6 | 1453cf0e |
+| K=3 | 512 | 77.8/61.4/56.2% | 1.456 | 1.8 | 28.7 (203+148) | 16.8 | 1453cf0e |
+
+So draft ≈ 12 ms per verify pass (K=2, 128: 0.6 s / 51), trunk ≈ 85 ms per pass (5.9 s / 69):
+the host `window()` verify is now the whole cost, ~6x a 13.2 ms resident step. Target
+(>= 1.5x plain) NOT reached. Before (2) was fixed K=2 -n 128 measured 53+22 passes, 1.693 tok/pass.
+
+Next (not done): the verify must run on the resident path. Serial t=1 resident steps over
+`[cur, d1..dk]` are exact but cost exactly plain decode plus the draft, so they can never win;
+the speedup needs a t=K+1 resident window whose per-row kernels are bit-identical to the t=1
+step (this entry shows the batched KDA projections are not) and which leaves `last_h` rows on
+the device for the drafter, plus a device rewind (KDA state snapshot/restore on device, DSA
+watermarks). The reruns are also ~1/3 of trunk passes at 512: per-token KDA checkpoints would
+remove them (ideal tok/pass 2.2-2.5 vs 1.46 honest).
+
 ## 2026-10-28 — KDA decode kernels on the B300: 2.5 -> 1.83 ms/token, ids unchanged (branch claude/glm5-kda3)
 
 What was wrong (B300, no perf-counter access on the pod: ERR_NVGPUCTRPERM, so standalone
