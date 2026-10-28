@@ -586,6 +586,8 @@ pub struct Engine {
     pub load_report: String,
     mtp: Option<Box<Mtp>>,
     pub last_mtp_ms: f64,
+    /// The GDN memstore's layer (`enable_store`; `None`: no store, nothing below touches it).
+    pub store: Option<super::memserve::StoreMeta>,
     probe_buf: Option<B>,
     train_dump_prompt: bool,
     train_dump: Option<(
@@ -1287,6 +1289,7 @@ impl Engine {
             load_report,
             mtp: None,
             last_mtp_ms: 0.0,
+            store: None,
             train_dump: None,
             train_dump_prompt: false,
             probe_buf: None,
@@ -4045,6 +4048,9 @@ impl Engine {
 /// this plus the token prefix resumes the sequence at `pos` (the server's prefix reuse).
 pub struct RunningState {
     pub pos: usize,
+    /// Where the GDN memstore's heads are in [`parts`](Self::parts) (`None`: the engine has
+    /// no store layer).
+    pub store: Option<super::memserve::StoreMeta>,
     gdn: Vec<(Vec<f32>, Vec<f32>)>,
     qsa_ring: Vec<Vec<f32>>,
     ple_ring: Vec<f32>,
@@ -4079,6 +4085,25 @@ impl RunningState {
         self.gdn.len()
     }
 
+    /// The memstore heads ([`super::memstore::MemStore::snapshot_heads`] of the store layer).
+    pub fn store_heads(&self) -> Option<Vec<f32>> {
+        let m = self.store?;
+        let st = &self.gdn.get(m.gdn_layer)?.0;
+        (st.len() == tang_compute::flash::GDN_STATE)
+            .then(|| super::memstore::MemStore::<CudaComputeDevice>::snapshot_heads(st))
+    }
+
+    /// Zero the memstore heads (the base heads stay), so the state can be shared or written to
+    /// disk without the session's store.
+    pub fn blank_store(&mut self) {
+        let Some(m) = self.store else { return };
+        if let Some((st, _)) = self.gdn.get_mut(m.gdn_layer) {
+            if st.len() == tang_compute::flash::GDN_STATE {
+                super::memserve::blank_heads(st);
+            }
+        }
+    }
+
     /// The inverse of [`parts`](Self::parts), for a model with `gdn_layers` GDN layers.
     pub fn from_parts(pos: usize, gdn_layers: usize, mut parts: Vec<Vec<f32>>) -> Result<Self> {
         ensure!(
@@ -4095,6 +4120,7 @@ impl RunningState {
         }
         Ok(RunningState {
             pos,
+            store: None,
             gdn,
             qsa_ring,
             ple_ring,
@@ -4122,6 +4148,7 @@ impl Engine {
             .collect();
         Ok(RunningState {
             pos: self.tokens.len(),
+            store: self.store,
             gdn,
             qsa_ring,
             ple_ring: dev.download(&self.ple.ring),
@@ -4166,6 +4193,84 @@ impl Engine {
         self.tokens.extend_from_slice(prefix);
         self.mtp_last.clear();
         Ok(())
+    }
+}
+
+// ---- GDN memstore (`super::memserve`): engine-internal store windows
+
+impl Engine {
+    /// Keep a GDN memstore in GDN layer `gdn_layer` (its index among the GDN layers).
+    pub fn enable_store(&mut self, gdn_layer: usize) -> Result<()> {
+        let layer = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.gdn.is_some())
+            .nth(gdn_layer)
+            .map(|(i, _)| i)
+            .with_context(|| format!("no GDN layer {gdn_layer}"))?;
+        super::memserve::check_shape(GDN_HK, GDN_HV)?;
+        self.store = Some(super::memserve::StoreMeta { gdn_layer, layer });
+        Ok(())
+    }
+
+    /// The store layer (slot 0 only: this engine runs one sequence).
+    fn store_layer(&self, slot: usize) -> Result<usize> {
+        ensure!(slot == 0, "the Flash-Next engine has one sequence");
+        let m = self.store.context("no memstore layer (enable_store)")?;
+        ensure!(self.layers[m.layer].gdn.is_some(), "store layer isn't GDN");
+        Ok(m.layer)
+    }
+
+    /// The memstore heads of the live state.
+    pub fn store_heads_at(&mut self, slot: usize) -> Result<Vec<f32>> {
+        let l = self.store_layer(slot)?;
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let st = self
+            .dev
+            .download(&self.layers[l].gdn.as_ref().unwrap().state);
+        Ok(super::memstore::MemStore::<CudaComputeDevice>::snapshot_heads(&st))
+    }
+
+    /// Splice `heads` into the live state's memstore heads (the base heads stay bitwise).
+    pub fn set_store_heads_at(&mut self, slot: usize, heads: &[f32]) -> Result<()> {
+        ensure!(
+            heads.len() == super::memserve::HEAD_FLOATS,
+            "store heads size"
+        );
+        let l = self.store_layer(slot)?;
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let g = self.layers[l].gdn.as_mut().unwrap();
+        let mut st = self.dev.download(&g.state);
+        super::memstore::MemStore::<CudaComputeDevice>::restore_heads(&mut st, heads);
+        self.dev.upload_into_f32(&mut g.state, &st);
+        self.dev.sync();
+        Ok(())
+    }
+
+    /// A store op as GDN windows on the store layer's live state, through the device's
+    /// `gdn_step` with the layer's own params: no other layer, the head, the QSA K/V or the
+    /// sampler is touched, and the sequence's tokens don't change.
+    pub fn store_op_at(
+        &mut self,
+        slot: usize,
+        op: &super::memserve::StoreOp,
+    ) -> Result<super::memserve::OpOut> {
+        let l = self.store_layer(slot)?;
+        self.side.sync().map_err(|e| anyhow!("{e}"))?;
+        self.dev.sync();
+        let g = self.layers[l].gdn.as_mut().unwrap();
+        let p = GdnParams {
+            conv: &g.conv,
+            dt_bias: &g.dt,
+            ssm_a: &g.a,
+            norm: &g.norm,
+        };
+        let out = super::memserve::run_op(&self.dev, p, EPS, &mut g.state, op);
+        self.dev.sync();
+        out
     }
 }
 

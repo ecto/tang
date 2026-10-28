@@ -35,7 +35,7 @@ use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::time::Instant;
 use tang_compute::cuda::CudaBuffer;
-use tang_compute::flash::{self as fl, Geometry};
+use tang_compute::flash::{self as fl, GdnParams, Geometry};
 use tang_compute::{ComputeDevice, CudaComputeDevice};
 use tang_moe::arena::{ArenaOptions, HostArena};
 use tang_moe::gpu::{self, Gpu, Graph, Module, Stream};
@@ -867,6 +867,8 @@ pub struct Coder {
     pub last_mtp_ms: f64,
     /// The second GPU of the layer split (`None`: one GPU, everything on `self.dev`).
     peer: Option<Box<Peer>>,
+    /// The GDN memstore's layer (`enable_store`; `None`: no store, nothing touches it).
+    pub store: Option<super::memserve::StoreMeta>,
 }
 
 #[derive(Default)]
@@ -1146,6 +1148,7 @@ impl Coder {
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
             peer,
+            store: None,
         };
         let mut c = c;
         c.write_slot_tables();
@@ -4634,7 +4637,114 @@ impl Coder {
         }
         let n = parts.len() / 2;
         parts.push(Vec::new());
-        super::engine::RunningState::from_parts(self.slot_tokens(slot).len(), n, parts)
+        let mut rs =
+            super::engine::RunningState::from_parts(self.slot_tokens(slot).len(), n, parts)?;
+        rs.store = self.store;
+        Ok(rs)
+    }
+
+    // ---- GDN memstore (`super::memserve`): engine-internal store windows
+
+    /// Keep a GDN memstore in GDN layer `gdn_layer` (its index among the GDN layers; on GPU 0
+    /// when the layers are split). Needs the memstore's head layout (16 k / 48 v heads):
+    /// Qwen3-Coder-Next's GDN layers (16 k / 32 v) are refused.
+    pub fn enable_store(&mut self, gdn_layer: usize) -> Result<()> {
+        super::memserve::check_shape(self.geo.gdn_hk, self.geo.gdn_hv)?;
+        let layer = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.gdn.is_some())
+            .nth(gdn_layer)
+            .map(|(i, _)| i)
+            .with_context(|| format!("no GDN layer {gdn_layer} on GPU 0"))?;
+        self.store = Some(super::memserve::StoreMeta { gdn_layer, layer });
+        Ok(())
+    }
+
+    /// The store layer (on GPU 0) and whether `slot` exists.
+    fn store_layer(&self, slot: usize) -> Result<usize> {
+        let m = self.store.context("no memstore layer (enable_store)")?;
+        ensure!(
+            slot == 0 || self.slots.get(slot).is_some_and(|s| s.is_some()),
+            "slot {slot} isn't allocated"
+        );
+        Ok(m.layer)
+    }
+
+    /// Slot `slot`'s state buffer of layer `l` (a GPU 0 GDN layer).
+    fn slot_state<'a>(
+        layers: &'a mut [Layer],
+        slots: &'a mut [Option<Slot>],
+        l: usize,
+        slot: usize,
+    ) -> Result<&'a mut B> {
+        let st = if slot == 0 {
+            layers[l].gdn.as_mut().map(|g| &mut g.state)
+        } else {
+            slots[slot].as_mut().and_then(|s| s.gdn[l].as_mut()).map(|(st, _)| st)
+        };
+        st.with_context(|| format!("slot {slot} has no state in layer {l}"))
+    }
+
+    /// The memstore heads of slot `slot`'s state.
+    pub fn store_heads_at(&mut self, slot: usize) -> Result<Vec<f32>> {
+        let l = self.store_layer(slot)?;
+        self.sync_all();
+        let st = Self::slot_state(&mut self.layers, &mut self.slots, l, slot)?;
+        let v = self.dev.download(st);
+        Ok(super::memstore::MemStore::<CudaComputeDevice>::snapshot_heads(&v))
+    }
+
+    /// Splice `heads` into slot `slot`'s memstore heads (the base heads stay bitwise).
+    pub fn set_store_heads_at(&mut self, slot: usize, heads: &[f32]) -> Result<()> {
+        ensure!(heads.len() == super::memserve::HEAD_FLOATS, "store heads size");
+        let l = self.store_layer(slot)?;
+        self.sync_all();
+        let st = Self::slot_state(&mut self.layers, &mut self.slots, l, slot)?;
+        let mut v = self.dev.download(st);
+        super::memstore::MemStore::<CudaComputeDevice>::restore_heads(&mut v, heads);
+        self.dev.upload_into_f32(st, &v);
+        self.dev.sync();
+        Ok(())
+    }
+
+    /// A store op as GDN windows on slot `slot`'s state of the store layer, through the
+    /// device's `gdn_step` with that layer's params: no other layer, the head, the K/V caches,
+    /// the MTP layer or the sampler is touched, and the slot's tokens don't change.
+    pub fn store_op_at(
+        &mut self,
+        slot: usize,
+        op: &super::memserve::StoreOp,
+    ) -> Result<super::memserve::OpOut> {
+        let l = self.store_layer(slot)?;
+        self.sync_all();
+        let GdnL {
+            conv,
+            dt,
+            a,
+            norm,
+            state,
+            ..
+        } = self.layers[l].gdn.as_mut().context("store layer isn't GDN")?;
+        let state = if slot == 0 {
+            state
+        } else {
+            &mut self.slots[slot]
+                .as_mut()
+                .and_then(|s| s.gdn[l].as_mut())
+                .context("slot has no store-layer state")?
+                .0
+        };
+        let p = GdnParams {
+            conv: &*conv,
+            dt_bias: &*dt,
+            ssm_a: &*a,
+            norm: &*norm,
+        };
+        let out = super::memserve::run_op(&self.dev, p, self.eps, state, op);
+        self.dev.sync();
+        out
     }
 
     /// Resume at `s.pos` with `prefix` (the `s.pos` tokens `s` was saved after).
