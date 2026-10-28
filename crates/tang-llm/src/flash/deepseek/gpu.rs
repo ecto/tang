@@ -139,6 +139,8 @@ const MORE: &[&str] = &[
     "ds_swiglu",
     "ds_router",
     "ds_linear_t8",
+    "ds_head_bf16",
+    "ds_argmax_rows",
     "ds_gather_rows",
     "ds_scatter_add",
     "ds_add",
@@ -520,6 +522,31 @@ impl Kernels {
                 s,
                 tang_moe::args![wv, x, y, ti, r],
             )?
+        }
+        Ok(())
+    }
+
+    /// The vocab head, `y` [t][rows] = `x` [t][cols] · `w`ᵀ (no rounding): `ds_head_bf16` for
+    /// bf16 weights in 8-row chunks, so each row's logits are the same at every `t`;
+    /// [`Kernels::linear`] otherwise.
+    pub fn head(&self, s: &Stream, w: &DsW, x: u64, y: u64, t: usize) -> Result<()> {
+        if w.fmt != 1 || w.cols % 8 != 0 || x % 16 != 0 {
+            return self.linear(s, w, x, y, t, false);
+        }
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        for i0 in (0..t).step_by(8) {
+            let ti = (t - i0).min(8) as i32;
+            let (xp, yp) = (x + (i0 * cols * 4) as u64, y + (i0 * rows * 4) as u64);
+            unsafe {
+                self.go(
+                    "ds_head_bf16",
+                    blocks(rows.div_ceil(4) * 32, 256),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![w.w, w.rows, w.cols, xp, yp, ti],
+                )?
+            };
         }
         Ok(())
     }
@@ -1816,6 +1843,82 @@ mod tests {
 
     /// Bandwidth on the real model's shapes with random weights (manual: `--ignored
     /// --nocapture fast_linear_bench`). Bytes = weights + scales read once per launch.
+    /// The vocab head at the real shape (129,280 x 5120 bf16, t = 1 and the 6-token verify),
+    /// CUDA-event timed, plus a bit-identity check of the R-rows-per-warp kernel against
+    /// `ds_linear_t8` (`cargo test ... --ignored --nocapture head_bench`).
+    #[test]
+    #[ignore]
+    fn head_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (rows, cols) = (129_280usize, 5120usize);
+        let wb: Vec<u16> = data(rows * cols, 7, 0.05)
+            .iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let wd = DevBuf::from_slice(&wb).unwrap();
+        let w = DsW {
+            w: wd.ptr,
+            s: 0,
+            rows: rows as i32,
+            cols: cols as i32,
+            fmt: 1,
+            _pad: 0,
+        };
+        let gb = (rows * cols * 2) as f64 / 1e9;
+        let ev = |f: &dyn Fn()| -> f64 {
+            f();
+            s.sync().unwrap();
+            let (a, b) = (
+                gpu::Event::new(true).unwrap(),
+                gpu::Event::new(true).unwrap(),
+            );
+            let n = 20;
+            a.record(&s).unwrap();
+            for _ in 0..n {
+                f();
+            }
+            b.record(&s).unwrap();
+            b.sync().unwrap();
+            b.since(&a).unwrap() as f64 * 1e3 / n as f64
+        };
+        for t in [1usize, 2, 6, 8] {
+            let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
+            let (y0, y1) = (
+                DevBuf::alloc(t * rows * 4).unwrap(),
+                DevBuf::alloc(t * rows * 4).unwrap(),
+            );
+            let base = ev(&|| k.linear(&s, &w, x.ptr, y0.ptr, t, false).unwrap());
+            let rr = ev(&|| k.head(&s, &w, x.ptr, y1.ptr, t).unwrap());
+            // each row of the t-row head equals that row run alone
+            let y2 = DevBuf::alloc(rows * 4).unwrap();
+            let mut same = true;
+            let all = y1.read::<f32>(0, t * rows).unwrap();
+            for i in 0..t {
+                k.head(&s, &w, x.ptr + (i * cols * 4) as u64, y2.ptr, 1)
+                    .unwrap();
+                let one = y2.read::<f32>(0, rows).unwrap();
+                same &= one
+                    .iter()
+                    .zip(&all[i * rows..])
+                    .all(|(p, q)| p.to_bits() == q.to_bits());
+            }
+            let base_v = y0.read::<f32>(0, t * rows).unwrap();
+            let md = base_v
+                .iter()
+                .zip(&all)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            eprintln!(
+                "head t={t}: linear {base:.0} us ({:.0} GB/s), ds_head_bf16 {rr:.0} us ({:.0} GB/s), rows t-independent {same}, max |diff| vs linear {md:.1e}",
+                gb / base * 1e6,
+                gb / rr * 1e6
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn fast_linear_bench() {

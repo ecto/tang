@@ -1419,12 +1419,20 @@ pub trait SpecPick {
     fn as_sampler(&mut self) -> Option<&mut SpecSampler> {
         None
     }
+    /// Whether every pick is an argmax with no RNG draws (so a verify walk needs only each
+    /// row's argmax, see [`verify_greedy`]).
+    fn greedy(&self) -> bool {
+        false
+    }
 }
 
 /// Temperature 0: argmax drafts, a draft is kept iff it is the target's argmax.
 pub struct Greedy;
 
 impl SpecPick for Greedy {
+    fn greedy(&self) -> bool {
+        true
+    }
     fn draft(&mut self, q: &[f32]) -> usize {
         argmax(q)
     }
@@ -1530,6 +1538,9 @@ impl SpecSampler {
 impl SpecPick for SpecSampler {
     fn as_sampler(&mut self) -> Option<&mut SpecSampler> {
         Some(self)
+    }
+    fn greedy(&self) -> bool {
+        SpecSampler::greedy(self)
     }
     fn draft(&mut self, q: &[f32]) -> usize {
         self.sample(q)
@@ -1645,11 +1656,30 @@ pub fn verify_rows(
     v: usize,
     pick: &mut dyn SpecPick,
 ) -> (usize, Vec<usize>) {
+    verify_rows_with(
+        &mut |k| logits[k * v..(k + 1) * v].to_vec(),
+        q,
+        ids,
+        v,
+        pick,
+    )
+}
+
+/// [`verify_rows`] with the target rows fetched on demand (`row(k)`, in order, each at most
+/// once): a walk that stops at row k reads k + 1 rows.
+pub fn verify_rows_with(
+    row: &mut dyn FnMut(usize) -> Vec<f32>,
+    q: &[f32],
+    ids: &[usize],
+    v: usize,
+    pick: &mut dyn SpecPick,
+) -> (usize, Vec<usize>) {
     let n = ids.len();
     let mut tokens = Vec::with_capacity(n);
     let mut k = 0;
     loop {
-        let row = &logits[k * v..(k + 1) * v];
+        let row = row(k);
+        let row = &row[..];
         if k + 1 == n {
             tokens.push(pick.verify(row, None).0);
             return (k, tokens);
@@ -1661,6 +1691,18 @@ pub fn verify_rows(
         }
         k += 1;
     }
+}
+
+/// [`verify_rows`] for a greedy pick from each row's argmax `amax` alone: drafts are kept
+/// while they equal the target's argmax, then that row's argmax (the replacement, or the
+/// bonus token after a fully accepted window).
+pub fn verify_greedy(amax: &[usize], ids: &[usize]) -> (usize, Vec<usize>) {
+    let n = ids.len();
+    let mut k = 0;
+    while k + 1 < n && ids[k + 1] == amax[k] {
+        k += 1;
+    }
+    (k, amax[..=k].to_vec())
 }
 
 /// The model side of [`generate`]: the CPU [`Model`] here, the GPU engine in `serve`.

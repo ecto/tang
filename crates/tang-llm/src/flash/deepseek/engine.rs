@@ -115,6 +115,8 @@ struct Inputs {
 struct StepOut {
     logits: Buf,
     rows: usize,
+    /// i32 [rows]: each logits row's argmax (as [`super::forward::argmax`]).
+    amax: Buf,
     mains: Vec<Buf>,
     jrows: Vec<(usize, usize, Buf, Buf)>,
 }
@@ -198,6 +200,8 @@ pub struct GpuModel {
     /// Skip the logits/hiddens read-back (and its sync): `forward` returns empty vectors.
     /// For expert-parallel ranks whose output nobody reads.
     pub skip_readback: bool,
+    /// The last step's output while its logits stay on the device ([`Self::verify_window`]).
+    last: Option<StepOut>,
     /// The step timeline ([`super::obs`]; `DS_OBS`).
     pub obs: super::obs::Obs,
     /// The expert-parallel reduce's stream: a graphable `moe_reduce` forks onto it (`fork`,
@@ -327,6 +331,7 @@ impl GpuModel {
             moe_tabs: RefCell::new(HashMap::new()),
             reduce_graphable: false,
             skip_readback: false,
+            last: None,
             obs: Default::default(),
         })
     }
@@ -1904,12 +1909,33 @@ impl GpuModel {
         sp: usize,
         hook: Option<&mut dyn FnMut(&str, &[f32])>,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        self.forward_impl(ids, sp, hook, false)
+        self.forward_impl(ids, sp, hook, false, true)
+            .map(|(l, m, _)| (l, m))
     }
 
     /// As [`Model::forward_all`]: every position's logits [T][V] (a verify window).
     pub fn forward_all(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<f32>, Vec<f32>)> {
-        self.forward_impl(ids, sp, None, true)
+        self.forward_impl(ids, sp, None, true, true)
+            .map(|(l, m, _)| (l, m))
+    }
+
+    /// A verify window that leaves its logits on the device: each row's argmax and the DSpark
+    /// target hiddens come back (a few bytes instead of [T][V] f32); [`Self::logits_row`]
+    /// reads single rows of this window on demand.
+    pub fn verify_window(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<usize>, Vec<f32>)> {
+        self.forward_impl(ids, sp, None, true, false)
+            .map(|(_, m, a)| (a, m))
+    }
+
+    /// Row `r` of the last [`Self::verify_window`]'s logits.
+    pub fn logits_row(&self, r: usize) -> Result<Vec<f32>> {
+        let v = self.cpu.cfg.vocab_size;
+        let out = self.last.as_ref().context("logits_row: no verify window")?;
+        if r >= out.rows {
+            bail!("logits_row: row {r} of {}", out.rows);
+        }
+        super::obs::d2h(v * 4);
+        Ok(out.logits.dev().read::<f32>(r * v, v)?)
     }
 
     /// Whether a step at `sp` with these settings is captured (see the module doc).
@@ -1930,9 +1956,11 @@ impl GpuModel {
         sp: usize,
         mut hook: Option<&mut dyn FnMut(&str, &[f32])>,
         all: bool,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        full: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<usize>)> {
         let c = self.cpu.cfg.clone();
         let (d, t, v) = (c.dim, ids.len(), c.vocab_size);
+        self.last = None;
         self.begin_step()?;
         let kind = match (sp, all && t > 1) {
             (0, _) => "prefill",
@@ -2032,11 +2060,17 @@ impl GpuModel {
         if self.skip_readback {
             // its events complete by the next step's start, which emits it
             self.obs.finish();
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
         self.sync()?;
-        super::obs::d2h((out.rows * v + out.mains.len() * t * d) * 4);
-        let logits = out.logits.dev().read::<f32>(0, out.rows * v)?;
+        let (logits, amax) = if full {
+            super::obs::d2h((out.rows * v + out.mains.len() * t * d) * 4);
+            (out.logits.dev().read::<f32>(0, out.rows * v)?, Vec::new())
+        } else {
+            super::obs::d2h((out.rows + out.mains.len() * t * d) * 4);
+            let a = out.amax.dev().read::<i32>(0, out.rows)?;
+            (Vec::new(), a.into_iter().map(|i| i as usize).collect())
+        };
         let n = out.mains.len();
         let mut main = vec![0f32; t * d * n];
         for (j, m) in out.mains.iter().enumerate() {
@@ -2046,8 +2080,11 @@ impl GpuModel {
                     .copy_from_slice(&mv[ti * d..(ti + 1) * d]);
             }
         }
+        if !full {
+            self.last = Some(out);
+        }
         self.obs.finish();
-        Ok((logits, main))
+        Ok((logits, main, amax))
     }
 
     /// The generation the next step will start at (one more when this one overflowed).
@@ -2131,11 +2168,27 @@ impl GpuModel {
         let x = self.hc_pre(h, pre_mix, t)?;
         self.rms(x, t, "norm.weight")?;
         let rows = if all { t } else { 1 };
-        let logits = self.raw(x.ptr + ((t - rows) * d * 4) as u64, rows, "head.weight")?;
+        let hw = self.dw("head.weight")?;
+        let logits = self.fbuf(rows * hw.v.rows as usize)?;
+        let xh = x.ptr + ((t - rows) * d * 4) as u64;
+        self.k.head(&self.s, &hw.v, xh, logits.ptr, rows)?;
+        let amax = self.fbuf(rows)?;
+        let vi = hw.v.rows;
+        unsafe {
+            self.k.go(
+                "ds_argmax_rows",
+                (rows as u32, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![logits.ptr, vi, amax.ptr],
+            )?
+        };
         self.end(sp_head);
         Ok(StepOut {
             logits,
             rows,
+            amax,
             mains,
             jrows: std::mem::take(&mut self.jrows),
         })
@@ -2382,9 +2435,25 @@ impl GpuModel {
         edit(pos0 + 1, &mut ids[1..]);
         let t1 = std::time::Instant::now();
         let snap = self.snapshot()?;
-        let (logits, mains) = self.forward_all(&ids, pos0)?;
+        let (amax, mains) = self.verify_window(&ids, pos0)?;
         let n = ids.len();
-        let (k, tokens) = super::forward::verify_rows(&logits, &draft.logits, &ids, v, pick);
+        let (k, tokens) = if pick.greedy() {
+            super::forward::verify_greedy(&amax, &ids)
+        } else {
+            // only the rows the walk reaches are read back
+            let mut err = None;
+            let mut row = |r: usize| {
+                self.logits_row(r).unwrap_or_else(|e| {
+                    err.get_or_insert(e);
+                    vec![0.0; v]
+                })
+            };
+            let r = super::forward::verify_rows_with(&mut row, &draft.logits, &ids, v, pick);
+            if let Some(e) = err {
+                return Err(e);
+            }
+            r
+        };
         let t2 = std::time::Instant::now();
         self.rewind(&snap, pos0 + k + 1, pos0 + n)?;
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
@@ -2985,6 +3054,58 @@ mod tests {
     }
 
     /// As forward.rs `tiny_spec_matches_greedy`, on the device.
+    /// Sampled speculative steps read back only the logits rows the accept walk reaches
+    /// (`verify_window` + `logits_row`): the same tokens, accepted counts and RNG state as the
+    /// full read-back (`forward_all` + `verify_rows`) from the same state.
+    #[test]
+    fn gpu_tiny_spec_sampling_lazy_rows() {
+        use super::super::forward::SpecSampler;
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let n = ids.len();
+        let start = |m: &mut GpuModel| {
+            let (l, main) = m.forward(&ids, 0, None).unwrap();
+            m.forward_spec(0, &main, 0).unwrap();
+            let t0 = argmax(&l);
+            let (_, main) = m.forward(&[t0], n, None).unwrap();
+            (t0, main)
+        };
+        let dir = Path::new(&tiny()).join("hf");
+        let (mut a, mut b) = (GpuModel::open(&dir).unwrap(), GpuModel::open(&dir).unwrap());
+        let ((ta, mut ma), (tb, mut mb)) = (start(&mut a), start(&mut b));
+        assert_eq!(ta, tb);
+        let (mut tok, mut sp) = (ta, n);
+        let c = a.cpu.cfg.clone();
+        let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
+        let (mut pa, mut pb) = (
+            SpecSampler::new(0.9, 0.95, 5),
+            SpecSampler::new(0.9, 0.95, 5),
+        );
+        let mut rows = 0;
+        for step in 0..8 {
+            let st = a
+                .decode_spec(tok, &ma, sp, &mut |_, _| {}, &mut pa)
+                .unwrap();
+            let pos0 = sp + mb.len() / w;
+            let d = b
+                .forward_spec_with(tok, &mb, sp, &mut |q: &[f32]| pb.draft(q))
+                .unwrap()
+                .unwrap();
+            let snap = b.snapshot().unwrap();
+            let (logits, mains) = b.forward_all(&d.ids, pos0).unwrap();
+            let (k, tokens) =
+                super::super::forward::verify_rows(&logits, &d.logits, &d.ids, v, &mut pb);
+            b.rewind(&snap, pos0 + k + 1, pos0 + d.ids.len()).unwrap();
+            assert_eq!((st.accepted, &st.tokens), (k, &tokens), "step {step}");
+            assert_eq!(pa.rng, pb.rng, "step {step}");
+            assert_eq!(st.main, mains[..(k + 1) * w], "step {step}");
+            rows += k + 1;
+            tok = *tokens.last().unwrap();
+            (ma, mb, sp) = (st.main, mains[..(k + 1) * w].to_vec(), pos0);
+        }
+        eprintln!("8 sampled steps: {rows} logits rows read");
+    }
+
     #[test]
     fn gpu_tiny_spec_matches_greedy() {
         let Some((mut m, meta)) = open() else { return };
