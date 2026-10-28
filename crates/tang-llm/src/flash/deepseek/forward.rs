@@ -1424,6 +1424,11 @@ pub trait SpecPick {
     fn greedy(&self) -> bool {
         false
     }
+    /// Whether [`Self::draft`] is the argmax (and consumes no state), so the engine may draw
+    /// drafts on the device.
+    fn greedy_draft(&self) -> bool {
+        self.greedy()
+    }
 }
 
 /// Temperature 0: argmax drafts, a draft is kept iff it is the target's argmax.

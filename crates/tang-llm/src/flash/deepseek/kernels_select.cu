@@ -301,3 +301,49 @@ extern "C" __global__ void ds_copy_u8(unsigned char* dst, const unsigned char* s
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
+
+// DSpark's greedy Markov draw on the device: ids[slot] = argmax(row) (the first maximum, as
+// the host `argmax`), or with row == nullptr keep ids[slot]; then, when memb != nullptr, the
+// Markov embedding row of that id: memb[0..rank] = tab[id * rank ..]. One block of 1024.
+extern "C" __global__ void ds_spark_pick(const float* row, int v, int* ids, int slot, const float* tab, int rank,
+                                         float* memb) {
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    __shared__ int pick;
+    int tid = threadIdx.x;
+    if (row) {
+        float bv = -DS_INF;
+        int bi = 0x7fffffff;
+        for (int j = tid; j < v; j += blockDim.x) {
+            float x = row[j];
+            if (x > bv) {
+                bv = x;
+                bi = j;
+            }
+        }
+        sv[tid] = bv;
+        si[tid] = bi;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                float ov = sv[tid + s];
+                int oi = si[tid + s];
+                if (ov > sv[tid] || (ov == sv[tid] && oi < si[tid])) {
+                    sv[tid] = ov;
+                    si[tid] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            int a = si[0] == 0x7fffffff ? 0 : si[0];
+            ids[slot] = a;
+            pick = a;
+        }
+    } else if (tid == 0) {
+        pick = ids[slot];
+    }
+    __syncthreads();
+    if (memb)
+        for (int j = tid; j < rank; j += blockDim.x) memb[j] = tab[(long long)pick * rank + j];
+}
