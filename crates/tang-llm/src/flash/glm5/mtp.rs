@@ -24,8 +24,9 @@
 use super::engine::{argmax, Glm5Engine};
 use super::mla::MlaWeights;
 use crate::flash::reference::{rms_norm_mul, Mat};
-use crate::gguf::Gguf;
 use anyhow::{ensure, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Context;
 use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
@@ -48,6 +49,21 @@ pub struct Mtp {
     latent: Vec<f32>,
     idx_k: Vec<f32>,
     idx_g: Vec<f32>,
+    /// The device home of this block (`TANG_GLM5_MTP_DEV`, default on with a GPU engine):
+    /// its own MLA caches + projections, its MoE FFN resident, the trunk's device LM head.
+    #[cfg(feature = "cuda")]
+    dev: Option<MtpDev>,
+}
+
+/// The NextN block on the device: the same pieces a trunk DSA layer uses (W3's `MlaCuda`
+/// with its own latent / indexer caches, the resident projections `MlaProj`, the W5 FFN
+/// `DevMoe`), called through their host-in / host-out entry points.
+#[cfg(feature = "cuda")]
+struct MtpDev {
+    cu: super::mla::cuda::MlaCuda,
+    p: super::mla_dev::MlaProj,
+    c: super::engine::DsaCache,
+    moe: super::moe::gpu::DevMoe,
 }
 
 /// What a batch of cells gives back.
@@ -87,23 +103,81 @@ impl Mtp {
             latent: Vec::new(),
             idx_k: Vec::new(),
             idx_g: Vec::new(),
+            #[cfg(feature = "cuda")]
+            dev: None,
         })
+        .and_then(|mut me| {
+            #[cfg(feature = "cuda")]
+            me.load_dev(e)?;
+            Ok(me)
+        })
+    }
+
+    /// Put the block on the engine's GPU 0 (no-op without one, or `TANG_GLM5_MTP_DEV=0`).
+    #[cfg(feature = "cuda")]
+    fn load_dev(&mut self, e: &Glm5Engine) -> Result<()> {
+        if std::env::var("TANG_GLM5_MTP_DEV").is_ok_and(|v| v == "0") {
+            return Ok(());
+        }
+        let Some(gf) = e.gpu.as_ref() else { return Ok(()) };
+        let (gpu, _) = gf.dev0();
+        gpu.bind().map_err(|er| anyhow::anyhow!("bind GPU 0 (mtp): {er}"))?;
+        let g = &e.m.g;
+        let cu = super::mla::cuda::MlaCuda::new_at(&self.mla, 0)
+            .map_err(|er| anyhow::anyhow!("mtp MlaCuda: {er}"))?;
+        let p = super::mla_dev::MlaProj::new(gpu, g, self.layer, &self.mla)?;
+        let mp = super::moe::MoeParams::from_gguf(g, self.layer)?;
+        let moe = super::moe::gpu::DevMoe::new(&mp)?;
+        self.dev = Some(MtpDev { cu, p, c: Default::default(), moe });
+        eprintln!("glm5: MTP layer blk.{} resident on GPU 0 (DSA + FFN + head)", self.layer);
+        Ok(())
+    }
+
+    /// Drop the device home: the host reference path (tests compare the two).
+    pub fn host_only(mut self) -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            self.dev = None;
+        }
+        self
+    }
+
+    /// Host LM-head logits of `hn` rows `[t][n]` (tests: the draft margin).
+    pub fn host_logits(&self, hn: &[f32]) -> Vec<f32> {
+        self.head.apply(hn, hn.len() / self.n, false)
+    }
+
+    /// Is the block on the device?
+    pub fn on_device(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        return self.dev.is_some();
+        #[cfg(not(feature = "cuda"))]
+        false
     }
 
     /// Cells in the cache (= the next cell's position).
     pub fn len(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(d) = &self.dev {
+            return d.c.valid_len();
+        }
         self.latent.len() / self.mla.kv_lora
     }
 
     /// Drop cells at positions `>= pos`.
     pub fn truncate(&mut self, pos: usize) {
+        #[cfg(feature = "cuda")]
+        if let Some(d) = &mut self.dev {
+            d.c.truncate_rows(pos, self.mla.kv_lora, self.mla.idx_dim);
+        }
         self.latent.truncate(pos * self.mla.kv_lora);
         self.idx_k.truncate(pos * self.mla.idx_dim);
         self.idx_g.truncate(pos * self.mla.idx_dim);
     }
 
     /// Run `toks.len()` cells at positions `len()..`, cell `i` pairing `h[i]` with `toks[i]`.
-    pub fn cells(&mut self, g: &Gguf, h: &[f32], toks: &[u32]) -> Result<CellOut> {
+    pub fn cells(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<CellOut> {
+        let g = &e.m.g;
         let (n, t, eps) = (self.n, toks.len(), self.eps);
         ensure!(
             h.len() == t * n,
@@ -127,6 +201,68 @@ impl Mtp {
         let mut xa = x.clone();
         xa.par_chunks_mut(n)
             .for_each(|r| rms_norm_mul(r, &self.attn_norm, eps));
+        #[cfg(feature = "cuda")]
+        let y = match self.dev.as_mut() {
+            Some(d) => {
+                let (gpu, _) = e.gpu.as_ref().context("mtp: device block without a GPU")?.dev0();
+                gpu.bind().map_err(|er| anyhow::anyhow!("bind (mtp): {er}"))?;
+                d.cu.set_seq(0);
+                super::engine::dsa_gpu_resident(self.layer, &self.mla, &d.cu, &d.p, &xa, t, pos0, &mut d.c, None)?
+            }
+            None => self.dsa_host(&xa, t, pos0),
+        };
+        #[cfg(not(feature = "cuda"))]
+        let y = self.dsa_host(&xa, t, pos0);
+        x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+        // ---- FFN half
+        let mut xf = x.clone();
+        xf.par_chunks_mut(n)
+            .for_each(|r| rms_norm_mul(r, &self.ffn_norm, eps));
+        #[cfg(feature = "cuda")]
+        let y = match self.dev.as_ref() {
+            Some(d) => {
+                let (_, k) = e.gpu.as_ref().context("mtp: no GPU")?.dev0();
+                super::moe::gpu::ffn_host(k, &d.moe, &xf, t)?
+            }
+            None => {
+                let p = super::moe::MoeParams::from_gguf(g, self.layer)?;
+                super::moe::moe_layer(&p, &xf, t)?
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let y = {
+            let p = super::moe::MoeParams::from_gguf(g, self.layer)?;
+            super::moe::moe_layer(&p, &xf, t)?
+        };
+        x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+        // ---- shared head
+        x.par_chunks_mut(n)
+            .for_each(|r| rms_norm_mul(r, &self.shnorm, eps));
+        let nv = self.head.rows;
+        #[cfg(feature = "cuda")]
+        if let Some(gf) = e.gpu.as_ref().filter(|_| self.dev.is_some()) {
+            let mut top = Vec::with_capacity(t);
+            for i in 0..t {
+                match gf.head_logits(&x[i * n..(i + 1) * n], n, nv)? {
+                    Some(lg) => top.push(argmax(&lg)),
+                    None => top.push(argmax(&self.head.apply(&x[i * n..(i + 1) * n], 1, false))),
+                }
+            }
+            return Ok(CellOut { h: x, top });
+        }
+        let logits = self.head.apply(&x, t, false);
+        let top = (0..t)
+            .map(|i| argmax(&logits[i * nv..(i + 1) * nv]))
+            .collect();
+        Ok(CellOut { h: x, top })
+    }
+}
+
+impl Mtp {
+    /// The attention half on the host (f32 caches).
+    fn dsa_host(&mut self, xa: &[f32], t: usize, pos0: usize) -> Vec<f32> {
+        let n = self.n;
+        let xa = xa.to_vec();
         let w = &self.mla;
         let kv_len = pos0 + t;
         let q_resid = w.gemv_q_a(&xa, t);
@@ -169,23 +305,7 @@ impl Mtp {
             sel.as_deref(),
             &mut y,
         );
-        x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
-        // ---- FFN half
-        let mut xf = x.clone();
-        xf.par_chunks_mut(n)
-            .for_each(|r| rms_norm_mul(r, &self.ffn_norm, eps));
-        let p = super::moe::MoeParams::from_gguf(g, self.layer)?;
-        let y = super::moe::moe_layer(&p, &xf, t)?;
-        x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
-        // ---- shared head
-        x.par_chunks_mut(n)
-            .for_each(|r| rms_norm_mul(r, &self.shnorm, eps));
-        let logits = self.head.apply(&x, t, false);
-        let nv = self.head.rows;
-        let top = (0..t)
-            .map(|i| argmax(&logits[i * nv..(i + 1) * nv]))
-            .collect();
-        Ok(CellOut { h: x, top })
+        y
     }
 }
 
@@ -193,8 +313,8 @@ impl Mtp {
 /// `h` rows with the token that FOLLOWS each position; `draft` then proposes up to `k`
 /// tokens after the last committed one.
 pub trait Drafter {
-    fn observe(&mut self, g: &Gguf, h: &[f32], next_toks: &[u32]) -> Result<()>;
-    fn draft(&mut self, g: &Gguf, k: usize) -> Result<Vec<u32>>;
+    fn observe(&mut self, e: &Glm5Engine, h: &[f32], next_toks: &[u32]) -> Result<()>;
+    fn draft(&mut self, e: &Glm5Engine, k: usize) -> Result<Vec<u32>>;
 }
 
 /// The MTP drafter: teacher-forced cells for committed positions, chained cells for drafts.
@@ -211,22 +331,22 @@ impl MtpDrafter {
 }
 
 impl Drafter for MtpDrafter {
-    fn observe(&mut self, g: &Gguf, h: &[f32], next_toks: &[u32]) -> Result<()> {
-        let o = self.mtp.cells(g, h, next_toks)?;
+    fn observe(&mut self, e: &Glm5Engine, h: &[f32], next_toks: &[u32]) -> Result<()> {
+        let o = self.mtp.cells(e, h, next_toks)?;
         let n = self.mtp.n;
         let t = next_toks.len();
         self.last = Some((o.h[(t - 1) * n..].to_vec(), o.top[t - 1]));
         Ok(())
     }
 
-    fn draft(&mut self, g: &Gguf, k: usize) -> Result<Vec<u32>> {
+    fn draft(&mut self, e: &Glm5Engine, k: usize) -> Result<Vec<u32>> {
         let Some((mut h, mut d)) = self.last.clone() else {
             return Ok(vec![]);
         };
         let keep = self.mtp.len();
         let mut out = vec![d];
         while out.len() < k {
-            let o = self.mtp.cells(g, &h, &[d])?;
+            let o = self.mtp.cells(e, &h, &[d])?;
             h = o.h;
             d = o.top[0];
             out.push(d);
@@ -313,13 +433,13 @@ pub fn generate(
     let mut nexts: Vec<u32> = prompt[1..].to_vec();
     nexts.push(cur);
     let td = Instant::now();
-    dr.observe(&e.m.g, &hs, &nexts)?;
+    dr.observe(e, &hs, &nexts)?;
     st.draft_s += td.elapsed().as_secs_f64();
     while gen.len() < n {
         let td = Instant::now();
         // never draft past n: the window is cur + drafts
         let kk = k.min(n - gen.len());
-        let mut drafts = dr.draft(&e.m.g, kk)?;
+        let mut drafts = dr.draft(e, kk)?;
         drafts.truncate(kk);
         st.draft_s += td.elapsed().as_secs_f64();
         let tt = Instant::now();
@@ -363,7 +483,7 @@ pub fn generate(
             let new = g2;
             st.trunk_s += tt.elapsed().as_secs_f64();
             let td = Instant::now();
-            dr.observe(&e.m.g, &h, &new)?;
+            dr.observe(e, &h, &new)?;
             st.draft_s += td.elapsed().as_secs_f64();
             cur = *new.last().unwrap();
             gen.extend_from_slice(&new);
@@ -374,7 +494,7 @@ pub fn generate(
         let new = g[..=a].to_vec();
         h.truncate((a + 1) * e.m.hp.n_embd);
         let td = Instant::now();
-        dr.observe(&e.m.g, &h, &new)?;
+        dr.observe(e, &h, &new)?;
         st.draft_s += td.elapsed().as_secs_f64();
         cur = *new.last().unwrap();
         gen.extend_from_slice(&new);

@@ -32,7 +32,7 @@ use std::time::Instant;
 /// One DSA layer's per-token caches: normed latent `[n][kv_lora]`, indexer key and gate
 /// rows `[n][idx_dim]`.
 #[derive(Default, Clone)]
-struct DsaCache {
+pub(crate) struct DsaCache {
     latent: Vec<f32>,
     idx_k: Vec<f32>,
     idx_g: Vec<f32>,
@@ -46,6 +46,26 @@ struct DsaCache {
     /// on are stale in the host mirrors above until `refresh_stale_dsa` pulls them.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stale_from: Option<usize>,
+}
+
+impl DsaCache {
+    /// Rows held (= the next row's position).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn valid_len(&self) -> usize {
+        self.valid.len()
+    }
+
+    /// Drop rows at positions `>= pos` (a rewind: the device rows are position-indexed and
+    /// the next append overwrites them).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn truncate_rows(&mut self, pos: usize, kl: usize, idd: usize) {
+        self.stale_from = self.stale_from.filter(|&f| f < pos);
+        self.latent.truncate(pos * kl);
+        self.lat16.truncate(pos * kl);
+        self.idx_k.truncate(pos * idd);
+        self.idx_g.truncate(pos * idd);
+        self.valid.truncate(pos);
+    }
 }
 
 /// The device-resident decode step (one stream, no per-stage host copies).
@@ -158,7 +178,7 @@ impl GpuFfn {
     /// The device LM head (TANG_GLM5_GPU_HEAD=1) for one decode row: the last normed h row
     /// up, one k5_q8 + one k5_gemv8, the logits row down. The host tiled path measured
     /// 39.6 ms/token (TANG_GLM5_TRACE); the kernel is ~150 us. `None` without a head.
-    fn head_logits(&self, h: &[f32], n: usize, nv: usize) -> Result<Option<Vec<f32>>> {
+    pub(crate) fn head_logits(&self, h: &[f32], n: usize, nv: usize) -> Result<Option<Vec<f32>>> {
         let Some(hd) = self.head_dev.as_ref() else {
             return Ok(None);
         };
@@ -565,6 +585,11 @@ impl GpuFfn {
         )?);
         eprintln!("glm5: mHC fused (device-resident streams, {} layers)", hp.n_layer);
         Ok(())
+    }
+
+    /// Device 0 and its MoE kernels (the MTP layer's device home, [`super::mtp`]).
+    pub(crate) fn dev0(&self) -> (&tang_moe::gpu::Gpu, &super::moe::gpu::Kernels) {
+        (&self.devs[0].0, &self.devs[0].1)
     }
 
     /// Whether layer `l`'s FFN is resident.
@@ -2164,7 +2189,7 @@ fn dsa_gpu(
 /// `x` up, `y` down, nothing else crosses per layer except the cache mirrors' new rows.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn dsa_gpu_resident(
+pub(crate) fn dsa_gpu_resident(
     l: usize,
     w: &MlaWeights,
     cu: &super::mla::cuda::MlaCuda,
