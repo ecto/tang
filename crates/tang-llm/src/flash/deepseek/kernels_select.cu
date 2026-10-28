@@ -553,6 +553,7 @@ extern "C" __global__ void __launch_bounds__(128) ds_moe_gate(DsW w, const float
         }
     }
     for (int q = min(nl, cap) + threadIdx.x; q < cap; q += blockDim.x) elist[q] = -1;
+}
 
 // ---- DSpark's sampled Markov draw on the device (`SpecSampler::sample`, same transform) ----
 
