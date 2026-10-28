@@ -716,7 +716,6 @@ impl FlashServe {
         let mut wrap_up = tok.encode(WRAP_UP)?;
         wrap_up.push(think.1);
         wrap_up.extend(tok.encode("\n\n")?);
-        let mut e = e;
         let store = match s.memory_layer {
             Some(n) => {
                 let m = e
