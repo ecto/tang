@@ -554,12 +554,10 @@ extern "C" __global__ void ds_index_score(const float* q, const float* ik, const
 }
 
 // wo_a, block-diagonal over groups: mid[t][g][r] = bf(Σ_i o[t][g][i] w[g*ol + r][i]).
-// Warp per DS_WO_R weight rows of one group, every token at once (up to DS_WO_T a pass): each
-// weight is read and decoded once rather than once a token, and each activation load feeds
-// DS_WO_R rows. Each output's sum runs in the same order as a warp per output (lane-strided,
-// then the xor tree), so the result is unchanged.
+// Every token at once (up to DS_WO_T a pass), so each weight is read and decoded once rather
+// than once a token. Each output's sum runs in the same order as a warp per output
+// (lane-strided, then the xor tree), so the result is unchanged.
 #define DS_WO_T 8
-#define DS_WO_R 1
 __device__ __forceinline__ float ds_fp8w(const unsigned char* wr, const unsigned char* sr, int i, int m) {
     // the e4m3 decode built from its bits (the same float as e4m3()); the column block's
     // scale is warp-uniform (i / 32 = m)
@@ -570,44 +568,58 @@ __device__ __forceinline__ float ds_fp8w(const unsigned char* wr, const unsigned
     return bf(dv * e8m0(sr[m]));
 }
 
-extern "C" __global__ void ds_wo_a(const float* o, DsW w, float* mid, int t, int g, int ol) {
-    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
-    int per = (ol + DS_WO_R - 1) / DS_WO_R;
-    if (warp >= g * per) return;
-    int gi = warp / per, r0 = (warp % per) * DS_WO_R;
-    int nr = min(DS_WO_R, ol - r0);
+// Block of 256 threads per DS_WO_ROWS consecutive rows of one group (ol % DS_WO_ROWS == 0):
+// the tokens' activations staged in shared memory 256 columns at a time, read by every warp.
+#define DS_WO_ROWS 16
+#define DS_WO_TC 256
+extern "C" __global__ void __launch_bounds__(256) ds_wo_a(const float* o, DsW w, float* mid, int t, int g, int ol) {
+    __shared__ float xs[DS_WO_T][DS_WO_TC];
+    int lane = threadIdx.x & 31, wi = threadIdx.x >> 5;
+    int base = blockIdx.x * DS_WO_ROWS, gi = base / ol;
+    const int RW = DS_WO_ROWS / 8;  // rows a warp
+    int r0 = base - gi * ol + wi * RW;
     int gd = w.cols, nsc = (gd + 31) / 32;
     long long ts = (long long)g * gd;
     for (int t0 = 0; t0 < t; t0 += DS_WO_T) {
         int nt = min(DS_WO_T, t - t0);
-        float s[DS_WO_R][DS_WO_T];
+        float s[RW][DS_WO_T];
 #pragma unroll
-        for (int j = 0; j < DS_WO_R; j++)
+        for (int j = 0; j < RW; j++)
 #pragma unroll
             for (int u = 0; u < DS_WO_T; u++) s[j][u] = 0.f;
         const float* ov = o + ((long long)t0 * g + gi) * gd;
-        for (int m = 0; m * 32 < gd; m++) {
-            int i = m * 32 + lane;
-            if (i >= gd) break;
-            float x[DS_WO_T];
+        for (int c0 = 0; c0 < gd; c0 += DS_WO_TC) {
+            __syncthreads();
+            for (int e = threadIdx.x; e < DS_WO_T * DS_WO_TC; e += 256) {
+                int u = e / DS_WO_TC, c = c0 + e % DS_WO_TC;
+                xs[u][e % DS_WO_TC] = u < nt && c < gd ? ov[u * ts + c] : 0.f;
+            }
+            __syncthreads();
+#pragma unroll 2
+            for (int mm = 0; mm < DS_WO_TC / 32; mm++) {
+                int i = c0 + mm * 32 + lane, m = i / 32;
+                if (c0 + mm * 32 >= gd) break;
+                float x[DS_WO_T];
 #pragma unroll
-            for (int u = 0; u < DS_WO_T; u++) x[u] = u < nt ? __ldg(ov + u * ts + i) : 0.f;
+                for (int u = 0; u < DS_WO_T; u++) x[u] = xs[u][mm * 32 + lane];
+                bool in = i < gd;
 #pragma unroll
-            for (int j = 0; j < DS_WO_R; j++) {
-                if (j >= nr) break;
-                int row = gi * ol + r0 + j;
-                float wv = w.fmt == 2
-                               ? ds_fp8w((const unsigned char*)w.w + (long long)row * gd,
-                                         (const unsigned char*)w.s + (long long)(row / 32) * nsc, i, m)
-                               : bf(wget(w, row, i));
+                for (int j = 0; j < RW; j++) {
+                    int row = gi * ol + r0 + j;
+                    float wv = !in ? 0.f
+                               : w.fmt == 2
+                                   ? ds_fp8w((const unsigned char*)w.w + (long long)row * gd,
+                                             (const unsigned char*)w.s + (long long)(row / 32) * nsc, i, m)
+                                   : bf(wget(w, row, i));
+                    if (in)
 #pragma unroll
-                for (int u = 0; u < DS_WO_T; u++)
-                    if (u < nt) s[j][u] += x[u] * wv;
+                        for (int u = 0; u < DS_WO_T; u++)
+                            if (u < nt) s[j][u] += x[u] * wv;
+                }
             }
         }
 #pragma unroll
-        for (int j = 0; j < DS_WO_R; j++) {
-            if (j >= nr) break;
+        for (int j = 0; j < RW; j++)
 #pragma unroll
             for (int u = 0; u < DS_WO_T; u++) {
                 if (u >= nt) break;
@@ -615,8 +627,16 @@ extern "C" __global__ void ds_wo_a(const float* o, DsW w, float* mid, int t, int
                 for (int o2 = 16; o2; o2 >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o2);
                 if (lane == 0) mid[((long long)(t0 + u) * g + gi) * ol + r0 + j] = bf(v);
             }
-        }
     }
+}
+
+// out[b][a][c] = in[a][b][c] for in [na][nb][nc]: the wo_a groups' rows to and from
+// per-group contiguous blocks for the K-split GEMV.
+extern "C" __global__ void ds_perm3(const float* in, float* out, int na, int nb, int nc) {
+    long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= (long long)na * nb * nc) return;
+    int c = e % nc, b = (e / nc) % nb, a = e / ((long long)nb * nc);
+    out[((long long)b * na + a) * nc + c] = in[e];
 }
 
 // Engram's gate, block per (t, c): out = bf(h + sigmoid(signed sqrt(normalized h·qk·key)) val).

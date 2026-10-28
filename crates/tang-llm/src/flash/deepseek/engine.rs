@@ -834,20 +834,68 @@ impl GpuModel {
         self.k.fp8_qdq(&self.s, o.ptr, t * h * hd)?;
         let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
         let mid = self.fbuf(t * g * ol)?;
-        let (wv, ti, gi, oli) = (wo_a.v, t as i32, g as i32, ol as i32);
-        unsafe {
-            self.k.go(
-                "ds_wo_a",
-                blocks(g * ol * 32, 256),
-                B256,
-                0,
-                &self.s,
-                args![o.ptr, wv, mid.ptr, ti, gi, oli],
-            )?
-        };
+        self.wo_a(o, &wo_a.v, mid, t, g, ol)?;
         let y = self.lin(mid, t, &format!("{p}.attn.wo_b.weight"));
         self.end(s);
         y
+    }
+
+    /// wo_a, block-diagonal over `g` groups: one K-split GEMV a group over the group-major
+    /// activations (the ks linears' relaxed bar), or under `DS_EXACT=1` the exact `ds_wo_a`.
+    fn wo_a(&self, o: Buf, w: &DsW, mid: Buf, t: usize, g: usize, ol: usize) -> Result<()> {
+        let gd = w.cols as usize;
+        let sub = |gi: usize| {
+            let mut v = *w;
+            v.rows = ol as i32;
+            if w.fmt == 2 {
+                v.w += (gi * ol * gd) as u64;
+                v.s += ((gi * ol / 32) * gd.div_ceil(32)) as u64;
+            } else {
+                v.w += (gi * ol * gd / 2) as u64;
+                v.s += (gi * ol * gd / 32) as u64;
+            }
+            v
+        };
+        let ks = self.fast && !self.k.exact && Kernels::fast_ok(w) && ol % 32 == 0;
+        if !ks {
+            anyhow::ensure!(ol % 16 == 0, "ds_wo_a wants o_lora_rank % 16 == 0");
+            let (ti, gi, oli) = (t as i32, g as i32, ol as i32);
+            return unsafe {
+                self.k.go(
+                    "ds_wo_a",
+                    ((g * ol / 16) as u32, 1, 1),
+                    B256,
+                    0,
+                    &self.s,
+                    args![o.ptr, *w, mid.ptr, ti, gi, oli],
+                )
+            };
+        }
+        let (og, yg) = (self.fbuf(t * g * gd)?, self.fbuf(t * g * ol)?);
+        self.perm3(o, og, t, g, gd)?;
+        for gi in 0..g {
+            let (xo, yo) = (
+                og.ptr + (gi * t * gd * 4) as u64,
+                yg.ptr + (gi * t * ol * 4) as u64,
+            );
+            self.k
+                .linear_fast(&self.s, &sub(gi), None, xo, yo, t, true, false, 0, 0.0)?;
+        }
+        self.perm3(yg, mid, g, t, ol)
+    }
+
+    fn perm3(&self, src: Buf, dst: Buf, na: usize, nb: usize, nc: usize) -> Result<()> {
+        let (a, b2, c) = (na as i32, nb as i32, nc as i32);
+        unsafe {
+            self.k.go(
+                "ds_perm3",
+                blocks(na * nb * nc, 256),
+                B256,
+                0,
+                &self.s,
+                args![src.ptr, dst.ptr, a, b2, c],
+            )
+        }
     }
 
     fn ring_seed(&self, lid: usize, kv: Buf, t: usize) -> Result<()> {
