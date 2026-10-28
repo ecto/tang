@@ -326,13 +326,15 @@ impl DevLayer {
             (false, true) => self.gv.qgemv9,
             (false, false) => self.gv.qgemv17,
         };
+        // the Q8_0 kernels stage nothing (kda_k5.cuh): 4 warps a block, no shared memory
+        let (nw, smem) = if rb as usize == cols / 256 * 144 { (nw, nw as u32 * rb) } else { (4, 0) };
         tang_moe::gpu::trace::bytes(bytes);
         unsafe {
             launch(
                 f,
                 (rows_total.div_ceil(nw) as u32, 1, 1),
                 ((32 * nw) as u32, 1, 1),
-                (nw as u32) * rb,
+                smem,
                 s,
                 args![tab.ptr, nseg as u32, codes, scales, cols as u32],
             )?;

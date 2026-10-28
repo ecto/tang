@@ -163,7 +163,13 @@ __device__ __forceinline__ void k5d_stage(unsigned char* sm, const unsigned char
     const unsigned long long a = (unsigned long long)src & ~15ull;
     *delta = (int)((unsigned long long)src - a);
     const unsigned n16 = ((unsigned)*delta + len + 15) >> 4;
-    for (unsigned i = tid; i < n16; i += nt) ((uint4*)sm)[i] = __ldg((const uint4*)a + i);
+    // cp.async (no register round trip): every 16 B granule of all three stages is in
+    // flight at once, under the state loads and the conv — the old load-then-store loop
+    // paid ~20 serial DRAM round trips per block. Waited on before the gate rows.
+    for (unsigned i = tid; i < n16; i += nt) {
+        const unsigned d = (unsigned)__cvta_generic_to_shared((uint4*)sm + i);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"((const uint4*)a + i) : "memory");
+    }
 }
 extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     const G5W fb, const G5W gb, const G5W bp, const float* __restrict__ X,
@@ -219,6 +225,7 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
         }
     }
     q[x] = qv; k[x] = kv;
+    asm volatile("cp.async.wait_all;" ::: "memory");
     __syncthreads();
     // gate rows (k5d_gate2: g5_dot's j-ascending acc += deq * x, deq = d * q)
     float gv, g2v;
@@ -286,9 +293,15 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     O[h * D + x] = o;
     os[x] = o;
     __syncthreads();
-    double ss = 0.0;
-    for (unsigned int d = 0; d < D; d++) { double v = (double)os[d]; ss += v * v; }
-    float r = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
+    // the f64 norm once per head (thread 0) and broadcast: every thread used to run the
+    // same 128-long f64 chain, and FP64 is scarce on the B300 (same expression: bit-equal)
+    if (x == 0) {
+        double ss = 0.0;
+        for (unsigned int d = 0; d < D; d++) { double v = (double)os[d]; ss += v * v; }
+        g1s[0] = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
+    }
+    __syncthreads();
+    const float r = g1s[0];
     const float yv = os[x] * r * ON[x] / (1.f + expf(-g2v));
     Y[h * D + x] = yv;
     // o_proj's k5_q8 over yb (COLS = DI, t = 0): this warp's 32 lanes are one Q8 block

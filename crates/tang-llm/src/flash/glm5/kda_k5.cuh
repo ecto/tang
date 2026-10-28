@@ -175,11 +175,18 @@ __device__ __forceinline__ uint4 k5_ldnc(const uint4* p) {
 }
 // MAXV = 16-byte granules a lane holds (rows up to 32 * MAXV * 16 B): k5_qgemv9 for
 // 4352 B rows (8.5 granules a lane), k5_qgemv17 for 8704 B (o_proj).
-template <int K5Q_MAXV>
+// No shared-memory staging (B300 microbench, NOTES 2026-10-28 kda3): staging capped the
+// rows in flight per SM at 228 KB / row_bytes and serialised load -> dot inside each warp
+// (3.7 TB/s on q|k|v|f_a|g_a, 2.4 on o_proj). Each lane now reads its own Q8_0 blocks
+// b = lane + 32 i straight from global as 9 aligned u32 words (a 34 B block starts at
+// 34b & ~3; odd b: the block is words 0..8 shifted by 16 bits, even b: words 0..7 plus
+// the low half of word 8), every word of the row issued up front (ld.global.cs). Same
+// per-block integer dot, same fmaf chain over i and xor tree: bit-equal to the staged
+// kernel. Word 8 of an even b never runs past the row: rb % 16 == 0 (host-checked).
+template <int K5Q_MAXNB>
 __device__ __forceinline__ void k5_qgemv_body(
     const K5Seg* __restrict__ segs, unsigned nseg, const unsigned char* __restrict__ xq,
     const float* __restrict__ xd, unsigned COLS) {
-    extern __shared__ uint4 dsm[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
     unsigned g = blockIdx.x * nw + warp;
     unsigned s = 0;
@@ -188,29 +195,30 @@ __device__ __forceinline__ void k5_qgemv_body(
         g -= segs[s].rows;
     }
     if (s >= nseg) return;
-    const unsigned rb = segs[s].row_bytes;
-    const int n16 = (int)(rb >> 4);
-    const uint4* src = (const uint4*)(segs[s].base + (unsigned long long)g * rb);
-    uint4* sm = dsm + (size_t)warp * n16;
-    uint4 v[K5Q_MAXV];
-#pragma unroll
-    for (int i = 0; i < K5Q_MAXV; i++)
-        if (lane + 32 * i < n16) v[i] = k5_ldnc(src + lane + 32 * i);
-#pragma unroll
-    for (int i = 0; i < K5Q_MAXV; i++)
-        if (lane + 32 * i < n16) sm[lane + 32 * i] = v[i];
-    __syncwarp();
-    const unsigned char* row = (const unsigned char*)sm;
-    float acc = 0.f;
     const int nb = (int)(COLS >> 5);
-    for (int b = lane; b < nb; b += 32) {
-        const unsigned short* p = (const unsigned short*)(row + 34 * b); // 2-byte aligned
-        const float dw = g5_h2f(p[0]);
-        const int4* xv = (const int4*)(xq + 32 * b);
-        const int4 x0 = __ldg(xv), x1 = __ldg(xv + 1);
+    const unsigned char* row = (const unsigned char*)(segs[s].base + (unsigned long long)g * segs[s].row_bytes);
+    unsigned wd[K5Q_MAXNB][9];
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXNB; i++) {
+        const int b = lane + 32 * i;
+        if (b < nb) {
+            const unsigned* p = (const unsigned*)(row + ((34u * (unsigned)b) & ~3u));
+#pragma unroll
+            for (int j = 0; j < 9; j++) wd[i][j] = __ldcs(p + j);
+        }
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXNB; i++) {
+        const int b = lane + 32 * i;
+        if (b >= nb) break;
+        const bool odd = b & 1;
+        const float dw = g5_h2f(odd ? (wd[i][0] >> 16) : (wd[i][0] & 0xffffu));
         int w[8];
 #pragma unroll
-        for (int j = 0; j < 8; j++) w[j] = (int)((unsigned)p[1 + 2 * j] | ((unsigned)p[2 + 2 * j] << 16));
+        for (int j = 0; j < 8; j++) w[j] = odd ? (int)wd[i][j + 1] : (int)__funnelshift_r(wd[i][j], wd[i][j + 1], 16);
+        const int4* xv = (const int4*)(xq + 32 * b);
+        const int4 x0 = __ldg(xv), x1 = __ldg(xv + 1);
         int si = __dp4a(w[0], x0.x, 0);
         si = __dp4a(w[1], x0.y, si); si = __dp4a(w[2], x0.z, si); si = __dp4a(w[3], x0.w, si);
         si = __dp4a(w[4], x1.x, si); si = __dp4a(w[5], x1.y, si); si = __dp4a(w[6], x1.z, si);
@@ -221,9 +229,9 @@ __device__ __forceinline__ void k5_qgemv_body(
     if (lane == 0) ((float*)segs[s].y)[g] = acc;
 }
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv9(const K5Seg* segs, unsigned nseg,
-    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<9>(segs, nseg, xq, xd, COLS); }
+    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<5>(segs, nseg, xq, xd, COLS); }
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv17(const K5Seg* segs, unsigned nseg,
-    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<17>(segs, nseg, xq, xd, COLS); }
+    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<9>(segs, nseg, xq, xd, COLS); }
 // k5_qgemv_q4k: k5_qgemv for Q4_K rows (the requantized KDA projections, NOTES 2026-10-27
 // kda-q4). Same segment table, staging and launch shape; only the dot differs. A Q4_K
 // super-block (144 B, 256 values) = f16 d, f16 dmin, 12 B of packed 6-bit (scale, min) for
