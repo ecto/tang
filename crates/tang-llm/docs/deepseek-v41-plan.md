@@ -294,7 +294,7 @@ target layers); attention prologue 5 + 1 memcpy (`ds_ks_quant`, wq_a and wkv `ds
 `dg_win_idx` + sparse attn); wo 2–3 (`ds_wo_ks`, wo_b quant + `ds_ks`); MoE 5 (`ds_router`,
 `ds_route_plan_q`, grouped gu, grouped down, `ds_moe_reduce_sh` + the NCCL all-reduce).
 
-**The dense-glue megakernel** (`mg_glue` in kernels_mega.cu, `DS_MEGA=1`, 1fa7c0a5): the 6
+**The dense-glue megakernel** (`mg_glue` in kernels_mega.cu, `DS_MEGA=1`, e93df959 + 3e4e8677): the 6
 launches + 1 memcpy from the MoE all-reduce of layer l−1 to the attention core of layer l
 (the attention mHC stage, the block input's quantization folded into its store, wq_a, wkv, the
 ring copy, `ds_qkv_post` with its 1024-thread reductions replayed in order by 256 threads,
