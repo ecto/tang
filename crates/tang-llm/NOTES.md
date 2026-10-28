@@ -4,6 +4,48 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 — MoE FFN: Q8_0 / Q6_K repacked at upload, fused gate|up rows, one routing launch (H200, branch claude/glm5-ffn-repack)
+
+Second H200 (pod nxn0swopws2xi8), real layers, `real_layers_fast_matches_cpu`. New knob
+`TANG_GLM5_MOE_SPLIT=1` (+ `TANG_TRACE_EXACT=1`) prints per-kernel GPU µs / declared bytes /
+TB/s over 50 calls (trace on, so totals include per-launch event gaps; the first kernel of a call
+also absorbs the gap since the previous call — the 12 µs `g5f_q8(x)` vs 6 µs `g5f_q8(h)`).
+
+Kernel split, T=1, µs (TB/s) — before = this branch with `REPACK=0 STAGE=1 MINB=6 FUSE2=0 ROUTE1=0`
+(= frog/glm5-forward 38bb2bed behaviour; the first H200 gave the same numbers within 1-2 µs):
+
+| layer | q8 x | router | select | gu | q8 h | down | sum | total |
+|---|---|---|---|---|---|---|---|---|
+| l4 before | 12.2 | 8.3 | 10.4 | 47.6 (1.96) | (in q8) | 37.8 (1.46) | 6.0 | 122.3 |
+| l4 after | — | route 17.1 | — | 41.9 (2.23) | 5.8 | 30.1 (1.83) | 6.0 | 100.8 |
+| l12 before (Q6_K down, Q8_0 shared) | 11.9 | 8.1 | 10.3 | 47.8 (1.95) | | 53.4 (1.20) | 6.1 | 137.5 |
+| l12 after | — | route 17.3 | — | 42.0 (2.22) | 5.8 | 32.2 (1.99) | 6.0 | 103.2 |
+| l0 dense Q8_0 before | 12.5 | | | 50.4 (2.12) | | 72.1 (0.74) | | 135.0 |
+| l0 after | 12.6 | | | 34.1 (3.13) | | 26.1 (2.05) | | 72.8 |
+
+Untraced bench, device x/y, µs/call T1 (before -> after): l0 129 -> 66, l4 112 -> 92 (1.36 -> 1.67
+TB/s of 153 MB), l11 132 -> 97, l12 127 -> 94. T8: l4 574 -> 545, l12 728 -> 491, l0 822 -> 327.
+Parity: fast-q8x2 rel l2 worst 5.1e-5 (unchanged), routing sets = CPU; ids with GPU_FFN_LAYERS=0-29
++ the baseline flags: `785 1196 6801 264 6386 38038 911 279`.
+
+Steps:
+1. Repack at upload (`upload_ffn`, DevMoe only; GGUF untouched; `TANG_GLM5_MOE_REPACK=0` off):
+   Q8_0 -> ty 108 `qs[k] | f16 d[k/32]`, Q6_K -> ty 114 `{ql,qh}[192] x nb | sc[16] x nb | d x nb`,
+   rows padded to 16 B. `g5f_lane_dot32r` reads both as 16 B loads per 32-chunk; the naive
+   reference decodes them through `g5_deq_r` (needs k). l12 down 54.8 -> 39.2, l0 135 -> 101.
+2. Defaults `MINB` 6 -> 8 and `STAGE` on -> off: with every routed/shared type on the 32-chunk dot,
+   the smem staging round trip costs more than it saves (l12 122 -> 111). Unroll 2/4: worse.
+3. `G5F_FUSE2` (default on): gate and up rows (and the down row pair) dotted in one loop, both rows'
+   loads in flight per iteration — gu 46 -> 42.
+4. `g5f_route` (`TANG_GLM5_MOE_ROUTE1`, default on for n_group <= 1, F32 router, ne >= hid/32):
+   q8(x) + router + select in one launch; the last block per token (atomic counter, reset on exit)
+   runs the select. 3 launches -> 1, ~30 -> 17 µs traced.
+
+Still open (target 60 µs not reached): gu 2.2 TB/s and down 1.8-2.0 TB/s on 93 / 55 MB; route 17 µs
+(256 router rows = 256 blocks, then a serial top-8 in one warp); sum 6 µs + q8(h) 6 µs launches.
+Next: router at more rows per block / split-K, fold q8(h) into gu (per-32 amax needs 32 rows of one
+slot in one block: a block-per-32-rows gu), fold sum into the next consumer.
+
 ## 2026-10-27 (integration) — batcher + kda-gemv + moe + bench + step-graph merged: B300 30.8 tok/s decode (branch claude/glm5-integrate)
 
 Merged onto frog/glm5-forward 66aa4b5e: frog/glm5-batcher, claude/glm5-kda-gemv, claude/glm5-moe,
