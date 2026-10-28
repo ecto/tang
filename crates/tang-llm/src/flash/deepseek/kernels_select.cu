@@ -189,8 +189,8 @@ extern "C" __global__ void ds_idx_cat(int* dst, const int* src, int t, int k, in
 
 // MoE routing lists, one block: ids/wts [t][k] -> per-expert CSR, rows ascending within an
 // expert: counts[ne], off[ne + 1], rows[t * k] (token), rw[t * k] (route weight).
-extern "C" __global__ void ds_route(const int* ids, const float* wts, int* counts, int* off, int* rows, float* rw,
-                                    int t, int k, int ne) {
+__device__ __forceinline__ void route_body(const int* ids, const float* wts, int* counts, int* off, int* rows,
+                                           float* rw, int t, int k, int ne) {
     int n = t * k;
     for (int e = threadIdx.x; e < ne; e += blockDim.x) {
         int c = 0;
@@ -216,6 +216,38 @@ extern "C" __global__ void ds_route(const int* ids, const float* wts, int* count
                 o++;
             }
     }
+}
+
+extern "C" __global__ void ds_route(const int* ids, const float* wts, int* counts, int* off, int* rows, float* rw,
+                                    int t, int k, int ne) {
+    route_body(ids, wts, counts, off, rows, rw, t, k, ne);
+}
+
+// ds_route, then ds_moe_plan, in block 0; blocks 1.. are ds_ks_quant of x's ng 32-groups (the
+// grouped K-split GU's activation, independent of the routing): three launches in one.
+extern "C" __global__ void ds_route_plan_q(const int* ids, const float* wts, int* counts, int* off, int* rows,
+                                           float* rw, int t, int k, int ne, const int* mask, int* elist, int cap,
+                                           const float* x, unsigned char* codes, float* sx, int ng) {
+    if (blockIdx.x == 0) {
+        route_body(ids, wts, counts, off, rows, rw, t, k, ne);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int j = 0;
+            for (int e = 0; e < ne && j < cap; e++)
+                if (counts[e] > 0 && mask[e]) elist[j++] = e;
+            for (; j < cap; j++) elist[j] = -1;
+        }
+        return;
+    }
+    int gw = ((blockIdx.x - 1) * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= ng) return;
+    float xv = x[(long long)gw * 32 + lane];
+    float a = fabsf(xv);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    float sc = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
+    codes[(long long)gw * 32 + lane] = (unsigned char)e4m3_byte(round_e4m3(fminf(fmaxf(xv / sc, -448.f), 448.f)));
+    if (lane == 0) sx[gw] = sc;
 }
 
 // Expert e's rows of x [.][d] into xs [cap][d] and its route weights into w [cap]; rows past

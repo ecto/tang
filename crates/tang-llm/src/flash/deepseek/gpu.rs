@@ -194,6 +194,7 @@ const MORE: &[&str] = &[
     "ds_moe_plan",
     "ds_moe_reduce",
     "ds_moe_reduce_sh",
+    "ds_route_plan_q",
     "ds_moe_gate",
     "ds_moe_plan_tiles",
     "ds_kst_f2_g0",
@@ -627,6 +628,36 @@ impl Kernels {
                 0,
                 s,
                 tang_moe::args![ids, wts, counts, off, rows, rw, ti, ki, nei],
+            )
+        }
+    }
+
+    /// [`Kernels::route`], `ds_moe_plan` (`elist` [cap] over `mask`) and the K-split quantization
+    /// of `x` [t][d] that [`Kernels::moe_gu_sh`] then takes as is (`pre`), in one launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_plan_q(
+        &self,
+        s: &Stream,
+        (ids, wts): (u64, u64),
+        (counts, off, rows, rw): (u64, u64, u64, u64),
+        (mask, elist, cap): (u64, u64, usize),
+        x: u64,
+        (t, k, ne, d): (usize, usize, usize, usize),
+    ) -> Result<()> {
+        let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
+        let ng = t * d / 32;
+        let (ti, ki, nei, ci, ngi) = (t as i32, k as i32, ne as i32, cap as i32, ng as i32);
+        unsafe {
+            self.go(
+                "ds_route_plan_q",
+                ((1 + ng.div_ceil(8)) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![
+                    ids, wts, counts, off, rows, rw, ti, ki, nei, mask, elist, ci, x, codes,
+                    scales, ngi
+                ],
             )
         }
     }
@@ -1261,7 +1292,12 @@ impl Kernels {
         lim: f32,
     ) -> Result<()> {
         let f = self.moe_ks_sh[fmt as usize - 2][s1.fmt as usize - 2][0];
-        let (codes, scales) = self.ks_quantize(s, xq, t, d)?;
+        // xq == 0: route_plan_q already quantized the activation into ks_x
+        let (codes, scales) = if xq == 0 {
+            (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64)
+        } else {
+            self.ks_quantize(s, xq, t, d)?
+        };
         let (sp, nbr, gx) = self.moe_ks_grid(inter, 8, d);
         let (si, nbri, ts, ni, s1, s3) = (
             sp as i32,

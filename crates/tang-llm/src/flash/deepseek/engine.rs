@@ -1763,7 +1763,12 @@ impl GpuModel {
         // on the 3090 bench so far, so opt-in for sweeping on H200)
         let fused = std::env::var("DS_MOE_GATE").is_ok_and(|v| v == "1")
             && Kernels::moe_gate_ok(&gw.v, t, ne, topk);
+        let sh = match &tab {
+            Some(tb) => self.moe_sh_weights(p, tb, t, topk)?,
+            None => None,
+        };
         let mut elist = None;
+        let mut preq = false;
         if fused {
             // gate GEMV + router + CSR (+ the grouped plan) in one launch
             let s = self.span("router");
@@ -1808,17 +1813,34 @@ impl GpuModel {
                 c.route_scale,
             )?;
             self.end(s);
-            // per-expert CSR on the device
+            // per-expert CSR on the device; with the shared expert folded, the plan and the
+            // GU's activation quantization ride in the same launch
             let s = self.span("route");
-            self.k.route(
-                &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
-            )?;
+            match (&tab, &sh) {
+                (Some(tb), Some(_)) => {
+                    let cap = (t * topk).min(tb.local);
+                    let el = self.fbuf(cap)?;
+                    self.k.route_plan_q(
+                        &self.s,
+                        (ids.ptr, wts.ptr),
+                        (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                        (tb.mask.ptr, el.ptr, cap),
+                        x.ptr,
+                        (t, topk, ne, d),
+                    )?;
+                    elist = Some(el);
+                    preq = true;
+                }
+                _ => self.k.route(
+                    &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+                )?,
+            }
             self.end(s);
         }
         if let Some(tab) = tab {
             if t <= 8 {
                 let (y, folded) = self.moe_grouped_routed(
-                    p, &tab, x, t, topk, ne, ids, counts, off, rows, rw, elist,
+                    p, &tab, x, t, topk, ne, ids, counts, off, rows, rw, elist, sh, preq,
                 )?;
                 if folded {
                     return self.moe_finish_folded(x, t, y);
@@ -1896,6 +1918,36 @@ impl GpuModel {
         self.moe_finish(p, x, t, y)
     }
 
+    /// The shared expert's weights when it folds into the grouped launches as one more slot
+    /// (on rank 0 alone under EP, so the reduce sums it once): its MLP launches and the add
+    /// gone. `DS_MOE_SH=0` keeps the MLP.
+    fn moe_sh_weights(
+        &self,
+        p: &str,
+        tab: &MoeTab,
+        t: usize,
+        topk: usize,
+    ) -> Result<Option<[Rc<DevW>; 3]>> {
+        if !self.moe_sh || t > 8 {
+            return Ok(None);
+        }
+        let pe = format!("{p}.ffn.shared_experts");
+        let ws = [
+            self.dw(&format!("{pe}.w1.weight"))?,
+            self.dw(&format!("{pe}.w3.weight"))?,
+            self.dw(&format!("{pe}.w2.weight"))?,
+        ];
+        let ok = self.k.moe_sh_ok(
+            [&ws[0].v, &ws[1].v, &ws[2].v],
+            tab.fmt,
+            t,
+            topk,
+            self.cpu.cfg.dim,
+            tab.inter,
+        );
+        Ok(ok.then_some(ws))
+    }
+
     /// The routed experts' partial sum y [t][d] by the grouped kernels: plan (live local
     /// experts), gate/up + SwiGLU, quantize, down to per-slot partials, ordered reduce.
     #[allow(clippy::too_many_arguments)]
@@ -1913,34 +1965,12 @@ impl GpuModel {
         rows: Buf,
         rw: Buf,
         planned: Option<Buf>,
+        sh: Option<[Rc<DevW>; 3]>,
+        preq: bool,
     ) -> Result<(Buf, bool)> {
         let d = self.cpu.cfg.dim;
         let (n, inter) = (t * topk, tab.inter);
         let slots = n.min(tab.local);
-        // the shared expert as one more slot of the grouped launches (on rank 0 alone under
-        // EP, so the reduce sums it once), its MLP launches and the add gone; `DS_MOE_SH=0` off
-        let sh = if self.moe_sh {
-            let pe = format!("{p}.ffn.shared_experts");
-            let ws = [
-                self.dw(&format!("{pe}.w1.weight"))?,
-                self.dw(&format!("{pe}.w3.weight"))?,
-                self.dw(&format!("{pe}.w2.weight"))?,
-            ];
-            if std::env::var("DS_MOE_SH_DEBUG").is_ok() {
-                eprintln!(
-                    "moe_sh {p}: routed fmt {} inter {inter}; shared {:?}",
-                    tab.fmt,
-                    ws.iter()
-                        .map(|w| (w.v.fmt, w.v.rows, w.v.cols))
-                        .collect::<Vec<_>>()
-                );
-            }
-            self.k
-                .moe_sh_ok([&ws[0].v, &ws[1].v, &ws[2].v], tab.fmt, t, topk, d, inter)
-                .then_some(ws)
-        } else {
-            None
-        };
         let s = self.span("grouped_gu");
         let elist = match planned {
             Some(e) => e,
@@ -1977,7 +2007,7 @@ impl GpuModel {
                 (tab.w1.ptr, tab.w3.ptr, elist.ptr),
                 (off.ptr, rows.ptr, rw.ptr),
                 (&ws[0].v, &ws[1].v, on),
-                x.ptr,
+                if preq { 0 } else { x.ptr },
                 h.ptr,
                 (t, n, slots, inter, d),
                 lim,
