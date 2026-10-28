@@ -4,6 +4,44 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (integration round 4) — merged on B300: whole-step graph default, 58.5 tok/s; MTP host draft is 6 s/pass (branch frog/glm5-forward)
+
+Pod: fresh B300 SXM6 (US-WA-2, 275 GB, CUDA 12.8 image, container disk). `scripts/glm5-bench.sh`
+on claude/glm5-integrate4 83b3ab92 with the B flag set (MOE=fast GEMV8 KDA_PF2 MHC_FUSED
+MLA_RESIDENT GPU_HEAD KDA_G5F=2 KDA_FUSED KDA_GRAPH), then frog/glm5-forward 75249bda as the
+reference. ids md5 = md5 of the `ids:` line's token list.
+
+| run | STEP_GRAPH | -n | decode tok/s | ids md5 |
+|---|---|---|---|---|
+| integrate4 | 1 (segments) | 128 | 55.92 | 7174cdd6 |
+| integrate4 | 2 (whole) | 128 | 58.28 | 7174cdd6 |
+| integrate4 | 1 | 512 | 53.94 | 1453cf0e |
+| integrate4 | 2 | 512 | **58.48** | 1453cf0e |
+| forward 75249bda | 1 | 512 | 54.29 | 1453cf0e |
+
+Haiku oracle on every run. The whole-step graph is bit-identical to the segments and to
+forward at 512 (across the dense→sparse indexer switch), and 2.4–4.5 tok/s faster. It is the
+default now (d68e2b65: unset / `2` = whole, `1` = segments, `0` = eager; the resident-step
+test runs all three). mew tiny-model suite 83/0/2 on f4005f33.
+
+MTP on the same pod (`--mtp K`, WIN_STEP default K+1), bench prompt -n 128:
+
+| K | accept | tok/pass | draft s | trunk s | ids md5 |
+|---|---|---|---|---|---|
+| 1 | 61/67 = 91% | 1.74 | 445.7 | 7.2 | baced18e |
+| 2 | 33/44 = 75% | 1.92 | 535.2 | 6.7 | 7174cdd6 |
+| 3 | 18/29 = 62% | 1.87 | 615.2 | 7.3 | 7174cdd6 |
+
+Haiku gates (-n 8) match the oracle at every depth. The whole run is 470–640 s for 128 tokens:
+the *draft* (the MTP layer blk.45 forward) costs ~6.6 s per pass on the host path while the
+trunk verify is ~0.1 s/pass. MTP is unusable until the draft layer runs on the device inside the
+resident step; the ×1.8 tok/pass is real but buried under a 60× draft cost. Also noted, not
+chased: K=1's 128-token ids differ from greedy (baced18e vs 7174cdd6) while K=2/3 match — a
+depth-1 acceptance edge to bisect before MTP goes on the device.
+
+Timings in the bench summary's stage columns are meaningless on the resident path (the trace
+span wraps the one sync per token); the ncu graph-node profile is the per-kernel source.
+
 ## 2026-10-28 (integration round 4 prep) — mtp-ready + stepgraph2 + kda-q4 merged; one test env lock; suite green in parallel (branch claude/glm5-integrate4)
 
 No real weights this round (no pods). Base frog/glm5-forward 75249bda, then `--no-ff` merges in order:
