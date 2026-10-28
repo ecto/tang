@@ -224,7 +224,7 @@ const KS_X: usize = 8 * 16384 * 2;
 const WO_X_COLS: usize = 32768;
 const WO_X: usize = 8 * WO_X_COLS + 8 * WO_X_COLS / 8;
 /// Row groups each grouped K-split block takes (blockIdx.x strides them).
-const MOE_KS_ITEMS: usize = 4;
+const MOE_KS_ITEMS: usize = 2;
 
 fn env_usize(k: &str) -> Option<usize> {
     std::env::var(k).ok().and_then(|v| v.parse().ok())
