@@ -646,23 +646,52 @@ __device__ int ds_ss_nth(const double* w, int v, unsigned long long kap, int n, 
     return *res;
 }
 
-// ids[slot] = a draw from SpecSampler::dist(row) (temperature `temp` > 0, top-p `top_p`):
-// w = exp((row - max) / temp) in f64, the smallest prefix by decreasing w (ties by id) holding
-// top_p of the mass, one uniform from the splitmix64 state *rng (advanced), the first prefix
-// token whose cumulative mass reaches it. `w` is [v] f64 scratch; `bias` (when given) is
-// first added to row, as ds_spark_pick. Then, as ds_spark_pick, the
-// Markov embedding row of the draw. One block of 1024.
-extern "C" __global__ void __launch_bounds__(1024) ds_spark_sample(float* row, int v, int* ids, int slot,
-                                           const float* tab, int rank, float* memb, float temp,
-                                           float top_p, unsigned long long* rng, double* w,
-                                           const float* bias) {
-    __shared__ double red[32][15];
-    __shared__ double out[15];
-    __shared__ float smx[32];
-    __shared__ int cnt[1024];
-    __shared__ int res;
-    __shared__ double sz, su;
-    __shared__ int pick;
+// The fast transformed distribution (SpecSampler::dist on the device). The kept top-p prefix
+// is almost always tiny, so instead of searching the whole vocab by key bits, one pass
+// buckets w by exponent (w >= 2^-e for the DS_SS_NB thresholds e below), the smallest bucket
+// holding the top-p mass (with a 1e-9 margin, so the host's running sum surely reaches it)
+// is gathered (at most DS_SS_CAP tokens: an exact prefix of the host's order, since it is
+// every token with w above a threshold), bitonic-sorted by (w desc, id asc), and one
+// thread runs the host's cut, total and renormalisation in its order. Returns the kept
+// count, or 0 when it does not apply (top_p >= 1, or the bucket is too big): the caller then
+// takes the full-vocab path. Always leaves w = exp((row - max) / temp) and z = sum w.
+#define DS_SS_CAP 2048
+#define DS_SS_NB 10
+__constant__ int ds_ss_e[DS_SS_NB] = {1, 2, 3, 4, 6, 8, 11, 14, 20, 32};
+
+struct DsSs {
+    double red[32][32];
+    double out[32];
+    double cw[DS_SS_CAP];
+    int ci[DS_SS_CAP];
+    float smx[32];
+    double z;
+    int n, keep;
+};
+
+// The N sums of each thread's `loc` over the block, in a fixed order; into out for all.
+template <int N>
+__device__ void ds_ss_sumn(double* loc, DsSs& S) {
+    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+#pragma unroll
+    for (int k = 0; k < N; k++) {
+        double x = loc[k];
+        for (int o = 16; o > 0; o >>= 1) x += __shfl_down_sync(0xffffffff, x, o);
+        if (lane == 0) S.red[wid][k] = x;
+    }
+    __syncthreads();
+    if (tid < N) {
+        double s = 0.0;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) s += S.red[w][tid];
+        S.out[tid] = s;
+    }
+    __syncthreads();
+}
+
+// Bias (when given) added to row in place, then w, z and the fast prefix (see above): the
+// kept count (cw = probabilities, ci = ids, by decreasing probability), or 0.
+__device__ int ds_ss_dist(float* row, int v, const float* bias, float temp, float top_p, double* w,
+                          DsSs& S) {
     int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     float mx = -DS_INF;
     for (int j = tid; j < v; j += blockDim.x) {
@@ -671,71 +700,323 @@ extern "C" __global__ void __launch_bounds__(1024) ds_spark_sample(float* row, i
         mx = fmaxf(mx, x);
     }
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
-    if (lane == 0) smx[wid] = mx;
+    if (lane == 0) S.smx[wid] = mx;
     __syncthreads();
     if (tid == 0) {
-        float m = smx[0];
-        for (int i = 1; i < (int)(blockDim.x >> 5); i++) m = fmaxf(m, smx[i]);
-        smx[0] = m;
+        float m = S.smx[0];
+        for (int i = 1; i < (int)(blockDim.x >> 5); i++) m = fmaxf(m, S.smx[i]);
+        S.smx[0] = m;
+        S.n = 0;
     }
     __syncthreads();
-    mx = smx[0];
-    double loc[15];
-    for (int k = 0; k < 15; k++) loc[k] = 0.0;
+    mx = S.smx[0];
+    double loc[DS_SS_NB + 1];
+    int cnt[DS_SS_NB];
+#pragma unroll
+    for (int k = 0; k <= DS_SS_NB; k++) loc[k] = 0.0;
+#pragma unroll
+    for (int k = 0; k < DS_SS_NB; k++) cnt[k] = 0;
     for (int j = tid; j < v; j += blockDim.x) {
         double x = exp((double)__fdiv_rn(__fsub_rn(row[j], mx), temp));
         w[j] = x;
-        loc[0] += x;
+        loc[DS_SS_NB] += x;
+        // w in [2^-kk, 2^-kk+1): w >= 2^-e iff kk <= e
+        int kk = 1023 - (int)(((unsigned long long)__double_as_longlong(x) >> 52) & 0x7ff);
+        int b = 0;
+        while (b < DS_SS_NB && ds_ss_e[b] < kk) b++;
+#pragma unroll
+        for (int k = 0; k < DS_SS_NB; k++)
+            if (b == k) {
+                loc[k] += x;
+                cnt[k]++;
+            }
+    }
+    ds_ss_sumn<DS_SS_NB + 1>(loc, S);
+    double z = S.out[DS_SS_NB], mass[DS_SS_NB];
+#pragma unroll
+    for (int k = 0; k < DS_SS_NB; k++) {
+        mass[k] = S.out[k];
+        loc[k] = (double)cnt[k];
     }
     __syncthreads();
-    ds_ss_sum15(loc, red, out);
+    ds_ss_sumn<DS_SS_NB>(loc, S);
+    if (tid == 0) S.z = z;
+    if (!(top_p < 1.0f)) return 0;
+    double tgt = (double)top_p * z * (1.0 + 1e-9), cm = 0.0, cc = 0.0;
+    int b = -1;
+    for (int k = 0; k < DS_SS_NB; k++) {
+        cm += mass[k];
+        cc += S.out[k];
+        if (cm >= tgt && cm > 0.0) {
+            b = k;
+            break;
+        }
+    }
+    if (b < 0 || cc > DS_SS_CAP) return 0;
+    double thr = ldexp(1.0, -ds_ss_e[b]);
+    __syncthreads();
+    for (int j = tid; j < v; j += blockDim.x)
+        if (w[j] >= thr) {
+            int p = atomicAdd(&S.n, 1);
+            if (p < DS_SS_CAP) {
+                S.cw[p] = w[j];
+                S.ci[p] = j;
+            }
+        }
+    __syncthreads();
+    int n = min(S.n, DS_SS_CAP), P = 1;
+    while (P < n) P <<= 1;
+    for (int j = n + tid; j < P; j += blockDim.x) {
+        S.cw[j] = -1.0;
+        S.ci[j] = 0x7fffffff;
+    }
+    __syncthreads();
+    for (int k = 2; k <= P; k <<= 1)
+        for (int jj = k >> 1; jj > 0; jj >>= 1) {
+            for (int i = tid; i < P; i += blockDim.x) {
+                int l = i ^ jj;
+                if (l > i) {
+                    double wi = S.cw[i], wl = S.cw[l];
+                    int ii = S.ci[i], il = S.ci[l];
+                    bool lfirst = wl > wi || (wl == wi && il < ii);
+                    bool up = (i & k) == 0;
+                    if (up ? lfirst : !lfirst) {
+                        S.cw[i] = wl;
+                        S.cw[l] = wi;
+                        S.ci[i] = il;
+                        S.ci[l] = ii;
+                    }
+                }
+            }
+            __syncthreads();
+        }
     if (tid == 0) {
-        sz = out[0];
-        unsigned long long s = *rng + 0x9E3779B97F4A7C15ull;
-        *rng = s;
-        unsigned long long z = s;
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-        z ^= z >> 31;
-        su = (double)(z >> 11) / (double)(1ull << 53);
+        double acc = 0.0;
+        int keep = 0;
+        for (int j = 0; j < n; j++) {
+            acc += S.cw[j] / z;
+            if (acc >= (double)top_p) {
+                keep = j + 1;
+                break;
+            }
+        }
+        if (keep) {
+            double total = 0.0;
+            for (int j = 0; j < keep; j++) total += S.cw[j];
+            for (int j = 0; j < keep; j++) S.cw[j] = S.cw[j] / total;
+        }
+        S.keep = keep;
     }
     __syncthreads();
-    double z = sz, u = su;
-    // the kept prefix: keys above kc, then the first m ties at kc
-    unsigned long long kc = 0;
-    double above = 0.0, total = z;
-    int ties = 0, m = 0;
-    bool cut = top_p < 1.0f;
-    if (cut) {
-        double tgt = (double)top_p * z;
-        kc = ds_ss_search(w, v, tgt, red, out);
-        ds_ss_above(w, v, kc, red, out, &above, &ties);
-        double wc = __longlong_as_double((long long)kc);
-        m = wc > 0.0 ? (int)ceil((tgt - above) / wc) : ties;
-        m = max(1, min(m, ties));
-        total = above + m * wc;
+    return S.keep;
+}
+
+// SpecSampler::draw over n (id, prob) entries, probabilities by decreasing size.
+__device__ int ds_ss_draw(const int* ci, const double* cp, int n, double u) {
+    double s = 0.0;
+    for (int j = 0; j < n; j++) s += cp[j];
+    double r = u * s;
+    for (int j = 0; j < n; j++) {
+        r -= cp[j];
+        if (r <= 0.0) return ci[j];
     }
-    double r = fmin(u * total, total);
+    return ci[n - 1];
+}
+
+__device__ unsigned long long ds_ss_next(unsigned long long* st) {
+    unsigned long long s = *st + 0x9E3779B97F4A7C15ull;
+    *st = s;
+    unsigned long long z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+__device__ double ds_ss_uniform(unsigned long long* st) {
+    return (double)(ds_ss_next(st) >> 11) / (double)(1ull << 53);
+}
+
+// ids[slot] = a draw from SpecSampler::dist(row) (temperature `temp` > 0, top-p `top_p`):
+// w = exp((row - max) / temp) in f64, the smallest prefix by decreasing w (ties by id) holding
+// top_p of the mass, one uniform from the splitmix64 state *rng (advanced), the first prefix
+// token whose cumulative mass reaches it. `w` is [v] f64 scratch; `bias` (when given) is
+// first added to row, as ds_spark_pick. The kept distribution goes to (qi, qp, qn) row
+// slot - 1 (DS_SS_CAP entries a row; qn = 0 when the full-vocab path ran) for the device
+// verify. Then, as ds_spark_pick, the Markov embedding row of the draw. One block of 1024.
+extern "C" __global__ void __launch_bounds__(1024) ds_spark_sample(float* row, int v, int* ids, int slot,
+                                           const float* tab, int rank, float* memb, float temp,
+                                           float top_p, unsigned long long* rng, double* w,
+                                           const float* bias, int* qi, double* qp, int* qn) {
+    __shared__ DsSs S;
+    __shared__ double red[32][15];
+    __shared__ double out[15];
+    __shared__ int cnt[1024];
+    __shared__ int res;
+    __shared__ double su;
+    __shared__ int pick;
+    int tid = threadIdx.x;
+    int keep = ds_ss_dist(row, v, bias, temp, top_p, w, S);
+    if (tid == 0) su = ds_ss_uniform(rng);
+    __syncthreads();
+    double z = S.z, u = su;
     int tok;
-    if (cut && r > above) {
-        double wc = __longlong_as_double((long long)kc);
-        int n = wc > 0.0 ? (int)ceil((r - above) / wc) : m;
-        tok = ds_ss_nth(w, v, kc, max(1, min(n, m)), cnt, &res);
+    if (keep > 0) {
+        if (qn) {
+            for (int j = tid; j < keep; j += blockDim.x) {
+                qi[(slot - 1) * DS_SS_CAP + j] = S.ci[j];
+                qp[(slot - 1) * DS_SS_CAP + j] = S.cw[j];
+            }
+        }
+        if (tid == 0) pick = ds_ss_draw(S.ci, S.cw, keep, u);
+        __syncthreads();
+        tok = pick;
     } else {
-        unsigned long long kd = ds_ss_search(w, v, r, red, out);
-        double ab;
-        int nt;
-        ds_ss_above(w, v, kd, red, out, &ab, &nt);
-        double wd = __longlong_as_double((long long)kd);
-        int n = wd > 0.0 ? (int)ceil((r - ab) / wd) : nt;
-        tok = ds_ss_nth(w, v, kd, max(1, min(n, nt)), cnt, &res);
+        // the full-vocab path: the kept prefix: keys above kc, then the first m ties at kc
+        unsigned long long kc = 0;
+        double above = 0.0, total = z;
+        int ties = 0, m = 0;
+        bool cut = top_p < 1.0f;
+        if (cut) {
+            double tgt = (double)top_p * z;
+            kc = ds_ss_search(w, v, tgt, red, out);
+            ds_ss_above(w, v, kc, red, out, &above, &ties);
+            double wc = __longlong_as_double((long long)kc);
+            m = wc > 0.0 ? (int)ceil((tgt - above) / wc) : ties;
+            m = max(1, min(m, ties));
+            total = above + m * wc;
+        }
+        double r = fmin(u * total, total);
+        if (cut && r > above) {
+            double wc = __longlong_as_double((long long)kc);
+            int n = wc > 0.0 ? (int)ceil((r - above) / wc) : m;
+            tok = ds_ss_nth(w, v, kc, max(1, min(n, m)), cnt, &res);
+        } else {
+            unsigned long long kd = ds_ss_search(w, v, r, red, out);
+            double ab;
+            int nt;
+            ds_ss_above(w, v, kd, red, out, &ab, &nt);
+            double wd = __longlong_as_double((long long)kd);
+            int n = wd > 0.0 ? (int)ceil((r - ab) / wd) : nt;
+            tok = ds_ss_nth(w, v, kd, max(1, min(n, nt)), cnt, &res);
+        }
     }
     if (tid == 0) {
         if (tok < 0) tok = 0;
         ids[slot] = tok;
         pick = tok;
+        if (qn) qn[slot - 1] = keep;
     }
     __syncthreads();
     if (memb)
         for (int j = tid; j < rank; j += blockDim.x) memb[j] = tab[(long long)pick * rank + j];
+}
+
+// The transformed distribution of each logits row (blockIdx.x) of a verify window, as
+// ds_spark_sample keeps it: (pi, pp, pn) row-major with DS_SS_CAP entries a row, pn = 0 when
+// the fast path does not apply. `w` is [rows][v] f64 scratch.
+extern "C" __global__ void __launch_bounds__(1024) ds_spec_dist(float* logits, int v, float temp,
+                                                                float top_p, double* w, int* pi,
+                                                                double* pp, int* pn) {
+    __shared__ DsSs S;
+    int r = blockIdx.x, tid = threadIdx.x;
+    int keep = ds_ss_dist(logits + (long long)r * v, v, nullptr, temp, top_p, w + (long long)r * v, S);
+    for (int j = tid; j < keep; j += blockDim.x) {
+        pi[r * DS_SS_CAP + j] = S.ci[j];
+        pp[r * DS_SS_CAP + j] = S.cw[j];
+    }
+    if (tid == 0) pn[r] = keep;
+}
+
+__device__ double ds_ss_at(const int* ci, const double* cp, int n, int t) {
+    for (int j = 0; j < n; j++)
+        if (ci[j] == t) return cp[j];
+    return 0.0;
+}
+
+// SpecSampler::verify's walk over a window of n rows (ids: the fed token, then n - 1 drafts):
+// P rows from ds_spec_dist, Q rows from the draft's ds_spark_sample, the RNG from rng0.
+// out = [ok, k, tokens[n], rng lo, rng hi]; ok = 0 (nothing else written) when a row the
+// walk reaches has no fast distribution, and the host walks instead. One block.
+extern "C" __global__ void __launch_bounds__(1024) ds_spec_walk(const int* ids, int n, const int* pi,
+                                                                const double* pp, const int* pn,
+                                                                const int* qi, const double* qp,
+                                                                const int* qn, unsigned long long rng0,
+                                                                int* out) {
+    __shared__ double res[DS_SS_CAP];
+    __shared__ unsigned long long st;
+    __shared__ int sk, acc;
+    int tid = threadIdx.x;
+    if (tid == 0) {
+        st = rng0;
+        sk = 0;
+        out[0] = 0;
+    }
+    __syncthreads();
+    while (true) {
+        int k = sk;
+        int np = pn[k];
+        bool last = k + 1 == n;
+        int nq = last ? 1 : qn[k];
+        if (np <= 0 || nq <= 0) return;
+        const int* Pi = pi + k * DS_SS_CAP;
+        const double* Pp = pp + k * DS_SS_CAP;
+        const int* Qi = qi + k * DS_SS_CAP;
+        const double* Qp = qp + k * DS_SS_CAP;
+        int tok = -1;
+        if (tid == 0) {
+            if (last) {
+                tok = ds_ss_draw(Pi, Pp, np, ds_ss_uniform(&st));
+                acc = 2;
+            } else {
+                int d = ids[k + 1];
+                double pd = ds_ss_at(Pi, Pp, np, d), qd = ds_ss_at(Qi, Qp, nq, d);
+                acc = qd > 0.0 && ds_ss_uniform(&st) * qd < pd;
+                if (acc) {
+                    out[2 + k] = d;
+                    sk = k + 1;
+                }
+            }
+        }
+        __syncthreads();
+        int a = acc;
+        __syncthreads();
+        if (a == 1) continue;
+        if (a == 0) {
+            // the residual norm(max(0, P - Q)) over P's order
+            for (int j = tid; j < np; j += blockDim.x)
+                res[j] = fmax(Pp[j] - ds_ss_at(Qi, Qp, nq, Pi[j]), 0.0);
+            __syncthreads();
+            if (tid == 0) {
+                double s = 0.0;
+                int lastp = -1;
+                for (int j = 0; j < np; j++)
+                    if (res[j] > 0.0) {
+                        s += res[j];
+                        lastp = j;
+                    }
+                if (lastp < 0) {
+                    tok = ds_ss_draw(Pi, Pp, np, ds_ss_uniform(&st));
+                } else {
+                    double r = ds_ss_uniform(&st) * s;
+                    tok = Pi[lastp];
+                    for (int j = 0; j < np; j++)
+                        if (res[j] > 0.0) {
+                            r -= res[j];
+                            if (r <= 0.0) {
+                                tok = Pi[j];
+                                break;
+                            }
+                        }
+                }
+            }
+        }
+        if (tid == 0) {
+            out[2 + k] = tok;
+            out[1] = k;
+            out[2 + n] = (int)(unsigned)(st & 0xffffffffull);
+            out[3 + n] = (int)(unsigned)(st >> 32);
+            out[0] = 1;
+        }
+        return;
+    }
 }

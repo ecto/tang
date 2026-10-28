@@ -116,6 +116,47 @@ impl SparkPack {
     }
 }
 
+/// Entries a row of a device-kept distribution (`DS_SS_CAP` in kernels_select.cu).
+const SS_CAP: usize = 2048;
+
+/// The device speculative sampler's buffers (fixed addresses: a captured draft writes the
+/// Q rows): the draft's kept distributions Q [blk][SS_CAP] (ids i32, probs f64, count), the
+/// verify window's P [blk + 1][...], P's f64 scratch [blk + 1][V], the window ids and the
+/// walk's result [ok, k, tokens[blk + 1], rng lo, rng hi].
+struct SpecDev {
+    qi: DevBuf,
+    qp: DevBuf,
+    qn: DevBuf,
+    pi: DevBuf,
+    pp: DevBuf,
+    pn: DevBuf,
+    w: DevBuf,
+    ids: DevBuf,
+    out: DevBuf,
+}
+
+/// `DS_SPEC_HOST=1`: sampled verify walks on the host (the reference path).
+fn host_walk() -> bool {
+    std::env::var("DS_SPEC_HOST").is_ok_and(|v| v == "1")
+}
+
+impl SpecDev {
+    fn new(blk: usize, v: usize) -> Result<Self> {
+        let n = blk + 1;
+        Ok(Self {
+            qi: DevBuf::alloc(blk * SS_CAP * 4)?,
+            qp: DevBuf::alloc(blk * SS_CAP * 8)?,
+            qn: DevBuf::zeroed(blk * 4)?,
+            pi: DevBuf::alloc(n * SS_CAP * 4)?,
+            pp: DevBuf::alloc(n * SS_CAP * 8)?,
+            pn: DevBuf::zeroed(n * 4)?,
+            w: DevBuf::alloc(n * v * 8)?,
+            ids: DevBuf::alloc(n * 4)?,
+            out: DevBuf::alloc((n + 4) * 4)?,
+        })
+    }
+}
+
 /// A captured draft (see [`GpuModel::spark`]): its pack in the arena.
 struct SparkGraph {
     g: Graph,
@@ -251,6 +292,13 @@ pub struct GpuModel {
     snap: Option<(Vec<DevBuf>, HashMap<usize, (DevBuf, DevBuf)>)>,
     /// DSpark's Markov embedding table [V][rank] f32, for the device-side greedy draft.
     spark_tab: Option<DevBuf>,
+    /// The device rejection sampler's buffers (see [`SpecDev`]), once a sampled draft ran.
+    spec_dev: Option<SpecDev>,
+    /// Whether the last draft left its kept distributions in `spec_dev` (a device sampled
+    /// draft), so a verify may walk on the device.
+    spec_q: bool,
+    /// Sampled verify walks run on the device, and on the host (a fallback).
+    pub spec_walks: (usize, usize),
     /// Expert parallelism ([`super::ep`]): the routed experts this rank runs. Others are
     /// skipped in `moe` and never uploaded. All of them when unsharded.
     pub owns_expert: Box<dyn Fn(usize) -> bool>,
@@ -412,6 +460,9 @@ impl GpuModel {
             journal: Vec::new(),
             snap: None,
             spark_tab: None,
+            spec_dev: None,
+            spec_q: false,
+            spec_walks: (0, 0),
             owns_expert: Box::new(|_| true),
             moe_reduce: None,
             moe_grouped: std::env::var("DS_MOE_LOOP").map_or(true, |v| v != "1"),
@@ -3147,6 +3198,7 @@ impl GpuModel {
                 })
                 .collect()
         };
+        self.spec_q = false;
         if let Draw::Host(draw) = &mut how {
             // the Markov head samples left to right: each position's bias (its predecessor's
             // Markov embedding through the head, a rank x V GEMV) on the device, the row read
@@ -3196,6 +3248,10 @@ impl GpuModel {
             _ => None,
         };
         let key = (t, samp.map(|(a, b)| (a.to_bits(), b.to_bits())));
+        if samp.is_some() && self.spec_dev.is_none() {
+            self.spec_dev = Some(SpecDev::new(blk, v)?);
+        }
+        self.spec_q = samp.is_some();
         let gen = self.gen();
         let lay = SparkPack::new(blk, v, d);
         let pk = if self.graphable(sp, false) {
@@ -3335,6 +3391,10 @@ impl GpuModel {
             }
             None => None,
         };
+        let (qi, qp, qn) = self
+            .spec_dev
+            .as_ref()
+            .map_or((0u64, 0u64, 0u64), |sd| (sd.qi.ptr, sd.qp.ptr, sd.qn.ptr));
         for i in 0..blk {
             let bias = self.raw(memb.ptr, 1, &mhead)?;
             let row = pk.ptr + (i * v * 4) as u64;
@@ -3357,7 +3417,7 @@ impl GpuModel {
                         &self.s,
                         args![
                             row, vi, idp, slot, tab, ri, memb.ptr, temp, top_p, rng, w.ptr,
-                            bias.ptr
+                            bias.ptr, qi, qp, qn
                         ],
                     )?,
                 }
@@ -3436,6 +3496,61 @@ impl GpuModel {
         Ok(())
     }
 
+    /// Speculative sampling's accept walk over the last verify window on the device
+    /// (`ds_spec_dist` per row, then `ds_spec_walk` against the draft's kept Q rows): the
+    /// accepted count, the tokens and the advanced RNG, from one small read-back; `None` when
+    /// a row the walk reached has no device distribution (the host walks instead).
+    fn spec_walk(
+        &mut self,
+        ids: &[usize],
+        temp: f32,
+        top_p: f32,
+        rng: u64,
+    ) -> Result<Option<(usize, Vec<usize>, u64)>> {
+        let v = self.cpu.cfg.vocab_size;
+        let n = ids.len();
+        let out = self.last.as_ref().context("spec_walk: no verify window")?;
+        if out.rows != n {
+            bail!("spec_walk: {} rows for {n} ids", out.rows);
+        }
+        let lp = out.logits.ptr;
+        let sd = self.spec_dev.as_ref().context("spec_walk: no draft")?;
+        sd.ids
+            .write(0, &ids.iter().map(|&i| i as i32).collect::<Vec<_>>())?;
+        let (vi, ni) = (v as i32, n as i32);
+        unsafe {
+            self.k.go(
+                "ds_spec_dist",
+                (n as u32, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![lp, vi, temp, top_p, sd.w.ptr, sd.pi.ptr, sd.pp.ptr, sd.pn.ptr],
+            )?;
+            self.k.go(
+                "ds_spec_walk",
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![
+                    sd.ids.ptr, ni, sd.pi.ptr, sd.pp.ptr, sd.pn.ptr, sd.qi.ptr, sd.qp.ptr,
+                    sd.qn.ptr, rng, sd.out.ptr
+                ],
+            )?;
+        }
+        self.sync()?;
+        super::obs::d2h((n + 4) * 4);
+        let o = sd.out.read::<i32>(0, n + 4)?;
+        if o[0] != 1 {
+            return Ok(None);
+        }
+        let k = o[1] as usize;
+        let tokens = o[2..3 + k].iter().map(|&t| t as usize).collect();
+        let rng = o[2 + n] as u32 as u64 | (o[3 + n] as u32 as u64) << 32;
+        Ok(Some((k, tokens, rng)))
+    }
+
     /// As [`Model::decode_spec`].
     pub fn decode_spec(
         &mut self,
@@ -3463,9 +3578,23 @@ impl GpuModel {
         let snap = self.snapshot()?;
         let amax = self.verify_window(&ids, pos0)?;
         let n = ids.len();
+        let dev = match pick.as_sampler() {
+            Some(sm) if !SpecSampler::greedy(sm) && self.spec_q && !host_walk() => {
+                let r = self.spec_walk(&ids, sm.temp, sm.top_p, sm.rng)?;
+                if let Some((_, _, rng)) = &r {
+                    sm.rng = *rng;
+                }
+                r
+            }
+            _ => None,
+        };
         let (k, tokens) = if pick.greedy() {
             super::forward::verify_greedy(&amax, &ids)
+        } else if let Some((k, tokens, _)) = dev {
+            self.spec_walks.0 += 1;
+            (k, tokens)
         } else {
+            self.spec_walks.1 += 1;
             // only the rows the walk reaches are read back
             let mut err = None;
             let mut row = |r: usize| {
@@ -4200,7 +4329,10 @@ mod tests {
             tok = *tokens.last().unwrap();
             (ma, mb, sp) = (st.main, mains[..(k + 1) * w].to_vec(), pos0);
         }
-        eprintln!("8 sampled steps: {rows} logits rows read");
+        eprintln!(
+            "8 sampled steps: {rows} logits rows; walks device/host {:?}",
+            a.spec_walks
+        );
     }
 
     #[test]

@@ -188,6 +188,8 @@ const MORE: &[&str] = &[
     "ds_copy_u8",
     "ds_spark_pick",
     "ds_spark_sample",
+    "ds_spec_dist",
+    "ds_spec_walk",
     "ds_moe_plan",
     "ds_moe_reduce",
     "ds_moe_gate",
@@ -3206,6 +3208,243 @@ mod tests {
         (0..t)
             .map(|ti| if causal { (ti + 1) / r } else { width })
             .collect()
+    }
+
+    /// Logits shaped like a model's: bf16 noise of amplitude `amp`, `peaks` boosted tokens.
+    fn peaky(v: usize, seed: u64, amp: f32, peaks: usize) -> Vec<f32> {
+        let mut l = data(v, seed, amp);
+        for j in 0..peaks {
+            let i = (seed as usize * 7919 + j * 104729) % v;
+            l[i] = amp * 3.0 + (j % 4) as f32 * 0.25;
+        }
+        l
+    }
+
+    /// `ds_spark_sample` against `SpecSampler::sample` on the real vocab size: the same draw
+    /// and RNG state, and the kept distribution it leaves for the device verify equal to
+    /// `SpecSampler::dist` (ids exactly, probabilities to f64 rounding). Covers the fast
+    /// bucketed path and the full-vocab fallback (a flat row's nucleus exceeds the cap).
+    #[test]
+    fn spark_sample_matches_host() {
+        use super::super::forward::SpecSampler;
+        use tang_moe::args;
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let v = 129280usize;
+        let cap = 2048usize;
+        let (ids, w) = (DevBuf::zeroed(8).unwrap(), DevBuf::alloc(v * 8).unwrap());
+        let (qi, qp, qn) = (
+            DevBuf::alloc(cap * 4).unwrap(),
+            DevBuf::alloc(cap * 8).unwrap(),
+            DevBuf::zeroed(4).unwrap(),
+        );
+        let (mut fast, mut full) = (0, 0);
+        let (mut ms, mut fms) = (0.0, 0.0);
+        for trial in 0..120u64 {
+            let (temp, top_p) =
+                [(0.6f32, 0.95f32), (1.0, 0.9), (0.3, 0.99), (0.6, 1.0)][trial as usize % 4];
+            let amp = [1.0f32, 8.0, 16.0, 30.0][(trial / 4) as usize % 4];
+            let l = peaky(v, trial + 1, amp, 1 + (trial as usize % 40));
+            let row = DevBuf::from_slice(&l).unwrap();
+            let rng = DevBuf::from_slice(&[trial * 977 + 5]).unwrap();
+            let (vi, slot, null, ri) = (v as i32, 1i32, 0u64, 0i32);
+            let t = std::time::Instant::now();
+            unsafe {
+                k.go(
+                    "ds_spark_sample",
+                    (1, 1, 1),
+                    (1024, 1, 1),
+                    0,
+                    &s,
+                    args![
+                        row.ptr, vi, ids.ptr, slot, null, ri, null, temp, top_p, rng.ptr, w.ptr,
+                        null, qi.ptr, qp.ptr, qn.ptr
+                    ],
+                )
+                .unwrap()
+            };
+            s.sync().unwrap();
+            let kt = t.elapsed().as_secs_f64() * 1e3;
+            ms += kt;
+            let mut host = SpecSampler::new(temp, top_p, trial * 977 + 5);
+            let want = host.sample(&l);
+            let got = ids.read::<i32>(4, 1).unwrap()[0] as usize;
+            assert_eq!(got, want, "trial {trial} amp {amp} T {temp} p {top_p}");
+            assert_eq!(rng.read::<u64>(0, 1).unwrap()[0], host.rng, "trial {trial}");
+            let n = qn.read::<i32>(0, 1).unwrap()[0] as usize;
+            if n == 0 {
+                full += 1;
+                continue;
+            }
+            fast += 1;
+            fms += kt;
+            let d = SpecSampler::new(temp, top_p, 0).dist(&l);
+            assert_eq!(n, d.len(), "trial {trial} kept");
+            let (gi, gp) = (qi.read::<i32>(0, n).unwrap(), qp.read::<f64>(0, n).unwrap());
+            for (j, &(i, p)) in d.iter().enumerate() {
+                assert_eq!(gi[j] as usize, i, "trial {trial} entry {j}");
+                assert!(
+                    (gp[j] - p).abs() <= 1e-12 * p.max(1e-300),
+                    "trial {trial} p {j}"
+                );
+            }
+        }
+        eprintln!(
+            "spark_sample: {fast} fast ({:.3} ms/draw), {full} full-vocab ({:.3} ms/draw)",
+            fms / fast.max(1) as f64,
+            (ms - fms) / full.max(1) as f64,
+        );
+        assert!(fast > 40 && full > 0, "{fast} fast {full} full");
+    }
+
+    /// The device speculative-sampling walk (`ds_spec_dist` + `ds_spec_walk`) against the
+    /// host's `verify_rows` with a `SpecSampler`: drafts drawn on the device from Q rows,
+    /// target rows P near Q (so walks accept, reject and reach the bonus row), and also
+    /// forced wrong drafts. Same accepted count, tokens and RNG state; and over many walks
+    /// the emitted first token's frequencies match a plain draw from P (chi-square).
+    #[test]
+    fn spec_walk_matches_host() {
+        use super::super::forward::{verify_rows, SpecSampler};
+        use tang_moe::args;
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (v, blk, cap) = (129280usize, 5usize, 2048usize);
+        let n = blk + 1;
+        let null = 0u64;
+        let (qi, qp, qn) = (
+            DevBuf::alloc(blk * cap * 4).unwrap(),
+            DevBuf::alloc(blk * cap * 8).unwrap(),
+            DevBuf::zeroed(blk * 4).unwrap(),
+        );
+        let (pi, pp, pn) = (
+            DevBuf::alloc(n * cap * 4).unwrap(),
+            DevBuf::alloc(n * cap * 8).unwrap(),
+            DevBuf::zeroed(n * 4).unwrap(),
+        );
+        let (w, pw) = (
+            DevBuf::alloc(v * 8).unwrap(),
+            DevBuf::alloc(n * v * 8).unwrap(),
+        );
+        let out = DevBuf::alloc((n + 4) * 4).unwrap();
+        let dids = DevBuf::zeroed((n + 1) * 4).unwrap();
+        let (mut walks, mut acc, mut ms) = (0, 0, 0.0);
+        for trial in 0..60u64 {
+            let (temp, top_p) = [(0.6f32, 0.95f32), (1.0, 0.9)][trial as usize % 2];
+            let amp = [12.0f32, 20.0][(trial / 2) as usize % 2];
+            let peaks = 2 + trial as usize % 12;
+            // Q rows, and P = Q plus a perturbation
+            let q: Vec<f32> = (0..blk)
+                .flat_map(|r| peaky(v, trial * 31 + r as u64 + 1, amp, peaks))
+                .collect();
+            let p: Vec<f32> = (0..n)
+                .flat_map(|r| {
+                    let base = if r < blk {
+                        q[r * v..(r + 1) * v].to_vec()
+                    } else {
+                        peaky(v, trial * 31 + 99, amp, peaks)
+                    };
+                    let e = data(v, trial * 131 + r as u64, 1.5);
+                    base.iter().zip(e).map(|(a, b)| a + b).collect::<Vec<_>>()
+                })
+                .collect();
+            let dq = DevBuf::from_slice(&q).unwrap();
+            let dp = DevBuf::from_slice(&p).unwrap();
+            let seed = trial * 7 + 3;
+            let rng = DevBuf::from_slice(&[seed]).unwrap();
+            let vi = v as i32;
+            for r in 0..blk {
+                let (row, slot, ri) = (dq.ptr + (r * v * 4) as u64, r as i32 + 1, 0i32);
+                unsafe {
+                    k.go(
+                        "ds_spark_sample",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &s,
+                        args![
+                            row, vi, dids.ptr, slot, null, ri, null, temp, top_p, rng.ptr, w.ptr,
+                            null, qi.ptr, qp.ptr, qn.ptr
+                        ],
+                    )
+                    .unwrap()
+                };
+            }
+            s.sync().unwrap();
+            let mut host = SpecSampler::new(temp, top_p, seed);
+            let mut ids: Vec<usize> = vec![7];
+            for r in 0..blk {
+                ids.push(host.sample(&q[r * v..(r + 1) * v]));
+            }
+            let got: Vec<usize> = dids
+                .read::<i32>(4, blk)
+                .unwrap()
+                .iter()
+                .map(|&x| x as usize)
+                .collect();
+            assert_eq!(got, ids[1..], "trial {trial} drafts");
+            assert_eq!(rng.read::<u64>(0, 1).unwrap()[0], host.rng);
+            for force in [false, true] {
+                let mut ids = ids.clone();
+                if force {
+                    ids[1 + trial as usize % blk] = (trial as usize * 4099) % v;
+                }
+                let r0 = host.rng;
+                let mut h = SpecSampler::new(temp, top_p, r0);
+                let (wk, wt) = verify_rows(&p, &q, &ids, v, &mut h);
+                let di =
+                    DevBuf::from_slice(&ids.iter().map(|&x| x as i32).collect::<Vec<_>>()).unwrap();
+                let ni = n as i32;
+                let t = std::time::Instant::now();
+                unsafe {
+                    k.go(
+                        "ds_spec_dist",
+                        (n as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &s,
+                        args![dp.ptr, vi, temp, top_p, pw.ptr, pi.ptr, pp.ptr, pn.ptr],
+                    )
+                    .unwrap();
+                    k.go(
+                        "ds_spec_walk",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &s,
+                        args![
+                            di.ptr, ni, pi.ptr, pp.ptr, pn.ptr, qi.ptr, qp.ptr, qn.ptr, r0, out.ptr
+                        ],
+                    )
+                    .unwrap();
+                }
+                s.sync().unwrap();
+                ms += t.elapsed().as_secs_f64() * 1e3;
+                let o = out.read::<i32>(0, n + 4).unwrap();
+                assert_eq!(
+                    o[0],
+                    1,
+                    "trial {trial}: no device walk, pn {:?} qn {:?}",
+                    pn.read::<i32>(0, n).unwrap(),
+                    qn.read::<i32>(0, blk).unwrap()
+                );
+                let gk = o[1] as usize;
+                let gt: Vec<usize> = o[2..3 + gk].iter().map(|&x| x as usize).collect();
+                let grng = o[2 + n] as u32 as u64 | (o[3 + n] as u32 as u64) << 32;
+                assert_eq!((gk, &gt), (wk, &wt), "trial {trial} force {force}");
+                assert_eq!(grng, h.rng, "trial {trial} force {force} rng");
+                walks += 1;
+                acc += gk;
+            }
+        }
+        eprintln!(
+            "spec_walk: {walks} walks, {acc} accepted, {:.3} ms/walk (dist + walk)",
+            ms / walks as f64
+        );
+        assert!(acc > 0);
     }
 
     #[test]
