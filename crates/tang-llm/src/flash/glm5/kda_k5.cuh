@@ -233,22 +233,33 @@ extern "C" __global__ void __launch_bounds__(256) k5_qgemv9(const K5Seg* segs, u
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv17(const K5Seg* segs, unsigned nseg,
     const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<9>(segs, nseg, xq, xd, COLS); }
 // k5_qgemv_q4k: k5_qgemv for Q4_K rows (the requantized KDA projections, NOTES 2026-10-27
-// kda-q4). Same segment table, staging and launch shape; only the dot differs. A Q4_K
-// super-block (144 B, 256 values) = f16 d, f16 dmin, 12 B of packed 6-bit (scale, min) for
-// its 8 sub-blocks of 32, then 128 B of nibbles: the 32 bytes of pair p hold sub-block 2p in
-// the low nibbles and 2p+1 in the high ones. Lane = sub-block sb = lane + 32 i:
+// kda-q4). Same segment table and launch shape (4 warps, no shared memory); only the dot
+// differs. A Q4_K super-block (144 B, 256 values) = f16 d, f16 dmin, 12 B of packed 6-bit
+// (scale, min) for its 8 sub-blocks of 32, then 128 B of nibbles: the 32 bytes of pair p hold
+// sub-block 2p in the low nibbles and 2p+1 in the high ones. Lane = sub-block sb = lane + 32 i:
 //   w·x over sb = xd[sb] · (d·sc · Σ q·xq  −  dmin·m · Σ xq)
 // (ggml's dequant w = d·sc·q − dmin·m, x ≈ xd · xq). Rows of 4096 (2304 B) take
-// k5_qgemv_q4k5, rows of 8192 (4608 B, o_proj) k5_qgemv_q4k9.
-__device__ __forceinline__ void k5_q4k_sm(const unsigned char* q, int j, int& sc, int& m) {
-    if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; }
-    else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+// k5_qgemv_q4k5 (4 sub-blocks a lane), rows of 8192 (4608 B, o_proj) k5_qgemv_q4k9 (8).
+// Direct reads, as k5_qgemv (NOTES 2026-10-28 kda-q4 eval): each lane issues its sub-blocks'
+// 16 B header (d, dmin, scales: shared by the 8 lanes of one super-block, one transaction)
+// and 32 B of nibbles (16 B aligned: 144 and 16 + 32p are multiples of 16) up front with
+// ld.global.cs, no staging. Same per-sub-block integer dots, same fmaf order over i, same
+// xor tree: bit-equal to the staged kernel it replaces.
+__device__ __forceinline__ int k5_q4k_b(const uint4& h, int k) { // scales byte k (blk + 4 + k)
+    const unsigned w = k < 4 ? h.y : (k < 8 ? h.z : h.w);
+    return (int)((w >> (8 * (k & 3))) & 0xFFu);
 }
-template <int K5Q_MAXV>
+__device__ __forceinline__ void k5_q4k_sm(const uint4& h, int j, int& sc, int& m) {
+    if (j < 4) { sc = k5_q4k_b(h, j) & 63; m = k5_q4k_b(h, j + 4) & 63; }
+    else {
+        sc = (k5_q4k_b(h, j + 4) & 0xF) | ((k5_q4k_b(h, j - 4) >> 6) << 4);
+        m = (k5_q4k_b(h, j + 4) >> 4) | ((k5_q4k_b(h, j) >> 6) << 4);
+    }
+}
+template <int K5Q_MAXNB>
 __device__ __forceinline__ void k5_qgemv_q4k_body(
     const K5Seg* __restrict__ segs, unsigned nseg, const unsigned char* __restrict__ xq,
     const float* __restrict__ xd, unsigned COLS) {
-    extern __shared__ uint4 dsm[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
     unsigned g = blockIdx.x * nw + warp;
     unsigned s = 0;
@@ -257,29 +268,30 @@ __device__ __forceinline__ void k5_qgemv_q4k_body(
         g -= segs[s].rows;
     }
     if (s >= nseg) return;
-    const unsigned rb = segs[s].row_bytes;
-    const int n16 = (int)(rb >> 4);
-    const uint4* src = (const uint4*)(segs[s].base + (unsigned long long)g * rb);
-    uint4* sm = dsm + (size_t)warp * n16;
-    uint4 v[K5Q_MAXV];
-#pragma unroll
-    for (int i = 0; i < K5Q_MAXV; i++)
-        if (lane + 32 * i < n16) v[i] = k5_ldnc(src + lane + 32 * i);
-#pragma unroll
-    for (int i = 0; i < K5Q_MAXV; i++)
-        if (lane + 32 * i < n16) sm[lane + 32 * i] = v[i];
-    __syncwarp();
-    const unsigned char* row = (const unsigned char*)sm;
-    float acc = 0.f;
     const int nsb = (int)(COLS >> 5);
-    for (int sb = lane; sb < nsb; sb += 32) {
-        const unsigned char* blk = row + 144 * (sb >> 3);
+    const unsigned char* row = (const unsigned char*)(segs[s].base + (unsigned long long)g * segs[s].row_bytes);
+    uint4 hd[K5Q_MAXNB], q0[K5Q_MAXNB], q1[K5Q_MAXNB];
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXNB; i++) {
+        const int sb = lane + 32 * i;
+        if (sb < nsb) {
+            const unsigned char* blk = row + 144 * (sb >> 3);
+            const uint4* qs = (const uint4*)(blk + 16 + 32 * ((sb & 7) >> 1));
+            hd[i] = __ldcs((const uint4*)blk);
+            q0[i] = __ldcs(qs);
+            q1[i] = __ldcs(qs + 1);
+        }
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXNB; i++) {
+        const int sb = lane + 32 * i;
+        if (sb >= nsb) break;
         const int j = sb & 7;
-        const unsigned short* h = (const unsigned short*)blk;
-        const float d = g5_h2f(h[0]), dmin = g5_h2f(h[1]);
+        const float d = g5_h2f(hd[i].x & 0xffffu), dmin = g5_h2f(hd[i].x >> 16);
         int sc, m;
-        k5_q4k_sm(blk + 4, j, sc, m);
-        const unsigned* qs = (const unsigned*)(blk + 16 + 32 * (j >> 1)); // 16 B aligned
+        k5_q4k_sm(hd[i], j, sc, m);
+        const unsigned qs[8] = {q0[i].x, q0[i].y, q0[i].z, q0[i].w, q1[i].x, q1[i].y, q1[i].z, q1[i].w};
         const int sh = 4 * (j & 1);
         const int4* xv = (const int4*)(xq + 32 * sb);
         const int4 x0 = __ldg(xv), x1 = __ldg(xv + 1);
@@ -296,7 +308,7 @@ __device__ __forceinline__ void k5_qgemv_q4k_body(
     if (lane == 0) ((float*)segs[s].y)[g] = acc;
 }
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv_q4k5(const K5Seg* segs, unsigned nseg,
-    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_q4k_body<5>(segs, nseg, xq, xd, COLS); }
+    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_q4k_body<4>(segs, nseg, xq, xd, COLS); }
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv_q4k9(const K5Seg* segs, unsigned nseg,
-    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_q4k_body<9>(segs, nseg, xq, xd, COLS); }
+    const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_q4k_body<8>(segs, nseg, xq, xd, COLS); }
 #endif // K5_HOST_CHECK
