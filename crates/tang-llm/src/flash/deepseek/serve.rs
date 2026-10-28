@@ -373,6 +373,13 @@ impl Backend for DsServe {
         req: &Request,
         on: &mut dyn FnMut(Piece) -> bool,
     ) -> Result<(Finish, Usage)> {
+        // the lab switch for `DS_SERVE_PROFILE`: the file /tmp/ds-profile-direct existing
+        // runs this request on the direct path (step interiors timed), else the graph path
+        let prof_direct = serve_profile().is_some() && {
+            let d = std::path::Path::new("/tmp/ds-profile-direct").exists();
+            super::obs::set(2, 1, d);
+            d
+        };
         let think = req.think.unwrap_or(true);
         let prompt = self
             .tpl
@@ -481,13 +488,13 @@ impl Backend for DsServe {
         if called && finish == Finish::Stop {
             finish = Finish::ToolCalls;
         }
-        if let Some(mode) = serve_profile() {
+        if serve_profile().is_some() {
             let recs = super::obs::take();
             super::obs::collect(true);
             let o = ProfileOpts {
                 steps: 0,
                 prompt_tokens: ids.len(),
-                direct: mode == "direct",
+                direct: prof_direct,
                 graph_debug: false,
                 spec: spec,
             };
