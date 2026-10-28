@@ -4,6 +4,77 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — device-resident decode step: B300 35.8 -> 47.7 tok/s, step graph 56.2 (branch claude/glm5-resident)
+
+The residual stream stays on the device for the whole decode token. Code: `glm5/resident.rs`, a
+child module of engine.rs, called from `step_slot`.
+- Embed: the host gathers one row and `MhcFused::begin_async` uploads it. That is the step's only H2D.
+- mHC pre: `pre_dev` writes the normed x straight into the consumer's input buffer (KDA `xb`, the
+  MLA scratch `x`, or the FFN's `Resident::x`).
+- Consumers, all async on the fused-mHC stream:
+  - KDA: `decode_dev`, its per-layer graph launched on the step stream.
+  - DSA: `MlaProj::window_dev`. The selection stays on the device (`idx_run_dev_resident` +
+    `attend_dev_sel`). `pos0`/`kv_len` are passed per token as plain kernel args; no device
+    position counter. The dense->sparse switch is still a host branch.
+  - FFN: `ffn_async`.
+- mHC post: `post_dev` takes the producer's y pointer.
+- Head: `end_dev`, then `rs_norm` (f64 sum, like the host `inv_rms`), the Q8_0 LM head (or a
+  `k5_gemv` head for the f32 fixture), then `rs_argmax` (first max). One sync, a 4-byte read.
+- DSA host mirrors are only resized. `DsaCache::stale_from` marks them, and `refresh_stale_dsa`
+  pulls the rows before any host DSA use, or before a device cache regrow.
+
+Default ON when every stage is resident (single slot, one GPU, MOE=fast, KDA fused/graph, mHC
+fused, MLA resident). `TANG_GLM5_RESIDENT=0` forces the old path.
+
+`TANG_GLM5_STEP_GRAPH=1` (default off) splits the step into 12 graph segments (n_dsa + 1) at the
+DSA cores, which run eagerly between segment launches.
+- Captured after one eager warm-up token. Any host window or slot resize drops the segments.
+- First version diverged from token 3 on (deterministic; a re-capture every token gave the
+  same wrong ids). Cause: the capture pass skipped the DSA items entirely, so their mHC post never
+  ran and the next segment's pre was captured with `do_post=0`, dropping the attention output.
+  Fix: `Pass::HostOnly` at each boundary.
+- Also changed: kda `gemv8_launch_on(s)`; the fused decode's non-G5F arm had launched on the layer's own stream.
+
+B300, tree = this branch rebased on 9c49294d. Flags: B (`MOE=fast GEMV8=1 KDA_PF2=1 MHC_FUSED=1
+MLA_RESIDENT=1 GPU_HEAD=1 KDA_G5F=2 KDA_FUSED=1 KDA_GRAPH=1`). Bench prompt, `-n 128 --temp 0`,
+`TANG_GLM5_TRACE=1`. All three -n 128 id streams are identical (md5 ab6f6605). The haiku gate =
+`785 1196 6801 264 6386 38038 911 279` for resident and for step graph.
+
+| path | decode tok/s | trace wall/token | launches | H2D# | D2H# | syncs |
+|---|---|---|---|---|---|---|
+| host (`RESIDENT=0`) | 35.83 | 25.8 ms | 561 | 182 | 226 | 216 |
+| resident (default) | **47.67** | 19.1 ms | 563 | 1 | 1 | 1 |
+| resident + `STEP_GRAPH=1` | **56.23** | 17.2 ms | 164 | 1 | 1 | 1 |
+
+On 38bb2bed, before the rebase: host 30.72, resident 40.26 / 40.29, step graph 48.09. The rebase
+gained +7.4 tok/s on the resident path vs +5.1 on the host path.
+- Resident is GPU-bound: the single sync waits 14.7 of 19.1 ms. Host enqueue is ~4.4 ms and overlaps.
+- The exact-timed trace (`TANG_TRACE_EXACT=1`) gives negative per-stage GPU ms here and does not
+  time graph nodes. Use wall.
+
+Still blocking a single whole-step graph:
+1. DSA. `kv_len`/`pos0`, the append row pointers, and the attend width and smem
+   (`(2*dl + width)*4`) change every token. Options: a device position counter read by
+   `mla_attn_abs2` / `lat_norm` / `idx_ln` / the kv_a gemv's output offset, with attend sized to a
+   max width; or `cuGraphExecKernelNodeSetParams` on ~14 nodes per DSA layer per token.
+2. Sparse (kv > top_k): `idx_pool`'s `n_pool` and the select grid move too. It runs eager and
+   copy-free, but has only been exercised on the tiny fixture (top_k 8), not real weights.
+3. Embed: a pageable async H2D before the first segment. A device gather of the Q-quant
+   `token_embd` row fed by `rs_argmax`'s output would close the token loop on the device.
+
+Verified:
+- mew tiny: `engine_gpu_resident_step_matches_host`. Host vs resident vs step-graph greedy ids are
+  equal over 40 decode tokens across the dense->sparse switch. A host window afterwards reads the
+  refreshed mirrors with logits max abs 0.
+- mew tiny: flash::glm5 suite 76 passed / 0 failed / 2 ignored (pre-rebase tree, trace-flake test
+  skipped).
+
+Not verified:
+- The trace-flake test run alone.
+- The suite on the rebased tree.
+- The mirror-refresh-on-regrow path (rows_fit false) on real weights.
+- Multi-slot: the resident path is gated to n_slots == 1.
+
 ## 2026-10-28 (integration round 2) — k5d_tail + FFN repack merged: B300 35.02 tok/s decode with repack off, now the default (branch claude/glm5-integrate2)
 
 Merged onto frog/glm5-forward 38bb2bed: claude/glm5-kda-kernels 1073e571 (k5d_tail, `TANG_GLM5_KDA_TAIL`
