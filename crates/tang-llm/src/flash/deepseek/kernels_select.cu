@@ -189,8 +189,8 @@ extern "C" __global__ void ds_idx_cat(int* dst, const int* src, int t, int k, in
 
 // MoE routing lists, one block: ids/wts [t][k] -> per-expert CSR, rows ascending within an
 // expert: counts[ne], off[ne + 1], rows[t * k] (token), rw[t * k] (route weight).
-extern "C" __global__ void ds_route(const int* ids, const float* wts, int* counts, int* off, int* rows, float* rw,
-                                    int t, int k, int ne) {
+__device__ __forceinline__ void route_body(const int* ids, const float* wts, int* counts, int* off, int* rows,
+                                           float* rw, int t, int k, int ne) {
     int n = t * k;
     for (int e = threadIdx.x; e < ne; e += blockDim.x) {
         int c = 0;
@@ -216,6 +216,38 @@ extern "C" __global__ void ds_route(const int* ids, const float* wts, int* count
                 o++;
             }
     }
+}
+
+extern "C" __global__ void ds_route(const int* ids, const float* wts, int* counts, int* off, int* rows, float* rw,
+                                    int t, int k, int ne) {
+    route_body(ids, wts, counts, off, rows, rw, t, k, ne);
+}
+
+// ds_route, then ds_moe_plan, in block 0; blocks 1.. are ds_ks_quant of x's ng 32-groups (the
+// grouped K-split GU's activation, independent of the routing): three launches in one.
+extern "C" __global__ void ds_route_plan_q(const int* ids, const float* wts, int* counts, int* off, int* rows,
+                                           float* rw, int t, int k, int ne, const int* mask, int* elist, int cap,
+                                           const float* x, unsigned char* codes, float* sx, int ng) {
+    if (blockIdx.x == 0) {
+        route_body(ids, wts, counts, off, rows, rw, t, k, ne);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int j = 0;
+            for (int e = 0; e < ne && j < cap; e++)
+                if (counts[e] > 0 && mask[e]) elist[j++] = e;
+            for (; j < cap; j++) elist[j] = -1;
+        }
+        return;
+    }
+    int gw = ((blockIdx.x - 1) * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= ng) return;
+    float xv = x[(long long)gw * 32 + lane];
+    float a = fabsf(xv);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    float sc = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
+    codes[(long long)gw * 32 + lane] = (unsigned char)e4m3_byte(round_e4m3(fminf(fmaxf(xv / sc, -448.f), 448.f)));
+    if (lane == 0) sx[gw] = sc;
 }
 
 // Expert e's rows of x [.][d] into xs [cap][d] and its route weights into w [cap]; rows past
@@ -277,9 +309,10 @@ extern "C" __global__ void ds_moe_plan_tiles(const int* elist, const int* off, i
 }
 
 // y [t][d] = Σ over token ti's local experts in ascending id of part[slot] (slot = the token's
-// CSR position under that expert): the per-expert loop's scatter order, from 0.
-extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
-                                         const int* mask, int t, int k, int d) {
+// CSR position under that expert): the per-expert loop's scatter order, from 0. ds_moe_reduce_sh
+// then adds the shared expert's row part[t * k + ti] (moe_finish's routed + shared, unrounded).
+__device__ __forceinline__ void moe_reduce_at(float* y, const float* part, const int* ids, const int* off,
+                                              const int* rows, const int* mask, int t, int k, int d, int sh) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * d) return;
     int ti = (int)(i / d), c = (int)(i % d);
@@ -301,7 +334,16 @@ extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int*
             }
         s += part[(long long)p * d + c];
     }
+    if (sh) s += part[((long long)t * k + ti) * d + c];
     y[i] = s;
+}
+extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
+                                         const int* mask, int t, int k, int d) {
+    moe_reduce_at(y, part, ids, off, rows, mask, t, k, d, 0);
+}
+extern "C" __global__ void ds_moe_reduce_sh(float* y, const float* part, const int* ids, const int* off,
+                                            const int* rows, const int* mask, int t, int k, int d, int sh) {
+    moe_reduce_at(y, part, ids, off, rows, mask, t, k, d, sh);
 }
 
 // n ints set to v (a verify window's [t][k] selection, -1 = no entry).
@@ -407,6 +449,7 @@ extern "C" __global__ void __launch_bounds__(128) ds_moe_gate(DsW w, const float
     {
         int n = blockIdx.x * 4 + wid;
         if (n < w.rows) {
+            row_prefetch(w, n, lane);
             float s[8];
 #pragma unroll
             for (int i = 0; i < 8; i++) s[i] = 0.f;

@@ -255,6 +255,11 @@ pub struct GpuModel {
     /// unsummed, for the post-mix to add (`ds_add_round` folded into `ds_hc_post`).
     defer_sh: Cell<bool>,
     sh: Cell<Option<Buf>>,
+    /// 8 rows of f32 zeros: the `sh` of a folded shared expert (the post-mix's `bf(y + 0)`).
+    zero_rows: DevBuf,
+    /// The shared expert folded into the grouped K-split launches at t <= 8 (`DS_MOE_SH=0`
+    /// keeps its own MLP; never under `DS_EXACT=1`).
+    pub moe_sh: bool,
     /// Set by the forward loop: the next block's prefix when it reads this block's stream
     /// as is, so the last post-mix also computes its attention mixes (`pend_mixes`).
     next_hc: Option<String>,
@@ -438,6 +443,8 @@ impl GpuModel {
             qk: RefCell::new(HashMap::new()),
             defer_sh: Cell::new(false),
             sh: Cell::new(None),
+            zero_rows: DevBuf::from_slice(&vec![0f32; 8 * c.dim])?,
+            moe_sh: std::env::var("DS_MOE_SH").map_or(true, |v| v != "0"),
             next_hc: None,
             pend_mixes: None,
             pend_stage: None,
@@ -1830,7 +1837,12 @@ impl GpuModel {
         // on the 3090 bench so far, so opt-in for sweeping on H200)
         let fused = std::env::var("DS_MOE_GATE").is_ok_and(|v| v == "1")
             && Kernels::moe_gate_ok(&gw.v, t, ne, topk);
+        let sh = match &tab {
+            Some(tb) => self.moe_sh_weights(p, tb, t, topk)?,
+            None => None,
+        };
         let mut elist = None;
+        let mut preq = false;
         if fused {
             // gate GEMV + router + CSR (+ the grouped plan) in one launch
             let s = self.span("router");
@@ -1875,19 +1887,41 @@ impl GpuModel {
                 c.route_scale,
             )?;
             self.end(s);
-            // per-expert CSR on the device
+            // per-expert CSR on the device; with the shared expert folded, the plan and the
+            // GU's activation quantization ride in the same launch
             let s = self.span("route");
-            self.k.route(
-                &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
-            )?;
+            match (&tab, &sh) {
+                (Some(tb), Some(_)) => {
+                    let cap = (t * topk).min(tb.local);
+                    let el = self.fbuf(cap)?;
+                    self.k.route_plan_q(
+                        &self.s,
+                        (ids.ptr, wts.ptr),
+                        (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                        (tb.mask.ptr, el.ptr, cap),
+                        x.ptr,
+                        (t, topk, ne, d),
+                    )?;
+                    elist = Some(el);
+                    preq = true;
+                }
+                _ => self.k.route(
+                    &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+                )?,
+            }
             self.end(s);
         }
         if let Some(tab) = tab {
-            let y = if t <= 8 {
-                self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw, elist)?
-            } else {
-                self.moe_grouped_tiled(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?
-            };
+            if t <= 8 {
+                let (y, folded) = self.moe_grouped_routed(
+                    p, &tab, x, t, topk, ne, ids, counts, off, rows, rw, elist, sh, preq,
+                )?;
+                if folded {
+                    return self.moe_finish_folded(x, t, y);
+                }
+                return self.moe_finish(p, x, t, y);
+            }
+            let y = self.moe_grouped_tiled(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?;
             return self.moe_finish(p, x, t, y);
         }
         // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
@@ -1958,11 +1992,42 @@ impl GpuModel {
         self.moe_finish(p, x, t, y)
     }
 
+    /// The shared expert's weights when it folds into the grouped launches as one more slot
+    /// (on rank 0 alone under EP, so the reduce sums it once): its MLP launches and the add
+    /// gone. `DS_MOE_SH=0` keeps the MLP.
+    fn moe_sh_weights(
+        &self,
+        p: &str,
+        tab: &MoeTab,
+        t: usize,
+        topk: usize,
+    ) -> Result<Option<[Rc<DevW>; 3]>> {
+        if !self.moe_sh || t > 8 {
+            return Ok(None);
+        }
+        let pe = format!("{p}.ffn.shared_experts");
+        let ws = [
+            self.dw(&format!("{pe}.w1.weight"))?,
+            self.dw(&format!("{pe}.w3.weight"))?,
+            self.dw(&format!("{pe}.w2.weight"))?,
+        ];
+        let ok = self.k.moe_sh_ok(
+            [&ws[0].v, &ws[1].v, &ws[2].v],
+            tab.fmt,
+            t,
+            topk,
+            self.cpu.cfg.dim,
+            tab.inter,
+        );
+        Ok(ok.then_some(ws))
+    }
+
     /// The routed experts' partial sum y [t][d] by the grouped kernels: plan (live local
     /// experts), gate/up + SwiGLU, quantize, down to per-slot partials, ordered reduce.
     #[allow(clippy::too_many_arguments)]
     fn moe_grouped_routed(
         &self,
+        p: &str,
         tab: &MoeTab,
         x: Buf,
         t: usize,
@@ -1974,7 +2039,9 @@ impl GpuModel {
         rows: Buf,
         rw: Buf,
         planned: Option<Buf>,
-    ) -> Result<Buf> {
+        sh: Option<[Rc<DevW>; 3]>,
+        preq: bool,
+    ) -> Result<(Buf, bool)> {
         let d = self.cpu.cfg.dim;
         let (n, inter) = (t * topk, tab.inter);
         let slots = n.min(tab.local);
@@ -2004,8 +2071,60 @@ impl GpuModel {
         } else {
             self.qdq(x, t * d)?
         };
-        let h = self.fbuf(n * inter)?;
         let lim = self.cpu.cfg.swiglu_limit;
+        if let Some(ws) = sh {
+            let on = self.obs.rank.get() == 0;
+            let h = self.fbuf((n + t) * inter)?;
+            self.k.moe_gu_sh(
+                &self.s,
+                tab.fmt,
+                (tab.w1.ptr, tab.w3.ptr, elist.ptr),
+                (off.ptr, rows.ptr, rw.ptr),
+                (&ws[0].v, &ws[1].v, on),
+                if preq { 0 } else { x.ptr },
+                h.ptr,
+                (t, n, slots, inter, d),
+                lim,
+            )?;
+            self.end(s);
+            let s = self.span("grouped_down");
+            let part = self.fbuf((n + t) * d)?;
+            self.k.moe_down_sh(
+                &self.s,
+                tab.fmt,
+                (tab.w2.ptr, elist.ptr, off.ptr),
+                (&ws[2].v, on),
+                h.ptr,
+                part.ptr,
+                (t, n, slots, d, inter),
+            )?;
+            let y = self.fbuf(t * d)?;
+            let (ti, ki, di, shi) = (t as i32, topk as i32, d as i32, on as i32);
+            unsafe {
+                self.k.go(
+                    "ds_moe_reduce_sh",
+                    blocks(t * d, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![
+                        y.ptr,
+                        part.ptr,
+                        ids.ptr,
+                        off.ptr,
+                        rows.ptr,
+                        tab.mask.ptr,
+                        ti,
+                        ki,
+                        di,
+                        shi
+                    ],
+                )?
+            };
+            self.end(s);
+            return Ok((y, true));
+        }
+        let h = self.fbuf(n * inter)?;
         self.k.moe_gu(
             &self.s, tab.fmt, tab.w1.ptr, tab.w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, xq.ptr,
             h.ptr, t, slots, inter, d, lim,
@@ -2043,7 +2162,7 @@ impl GpuModel {
             )?
         };
         self.end(s);
-        Ok(y)
+        Ok((y, false))
     }
 
     /// [`Self::moe_grouped_routed`] for t > 8 (prefill): the same plan and ordered reduce,
@@ -2216,6 +2335,36 @@ impl GpuModel {
                 0,
                 &self.s,
                 args![y.ptr, sh.ptr, nn],
+            )?
+        };
+        self.end(s);
+        Ok(y)
+    }
+
+    /// [`Self::moe_finish`] when the grouped launches already summed the shared expert into
+    /// `y` (unrounded): the EP reduce in order, then the one bf16 rounding — deferred to the mHC
+    /// post-mix as `bf(y + 0)` (a zero `sh`) or here.
+    fn moe_finish_folded(&self, _x: Buf, t: usize, y: Buf) -> Result<Buf> {
+        let d = self.cpu.cfg.dim;
+        if let Some(reduce) = &self.moe_reduce {
+            let s = self.span("reduce");
+            reduce(&y.dev(), t * d, &self.s)?;
+            self.end(s);
+        }
+        if self.defer_sh.get() {
+            self.sh.set(Some(Buf::from(&self.zero_rows)));
+            return Ok(y);
+        }
+        let s = self.span("finish");
+        let nn = (t * d) as i64;
+        unsafe {
+            self.k.go(
+                "ds_round",
+                blocks(t * d, 256),
+                B256,
+                0,
+                &self.s,
+                args![y.ptr, nn],
             )?
         };
         self.end(s);

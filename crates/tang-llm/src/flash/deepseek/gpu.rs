@@ -105,6 +105,9 @@ pub struct Kernels {
     moe: [[[Func; 2]; 4]; 2],
     /// `ds_moe_ks_{gu,down}_f{fmt}`, the grouped MoE on the K-split path, by (fmt - 2, down).
     moe_ks: [[Func; 2]; 2],
+    /// `ds_moe_ks_{gu,down}_f{fmt}_s{sfmt}`: [`Kernels::moe_ks`] with the shared expert (format
+    /// sfmt) as one more slot, by (fmt - 2, sfmt - 2, down).
+    moe_ks_sh: [[[Func; 2]; 2]; 2],
     /// `ds_wo_ks_f{fmt}`, wo_a's grouped K-split GEMV, by fmt - 2, and its quantized activation.
     wo_ks: [Func; 2],
     wo_x: DevBuf,
@@ -201,6 +204,8 @@ const MORE: &[&str] = &[
     "ds_spec_walk",
     "ds_moe_plan",
     "ds_moe_reduce",
+    "ds_moe_reduce_sh",
+    "ds_route_plan_q",
     "ds_moe_gate",
     "ds_moe_plan_tiles",
     "ds_kst_f2_g0",
@@ -244,7 +249,7 @@ const KS_X: usize = 8 * 16384 * 2;
 const WO_X_COLS: usize = 32768;
 const WO_X: usize = 8 * WO_X_COLS + 8 * WO_X_COLS / 8;
 /// Row groups each grouped K-split block takes (blockIdx.x strides them).
-const MOE_KS_ITEMS: usize = 4;
+const MOE_KS_ITEMS: usize = 2;
 
 fn env_usize(k: &str) -> Option<usize> {
     std::env::var(k).ok().and_then(|v| v.parse().ok())
@@ -335,6 +340,18 @@ impl Kernels {
                 [m.func("ds_moe_ks_gu_f2")?, m.func("ds_moe_ks_down_f2")?],
                 [m.func("ds_moe_ks_gu_f3")?, m.func("ds_moe_ks_down_f3")?],
             ],
+            moe_ks_sh: {
+                let mut a = [[[std::ptr::null_mut(); 2]; 2]; 2];
+                for (f, af) in a.iter_mut().enumerate() {
+                    for (sf, asf) in af.iter_mut().enumerate() {
+                        for (di, kind) in ["gu", "down"].iter().enumerate() {
+                            asf[di] =
+                                m.func(&format!("ds_moe_ks_{kind}_f{}_s{}", f + 2, sf + 2))?;
+                        }
+                    }
+                }
+                a
+            },
             wo_ks: [m.func("ds_wo_ks_f2")?, m.func("ds_wo_ks_f3")?],
             wo_x: DevBuf::alloc(WO_X)?,
             ks: [
@@ -644,6 +661,36 @@ impl Kernels {
                 0,
                 s,
                 tang_moe::args![ids, wts, counts, off, rows, rw, ti, ki, nei],
+            )
+        }
+    }
+
+    /// [`Kernels::route`], `ds_moe_plan` (`elist` [cap] over `mask`) and the K-split quantization
+    /// of `x` [t][d] that [`Kernels::moe_gu_sh`] then takes as is (`pre`), in one launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_plan_q(
+        &self,
+        s: &Stream,
+        (ids, wts): (u64, u64),
+        (counts, off, rows, rw): (u64, u64, u64, u64),
+        (mask, elist, cap): (u64, u64, usize),
+        x: u64,
+        (t, k, ne, d): (usize, usize, usize, usize),
+    ) -> Result<()> {
+        let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
+        let ng = t * d / 32;
+        let (ti, ki, nei, ci, ngi) = (t as i32, k as i32, ne as i32, cap as i32, ng as i32);
+        unsafe {
+            self.go(
+                "ds_route_plan_q",
+                ((1 + ng.div_ceil(8)) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![
+                    ids, wts, counts, off, rows, rw, ti, ki, nei, mask, elist, ci, x, codes,
+                    scales, ngi
+                ],
             )
         }
     }
@@ -1230,6 +1277,119 @@ impl Kernels {
                 0,
                 s,
                 tang_moe::args![w2s, elist, off, hq, part],
+            )?
+        }
+        Ok(())
+    }
+
+    /// Whether [`Kernels::moe_gu_sh`] / [`Kernels::moe_down_sh`] take `t` tokens with the
+    /// shared expert `sh` (w1, w3, w2) folded in as one more slot of a layer whose routed
+    /// experts are `fmt`, `inter` × `d`: the K-split path only (never under `DS_EXACT`), the
+    /// shared expert of the routed shape, and `t * (k + 1)` hidden rows fitting `ks_x`.
+    pub fn moe_sh_ok(
+        &self,
+        sh: [&DsW; 3],
+        fmt: i32,
+        t: usize,
+        k: usize,
+        d: usize,
+        inter: usize,
+    ) -> bool {
+        let [a, b, c] = sh;
+        let n = t * (k + 1);
+        !self.exact
+            && (2..=3).contains(&fmt)
+            && Self::fast_ok(a)
+            && Self::fast_ok(c)
+            && (a.rows as usize, a.cols as usize) == (inter, d)
+            && (b.fmt, b.rows, b.cols) == (a.fmt, a.rows, a.cols)
+            && (c.fmt, c.rows as usize, c.cols as usize) == (a.fmt, d, inter)
+            && self.moe_ks_ok(t, d, t)
+            && self.moe_ks_ok(t, inter, n)
+    }
+
+    /// [`Kernels::moe_gu`] on the K-split path with the shared expert (`s1`, `s3`) as one more
+    /// slot when `on` (every token at weight 1, into `h` rows `n = t * k` ..): one launch for
+    /// the routed and shared gate/up. See [`Kernels::moe_sh_ok`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gu_sh(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        (w1s, w3s, elist): (u64, u64, u64),
+        (off, rows, rw): (u64, u64, u64),
+        (s1, s3, on): (&DsW, &DsW, bool),
+        xq: u64,
+        h: u64,
+        (t, n, slots, inter, d): (usize, usize, usize, usize, usize),
+        lim: f32,
+    ) -> Result<()> {
+        let f = self.moe_ks_sh[fmt as usize - 2][s1.fmt as usize - 2][0];
+        // xq == 0: route_plan_q already quantized the activation into ks_x
+        let (codes, scales) = if xq == 0 {
+            (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64)
+        } else {
+            self.ks_quantize(s, xq, t, d)?
+        };
+        let (sp, nbr, gx) = self.moe_ks_grid(inter, 8, d);
+        let (si, nbri, ts, ni, s1, s3) = (
+            sp as i32,
+            nbr as i32,
+            (t * on as usize) as i32,
+            n as i32,
+            *s1,
+            *s3,
+        );
+        let gy = slots + on as usize;
+        unsafe {
+            super::obs::launch(
+                f,
+                (gx as u32, gy.max(1) as u32, 1),
+                (256, 1, 1),
+                (t * (d.div_ceil(128) * 128 + 32) + t * (d / 32) * 4) as u32,
+                s,
+                tang_moe::args![
+                    w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3, ts, ni
+                ],
+            )?
+        }
+        Ok(())
+    }
+
+    /// [`Kernels::moe_down`] on the K-split path with the shared expert's `s2` as one more
+    /// slot when `on`: `hq` rows `n = t * k` .. `n + t` (quantized with the routed rows) into
+    /// `part` rows `n` .., for `ds_moe_reduce_sh`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_sh(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        (w2s, elist, off): (u64, u64, u64),
+        (s2, on): (&DsW, bool),
+        hq: u64,
+        part: u64,
+        (t, n, slots, d, inter): (usize, usize, usize, usize, usize),
+    ) -> Result<()> {
+        let f = self.moe_ks_sh[fmt as usize - 2][s2.fmt as usize - 2][1];
+        let rows = n + if on { t } else { 0 };
+        let (codes, scales) = self.ks_quantize(s, hq, rows, inter)?;
+        let (sp, nbr, gx) = self.moe_ks_grid(d, 16, inter);
+        let (si, nbri, ts, ni, s2) = (
+            sp as i32,
+            nbr as i32,
+            (t * on as usize) as i32,
+            n as i32,
+            *s2,
+        );
+        let gy = slots + on as usize;
+        unsafe {
+            super::obs::launch(
+                f,
+                (gx as u32, gy.max(1) as u32, 1),
+                (256, 1, 1),
+                (t * (inter.div_ceil(128) * 128 + 32) + t * (inter / 32) * 4) as u32,
+                s,
+                tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni],
             )?
         }
         Ok(())
