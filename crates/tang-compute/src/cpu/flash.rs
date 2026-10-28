@@ -1083,6 +1083,179 @@ mod tests {
         }
     }
 
+    /// Qwenputer's trick (divagr.com/blog/qwenputer): with the decay gate at 1, β at 1 and
+    /// one-hot keys, a GDN write lands in exactly one state row and a one-hot query reads it
+    /// back exact, so the state is addressable RAM. Pins what holds in this kernel's order of
+    /// operations:
+    /// - the gate and β reach exactly 1.0 from realistic projections (a + dt = −30, b = 40);
+    /// - a write into a zero row stores `v` bitwise, and touches no other row;
+    /// - overwriting a row holding `s` stores `fma(1, (v − s)·1, s)`, which is `v` bitwise
+    ///   whenever `v − s` is exact (integers below 2^24, the same binade), and otherwise is off
+    ///   by one rounding, so a compiler that wants exact overwrites keeps values integral;
+    /// - a one-hot query returns the row scaled by 128^-½ before the output norm.
+    #[test]
+    fn gdn_one_hot_write_is_exact_ram() {
+        let d = GDN_D;
+        let t = 8; // 4 writes into fresh rows, then 4 overwrites of the same rows
+        let (dt, a, norm) = (vec![0.0; GDN_HV], vec![-1.0; GDN_HV], vec![1.0; GDN_D]);
+        let mut proj = vec![0f32; t * GDN_PROJ];
+        let mut h = vec![0f32; t * GDN_CONV];
+        // row written at step tt (k head hk): a fixed per-head row, so overwrites hit it
+        let row = |tt: usize, hk: usize| (hk * 7 + (tt % 4) * 31) % d;
+        let val = |tt: usize, hv: usize, j: usize| -> f32 {
+            // integers in ±2^12 for the first pass, a different set for the overwrite pass
+            let s = ((tt * 1_000_003 + hv * 7_919 + j * 104_729) % 8_192) as f32 - 4_096.0;
+            if tt < 4 {
+                s
+            } else {
+                -s + 1.0
+            }
+        };
+        for tt in 0..t {
+            let p = &mut proj[tt * GDN_PROJ..(tt + 1) * GDN_PROJ];
+            for hv in 0..GDN_HV {
+                p[GDN_A + hv] = -30.0; // softplus(−30) ≈ 9e−14; exp(−9e−14) rounds to 1
+                p[GDN_B + hv] = 40.0; // sigmoid(40) rounds to 1
+                for j in 0..d {
+                    p[GDN_Z + hv * d + j] = 40.0;
+                    h[tt * GDN_CONV + 2 * GDN_HK * d + hv * d + j] = val(tt, hv, j);
+                }
+            }
+            for hk in 0..GDN_HK {
+                let r = row(tt, hk);
+                h[tt * GDN_CONV + hk * d + r] = 1.0; // q one-hot
+                h[tt * GDN_CONV + GDN_HK * d + hk * d + r] = 1.0; // k one-hot
+            }
+        }
+        // the gate really is 1.0, not 1 − ε: the kernel's own formula
+        let sp = (-30f32).exp().ln_1p();
+        assert_eq!((sp * a[0]).exp().to_bits(), 1.0f32.to_bits());
+        assert_eq!(sigmoid(40.0).to_bits(), 1.0f32.to_bits());
+
+        // first pass: 4 writes into zero rows
+        let mut state = vec![0f32; crate::flash::GDN_STATE];
+        let y = gdn_step(
+            &mut state,
+            &h,
+            &proj,
+            GDN_PROJ,
+            (&dt, &a, &norm),
+            4,
+            4,
+            true,
+            0.0,
+        );
+        let at = |state: &[f32], i: usize, hv: usize, j: usize| state[(i * GDN_HV + hv) * d + j];
+        let mut touched = 0;
+        for hv in 0..GDN_HV {
+            let hk = hv % GDN_HK;
+            for tt in 0..4 {
+                let r = row(tt, hk);
+                for j in 0..d {
+                    assert_eq!(at(&state, r, hv, j).to_bits(), val(tt, hv, j).to_bits());
+                }
+            }
+            for i in 0..d {
+                if (0..4).any(|tt| row(tt, hk) == i) {
+                    continue;
+                }
+                for j in 0..d {
+                    assert_eq!(
+                        at(&state, i, hv, j),
+                        0.0,
+                        "row {i} of head {hv} was written"
+                    );
+                }
+                touched += 1;
+            }
+        }
+        assert_eq!(touched, GDN_HV * (d - 4));
+        // the read: the output row before its norm is the state row · 128^-½, so y, which is
+        // rms-normalised with eps 0, is the row scaled by one common factor
+        for hv in 0..GDN_HV {
+            let tt = 3;
+            let r = row(tt, hv % GDN_HK);
+            let o: Vec<f32> = (0..d).map(|j| at(&state, r, hv, j) * INV_SQRT_D).collect();
+            let rs = 1.0 / (o.iter().map(|x| x * x).sum::<f32>() / d as f32).sqrt();
+            for j in 0..d {
+                let want = o[j] * rs;
+                let got = y[tt * GDN_V + hv * d + j];
+                assert!(
+                    (got - want).abs() <= 2e-6 * (1.0 + want.abs()),
+                    "{got} vs {want}"
+                );
+            }
+        }
+
+        // second pass: overwrite the same rows with new integers; exact, since v − s is exact
+        let _ = gdn_step(
+            &mut state,
+            &h[4 * GDN_CONV..],
+            &proj[4 * GDN_PROJ..],
+            GDN_PROJ,
+            (&dt, &a, &norm),
+            4,
+            4,
+            true,
+            0.0,
+        );
+        for hv in 0..GDN_HV {
+            let hk = hv % GDN_HK;
+            for tt in 4..8 {
+                let r = row(tt, hk);
+                for j in 0..d {
+                    assert_eq!(at(&state, r, hv, j).to_bits(), val(tt, hv, j).to_bits());
+                }
+            }
+        }
+
+        // overwriting with arbitrary floats is the two-rounding model, and not always exact
+        let vals_ = vals(t * GDN_CONV, 11, 1e3);
+        let mut hf = h.clone();
+        for tt in 0..t {
+            for c in 2 * GDN_HK * d..GDN_CONV {
+                hf[tt * GDN_CONV + c] = vals_[tt * GDN_CONV + c];
+            }
+        }
+        let before = state.clone();
+        let _ = gdn_step(
+            &mut state,
+            &hf[4 * GDN_CONV..],
+            &proj[4 * GDN_PROJ..],
+            GDN_PROJ,
+            (&dt, &a, &norm),
+            4,
+            4,
+            true,
+            0.0,
+        );
+        let (mut exact, mut off) = (0usize, 0usize);
+        for hv in 0..GDN_HV {
+            let hk = hv % GDN_HK;
+            let mut s = before.clone();
+            for tt in 4..8 {
+                let r = row(tt, hk);
+                for j in 0..d {
+                    let v = hf[tt * GDN_CONV + 2 * GDN_HK * d + hv * d + j];
+                    let prev = s[(r * GDN_HV + hv) * d + j];
+                    let model = 1.0f32.mul_add((v - prev) * 1.0, prev);
+                    s[(r * GDN_HV + hv) * d + j] = model;
+                    assert_eq!(at(&state, r, hv, j).to_bits(), model.to_bits());
+                    if model.to_bits() == v.to_bits() {
+                        exact += 1
+                    } else {
+                        off += 1
+                    }
+                }
+            }
+        }
+        assert!(
+            exact > 0 && off > 0,
+            "exact {exact}, off by a rounding {off}"
+        );
+        eprintln!("float overwrites: {exact} exact, {off} off by one rounding");
+    }
+
     #[test]
     fn pexp_is_within_two_ulp_of_exp() {
         let mut x = -87.0f32;
