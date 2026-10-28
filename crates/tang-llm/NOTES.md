@@ -4,6 +4,50 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (integration round 4 prep) — mtp-ready + stepgraph2 + kda-q4 merged; one test env lock; suite green in parallel (branch claude/glm5-integrate4)
+
+No real weights this round (no pods). Base frog/glm5-forward 75249bda, then `--no-ff` merges in order:
+1. claude/glm5-mtp-ready 6383697b. Textual conflict: this file only (both kept). engine.rs / kda_dev.rs
+   auto-merged; builds as is.
+2. claude/glm5-stepgraph2 b236d771. Conflicts: this file; `resident.rs` `step_resident`'s mode parse
+   (forward made segments the default with `=0` eager; stepgraph2 had `=1` opt-in and added `=2`).
+   Now: unset / `1` = segments (default), `2` = whole step, `0` = eager.
+3. claude/glm5-kda-q4 32d84547. Conflict: this file. The Q4_K `k5_qgemv_q4k5/9` tables are picked by
+   tensor type at load (every KDA matrix Q4_K), so the default Q8_0 GGUF path is unchanged.
+
+Env lock: there were two Mutexes (stepgraph2's `glm5::ENV_LOCK`, mtp-ready's engine-tests one) and
+only the setters held them, so readers still raced. Now `glm5::ENV_LOCK` is an `RwLock`; every test in
+engine.rs, kda_dev.rs, kda_decode.rs, mla.rs, mhc_fused.rs, moe_tests.rs, mtp_tests.rs holds exactly one
+guard for its body: `env_write()` if it sets / removes `TANG_GLM5_*` or toggles the trace
+(real_weights_gpu_matches_cpu, slots_batch_matches_single, win_step_window_matches_steps,
+resident_step_matches_host, trace_is_transparent, glm5_kda_layer_bench_real, kda_g5f_real_bench,
+kda_quant_real_bench), else `env_read()`. Not re-entrant: `gpu_slots_case` no longer locks.
+
+MTP vs resident (decision): MTP stays on the host `window()` path entirely: prefill, the t>1 verify
+window, and the rerun of the accepted prefix (including t=1 reruns) all call `window()`, which drops the
+step graph and refreshes stale DSA mirrors. The resident step can't serve MTP anyway: it doesn't produce
+`last_h`, which the drafter needs. `restore` clears `kda_dev_fresh` (so `resident_ready` is false until a
+window re-seeds), now also calls `drop_step_graph()` (segments, whole graphs, `[tok,pos]`, cap) and
+clamps `DsaCache::stale_from` to the rewind point. A plain decode after an MTP rewind takes one eager
+resident token, then recaptures.
+
+Tests:
+- local CPU `flash::glm5`: 42 passed.
+- mew 3090 CUDA `flash::glm5` (TANG_REQUIRE_CUDA=1), PARALLEL: 83 passed / 0 failed / 2 ignored (the two
+  `#[ignore]` real-weight benches, not flakes). Same with `TANG_GLM5_STEP_GRAPH=2`: 83/0/2, and `=0`: 83/0/2.
+  Caveat: tests that set STEP_GRAPH themselves remove it after, so later tests in those runs see the default.
+- mew tiny f32, prompt `3 17 42 7 99 5`, `-n 40`, flags MOE=fast KDA_PF2 KDA_GRAPH GEMV8 MHC_FUSED
+  MLA_RESIDENT KDA_FUSED: plain greedy ids md5 bc55ff4b under graph default (2 segments captured),
+  `=2` (dense + sparse whole graphs captured) and `=0`. `--mtp 1/2/3` ids = plain under all three.
+  The tiny drafter accepts 0% (random weights), so every pass rewinds + reruns: restore is exercised
+  39 times per run; accept rate / tok/s mean nothing here.
+
+Still needs a B300:
+- graph=2 real-weights gate: haiku `-n 8` ids = oracle, `-n 512` md5 vs graph=1, tok/s and launches.
+- `--mtp 1/2/3`: ids vs plain, tok/s, accept rate per depth.
+- WIN_STEP cost at depth 3 (default K+1 vs `TANG_GLM5_KDA_WIN_STEP=0`).
+- kda-q4: Q4_K-requantized KDA GGUF vs Q8_0, tok/s A/B and the ids/perplexity gate.
+
 ## 2026-10-28 (integration round 3) — resident step merged; the step graph is now the default: B300 56.7 tok/s (branch frog/glm5-forward)
 
 Fast-forwarded frog/glm5-forward 9c49294d -> claude/glm5-resident 5c024107 (clean ff). Then:
@@ -65,6 +109,51 @@ Not verified:
 - A shadow of the step graph itself (the MoE shadow forces the host path).
 - Multi-slot. Resident (and so the graph) is still gated to n_slots == 1.
 - The parallel env races in the test suite are not fixed.
+
+## 2026-10-28 (later) — `TANG_GLM5_STEP_GRAPH=2`: the whole decode token as one graph replay (branch claude/glm5-stepgraph2)
+
+On top of claude/glm5-resident 5c024107. Code: `resident.rs` (`step_whole`, `rs_embed`), `mla.rs`
+(`*_p` kernels, `MlaCuda::{row_cap, reserve_pool, stage_ape, *_pos}`), `mla_dev.rs` (`window_dev_pos`).
+- Position counter: `Resident::tok` is now `[token, pos]` u32. `rs_argmax(..., inc)` writes the
+  token and, in the whole graph, advances `pos`. The DSA kernels read `pos` (`kv_len = pos + 1`):
+  `mla_lat_norm_bf16_p` / `mla_idx_ln_p` write cache row `pos` from the cache BASE (the wk / gate
+  GEMVs now go to scratch `yk`/`yg`, the LN kernel copies them in), `idx_pool_keys_p` computes the
+  pool this token completes (grid 1, early exit), `idx_select_p` (grid 1, smem at the topk/kp cap),
+  `mla_attn_abs2_p` (width = pos + 1 dense or `select_width`; smem sized to max(topk, select_width),
+  which bounds the dense width because dense only holds while kv_len <= topk). The eager kernels
+  call the same `__device__` bodies.
+- Dense/sparse: two captured graphs `[dense, sparse]`, picked on the host from the cached `pos0`
+  (one compare, no transfer). Before a sparse replay the eager incremental `idx_pool` catches up
+  pools no replay computed (the dense graph skips the indexer); a no-op once caught up.
+- Capacity: the graphs bake the DSA cache bases, so they are valid while `pos0 + 1 <= min row_cap`.
+  Past it both drop, the token runs eagerly (regrows), the next token recaptures. Pools are
+  reserved for `cap / kpool + 1` before capture; a pool realloc drops the other graph.
+- Embed: `rs_embed` gathers row `tok[0]` of the GGUF `token_embd` (uploaded once, own quant type:
+  F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K) with `_rn` ops in the host's evaluation order (no FMA
+  contraction), broadcast to the hc streams in `MhcFused::r`. Other types: host gather + upload.
+- Host per token: (8-byte upload only when `[tok, pos]` is out of step: after an eager token or a
+  host window), graph launch, the DSA watermarks / mirror sizes, sync, 4-byte read.
+- `TANG_GLM5_STEP_GRAPH=1` is unchanged; default unchanged.
+
+Verified:
+- mew tiny: `engine_gpu_resident_step_matches_host` now also runs graph=2. Host = resident =
+  graph=1 = graph=2 greedy ids over 40 decode tokens across the dense->sparse switch (graph=2
+  replays: 11 dense, 28 sparse). Passes alone.
+- mew tiny, flash::glm5 suite: 78 passed / 0 failed / 2 ignored, with the trace test skipped (it
+  passes alone). The parallel failure of the resident test was an env-var race. Fix:
+  `glm5::ENV_LOCK`, held by the resident test and `gpu_slots_case` (which sets / removes
+  `TANG_GLM5_MOE` / `KDA_PF2`).
+- H200 gate with the flags as given (`TANG_GLM5_GPU_FFN=0`): ids = oracle for graph=1 and graph=2.
+  But 0 of 45 FFNs were on the GPU, so the resident step never ran, and neither graph did.
+- H200 with `GPU_FFN` unset (all FFNs on the GPU): the load OOMs at layer 31's FFN
+  (`CUDA_ERROR_OUT_OF_MEMORY`, 24 of 45 uploaded), so every gate and bench failed. The resident
+  step needs every FFN on one GPU, and this single H200 (141 GB) cannot hold them with this tree's
+  footprint. The real-weights check needs the B300 or a multi-GPU box.
+
+Not verified:
+- Real weights with the FFNs on the GPU: the gate, the -n 512 md5 vs graph=1, the bench table.
+- The capacity-regrow / recapture path (the tiny run stays inside its 72-row cap).
+- Embed bit-exactness on the real `token_embd` type.
 
 ## 2026-10-28 — device-resident decode step: B300 35.8 -> 47.7 tok/s, step graph 56.2 (branch claude/glm5-resident)
 
@@ -137,6 +226,107 @@ Not verified:
 - The mirror-refresh-on-regrow path (rows_fit false) on real weights.
 - Multi-slot: the resident path is gated to n_slots == 1.
 
+## 2026-10-28 (mtp-ready) — MTP + WIN_STEP bisect fix merged onto 9c49294d; WIN_STEP = K+1 by default under --mtp (branch claude/glm5-mtp-ready)
+- Merge of claude/glm5-mtp-bisect (contains claude/glm5-mtp) onto frog/glm5-forward 9c49294d.
+  Conflicts: this file (all entries kept), engine.rs CLI (`--slots` and `--mtp` both kept,
+  now mutually exclusive), kda_dev.rs `core_pf2` (the WIN_STEP serial loop now passes the
+  batcher's `slot`). Semantic conflict: `Snap`/`snapshot`/`restore` ported to the per-slot
+  `kda[slot][layer]` / `dsa[slot][layer]` layout — MTP rewinds slot 0 only.
+- `TANG_GLM5_KDA_WIN_STEP` unset now falls back to `mtp::WIN_STEP_DEFAULT`, which
+  `mtp::cli_run` sets to K+1 (the verify window), so `--mtp K` is exact by default; env
+  still overrides (`=0` restores the chunked core). Plain decode: default 0, unchanged.
+- Test `engine_gpu_win_step_window_matches_steps` (tiny, PF2): one t-token window with
+  win_step >= t vs t single decode steps, t = 2,3,4 — every logit row max abs 0 (bitwise),
+  and the step after the window also 0. Its PF2 env set/remove raced
+  `engine_gpu_slots_batch_matches_single` in the parallel run (slot 0 max abs 9.8); fixed
+  with a test `ENV_LOCK` around both loads.
+- Verified: local CPU `flash::glm5` 42/0. mew 3090 (TANG_REQUIRE_CUDA=1) 80 passed / 1
+  failed — the known `engine_gpu_trace_is_transparent` parallel flake (passes alone).
+- H200 #1 (/root/w-mtp, B flags): haiku -n 8 --temp 0 ids gate plain = oracle
+  `785 1196 6801 264 6386 38038 911 279`; --mtp 1 = oracle (accept 4/4, win_step=2 logged).
+  --mtp 2, --mtp 3 and --mtp 3 with WIN_STEP=0 exited rc=0 but their ids were NOT read
+  back: the box was stopped externally before the logs could be fetched. The tok/s bench
+  (plain, --mtp 1/2/3, and the WIN_STEP=0 vs default cost at depth 3) never ran — the GPU
+  lock was contended by other agents for ~3 h. OPEN: rerun all of it on a live H200.
+
+
+## 2026-10-28 — KDA projections requantized Q8_0 → Q4_K / Q5_K: quality, sizes, kernel µs (H200, branch claude/glm5-kda-q4)
+
+The 34 KDA layers' q/k/v/o/f_a/g_a (204 tensors) are Q8_0 in UD-Q4_K_XL: 4.886 GB read per
+token, more than the MoE's active experts. `tools/glm5-kda-requant.py` rewrites ONLY those tensors
+(gguf-py dequant → ggml's `ggml_quantize_chunk`, no imatrix); every other tensor and every KV is
+copied verbatim, shards without a target (1, 6) are symlinked. The MLA layers' attn_output
+(16384 wide) is untouched. No loader change was needed: `moe::gpu::upload` and every KDA GEMV path
+(k5_gemv / g5_dot, g5f_gemv) already take any G5W type; gemv8 is per-matrix Q8_0-only and falls back.
+
+| KDA proj type | KDA bytes/token | whole GGUF |
+|---|---|---|
+| Q8_0 (as shipped) | 4.886 GB | 199.71 GB |
+| Q5_K | 3.162 GB | 197.98 GB |
+| Q4_K | 2.587 GB | 197.41 GB |
+
+Quality: llama.cpp `llama-perplexity` (8ca4060, CUDA, experts on the CPU) on
+`bench/glm5-ppl/eval.txt` (prose + chat + Rust/Python, 3072 tokens scored: `-c 512 --chunks 6`),
+KL against the original's logits on the same chunks. The CPU reference (`glm5-ref`) was tried
+first: >10 min for 36 tokens, single-threaded — not usable for this.
+
+| KDA proj | PPL | PPL ratio | mean KLD | same top-1 | RMS Δp |
+|---|---|---|---|---|---|
+| Q8_0 | 3.4315 ± 0.188 | — | — | — | — |
+| Q5_K | 3.4807 ± 0.194 | 1.0143 ± 0.0082 | 0.0329 | 92.8 % | 5.7 % |
+| Q4_K | 3.4850 ± 0.195 | 1.0156 ± 0.0095 | 0.0431 | 92.5 % | 6.5 % |
+
+Q5_K and Q4_K are indistinguishable on PPL here (the gap is inside the error); Q4_K costs ~30 %
+more KLD than Q5_K. Both cost ~1.5 % PPL, which is the price of dropping the imatrix-free
+Q8_0 → 4/5-bit step on 1/4 of the per-token weight bytes; an imatrix requant was not tried.
+
+tang engine, Q4_K GGUF (`G5F=2 GEMV8 KDA_PF2 MOE=fast GPU_FFN_LAYERS=0-29`):
+- ids gate `-n 8 --temp 0` = `785 1196 6801 264 6386 38038 911 279` = the oracle, also with
+  GPU_FFN=0. The requant does not move the first 8 greedy tokens.
+- 3 greedy `-n 128` generations vs the original (scripts/glm5-kda-q4-eval.sh; logs in
+  /root/w-q4/out on the H200). Common prefix: code (Rust fibonacci) 72/128, prose (harbor town)
+  2/128, chat (sourdough tips) 49/128. Every divergence is a paraphrase at the same plan step
+  ("u64 or u128, or discuss overflow" vs "u64 or u128 for larger values, though u64 overflows at
+  F(93)"; "is asking me to describe" vs "wants a description of"); the content, structure and
+  code that follow are the same in kind. Q5_K generations were not run (lock time).
+
+Kernel: `kda_quant_real_bench` (new, kda_decode.rs): layer 0, CUDA events, T=1, median of 50; both
+kernels checked against the CPU f32 dequant · x (rel 3.4e-3 … 3.8e-3 everywhere = the int8
+activation band, same as Q8_0). `k5_qgemv_q4k5/9` (new, kda_k5.cuh) is k5_qgemv with a Q4_K dot
+(lane = 32-wide sub-block, d·sc·Σq·x − dmin·m·Σx), so G5F=2 keeps its one launch for
+q|k|v|f_a|g_a. Q5_K has no qgemv variant and runs on g5f_gemv.
+
+| µs (TB/s) | Q8_0 g5f | Q8_0 qgemv | Q5_K g5f | Q4_K g5f | Q4_K qgemv |
+|---|---|---|---|---|---|
+| q / k / v | 19.8 (1.80) | 16.7 (2.13) | 16.0 (1.44) | 15.1 (1.25) | 13.4 (1.41) |
+| f_a / g_a | 9.6 | 7.0 | 8.4 | 8.5 | 7.3 |
+| o | 16.8 (2.12) | 18.8 (1.89) | 15.8 (1.46) | 14.3 (1.32) | 13.6 (1.38) |
+| merged q\|k\|v\|f_a\|g_a | — | 39.4 (2.74) | — | — | 26.8 (2.13) |
+| per layer (G5F=2 = merged + o) | 95.3 | **58.2** | 80.7 | 76.6 | **40.4** |
+| × 34 layers, ms/token | | 1.98 | 2.74 | | **1.37** |
+
+G5F=2 vs G5F=1, 32 naive decode steps on Q4_K and Q5_K: 0 difference (Q8_0: 1.7e-5). Not
+understood yet; the per-matrix timings differ, so the two kernels did run.
+
+Reading:
+- Q4_K + qgemv saves 0.61 ms/token of KDA projection time on the H200 (−31 %), not the −47 % the
+  bytes promise: the 4-bit dot is ALU-heavier and the kernels sit at 1.4–2.1 TB/s instead of
+  2.1–2.7. Still the best KDA config measured.
+- Q5_K is SLOWER than today's Q8_0 G5F=2 (80.7 vs 58.2 µs/layer) until it gets a qgemv variant;
+  even then its byte saving is 35 %, not 47 %.
+
+Recommendation: ship Q4_K KDA projections with G5F=2 (k5_qgemv_q4k) as an opt-in GGUF, not Q5_K:
+same PPL within error, 0.6 ms/token less on the H200 (expect similar on the B300), the ids gate
+holds. Before making it default: an imatrix requant (UD's own recipe for the rest of the file),
+a longer PPL text (3072 tokens gives ±0.9 % on the ratio), and the B300 A/B tok/s.
+NOT verified: B300; fused/graph path bit-equality on Q4_K (decode_fast uses the same
+k5_qgemv via g5f_x/g5f_o, so it should hold); Q5_K generations; multi-slot batched decode (T>1
+takes g5f_gemv, which handles Q4_K).
+
+Ops: the network volume is quota-limited (~290 GB; a second 200 GB copy failed at 100 GB), and
+/dev/shm is noexec — the requant shards were split over /workspace, /root and /dev/shm via
+symlinks, one variant at a time, and deleted after. llama-perplexity with experts on the CPU took
+~7 min to load and ~400 s per 512-token chunk under the other agents' CPU load.
 ## 2026-10-28 (integration round 2) — k5d_tail + FFN repack merged: B300 35.02 tok/s decode with repack off, now the default (branch claude/glm5-integrate2)
 
 Merged onto frog/glm5-forward 38bb2bed: claude/glm5-kda-kernels 1073e571 (k5d_tail, `TANG_GLM5_KDA_TAIL`
@@ -611,6 +801,66 @@ Ops: two copies of a run script once interleaved on one status file and target d
 second launch while the first was mid-queue) — run scripts now take an instance lock
 (`flock -n` on a run lock). `pkill -f <pattern>` over ssh matches the ssh's own shell and
 other workers' jobs: kill by cwd/pid only.
+## 2026-10-28 — MTP near-tie bisected: the KDA chunked core (t>1) vs the recurrent step (branch claude/glm5-mtp-bisect)
+Tool: `TANG_GLM5_WINDIFF=S,T` (engine.rs `windiff`): step-decode to gen[S], snapshot, then
+(A) T single steps, (A2) again, (B) one T-token window over the same tokens; per-layer taps
+(attn in/out, ffn in/out, l2 rel per row) + logits top-2. H200 /root/w-bisect, fast env
+(GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT GPU_HEAD), haiku prompt.
+- A vs A2: 0 everywhere (steps deterministic; snapshot/restore exact).
+- Near-tie (S=59, feeding `42612 11 30957 11`, row 1 = the token after `…42612 11`): step
+  30957 19.2940 vs 342 19.2044, **margin 0.0897**; window flips it: 342 19.4025 vs 30957
+  19.2110. Row logits window-vs-step rel 1.3e-2, max abs 0.24.
+- First difference: **l00 attn_out (KDA), row 0, rel 2.7e-7** with bit-identical input
+  (attn_in 0). Grows through the stack: l01 attn_out ~1e-3, l02 2.5e-3, l06 ffn_out 3e-2 (one
+  row jumps — MoE routing amplifies), l07–l10 up to 1e-1 on that row, settling ~5e-3–1e-2.
+  (Table at S=56: l00 attn_out 2.6e-7, ffn_out 1.1e-5, l01 attn_out 6.3e-4, l04 3.8e-3, l06
+  ffn_out 3.0e-2, l07 ffn_out 1.0e-1, l09 ffn_out 1.0e-1, l12 1.9e-2, l19 ~5e-3.)
+- Cause: `kda_dev::core_pf2` runs t>1 through `prefill_dev` (conv_ip + PF2 chunked WY form),
+  t=1 through `decode_dev` (fused conv + recurrent delta step). Same math, different fp
+  order. Everything else (gemv8/xq8 projections, gates, MoE fast tile, fused mHC, resident
+  MLA, GPU head) is already per-token bit-identical between t=4 and 4×t=1 — proven by the fix:
+- Fix (flag): `TANG_GLM5_KDA_WIN_STEP=N` — windows with t ≤ N run the core as t
+  `decode_dev` launches (token offsets into qkvb/gb_out/bb/ob). With N=4 at S=59: **every tap
+  of all 45 layers and all 4 logit rows bit-identical (0.0)**.
+- Verified: `--mtp 3 -n 64` with WIN_STEP=4 ids == plain decode, all 64 (ends `42612 11 30957
+  11 342`); 1.75 tok/pass (23 verify + 13 rerun). Gate -n 8: plain and --mtp 3 both `785 1196
+  6801 264 6386 38038 911 279`.
+- Cost: t serial step launches per KDA layer per window instead of one chunk (tiny at t≤4;
+  not timed). Default off. Unverified: prefill/long windows untouched (still chunked, so a
+  prefill-vs-decode difference of the same ~1e-2 logit band remains by design); bound
+  otherwise is logits ~1e-2 rel / ~0.3 abs, so near-ties with margin < ~0.3 can flip.
+
+## 2026-10-27 (late) — MTP: the NextN layer drafts at 85–93% (branch claude/glm5-mtp)
+GGUF facts (unsloth UD-Q4_K_XL, dumped on the H200): `nextn_predict_layers = 1`,
+`block_count = 46`; `blk.45` is the NextN block — `nextn.eh_proj` [8192→4096] Q8_0,
+`nextn.{enorm,hnorm,shared_head_norm}` F32, a full DSA attention (MLA + indexer tensors) and
+the 288-expert MoE + shared expert. No `nextn.embed_tokens` / `shared_head.head` (uses
+`token_embd` / `output`), no mHC tensors. `index_share_mtp = true`. Forward per llama.cpp
+`graph_mtp` (/private/tmp/llamacpp-ref/glm5-next.cpp): `eh_proj @ [enorm(embed(x_{i+1})) ;
+hnorm(h_i)]`, plain-residual DSA + MoE, `shared_head_norm`, `output`. `h_i` is the trunk's
+**post-output_norm** hidden; a chain step's `h` is the previous MTP cell's post-shared_head_norm.
+Code: `mtp.rs` (CPU drafter + greedy draft-and-verify, `--mtp K` / `TANG_GLM5_MTP=K`),
+`mtp_tests.rs`; engine.rs hooks `last_h`, `snapshot`/`restore` (KDA host copies, read back
+from resident layers first; DSA caches truncate), and the GPU head now runs every window row.
+A partial accept rewinds and re-runs the accepted prefix (no per-token KDA checkpoints).
+Results (H200, fast env: GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT
+GPU_HEAD, k=3, -n 128; depth d rate is conditional on depths < d accepted):
+- gate "Write a haiku about the sea." -n 8 --mtp 3: ids `785 1196 6801 264 6386 38038 911 279`
+  (= oracle), 2 verify passes, 100% accept.
+- code: d1 88.4% d2 78.4% d3 62.1%; 1.91 tok/pass actual, 2.98 verify-only.
+- prose: d1 84.8% d2 64.1% d3 75.0%; 1.75 actual, 2.78 verify-only.
+- chat: d1 93.0% d2 70.0% d3 57.1%; 1.81 actual, 2.95 verify-only.
+- haiku -n 64: 1.85 actual / 2.86 verify-only.
+NOT identical at -n 64: MTP on/off agree for 60 tokens, then plain gives `30957 11 342`, MTP
+`342 69898 11` (inside an accepted verify window). Not the head (same with the per-row GPU
+head, logs2). It's a t=4-window vs t=1-step numerics difference in the trunk (KDA fused
+decode / MoE fast / mHC t=1 paths vs window paths) at a near-tie; unbisected.
+Tiny fixture (CPU): output == plain greedy for MTP / junk / oracle drafters, k=1..3; the
+oracle is never rewound. Drafting is CPU (~2 s/cell at 4096: CPU MoE for blk.45).
+GPU version needs: blk.45 resident (MLA via mla_dev + its MoE in GpuFfn + eh_proj gemv +
+device head/argmax, no host round trip per cell); per-token KDA state checkpoints in the
+window kernel (drop the re-run: 1.8 → 2.9 tok/pass); trunk window rows bitwise equal to t=1
+decode (or bisect the near-tie flip first).
 
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as

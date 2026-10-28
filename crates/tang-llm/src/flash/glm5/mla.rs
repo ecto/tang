@@ -1129,7 +1129,7 @@ extern "C" __global__ void idx_pool_keys(
 // Tie order: lower index first (matches our CPU ref; W0 owns the torch tie study).
 // smem: npool<=2048 scores not needed — scores stay in registers via a serial loop over
 // pools with a running top-k insertion (n_select <= 512, kept in shared memory).
-extern "C" __global__ void idx_select(
+__device__ __forceinline__ void idx_select_impl(
     const float* __restrict__ iq, const float* __restrict__ hw,
     const float* __restrict__ pk, const unsigned char* __restrict__ valid,
     int* __restrict__ sel, float* __restrict__ dbg,
@@ -1209,6 +1209,60 @@ extern "C" __global__ void idx_select(
     for (; wi < width; wi++) out[wi] = -1;
 }
 
+extern "C" __global__ void idx_select(
+    const float* __restrict__ iq, const float* __restrict__ hw,
+    const float* __restrict__ pk, const unsigned char* __restrict__ valid,
+    int* __restrict__ sel, float* __restrict__ dbg,
+    int t, int kvlen, int pos0, int first_key, int npool,
+    int nh, int hd, int kp, int topk, int width, float score_scale, float hw_scale)
+{
+    idx_select_impl(iq, hw, pk, valid, sel, dbg, t, kvlen, pos0, first_key, npool, nh, hd, kp, topk, width,
+        score_scale, hw_scale);
+}
+
+// ---- the whole-step graph's position-counter variants (TANG_GLM5_STEP_GRAPH=2) ----
+// One decode token (t = 1) at pos = *posp (a device u32 the step graph increments at its
+// end): kv_len = pos + 1, the cache rows written are row pos. Same math as the eager
+// kernels; only where the per-token scalars come from differs.
+
+// idx_select at the device position: grid 1, smem (topk/kp)*8 (the npool cap).
+extern "C" __global__ void idx_select_p(
+    const float* __restrict__ iq, const float* __restrict__ hw,
+    const float* __restrict__ pk, const unsigned char* __restrict__ valid,
+    int* __restrict__ sel, int nh, int hd, int kp, int topk, int width, float score_scale, float hw_scale,
+    const unsigned* __restrict__ posp)
+{
+    const int pos = (int)posp[0];
+    idx_select_impl(iq, hw, pk, valid, sel, NULL, 1, pos + 1, pos, 0, (pos + 1) / kp, nh, hd, kp, topk, width,
+        score_scale, hw_scale);
+}
+
+// idx_pool_keys for the pool this token completes (none unless (pos+1) % kp == 0). grid 1.
+extern "C" __global__ void idx_pool_keys_p(
+    const float* __restrict__ cache_k, const float* __restrict__ cache_gate,
+    const float* __restrict__ ape, float* __restrict__ pk_out, int hd, int kp,
+    const unsigned* __restrict__ posp)
+{
+    const int kvlen = (int)posp[0] + 1;
+    if (kvlen % kp != 0) return;
+    const int p = kvlen / kp - 1;
+    const int base = p * kp;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float lg[8];
+        float mx = G5_NEG_INF_F;
+        for (int j = 0; j < kp; j++) {
+            lg[j] = cache_gate[(size_t)(base + j) * hd + d] + ape[(size_t)j * hd + d];
+            if (lg[j] > mx) mx = lg[j];
+        }
+        float sum = 0.f;
+        for (int j = 0; j < kp; j++) { lg[j] = expf(lg[j] - mx); sum += lg[j]; }
+        float acc = 0.f;
+        for (int j = 0; j < kp; j++)
+            acc += lg[j] / sum * cache_k[(size_t)(base + j) * hd + d];
+        pk_out[(size_t)p * hd + d] = acc;
+    }
+}
+
 // mla_rms_norm: in place, one block (256 threads) per token: x[t][n] *= w / sqrt(mean(x^2) + eps)
 // (q_a_layernorm on the device-resident projection path).
 extern "C" __global__ void mla_rms_norm(float* __restrict__ x, const float* __restrict__ w, int n, float eps)
@@ -1272,6 +1326,39 @@ extern "C" __global__ void mla_idx_ln(float* __restrict__ k, const float* __rest
     if (threadIdx.x == 0) valid[blockIdx.x] = 1;
 }
 
+// mla_lat_norm_bf16 at the device position: one block, lat = the cache BASE (row *posp).
+extern "C" __global__ void mla_lat_norm_bf16_p(const float* __restrict__ y, const float* __restrict__ an,
+    unsigned short* __restrict__ lat, int dl, float eps, const unsigned* __restrict__ posp)
+{
+    __shared__ float red[256];
+    unsigned short* row = lat + (size_t)posp[0] * dl;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < dl; i += blockDim.x) s += y[i] * y[i];
+    const float inv = rsqrtf(mla_bsum(s, red) / dl + eps);
+    for (int i = threadIdx.x; i < dl; i += blockDim.x) row[i] = f2bf(y[i] * inv * an[i]);
+}
+
+// mla_idx_ln at the device position: one block. yk / yg = the wk / gate GEMVs' scratch
+// outputs; k / g / valid = the cache BASES. k[pos] = LayerNorm(yk) * w + b, g[pos] = yg,
+// valid[pos] = 1.
+extern "C" __global__ void mla_idx_ln_p(const float* __restrict__ yk, const float* __restrict__ yg,
+    float* __restrict__ k, float* __restrict__ g, const float* __restrict__ w, const float* __restrict__ b,
+    unsigned char* __restrict__ valid, int hd, const unsigned* __restrict__ posp)
+{
+    __shared__ float red[256];
+    const unsigned pos = posp[0];
+    float* kt = k + (size_t)pos * hd;
+    float* gt = g + (size_t)pos * hd;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) s += yk[i];
+    const float mean = mla_bsum(s, red) / hd;
+    float v = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) v += (yk[i] - mean) * (yk[i] - mean);
+    const float inv = rsqrtf(mla_bsum(v, red) / hd + 1e-6f);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) { kt[i] = (yk[i] - mean) * inv * w[i] + b[i]; gt[i] = yg[i]; }
+    if (threadIdx.x == 0) valid[pos] = 1;
+}
+
 // ---------------- absorbed MLA, coalesced (the resident path's attend) ----------------
 // The naive kernel decompresses every selected key through W_k_h / W_v_h, re-reading the
 // full f32 decompress weights per key (~82 MB per key per layer at the real geometry, with
@@ -1301,7 +1388,7 @@ extern "C" __global__ void mla_fold_q2(const float* __restrict__ q, const float*
 // Scores: one warp per key, lanes along the latent row; softmax over the block; the
 // weighted latent sum with threads along l (coalesced over keys' rows); then W_v_h: one
 // warp per output d, lanes along l. sel/dense semantics as mla_attn_naive.
-extern "C" __global__ void mla_attn_abs2(const float* __restrict__ qa, const unsigned short* __restrict__ lat,
+__device__ __forceinline__ void mla_attn_abs2_impl(const float* __restrict__ qa, const unsigned short* __restrict__ lat,
     const float* __restrict__ wv, const int* __restrict__ sel, float* __restrict__ out,
     int nkv, int pos0, int nh, int dv, int dl, int width, float scale)
 {
@@ -1372,6 +1459,23 @@ extern "C" __global__ void mla_attn_abs2(const float* __restrict__ qa, const uns
         for (int s2 = 16; s2 > 0; s2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s2);
         if (lane == 0) o[d] = den > 0.f ? a / den : 0.f;
     }
+}
+
+extern "C" __global__ void mla_attn_abs2(const float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const float* __restrict__ wv, const int* __restrict__ sel, float* __restrict__ out,
+    int nkv, int pos0, int nh, int dv, int dl, int width, float scale)
+{
+    mla_attn_abs2_impl(qa, lat, wv, sel, out, nkv, pos0, nh, dv, dl, width, scale);
+}
+
+// mla_attn_abs2 at the device position: nkv = pos + 1; width = `width` with a selection,
+// else pos + 1 (dense causal). smem sized by the caller for the largest width.
+extern "C" __global__ void mla_attn_abs2_p(const float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const float* __restrict__ wv, const int* __restrict__ sel, float* __restrict__ out,
+    int nh, int dv, int dl, int width, float scale, const unsigned* __restrict__ posp)
+{
+    const int pos = (int)posp[0];
+    mla_attn_abs2_impl(qa, lat, wv, sel, out, pos + 1, pos, nh, dv, dl, sel == NULL ? pos + 1 : width, scale);
 }
 "#;
 
@@ -2598,6 +2702,144 @@ pub mod cuda {
             Ok(())
         }
 
+        // ---- the whole-step graph (TANG_GLM5_STEP_GRAPH=2): one t = 1 decode token at the
+        // device position `*posp`; the cache BASES are baked into the captured launches, so
+        // the caller must keep every row the graph can reach inside [`Self::row_cap`]
+        // (and the pools inside [`Self::reserve_pool`]) for the graph's lifetime ----
+
+        /// Rows the active sequence's latent + indexer caches hold without a regrow.
+        pub fn row_cap(&self) -> usize {
+            let lru = self.seqs.borrow();
+            let Some(e) = lru.entries.iter().find(|e| e.id == lru.active) else { return 0 };
+            let cap = |b: &Option<DevBuf>, per: usize| b.as_ref().map_or(0, |b| b.len / per);
+            cap(&e.lat_d, self.dl * 2)
+                .min(cap(&e.idk_d, self.idxd * 4))
+                .min(cap(&e.idg_d, self.idxd * 4))
+                .min(cap(&e.val_d, 1))
+        }
+
+        /// Make room for `n_pool` pooled keys (the graph bakes the pool base). Returns
+        /// whether it reallocated (the pools then recompute from 0 on the next `idx_pool`).
+        pub fn reserve_pool(&self, n_pool: usize) -> Result<bool, gpu::Error> {
+            let before = {
+                let lru = self.seqs.borrow();
+                lru.entries.iter().find(|e| e.id == lru.active).and_then(|e| e.pool_d.as_ref().map(|b| b.ptr))
+            };
+            self.ensure_pool(n_pool)?;
+            let lru = self.seqs.borrow();
+            let after = lru.entries.iter().find(|e| e.id == lru.active).and_then(|e| e.pool_d.as_ref().map(|b| b.ptr));
+            Ok(before != after)
+        }
+
+        /// The pooled-key watermark of the active sequence (pools `[0, n)` computed).
+        pub fn pool_upto(&self) -> usize {
+            let lru = self.seqs.borrow();
+            lru.entries.iter().find(|e| e.id == lru.active).map_or(0, |e| e.pool_upto)
+        }
+
+        /// A graph replay computed pools up to `n`: advance the watermark.
+        pub fn set_pool_upto(&self, n: usize) {
+            let mut lru = self.seqs.borrow_mut();
+            let i = lru.active_idx();
+            lru.entries[i].pool_upto = n;
+        }
+
+        fn bases(&self) -> Result<(u64, u64, u64, u64, u64), gpu::Error> {
+            let lru = self.seqs.borrow();
+            let e = lru
+                .entries
+                .iter()
+                .find(|e| e.id == lru.active)
+                .ok_or_else(|| gpu::Error("mla pos: no active sequence".into()))?;
+            let p = |b: &Option<DevBuf>, n: &str| b.as_ref().map(|b| b.ptr).ok_or_else(|| gpu::Error(format!("mla pos: no {n} cache")));
+            Ok((p(&e.lat_d, "latent")?, p(&e.idk_d, "idx k")?, p(&e.idg_d, "idx gate")?, p(&e.val_d, "valid")?, e.pool_d.as_ref().map_or(0, |b| b.ptr)))
+        }
+
+        /// `mla_lat_norm_bf16_p`: y [dl] f32 -> latent row `*posp`.
+        pub fn lat_norm_pos(&self, y: u64, an: u64, posp: u64, stream: &Stream) -> Result<(), gpu::Error> {
+            let (lat, ..) = self.bases()?;
+            let f = self.m.func("mla_lat_norm_bf16_p")?;
+            let (dl, eps) = (self.dl as i32, self.eps);
+            unsafe { gpu::launch(f, (1, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![y, an, lat, dl, eps, posp])? };
+            Ok(())
+        }
+
+        /// `mla_idx_ln_p`: the indexer rows `*posp` from the wk / gate GEMV scratch.
+        pub fn idx_ln_pos(&self, yk: u64, yg: u64, w: u64, b: u64, posp: u64, stream: &Stream) -> Result<(), gpu::Error> {
+            let (_, k, g, v, _) = self.bases()?;
+            let f = self.m.func("mla_idx_ln_p")?;
+            let hd = self.idxd as i32;
+            unsafe { gpu::launch(f, (1, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![yk, yg, k, g, w, b, v, hd, posp])? };
+            Ok(())
+        }
+
+        /// Stage the per-layer `i_ape` constant (before a capture: no alloc inside one).
+        pub fn stage_ape(&self, i_ape: &[f32]) -> Result<(), gpu::Error> {
+            let mut a = self.ape_d.borrow_mut();
+            if a.is_none() {
+                *a = Some(DevBuf::from_slice(i_ape)?);
+            }
+            Ok(())
+        }
+
+        /// `idx_pool_keys_p`: the pool token `*posp` completes, if any.
+        pub fn idx_pool_pos(&self, i_ape: &[f32], posp: u64, stream: &Stream) -> Result<(), gpu::Error> {
+            let (_, k, g, _, pool) = self.bases()?;
+            if pool == 0 {
+                return Err(gpu::Error("idx_pool_pos: no pool buffer (reserve_pool first)".into()));
+            }
+            let apd = {
+                let mut a = self.ape_d.borrow_mut();
+                if a.is_none() {
+                    *a = Some(DevBuf::from_slice(i_ape)?);
+                }
+                a.as_ref().unwrap().ptr
+            };
+            let f = self.m.func("idx_pool_keys_p")?;
+            let (hd, kp) = (self.idxd as i32, self.kpool as i32);
+            unsafe { gpu::launch(f, (1, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![k, g, apd, pool, hd, kp, posp])? };
+            Ok(())
+        }
+
+        /// `idx_select_p`: the selection for the query at `*posp`, left on the device;
+        /// returns its `[select_width]` i32 pointer.
+        pub fn idx_select_pos(&self, iq: u64, hw: u64, posp: u64, stream: &Stream) -> Result<u64, gpu::Error> {
+            self.ensure_scratch(1)?;
+            let (_, _, _, v, pool) = self.bases()?;
+            let sd = self.sd_out.borrow().ptr;
+            let f = self.m.func("idx_select_p")?;
+            let (nh, hd, kp, tk) = (self.idxh as i32, self.idxd as i32, self.kpool as i32, self.topk as i32);
+            let wd = (self.topk + if self.tail { self.kpool - 1 } else { 0 }) as i32;
+            let ssc = 1.0f32 / (self.idxd as f32).sqrt();
+            let hsc = 1.0f32 / (self.idxh as f32).sqrt();
+            let smem = ((self.topk / self.kpool) * 8) as u32;
+            unsafe {
+                gpu::launch(f, (1, 1, 1), (256, 1, 1), smem, stream, tang_moe::args![iq, hw, pool, v, sd, nh, hd, kp, tk, wd, ssc, hsc, posp])?
+            };
+            Ok(sd)
+        }
+
+        /// [`Self::attend_dev_sel`] at `*posp` (t = 1): `sel_ptr` 0 = dense causal.
+        pub fn attend_pos(&self, q: u64, posp: u64, sel_ptr: u64, stream: &Stream) -> Result<u64, gpu::Error> {
+            self.ensure_scratch(1)?;
+            let (lat, ..) = self.bases()?;
+            let od_ptr = self.o_d.borrow().ptr;
+            let qa_ptr = self.qa_d.borrow().ptr;
+            let sw = self.topk + if self.tail { self.kpool - 1 } else { 0 };
+            let (nh, dk, dv, dl, wd) = (self.nh as i32, self.dk as i32, self.dv as i32, self.dl as i32, sw as i32);
+            let scale = 1.0f32 / (self.dk as f32).sqrt();
+            let (wkp, wvp) = (self.wk_d.ptr, self.wv_d.ptr);
+            let ff = self.m.func("mla_fold_q2")?;
+            unsafe { gpu::launch(ff, (self.nh as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![q, wkp, qa_ptr, nh, dk, dl])? };
+            let f = self.m.func("mla_attn_abs2_p")?;
+            // dense width <= topk (dense only while kv_len <= topk), sparse = sw
+            let smem = ((2 * self.dl + sw.max(self.topk)) * 4) as u32;
+            unsafe {
+                gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream, tang_moe::args![qa_ptr, lat, wvp, sel_ptr, od_ptr, nh, dv, dl, wd, scale, posp])?
+            };
+            Ok(od_ptr)
+        }
+
         /// Absorbed attention ([`mla_forward_absorbed`]'s GPU twin): `q` [t][nh*dk]
         /// f32, folded on-device by `mla_fold_q` into `qa` [t][nh*dl], then
         /// `mla_attn_absorbed` scores 512-dim dots against the bf16 latent cache and
@@ -2762,6 +3004,7 @@ pub mod cuda {
     ///   --features cuda glm5::mla::cuda -- --nocapture` (release, nvcc present).
     #[test]
     fn cuda_naive_matches_cpu() {
+        let _env = crate::flash::glm5::env_read();
         let Some(g) = Gpu::for_test() else { return };
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
@@ -3062,6 +3305,7 @@ pub mod cuda {
     /// the resident path never changes results vs the plain upload path.
     #[test]
     fn cuda_resident_flow_matches_upload() {
+        let _env = crate::flash::glm5::env_read();
         let Some(g) = Gpu::for_test() else { return };
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
@@ -3298,6 +3542,7 @@ pub mod cuda {
     /// CONTENT must not.
     #[test]
     fn resident_pool_content_matches_a_fresh_pool() {
+        let _env = crate::flash::glm5::env_read();
         let Some(g) = Gpu::for_test() else { return };
         let w = super::tests::weights_from_fixtures();
         let m = super::tests::load_meta();
@@ -3466,6 +3711,7 @@ mod tests {
 
     #[test]
     fn indexer_matches_hf() {
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
         let (b, s) = (m["B"].as_u64().unwrap(), m["S"].as_u64().unwrap());
@@ -3570,6 +3816,7 @@ mod tests {
 
     #[test]
     fn attention_matches_hf() {
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
         let (b, s) = (m["B"].as_u64().unwrap() as usize, m["S"].as_u64().unwrap() as usize);
@@ -3616,6 +3863,7 @@ mod tests {
 
     #[test]
     fn padded_batch_matches_hf() {
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
         let p = &m["padded"];
@@ -3693,6 +3941,7 @@ mod tests {
 
     #[test]
     fn dense_fast_path_is_noop() {
+        let _env = crate::flash::glm5::env_read();
         assert!(indexer_is_dense(2048, 2048));
         assert!(indexer_is_dense(130, 2048));
         assert!(!indexer_is_dense(2049, 2048));
@@ -3704,6 +3953,7 @@ mod tests {
     /// >budget path (the same shape as the real model's >2048 case, R7).
     #[test]
     fn indexer_long_context_matches_hf() {
+        let _env = crate::flash::glm5::env_read();
         let mut d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("tests/fixtures/glm5/mla-long");
         let dir = d.to_str().unwrap().to_string();
@@ -3797,6 +4047,7 @@ mod tests {
     /// the HF module; the numbers are in meta.json under "real_indexer".
     #[test]
     fn real_indexer_saturation_is_recorded() {
+        let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         assert!(m["real_indexer"]["2048"]["all_visible_up_to_2048+3"].as_bool().unwrap());
         assert!(!m["real_indexer"]["2100"]["all_visible_up_to_2048+3"].as_bool().unwrap());
@@ -3811,6 +4062,7 @@ mod absorbed_tests {
     /// same softmax, `Σ p·(W_v·lat) = W_v·(Σ p·lat)`. Sparse and dense paths.
     #[test]
     fn absorbed_matches_naive() {
+        let _env = crate::flash::glm5::env_read();
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
         let (b, s) = (
@@ -3900,6 +4152,7 @@ mod absorbed_tests {
     /// reproduce `ref_attn_out` within the same 1e-5 bar on rows the selection covers.
     #[test]
     fn absorbed_matches_hf_sparse() {
+        let _env = crate::flash::glm5::env_read();
         let m = super::tests::load_meta();
         let w = super::tests::weights_from_fixtures();
         let t = m["B"].as_u64().unwrap() as usize * m["S"].as_u64().unwrap() as usize;

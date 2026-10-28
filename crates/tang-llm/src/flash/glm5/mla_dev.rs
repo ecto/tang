@@ -36,6 +36,9 @@ struct Scratch {
     y: DevBuf,
     /// kv_a . x before the norm, [t][kv_lora] f32
     ylat: DevBuf,
+    /// the indexer wk / gate GEMVs' outputs on the position-counter path, [t][idx_dim] f32
+    yk: DevBuf,
+    yg: DevBuf,
 }
 
 /// One DSA layer's resident projections.
@@ -153,6 +156,8 @@ impl MlaProj {
                 od: f(cap * ov / 32)?,
                 y: f(cap * self.hid)?,
                 ylat: f(cap * self.dl)?,
+                yk: f(cap * self.hd)?,
+                yg: f(cap * self.hd)?,
             });
         }
         Ok(std::cell::RefMut::map(s, |s| s.as_mut().unwrap()))
@@ -340,6 +345,40 @@ impl MlaProj {
         let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, t)?;
         self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
         drop(tr);
+        Ok(sc.y.ptr)
+    }
+
+    /// [`Self::window_dev`] for the whole-step graph (`TANG_GLM5_STEP_GRAPH=2`): one token
+    /// (t = 1) at the device position `*posp`, so nothing here changes from token to token
+    /// and the launches can be captured once. `sparse` picks the indexer branch (the caller
+    /// keeps one graph per branch). Device work only: the host watermarks
+    /// ([`MlaCuda::append_done`], [`MlaCuda::set_pool_upto`]) and mirrors are the caller's.
+    pub fn window_dev_pos(&self, cu: &MlaCuda, w: &MlaWeights, posp: u64, sparse: bool, s: &Stream) -> Result<u64> {
+        let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla_dev: {e}");
+        let sc = self.scratch(1)?;
+        let (h, ql) = (self.hid, self.ql);
+        let xw = [&self.q_a, &self.ip, &self.kv_a, &self.i_wk, &self.i_gate];
+        let ax = self.act(s, &xw, sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, 1)?;
+        self.k.fast.gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, 1, ql, h)?;
+        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, 1, self.eps, s).map_err(gerr)?;
+        let aq = self.act(s, &[&self.q_b, &self.iq_b], sc.qr.ptr, sc.qrq.ptr, sc.qrq2.ptr, sc.qrd.ptr, ql, 1)?;
+        self.k.fast.gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, 1, self.nhdk, ql)?;
+        self.k.fast.gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, 1, self.dl, h)?;
+        cu.lat_norm_pos(sc.ylat.ptr, self.kvan.ptr, posp, s).map_err(gerr)?;
+        self.k.fast.gemv(s, self.i_wk.w, 0, ax, sc.yk.ptr, self.hd, 1, self.hd, h)?;
+        self.k.fast.gemv(s, self.i_gate.w, 0, ax, sc.yg.ptr, self.hd, 1, self.hd, h)?;
+        cu.idx_ln_pos(sc.yk.ptr, sc.yg.ptr, self.iknw.ptr, self.iknb.ptr, posp, s).map_err(gerr)?;
+        let sel = if sparse {
+            cu.idx_pool_pos(&w.i_ape, posp, s).map_err(gerr)?;
+            self.k.fast.gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, 1, self.iqr, ql)?;
+            self.k.fast.gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, 1, self.ih, h)?;
+            cu.idx_select_pos(sc.iq.ptr, sc.hw.ptr, posp, s).map_err(gerr)?
+        } else {
+            0
+        };
+        let ov = cu.attend_pos(sc.q.ptr, posp, sel, s).map_err(gerr)?;
+        let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, 1)?;
+        self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, 1, h, self.nhdv)?;
         Ok(sc.y.ptr)
     }
 }

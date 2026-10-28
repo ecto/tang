@@ -921,6 +921,9 @@ pub struct Kernels5 {
     /// `k5_qgemv9` / `k5_qgemv17`: the multi-matrix T=1 Q8_0 GEMV (kda_k5.cuh).
     pub qgemv9: Func,
     pub qgemv17: Func,
+    /// `k5_qgemv_q4k5` / `k5_qgemv_q4k9`: the same launch for Q4_K rows of 4096 / 8192.
+    pub qgemv_q4k5: Func,
+    pub qgemv_q4k9: Func,
 }
 
 impl Kernels5 {
@@ -936,6 +939,8 @@ impl Kernels5 {
             norm: m.func("k5_gated_norm")?,
             qgemv9: m.func("k5_qgemv9")?,
             qgemv17: m.func("k5_qgemv17")?,
+            qgemv_q4k5: m.func("k5_qgemv_q4k5")?,
+            qgemv_q4k9: m.func("k5_qgemv_q4k9")?,
             _m: m,
         })
     }
