@@ -4670,12 +4670,17 @@ mod tests {
                 .0;
         }
         drop(m);
+        let keep = ["DS_DRAFT_N", "DS_DRAFT_CONF"].map(|k| (k, std::env::var_os(k)));
         for (dn, conf) in [("3", "0"), ("7", "0"), ("7", "0.3")] {
             std::env::set_var("DS_DRAFT_N", dn);
             std::env::set_var("DS_DRAFT_CONF", conf);
             let m = GpuModel::open(&Path::new(&tiny()).join("hf"));
-            std::env::remove_var("DS_DRAFT_N");
-            std::env::remove_var("DS_DRAFT_CONF");
+            for (k, v) in &keep {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
             let mut m = m.unwrap();
             let dn: usize = dn.parse().unwrap();
             assert_eq!(m.cpu.cfg.draft_n, dn);
