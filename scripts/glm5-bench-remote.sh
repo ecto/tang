@@ -9,7 +9,7 @@ BIN=$R/src/target/release/tang-llm
 ORACLE="785 1196 6801 264 6386 38038 911 279"
 read -r -a FE <<< "$FLAGS"
 unset TANG_GLM5_GPU_FFN TANG_GLM5_GPU_FFN_LAYERS TANG_GLM5_GPU TANG_GLM5_TRACE
-exec 8> "$HOME/.gpu.lock"; flock 8
+exec 8> "$HOME/.gpu.lock"; flock 8   # the launcher also holds /root/gpu.lock
 # 1. ids gate
 env "${FE[@]+"${FE[@]}"}" timeout 3600 "$BIN" flash-generate "$G5" --prompt 'Write a haiku about the sea.' \
   -n 8 --temp 0 > "$O/gate.log" 2>&1 < /dev/null

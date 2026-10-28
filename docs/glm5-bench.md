@@ -42,6 +42,7 @@ bench 66aa4b5e TANG_GLM5_MOE=fast ...: ids OK, prefill X tok/s (N tok), decode Y
 |---|---|---|
 | `GLM5_FLAGS` | empty (naive kernels) | env assignments for both runs, space-separated, no spaces in values |
 | `GLM5_LABEL` | derived from the flags | output dir name under `/root/tang-bench/out` |
+| `GLM5_ROOT` | `/root/tang-bench` | remote work dir (src, target, out); use your own on a shared box |
 | `GLM5_N` | 128 | decode tokens for the timed run |
 | `GLM5_GGUF` | `/workspace/glm53/UD-Q4_K_XL/...-00001-of-00006.gguf` | first shard |
 | `GLM5_NO_BUILD` | 0 | 1 = reuse the last build (source md5 still checked) |

@@ -15,6 +15,7 @@
 #    (per decode token, wall). Logs: /root/tang-bench/out/<label>/{gate,bench}.log.
 #
 # GLM5_FLAGS  env assignments for both runs (empty = naive kernels). A/B = two invocations.
+# GLM5_ROOT   remote work dir (default /root/tang-bench).
 # GLM5_LABEL  output dir name (default: derived from the flags). GLM5_GGUF: first shard.
 # Needs direct-TCP ssh (root@IP -p PORT); the ssh.runpod.io proxy is PTY-only.
 set -euo pipefail
@@ -26,7 +27,7 @@ if [ "${1:-}" = -p ]; then PORT=$2; shift 2; fi
 SRC=$(cd "${1:-.}" && pwd)
 SSHOPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 SSH="ssh $SSHOPTS ${PORT:+-p $PORT} $DEST"
-R=/root/tang-bench
+R=${GLM5_ROOT:-/root/tang-bench}
 FLAGS=${GLM5_FLAGS:-}
 LABEL=${GLM5_LABEL:-$(echo "${FLAGS:-naive}" | sed -E 's/TANG_GLM5_//g; s/[^A-Za-z0-9=]+/_/g')}
 G5=${GLM5_GGUF:-/workspace/glm53/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
@@ -67,6 +68,6 @@ fi; echo weights 6/6"
 PROMPT=$(tr '\n' ' ' < "$HERE/scripts/glm5-bench-prompt.txt")
 q() { printf '%q' "$1"; }
 $SSH "rm -rf $R/out/$LABEL; mkdir -p $R/out; R=$R G5=$(q "$G5") FLAGS=$(q "$FLAGS") LABEL=$(q "$LABEL") COMMIT=$COMMIT N=${GLM5_N:-128} PROMPT=$(q "$PROMPT") \
-  setsid nohup bash $R/bench-remote.sh > $R/out/$LABEL.out 2>&1 < /dev/null & sleep 1; echo launched $LABEL"
+  setsid nohup flock /root/gpu.lock bash $R/bench-remote.sh > $R/out/$LABEL.out 2>&1 < /dev/null & sleep 1; echo launched $LABEL"
 until $SSH "test -f $R/out/$LABEL/DONE"; do sleep 30; done
 $SSH "cat $R/out/$LABEL/summary"
