@@ -644,8 +644,11 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_mix_ks(const float* __re
 // sinkhorn_row on one warp, bit for bit: lane l holds comb element l (hc * hc <= 32); every
 // row / column sum is taken in sinkhorn_row's order (each lane redoing its own row's or
 // column's sum from shuffles). All 32 lanes call it.
-__device__ __forceinline__ void sinkhorn_warp(const float* m, const float* scale, const float* base, float* pre,
-                                              float* post, float* comb, int ti, int hc, int iters, float eps) {
+template <int HCT>
+__device__ __forceinline__ void sinkhorn_warp_t(const float* m, const float* scale, const float* base, float* pre,
+                                                float* post, float* comb, int ti, int hc_, int iters, float eps) {
+    // HCT > 0: hc known at compile time (the loops unrolled, the same operations in the same order)
+    const int hc = HCT > 0 ? HCT : hc_;
     int l = threadIdx.x & 31, j = l / hc, k = l % hc, nn = hc * hc;
     if (l < hc) {
         pre[ti * hc + l] = 1.f / (1.f + expf(-(m[l] * scale[0] + base[l]))) + eps;
@@ -653,22 +656,34 @@ __device__ __forceinline__ void sinkhorn_warp(const float* m, const float* scale
     }
     float c = l < nn ? m[2 * hc + l] * scale[2] + base[2 * hc + l] : 0.f;
     float mx = -DS_INF;
+#pragma unroll
     for (int q = 0; q < hc; q++) mx = fmaxf(mx, __shfl_sync(0xffffffffu, c, (j * hc + q) & 31));
     c = expf(c - mx);
     float s = 0.f;
+#pragma unroll
     for (int q = 0; q < hc; q++) s += __shfl_sync(0xffffffffu, c, (j * hc + q) & 31);
     c = c / s + eps;
     for (int it = 0; it < iters; it++) {
         if (it > 0) {
             s = 0.f;
+#pragma unroll
             for (int q = 0; q < hc; q++) s += __shfl_sync(0xffffffffu, c, (j * hc + q) & 31);
             c /= s + eps;
         }
         s = 0.f;
+#pragma unroll
         for (int q = 0; q < hc; q++) s += __shfl_sync(0xffffffffu, c, (q * hc + k) & 31);
         c /= s + eps;
     }
     if (l < nn) comb[(long long)ti * nn + l] = c;
+}
+
+__device__ __forceinline__ void sinkhorn_warp(const float* m, const float* scale, const float* base, float* pre,
+                                              float* post, float* comb, int ti, int hc, int iters, float eps) {
+    if (hc == 4)
+        sinkhorn_warp_t<4>(m, scale, base, pre, post, comb, ti, hc, iters, eps);
+    else
+        sinkhorn_warp_t<0>(m, scale, base, pre, post, comb, ti, hc, iters, eps);
 }
 
 // The rest of an mHC stage in one launch, block (1024 threads) per token: ds_hc_sinkhorn on
@@ -2104,5 +2119,354 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, co
             v = ds_rope_at(odd ? v2 : v, odd ? v : v2, col, d, rd, tab, Pp[0] + add + ti * ps, 1);
         }
         o[((long long)ti * h + hi) * d + col] = v;
+    }
+}
+
+// ---- split-K decode attention (relaxed bar; d == 512, h % 32 == 0) -----------------------------
+//
+// ds_attn_fd: block per (t, 64-head group, key split s of S). q's 64 heads and the split's keys
+// (16-key tiles) sit in shared memory as bf16 pairs (both are bf16-valued, so exactly); per tile
+// the scores (thread: 2 heads x 2 keys), an online softmax per head (running max / sum,
+// p = exp(s - m) unrounded), and o += P kv (thread: a dim pair, all 64 heads in registers).
+// Out: part[t][S][h][d] (unnormalised) and ml[t][S][h][2] (running max, sum).
+// ds_attn_fd_comb: block per (t, head): the splits merged with the sink in the denominator,
+// o = bf(sum_s w_s part_s / den), the o rope (inverse) fused as ds_attn_pv's.
+#define FD_KT 16
+#define FD_QP 257
+#define FD_SMEM ((64 * FD_QP + FD_KT * FD_QP + FD_KT * 64 + 3 * 64 + FD_KT) * 4)
+__device__ __forceinline__ unsigned int fd_pack(float2 v) {
+    return (__float_as_uint(v.x) >> 16) | (__float_as_uint(v.y) & 0xffff0000u);
+}
+extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, const float* kv0, int split,
+                                                             const float* kv1, const int* idxs, float* part,
+                                                             float* ml, int h, int d, int k, float scale, int S,
+                                                             const float2* tab, const int* Pp, int rd, int add,
+                                                             int ps) {
+    extern __shared__ float fsm[];
+    unsigned int* Qs = (unsigned int*)fsm;  // [64][FD_QP]
+    unsigned int* Ks = Qs + 64 * FD_QP;     // [FD_KT][FD_QP]
+    float* Ps = (float*)(Ks + FD_KT * FD_QP);  // [FD_KT][64]
+    float* scal = Ps + FD_KT * 64;            // [64]
+    float* mrun = scal + 64;
+    float* lrun = mrun + 64;
+    int* Is = (int*)(lrun + 64);  // [FD_KT]
+    int hg = h / 64, b = blockIdx.x, tid = threadIdx.x;
+    int si = b % S, g = (b / S) % hg, ti = b / (S * hg);
+    for (int e = tid; e < 64 * 128; e += 256) {
+        int hh = e / 128, c4 = e % 128, col = 4 * c4;
+        const float* qr = q + ((long long)ti * h + g * 64 + hh) * d;
+        float4 v = *(const float4*)(qr + col);
+        if (tab && col >= d - rd) {
+            int pos = Pp[0] + add + ti * ps;
+            float a0 = ds_rope_at(v.x, v.y, col, d, rd, tab, pos, 0);
+            float a1 = ds_rope_at(v.x, v.y, col + 1, d, rd, tab, pos, 0);
+            float a2 = ds_rope_at(v.z, v.w, col + 2, d, rd, tab, pos, 0);
+            float a3 = ds_rope_at(v.z, v.w, col + 3, d, rd, tab, pos, 0);
+            v = make_float4(a0, a1, a2, a3);
+        }
+        Qs[hh * FD_QP + 2 * c4] = fd_pack(make_float2(v.x, v.y));
+        Qs[hh * FD_QP + 2 * c4 + 1] = fd_pack(make_float2(v.z, v.w));
+    }
+    if (tid < 64) {
+        mrun[tid] = -DS_INF;
+        lrun[tid] = 0.f;
+    }
+    int ntile = (k + FD_KT - 1) / FD_KT;
+    int t0 = (int)((long long)si * ntile / S), t1 = (int)((long long)(si + 1) * ntile / S);
+    const int* ix = idxs + (long long)ti * k;
+    float2 acc[64];
+#pragma unroll
+    for (int m = 0; m < 64; m++) acc[m] = make_float2(0.f, 0.f);
+    int hp = (tid >> 3) * 2, kp = (tid & 7) * 2;
+    for (int tt = t0; tt < t1; tt++) {
+        __syncthreads();
+        if (tid < FD_KT) {
+            int j = tt * FD_KT + tid;
+            Is[tid] = j < k ? ix[j] : -1;
+        }
+        __syncthreads();
+        for (int e = tid; e < FD_KT * 128; e += 256) {
+            int kk = e / 128, c4 = e % 128, r = Is[kk];
+            float4 v = r >= 0 ? *(const float4*)(DS_KROW(r) + 4 * c4) : make_float4(0.f, 0.f, 0.f, 0.f);
+            Ks[kk * FD_QP + 2 * c4] = fd_pack(make_float2(v.x, v.y));
+            Ks[kk * FD_QP + 2 * c4 + 1] = fd_pack(make_float2(v.z, v.w));
+        }
+        __syncthreads();
+        float sc[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+        const unsigned int *q0 = Qs + hp * FD_QP, *q1 = q0 + FD_QP;
+        const unsigned int *k0 = Ks + kp * FD_QP, *k1 = k0 + FD_QP;
+#pragma unroll 8
+        for (int jj = 0; jj < 256; jj++) {
+            unsigned int a = q0[jj], bq = q1[jj], c = k0[jj], e2 = k1[jj];
+            float a0 = __uint_as_float(a << 16), a1 = __uint_as_float(a & 0xffff0000u);
+            float b0 = __uint_as_float(bq << 16), b1 = __uint_as_float(bq & 0xffff0000u);
+            float c0 = __uint_as_float(c << 16), c1 = __uint_as_float(c & 0xffff0000u);
+            float e0 = __uint_as_float(e2 << 16), e1 = __uint_as_float(e2 & 0xffff0000u);
+            sc[0][0] = fmaf(a1, c1, fmaf(a0, c0, sc[0][0]));
+            sc[0][1] = fmaf(a1, e1, fmaf(a0, e0, sc[0][1]));
+            sc[1][0] = fmaf(b1, c1, fmaf(b0, c0, sc[1][0]));
+            sc[1][1] = fmaf(b1, e1, fmaf(b0, e0, sc[1][1]));
+        }
+        bool v0 = Is[kp] >= 0, v1 = Is[kp + 1] >= 0;
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+            float s0 = v0 ? sc[u][0] * scale : -DS_INF, s1 = v1 ? sc[u][1] * scale : -DS_INF;
+            float mt = fmaxf(s0, s1);
+            for (int o = 1; o < 8; o <<= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+            int hh = hp + u;
+            float mo = mrun[hh], mn = fmaxf(mo, mt);
+            float p0 = 0.f, p1 = 0.f, f = 1.f;
+            if (mn > -DS_INF) {
+                p0 = expf(s0 - mn);
+                p1 = expf(s1 - mn);
+                f = mo > -DS_INF ? expf(mo - mn) : 0.f;
+            }
+            float ls = p0 + p1;
+            for (int o = 1; o < 8; o <<= 1) ls += __shfl_xor_sync(0xffffffffu, ls, o);
+            Ps[kp * 64 + hh] = p0;
+            Ps[(kp + 1) * 64 + hh] = p1;
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                scal[hh] = f;
+                mrun[hh] = mn;
+                lrun[hh] = lrun[hh] * f + ls;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < 64; m += 4) {
+            float4 f = *(const float4*)(scal + m);
+            acc[m].x *= f.x, acc[m].y *= f.x;
+            acc[m + 1].x *= f.y, acc[m + 1].y *= f.y;
+            acc[m + 2].x *= f.z, acc[m + 2].y *= f.z;
+            acc[m + 3].x *= f.w, acc[m + 3].y *= f.w;
+        }
+        for (int kk = 0; kk < FD_KT; kk++) {
+            unsigned int kw = Ks[kk * FD_QP + tid];
+            float vx = __uint_as_float(kw << 16), vy = __uint_as_float(kw & 0xffff0000u);
+            const float* pr = Ps + kk * 64;
+#pragma unroll
+            for (int m = 0; m < 64; m += 4) {
+                float4 p = *(const float4*)(pr + m);
+                acc[m].x = fmaf(p.x, vx, acc[m].x), acc[m].y = fmaf(p.x, vy, acc[m].y);
+                acc[m + 1].x = fmaf(p.y, vx, acc[m + 1].x), acc[m + 1].y = fmaf(p.y, vy, acc[m + 1].y);
+                acc[m + 2].x = fmaf(p.z, vx, acc[m + 2].x), acc[m + 2].y = fmaf(p.z, vy, acc[m + 2].y);
+                acc[m + 3].x = fmaf(p.w, vx, acc[m + 3].x), acc[m + 3].y = fmaf(p.w, vy, acc[m + 3].y);
+            }
+        }
+    }
+    __syncthreads();
+    long long base = ((long long)ti * S + si) * h + g * 64;
+#pragma unroll
+    for (int m = 0; m < 64; m++) *(float2*)(part + (base + m) * d + 2 * tid) = acc[m];
+    if (tid < 64) {
+        ml[(base + tid) * 2] = mrun[tid];
+        ml[(base + tid) * 2 + 1] = lrun[tid];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* part, const float* ml,
+                                                                  const float* sink, float* o, int h, int d,
+                                                                  int S, const float2* tab, const int* Pp, int rd,
+                                                                  int add, int ps) {
+    int b = blockIdx.x, hi = b % h, ti = b / h, tid = threadIdx.x;
+    float M = -DS_INF;
+    for (int s = 0; s < S; s++) M = fmaxf(M, ml[(((long long)ti * S + s) * h + hi) * 2]);
+    M = fmaxf(M, -1e30f);
+    float den = expf(sink[hi] - M);
+    float2 a = make_float2(0.f, 0.f);
+    for (int s = 0; s < S; s++) {
+        long long r = ((long long)ti * S + s) * h + hi;
+        float m = ml[r * 2];
+        float w = m > -DS_INF ? expf(m - M) : 0.f;
+        den += w * ml[r * 2 + 1];
+        float2 v = *(const float2*)(part + r * d + 2 * tid);
+        a.x = fmaf(w, v.x, a.x);
+        a.y = fmaf(w, v.y, a.y);
+    }
+    int col = 2 * tid;
+    float x = bf(a.x / den), y = bf(a.y / den);
+    if (tab && col >= d - rd) {
+        int pos = Pp[0] + add + ti * ps;
+        float x2 = ds_rope_at(x, y, col, d, rd, tab, pos, 1);
+        y = ds_rope_at(x, y, col + 1, d, rd, tab, pos, 1);
+        x = x2;
+    }
+    *(float2*)(o + ((long long)ti * h + hi) * d + col) = make_float2(x, y);
+}
+
+// ds_attn_fd on the tensor cores (bf16 mma, f32 accumulate), same blocks and outputs: per
+// 16-key tile the 64 x 16 scores (warp w: heads 16 (w / 2) .., keys 8 (w % 2) ..), the online
+// softmax as ds_attn_fd (p then rounded to bf16 for the mma), and o += P kv (warp w: all 64
+// heads, dims 64 w ..; the accumulators stay in mma fragments).
+__device__ __forceinline__ void mma16816bf(float* c, unsigned int a0, unsigned int a1, unsigned int a2,
+                                           unsigned int a3, unsigned int b0, unsigned int b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+#define FD_IMAX 1024
+#define FDM_SMEM ((64 * FD_QP + FD_KT * FD_QP + 64 * 17 + 64 * 9 + 3 * 64 + FD_IMAX) * 4)
+extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, const float* kv0, int split,
+                                                              const float* kv1, const int* idxs, float* part,
+                                                              float* ml, int h, int d, int k, float scale, int S,
+                                                              const float2* tab, const int* Pp, int rd, int add,
+                                                              int ps) {
+    extern __shared__ float fsm[];
+    unsigned int* Qs = (unsigned int*)fsm;       // [64][FD_QP]
+    unsigned int* Ks = Qs + 64 * FD_QP;          // [FD_KT][FD_QP]
+    float* Ss = (float*)(Ks + FD_KT * FD_QP);    // [64][17]
+    unsigned int* Pb = (unsigned int*)(Ss + 64 * 17);  // [64][9]: bf16 key pairs
+    float* scal = (float*)(Pb + 64 * 9);
+    float* mrun = scal + 64;
+    float* lrun = mrun + 64;
+    int* Is = (int*)(lrun + 64);  // [FD_IMAX]: the split's key indices
+    int hg = h / 64, b = blockIdx.x, tid = threadIdx.x;
+    int si = b % S, g = (b / S) % hg, ti = b / (S * hg);
+    int lane = tid & 31, w = tid >> 5, gq = lane >> 2, tq = lane & 3;
+    for (int e = tid; e < 64 * 128; e += 256) {
+        int hh = e / 128, c4 = e % 128, col = 4 * c4;
+        const float* qr = q + ((long long)ti * h + g * 64 + hh) * d;
+        float4 v = *(const float4*)(qr + col);
+        if (tab && col >= d - rd) {
+            int pos = Pp[0] + add + ti * ps;
+            float a0 = ds_rope_at(v.x, v.y, col, d, rd, tab, pos, 0);
+            float a1 = ds_rope_at(v.x, v.y, col + 1, d, rd, tab, pos, 0);
+            float a2 = ds_rope_at(v.z, v.w, col + 2, d, rd, tab, pos, 0);
+            float a3 = ds_rope_at(v.z, v.w, col + 3, d, rd, tab, pos, 0);
+            v = make_float4(a0, a1, a2, a3);
+        }
+        Qs[hh * FD_QP + 2 * c4] = fd_pack(make_float2(v.x, v.y));
+        Qs[hh * FD_QP + 2 * c4 + 1] = fd_pack(make_float2(v.z, v.w));
+    }
+    if (tid < 64) {
+        mrun[tid] = -DS_INF;
+        lrun[tid] = 0.f;
+    }
+    int ntile = (k + FD_KT - 1) / FD_KT;
+    int t0 = (int)((long long)si * ntile / S), t1 = (int)((long long)(si + 1) * ntile / S);
+    const int* ix = idxs + (long long)ti * k;
+    for (int e = tid; e < (t1 - t0) * FD_KT; e += 256) {
+        int j = t0 * FD_KT + e;
+        Is[e] = j < k ? ix[j] : -1;
+    }
+    __syncthreads();
+    // the next tile's keys in registers while this one computes (thread: 2 float4)
+    float4 kn[FD_KT * 128 / 256];
+    auto kload = [&](int tt) {
+#pragma unroll
+        for (int u = 0; u < FD_KT * 128 / 256; u++) {
+            int e = tid + 256 * u, kk = e / 128, c4 = e % 128, r = Is[(tt - t0) * FD_KT + kk];
+            kn[u] = r >= 0 ? *(const float4*)(DS_KROW(r) + 4 * c4) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    auto kstore = [&]() {
+#pragma unroll
+        for (int u = 0; u < FD_KT * 128 / 256; u++) {
+            int e = tid + 256 * u, kk = e / 128, c4 = e % 128;
+            Ks[kk * FD_QP + 2 * c4] = fd_pack(make_float2(kn[u].x, kn[u].y));
+            Ks[kk * FD_QP + 2 * c4 + 1] = fd_pack(make_float2(kn[u].z, kn[u].w));
+        }
+    };
+    if (t0 < t1) kload(t0);
+    float acc[4][8][4];
+#pragma unroll
+    for (int m = 0; m < 4; m++)
+#pragma unroll
+        for (int n = 0; n < 8; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[m][n][c] = 0.f;
+    int sm0 = (w >> 1) * 16, sn0 = (w & 1) * 8;  // this warp's score tile
+    int hp = (tid >> 3) * 2, kp = (tid & 7) * 2;  // the softmax mapping (as ds_attn_fd)
+    for (int tt = t0; tt < t1; tt++) {
+        const int* It = Is + (tt - t0) * FD_KT;
+        __syncthreads();  // the previous tile's Ks consumed
+        kstore();
+        __syncthreads();
+        if (tt + 1 < t1) kload(tt + 1);
+        {
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            const unsigned int *qa = Qs + (sm0 + gq) * FD_QP, *qb = qa + 8 * FD_QP;
+            const unsigned int* kb = Ks + (sn0 + gq) * FD_QP;
+#pragma unroll 8
+            for (int ks = 0; ks < 32; ks++) {
+                int o = ks * 8 + tq;
+                mma16816bf(c, qa[o], qb[o], qa[o + 4], qb[o + 4], kb[o], kb[o + 4]);
+            }
+            Ss[(sm0 + gq) * 17 + sn0 + 2 * tq] = c[0];
+            Ss[(sm0 + gq) * 17 + sn0 + 2 * tq + 1] = c[1];
+            Ss[(sm0 + gq + 8) * 17 + sn0 + 2 * tq] = c[2];
+            Ss[(sm0 + gq + 8) * 17 + sn0 + 2 * tq + 1] = c[3];
+        }
+        __syncthreads();
+        bool v0 = It[kp] >= 0, v1 = It[kp + 1] >= 0;
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+            int hh = hp + u;
+            float s0 = v0 ? Ss[hh * 17 + kp] * scale : -DS_INF, s1 = v1 ? Ss[hh * 17 + kp + 1] * scale : -DS_INF;
+            float mt = fmaxf(s0, s1);
+            for (int o = 1; o < 8; o <<= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+            float mo = mrun[hh], mn = fmaxf(mo, mt);
+            float p0 = 0.f, p1 = 0.f, f = 1.f;
+            if (mn > -DS_INF) {
+                p0 = bf(expf(s0 - mn));
+                p1 = bf(expf(s1 - mn));
+                f = mo > -DS_INF ? expf(mo - mn) : 0.f;
+            }
+            float ls = p0 + p1;
+            for (int o = 1; o < 8; o <<= 1) ls += __shfl_xor_sync(0xffffffffu, ls, o);
+            Pb[hh * 9 + kp / 2] = fd_pack(make_float2(p0, p1));
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                scal[hh] = f;
+                mrun[hh] = mn;
+                lrun[hh] = lrun[hh] * f + ls;
+            }
+        }
+        __syncthreads();
+        unsigned int pa[4][4];
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            float f0 = scal[m * 16 + gq], f1 = scal[m * 16 + gq + 8];
+#pragma unroll
+            for (int n = 0; n < 8; n++) {
+                acc[m][n][0] *= f0, acc[m][n][1] *= f0;
+                acc[m][n][2] *= f1, acc[m][n][3] *= f1;
+            }
+            const unsigned int *r0 = Pb + (m * 16 + gq) * 9, *r1 = r0 + 8 * 9;
+            pa[m][0] = r0[tq];
+            pa[m][1] = r1[tq];
+            pa[m][2] = r0[tq + 4];
+            pa[m][3] = r1[tq + 4];
+        }
+#pragma unroll
+        for (int n = 0; n < 8; n++) {
+            int dim = w * 64 + n * 8 + gq, wd = dim >> 1, sh = (dim & 1) * 16;
+            unsigned int k0 = (Ks[(2 * tq) * FD_QP + wd] >> sh) & 0xffffu;
+            unsigned int k1 = (Ks[(2 * tq + 1) * FD_QP + wd] >> sh) & 0xffffu;
+            unsigned int k8 = (Ks[(2 * tq + 8) * FD_QP + wd] >> sh) & 0xffffu;
+            unsigned int k9 = (Ks[(2 * tq + 9) * FD_QP + wd] >> sh) & 0xffffu;
+            unsigned int b0 = k0 | (k1 << 16), b1 = k8 | (k9 << 16);
+#pragma unroll
+            for (int m = 0; m < 4; m++) mma16816bf(acc[m][n], pa[m][0], pa[m][1], pa[m][2], pa[m][3], b0, b1);
+        }
+    }
+    __syncthreads();
+    long long base = ((long long)ti * S + si) * h + g * 64;
+#pragma unroll
+    for (int m = 0; m < 4; m++)
+#pragma unroll
+        for (int n = 0; n < 8; n++) {
+            int dim = w * 64 + n * 8 + 2 * tq;
+            *(float2*)(part + (base + m * 16 + gq) * d + dim) = make_float2(acc[m][n][0], acc[m][n][1]);
+            *(float2*)(part + (base + m * 16 + gq + 8) * d + dim) = make_float2(acc[m][n][2], acc[m][n][3]);
+        }
+    if (tid < 64) {
+        ml[(base + tid) * 2] = mrun[tid];
+        ml[(base + tid) * 2 + 1] = lrun[tid];
     }
 }
