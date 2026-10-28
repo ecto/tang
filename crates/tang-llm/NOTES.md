@@ -4,6 +4,43 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — KDA decode kernels on the B300: 2.5 -> 1.83 ms/token, ids unchanged (branch claude/glm5-kda3)
+
+What was wrong (B300, no perf-counter access on the pod: ERR_NVGPUCTRPERM, so standalone
+microbenches + %globaltimer phase stamps instead of ncu):
+- `k5_qgemv9/17` staged each whole row in shared memory, one row a warp: smem capped rows in
+  flight per SM and each warp serialised load -> dot. Microbench (synthetic Q8_0, 6 weight copies
+  rotated past L2): q|k|v|f_a|g_a 29.1 us (3.71 TB/s), o_proj 14.7 us (2.43 TB/s). A pure
+  streaming-read kernel on the same sizes tops out at 19.5 us (5.8 TB/s, 108 MB) / 7.4 us
+  (4.97 TB/s, 35 MB). A grid-stride + register-prefetch version of the staged kernel was SLOWER
+  in the real run (30.6 -> 33.1 us), dropped.
+- `k5d_tail` (64 blocks x 128) phase stamps: beta 4.4 us (warp 0, 16 serial L2 round trips for x),
+  f64 gated norm 8.7 us (B300 FP64: a dependent DADD is ~35 ns; 128 of them = 4.5 us even with
+  operands ready), gate rows 2.7, state 1.6, conv 1.2. Removing the all-threads f64 chain alone
+  (thread 0 only) was worth only 26.5 -> 25.8: it is latency, not throughput.
+
+Fix (all bit-equal by construction, checked in the microbenches: every output/state buffer memcmp):
+- `k5_qgemv_body` (Q8_0): no staging; each lane reads its own 34 B blocks as 9 aligned u32 words
+  (`ld.global.cs`), all issued up front, funnel-shifted for even b. Block 128, no smem.
+  Microbench 29.1 -> 22.4 us, 14.7 -> 11.6 us. Q4_K kernels untouched.
+- `k5d_tail`: weight staging via `cp.async` (was a load-then-store loop); x staged too (dynamic
+  smem HID*4+16, attribute set in `Fast::new`) so beta reads smem; the norm's squares
+  `(double)o*(double)o` (exact) formed by all threads in parallel, thread 0 runs only the DADD
+  chain and broadcasts r. Microbench 21.9 -> 17.4 us.
+
+Verification, B300 nsys graph nodes (32-token haiku, avg us), baseline 7b1193b7 -> 277363dd -> 4e587f73:
+| kernel | base | 277363dd | 4e587f73 |
+|---|---|---|---|
+| k5_qgemv9 | 30.6 | 23.5 | 23.5 |
+| k5d_tail | 25.8 (f64-once only) / 26.5 | 22.8 | 18.4 |
+| k5_qgemv17 | 16.2 | 11.8 | 11.8 |
+KDA per layer 73.3 -> 53.7 us = 2.49 -> 1.83 ms/token. Decode (glm5-bench, full flags):
+58.25 -> 59.47 -> 59.96 tok/s at -n 128 (ids md5 7174cdd6 every run); -n 512: 60.14 / 60.81
+(md5 1453cf0e). mew `flash::glm5`: 83 passed / 0 failed after each commit.
+
+Not done / open: target 1.2 ms not reached. What is left is the f64 DADD chain (~4.5 us/layer,
+irreducible while the norm stays f64-exact; an f32 norm would change state bits, untested
+for ids), qgemv9 at 23.5 vs the 19.5 us read ceiling, o_proj 11.8 vs 7.4.
 ## 2026-10-28 (integration round 5) — mhc2 + moe2 + kda-load merged: B300 71.9 tok/s, ids identical (branch frog/glm5-forward)
 
 32b0a45a = forward + claude/glm5-kda-load 76539eda + claude/glm5-moe2 2dd23da7 + claude/glm5-mhc2
