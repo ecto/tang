@@ -12,56 +12,73 @@ use std::collections::HashMap;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
-use tang_compute::flash::shape::{GDN_D, GDN_HK, GDN_HV};
-use tang_compute::flash::{GdnParams, GDN_STATE};
+use tang_compute::flash::GdnParams;
 use tang_compute::{ComputeDevice, CpuDevice};
 
-use super::memstore::{MemStore, STORE_HK, STORE_HV, VALUE_LIMIT};
+use super::memstore::{KMap, Layout, MemStore, VALUE_LIMIT};
 
-/// Floats in a store blob: the 12 store v heads' 128 × 128 rows.
-pub const HEAD_FLOATS: usize = GDN_D * STORE_HV.len() * GDN_D;
-/// Bytes in a store blob (768 KiB).
-pub const BLOB_BYTES: usize = 4 * HEAD_FLOATS;
+/// Floats in a 48-head layout's store heads: the 12 store v heads' 128 × 128 rows
+/// ([`Layout::head_floats`] in general).
+pub const HEAD_FLOATS: usize = 128 * 12 * 128;
+/// Bytes in a store blob's header: `MEMB`, version 1, then k heads, v heads, head dim and the
+/// k mapping (0 tiled, 1 grouped), each a little-endian u32.
+pub const BLOB_HEADER: usize = 24;
+/// Bytes in a 48-head layout's store blob (768 KiB of heads and the header).
+pub const BLOB_BYTES: usize = BLOB_HEADER + 4 * HEAD_FLOATS;
+
+/// Bytes in a store blob of layout `l`.
+pub fn blob_bytes(l: Layout) -> usize {
+    BLOB_HEADER + 4 * l.head_floats()
+}
 
 /// Where the store lives inside a recurrent-state snapshot: `RunningState::parts()[2 · gdn_layer]`
-/// (the GDN layer's `[i][hv][j]` state), v heads [`STORE_HV`] (k heads [`STORE_HK`]).
+/// (the GDN layer's `[i][hv][j]` state), v heads `layout.store_hv` (k heads `layout.store_hk`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreMeta {
     /// Index among the model's GDN layers (the state's part `2 · gdn_layer`).
     pub gdn_layer: usize,
     /// The model layer it is (for logs and humans).
     pub layer: usize,
+    /// The head layout ([`check_shape`] of the engine's GDN shape).
+    pub layout: Layout,
 }
 
 impl StoreMeta {
     /// The store's v heads in the layer state.
     pub fn heads(&self) -> &'static [usize] {
-        &STORE_HV
+        self.layout.store_hv
     }
 
     /// The store's k heads.
     pub fn k_heads(&self) -> &'static [usize] {
-        &STORE_HK
+        self.layout.store_hk
     }
 
     /// As JSON, for `/v1/memory` replies and logs.
     pub fn to_json(&self) -> Value {
+        let l = self.layout;
         json!({
             "gdn_layer": self.gdn_layer,
             "layer": self.layer,
-            "v_heads": STORE_HV,
-            "k_heads": STORE_HK,
+            "layout": l.name,
+            "v_heads": l.store_hv,
+            "k_heads": l.store_hk,
+            "slots": l.slots(),
+            "max_files": l.max_files(),
+            "max_tokens": l.max_tokens(),
+            "blob_bytes": blob_bytes(l),
         })
     }
 
     /// The trailer a state file carries after its parts (`MEMS`, gdn layer, layer, then the
-    /// v heads), so the store heads are identifiable in a file on disk.
+    /// v heads, which name the layout), so the store heads are identifiable in a file on disk.
     pub fn trailer(&self) -> Vec<u8> {
+        let hv = self.layout.store_hv;
         let mut b = b"MEMS".to_vec();
-        for x in [self.gdn_layer, self.layer, STORE_HV.len()] {
+        for x in [self.gdn_layer, self.layer, hv.len()] {
             b.extend_from_slice(&(x as u64).to_le_bytes());
         }
-        for &h in &STORE_HV {
+        for &h in hv {
             b.extend_from_slice(&(h as u64).to_le_bytes());
         }
         b
@@ -75,50 +92,104 @@ impl StoreMeta {
         };
         let n = w(2)?;
         let heads: Option<Vec<usize>> = (0..n).map(|i| w(3 + i)).collect();
-        (heads? == STORE_HV).then_some(StoreMeta {
+        let heads = heads?;
+        let layout = Layout::ALL.into_iter().find(|l| l.store_hv == heads)?;
+        Some(StoreMeta {
             gdn_layer: w(0)?,
             layer: w(1)?,
+            layout,
         })
     }
 }
 
-/// Can the store be laid out in a GDN layer of `hk` k heads and `hv` v heads? The memstore's
-/// layout is the Flash-Next shape (16 k / 48 v heads, v head `h` on k head `h % 16`).
-pub fn check_shape(hk: usize, hv: usize) -> Result<()> {
-    ensure!(
-        hk == GDN_HK && hv == GDN_HV,
-        "the memstore layout needs GDN layers of {GDN_HK} k / {GDN_HV} v heads (Flash-Next); \
-         this model's have {hk} k / {hv} v heads"
-    );
-    Ok(())
+/// The store layout for a GDN layer of `hk` k heads and `hv` v heads: [`Layout::FLASH`]
+/// (16 k / 48 v, tiled) or [`Layout::CODER`] (16 k / 32 v, grouped); anything else is refused.
+pub fn check_shape(hk: usize, hv: usize) -> Result<Layout> {
+    Layout::of_shape(hk, hv)
 }
 
-/// Zero the store heads of a layer state, leaving the base heads alone.
+/// Zero the store heads of a layer state (its layout from its size), leaving the base heads
+/// alone.
 pub fn blank_heads(state: &mut [f32]) {
-    MemStore::<CpuDevice>::restore_heads(state, &vec![0f32; HEAD_FLOATS]);
+    let l = Layout::of_state_len(state.len()).expect("not a GDN layer state");
+    MemStore::<CpuDevice>::restore_heads(state, &vec![0f32; l.head_floats()]);
 }
 
-/// A store blob's heads (little-endian f32, [`BLOB_BYTES`] bytes).
-pub fn blob_to_heads(b: &[u8]) -> Result<Vec<f32>> {
+fn layout_words(l: Layout) -> [u32; 4] {
+    let map = match l.kmap {
+        KMap::Tiled => 0,
+        KMap::Grouped => 1,
+    };
+    [l.hk as u32, l.hv as u32, l.d as u32, map]
+}
+
+/// A store blob's layout and heads: [`BLOB_HEADER`] bytes of header naming the layout, then the
+/// heads as little-endian f32. A headerless blob of exactly the 48-head layout's 768 KiB (the
+/// phase-1 format) reads as that layout.
+pub fn blob_to_heads(b: &[u8]) -> Result<(Layout, Vec<f32>)> {
+    let f32s = |b: &[u8]| -> Vec<f32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect()
+    };
+    if b.len() == 4 * HEAD_FLOATS {
+        return Ok((Layout::FLASH, f32s(b)));
+    }
     ensure!(
-        b.len() == BLOB_BYTES,
-        "a store blob is {BLOB_BYTES} bytes (12 heads × 128 × 128 f32), not {}",
+        b.len() >= BLOB_HEADER && &b[..4] == b"MEMB",
+        "not a store blob (no MEMB header)"
+    );
+    let w: Vec<u32> = b[4..BLOB_HEADER]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::from_le_bytes(c))
+        .collect();
+    ensure!(
+        w[0] == 1,
+        "store blob version {} (this build reads 1)",
+        w[0]
+    );
+    let layout = Layout::ALL
+        .into_iter()
+        .find(|&l| layout_words(l)[..] == w[1..])
+        .with_context(|| {
+            format!(
+                "store blob of an unknown layout ({} k / {} v heads, d {}, map {})",
+                w[1], w[2], w[3], w[4]
+            )
+        })?;
+    ensure!(
+        b.len() == blob_bytes(layout),
+        "a {} store blob is {} bytes, not {}",
+        layout.name,
+        blob_bytes(layout),
         b.len()
     );
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect())
+    Ok((layout, f32s(&b[BLOB_HEADER..])))
 }
 
-/// The blob of a store's heads.
+/// The blob of a store's heads (the layout from their size).
 pub fn heads_to_blob(h: &[f32]) -> Vec<u8> {
-    h.iter().flat_map(|x| x.to_le_bytes()).collect()
+    let l = Layout::of_heads_len(h.len()).expect("store heads of no layout");
+    let mut b = b"MEMB".to_vec();
+    for x in std::iter::once(1).chain(layout_words(l)) {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b.extend(h.iter().flat_map(|x| x.to_le_bytes()));
+    b
 }
 
-/// [`MemStore::audit`] of a blob's heads: the poisoned v heads (empty: intact).
+/// [`MemStore::audit`] of a store's heads (the layout from their size): the poisoned v heads
+/// (empty: intact).
 pub fn audit_heads(heads: &[f32]) -> Vec<usize> {
+    let Ok(l) = Layout::of_heads_len(heads.len()) else {
+        return Layout::FLASH.store_hv.to_vec();
+    };
     let dev = CpuDevice::new();
-    let mut s = vec![0f32; GDN_STATE];
+    let mut s = vec![0f32; l.state_len()];
     MemStore::<CpuDevice>::restore_heads(&mut s, heads);
     MemStore::<CpuDevice>::audit(&dev, &dev.upload_f32(&s))
 }
@@ -248,20 +319,35 @@ pub enum ExportError {
 /// store heads are zeroed, and with `ephemeral` the session's copy is dropped too.
 /// [`resident`](Self::resident) says which slots carry a store, so saved prefix states (RAM
 /// and the disk tier) blank those heads.
-#[derive(Default)]
 pub struct Sessions {
     /// Zero and forget a session's store when its slot is evicted or the session ends (never
     /// kept past the slot, never written to disk).
     pub ephemeral: bool,
+    /// The engine's store layout; blobs of another are refused.
+    pub layout: Layout,
     held: HashMap<String, Vec<f32>>,
     slots: HashMap<usize, String>,
 }
 
+impl Default for Sessions {
+    fn default() -> Self {
+        Sessions::new(false)
+    }
+}
+
 impl Sessions {
+    /// Sessions over the 48-head layout.
     pub fn new(ephemeral: bool) -> Self {
+        Sessions::with_layout(ephemeral, Layout::FLASH)
+    }
+
+    /// Sessions over `layout` (the engine's [`StoreMeta::layout`]).
+    pub fn with_layout(ephemeral: bool, layout: Layout) -> Self {
         Sessions {
             ephemeral,
-            ..Default::default()
+            layout,
+            held: HashMap::new(),
+            slots: HashMap::new(),
         }
     }
 
@@ -290,7 +376,18 @@ impl Sessions {
     /// `POST /v1/memory/load`: `blob` becomes `key`'s store (replacing any), and goes into the
     /// key's slot when it has one. Refused when the audit flags it.
     pub fn load(&mut self, host: &mut dyn StoreHost, key: &str, blob: &[u8]) -> Result<()> {
-        let heads = blob_to_heads(blob)?;
+        let (layout, heads) = blob_to_heads(blob)?;
+        ensure!(
+            layout == self.layout,
+            "this blob is a {} store ({} k / {} v GDN heads); this engine's store is {} ({} k / \
+             {} v): a store doesn't move between head layouts",
+            layout.name,
+            layout.hk,
+            layout.hv,
+            self.layout.name,
+            self.layout.hk,
+            self.layout.hv
+        );
         let bad = audit_heads(&heads);
         ensure!(
             bad.is_empty(),
@@ -309,7 +406,7 @@ impl Sessions {
             .held
             .get(key)
             .cloned()
-            .unwrap_or_else(|| vec![0f32; HEAD_FLOATS]);
+            .unwrap_or_else(|| vec![0f32; self.layout.head_floats()]);
         let (slot, borrowed) = match self.slot_of(key) {
             Some(s) => (s, None),
             None => (0, Some(host.store_heads(0)?)),
@@ -376,7 +473,7 @@ impl Sessions {
 
     fn detach_keep(&mut self, host: &mut dyn StoreHost, slot: usize) -> Result<()> {
         if self.slots.remove(&slot).is_some() {
-            host.set_store_heads(slot, &vec![0f32; HEAD_FLOATS])?;
+            host.set_store_heads(slot, &vec![0f32; self.layout.head_floats()])?;
         }
         Ok(())
     }
@@ -395,7 +492,7 @@ impl Sessions {
         json!({
             "sessions": self.held.len(),
             "resident_slots": self.slots.len(),
-            "bytes": self.held.len() * BLOB_BYTES,
+            "bytes": self.held.len() * blob_bytes(self.layout),
             "ephemeral": self.ephemeral,
         })
     }
@@ -404,19 +501,19 @@ impl Sessions {
 /// A store blob as text: each file's name, length and token ids, and with `decode` the text.
 pub fn dump(blob: &[u8], decode: Option<&dyn Fn(&[u32]) -> Result<String>>) -> Result<String> {
     use std::fmt::Write as _;
-    let heads = blob_to_heads(blob)?;
+    let (l, heads) = blob_to_heads(blob)?;
     let bad = audit_heads(&heads);
     let dev = CpuDevice::new();
-    let mut s = vec![0f32; GDN_STATE];
+    let mut s = vec![0f32; l.state_len()];
     MemStore::<CpuDevice>::restore_heads(&mut s, &heads);
     let mut state = dev.upload_f32(&s);
     // The store's own windows pin g = 1 and β, so any finite params read it; these keep the
     // read's arithmetic plain.
     let (conv, dt, a, norm) = (
         dev.upload_f32(&[0.0]),
-        dev.upload_f32(&[0.0; GDN_HV]),
-        dev.upload_f32(&[-1.0; GDN_HV]),
-        dev.upload_f32(&[1.0; GDN_D]),
+        dev.upload_f32(&vec![0.0; l.hv]),
+        dev.upload_f32(&vec![-1.0; l.hv]),
+        dev.upload_f32(&vec![1.0; l.d]),
     );
     let params = || GdnParams {
         conv: &conv,
@@ -432,11 +529,12 @@ pub fn dump(blob: &[u8], decode: Option<&dyn Fn(&[u32]) -> Result<String>>) -> R
     let cap = st.capacity();
     writeln!(
         out,
-        "{} files, {} tokens, {}/{} content rows",
+        "{}: {} files, {} tokens, {}/{} content rows",
+        l.name,
         cap.files,
         cap.tokens,
         cap.rows_used,
-        super::memstore::ROWS
+        l.rows()
     )?;
     for (name, len) in st.list(&mut state)? {
         let ids = st.get(&mut state, &name)?.unwrap_or_default();
@@ -513,7 +611,7 @@ pub fn encode_state_file(
     bytes.extend_from_slice(&(parts.len() as u64).to_le_bytes());
     for (k, p) in parts.iter().enumerate() {
         bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
-        if masked == Some(k) && p.len() == GDN_STATE {
+        if masked == Some(k) && store.is_some_and(|m| p.len() == m.layout.state_len()) {
             let mut q = p.to_vec();
             blank_heads(&mut q);
             q.iter()
@@ -545,13 +643,22 @@ mod tests {
     /// engine's slots of the store layer.
     struct Host {
         dev: CpuDevice,
+        layout: Layout,
         params: [<CpuDevice as ComputeDevice>::Buffer; 4],
         states: Vec<<CpuDevice as ComputeDevice>::Buffer>,
     }
 
-    fn noise(seed: u64) -> Vec<f32> {
+    /// Run `case` under every layout.
+    fn each_layout(case: impl Fn(Layout)) {
+        for l in Layout::ALL {
+            eprintln!("layout {}", l.name);
+            case(l);
+        }
+    }
+
+    fn noise(seed: u64, l: Layout) -> Vec<f32> {
         let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-        (0..GDN_STATE)
+        (0..l.state_len())
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -562,11 +669,11 @@ mod tests {
     }
 
     impl Host {
-        fn new(slots: usize) -> Self {
+        fn new(slots: usize, layout: Layout) -> Self {
             let dev = CpuDevice::new();
-            let dt: Vec<f32> = (0..GDN_HV).map(|h| (h as f32 * 0.37).sin()).collect();
-            let a: Vec<f32> = (0..GDN_HV).map(|h| -0.5 - (h % 7) as f32).collect();
-            let norm: Vec<f32> = (0..GDN_D).map(|j| 0.6 + (j % 5) as f32 * 0.3).collect();
+            let dt: Vec<f32> = (0..layout.hv).map(|h| (h as f32 * 0.37).sin()).collect();
+            let a: Vec<f32> = (0..layout.hv).map(|h| -0.5 - (h % 7) as f32).collect();
+            let norm: Vec<f32> = (0..layout.d).map(|j| 0.6 + (j % 5) as f32 * 0.3).collect();
             let params = [
                 dev.upload_f32(&[0.0]),
                 dev.upload_f32(&dt),
@@ -575,13 +682,14 @@ mod tests {
             ];
             let states = (0..slots)
                 .map(|i| {
-                    let mut s = noise(i as u64 + 1);
+                    let mut s = noise(i as u64 + 1, layout);
                     blank_heads(&mut s);
                     dev.upload_f32(&s)
                 })
                 .collect();
             Host {
                 dev,
+                layout,
                 params,
                 states,
             }
@@ -623,9 +731,9 @@ mod tests {
     }
 
     /// A blob holding `files`, built through the store itself.
-    fn blob_with(files: &[(&str, Vec<u32>)]) -> Vec<u8> {
-        let mut h = Host::new(1);
-        let mut s = Sessions::new(false);
+    fn blob_with(files: &[(&str, Vec<u32>)], l: Layout) -> Vec<u8> {
+        let mut h = Host::new(1, l);
+        let mut s = Sessions::with_layout(false, l);
         for (n, ids) in files {
             s.op(&mut h, "build", &put(n, ids)).unwrap();
         }
@@ -661,79 +769,83 @@ mod tests {
     /// slot; the borrowed slot 0's own state (base and store heads) is bitwise as it was.
     #[test]
     fn memserve_load_then_get() {
-        let files = [("notes/a.md", vec![5u32, 6, 7]), ("b", (0..300).collect())];
-        let blob = blob_with(&files);
-        let mut h = Host::new(2);
-        let before = h.state(0);
-        let mut s = Sessions::new(false);
-        s.load(&mut h, "k1", &blob).unwrap();
-        for (n, ids) in &files {
+        each_layout(|l| {
+            let files = [("notes/a.md", vec![5u32, 6, 7]), ("b", (0..300).collect())];
+            let blob = blob_with(&files, l);
+            let mut h = Host::new(2, l);
+            let before = h.state(0);
+            let mut s = Sessions::with_layout(false, l);
+            s.load(&mut h, "k1", &blob).unwrap();
+            for (n, ids) in &files {
+                assert_eq!(
+                    s.op(&mut h, "k1", &get(n)).unwrap(),
+                    OpOut::Got(Some(ids.clone()))
+                );
+            }
             assert_eq!(
-                s.op(&mut h, "k1", &get(n)).unwrap(),
-                OpOut::Got(Some(ids.clone()))
+                s.op(&mut h, "k1", &get("missing")).unwrap(),
+                OpOut::Got(None)
             );
-        }
-        assert_eq!(
-            s.op(&mut h, "k1", &get("missing")).unwrap(),
-            OpOut::Got(None)
-        );
-        assert_eq!(
-            h.state(0).iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-            before.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-        );
-        // another session sees nothing
-        assert_eq!(s.op(&mut h, "k2", &get("b")).unwrap(), OpOut::Got(None));
-        assert!(!s.has("k2"));
-        // attached to its slot, the slot carries the store and ops run there
-        s.attach(&mut h, 1, Some("k1")).unwrap();
-        assert_eq!(s.resident(1), Some("k1"));
-        assert_eq!(
-            MemStore::<CpuDevice>::snapshot_heads(&h.state(1)),
-            blob_to_heads(&blob).unwrap()
-        );
-        assert_eq!(
-            s.op(&mut h, "k1", &get("notes/a.md")).unwrap(),
-            OpOut::Got(Some(vec![5, 6, 7]))
-        );
+            assert_eq!(
+                h.state(0).iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                before.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+            // another session sees nothing
+            assert_eq!(s.op(&mut h, "k2", &get("b")).unwrap(), OpOut::Got(None));
+            assert!(!s.has("k2"));
+            // attached to its slot, the slot carries the store and ops run there
+            s.attach(&mut h, 1, Some("k1")).unwrap();
+            assert_eq!(s.resident(1), Some("k1"));
+            assert_eq!(
+                MemStore::<CpuDevice>::snapshot_heads(&h.state(1)),
+                blob_to_heads(&blob).unwrap().1
+            );
+            assert_eq!(
+                s.op(&mut h, "k1", &get("notes/a.md")).unwrap(),
+                OpOut::Got(Some(vec![5, 6, 7]))
+            );
+        });
     }
 
     /// Export after read-only ops is bitwise the loaded blob; after writes it is the new store,
     /// which a fresh server loads and reads back.
     #[test]
     fn memserve_export_after_ops() {
-        let blob = blob_with(&[("x", vec![1, 2, 3])]);
-        let mut h = Host::new(2);
-        let mut s = Sessions::new(false);
-        s.load(&mut h, "k", &blob).unwrap();
-        s.op(&mut h, "k", &get("x")).unwrap();
-        s.op(&mut h, "k", &StoreOp::List).unwrap();
-        assert!(
-            s.export("k").unwrap() == blob,
-            "read-only ops changed the store"
-        );
-        s.attach(&mut h, 1, Some("k")).unwrap();
-        s.op(&mut h, "k", &put("y", &[9; 200])).unwrap();
-        s.op(&mut h, "k", &StoreOp::Delete { name: "x".into() })
-            .unwrap();
-        let out = s.export("k").unwrap();
-        assert_eq!(
-            heads_to_blob(&MemStore::<CpuDevice>::snapshot_heads(&h.state(1))),
-            out,
-            "the slot carries what is exported"
-        );
-        let mut h2 = Host::new(1);
-        let mut s2 = Sessions::new(false);
-        s2.load(&mut h2, "k", &out).unwrap();
-        assert_eq!(
-            s2.op(&mut h2, "k", &get("y")).unwrap(),
-            OpOut::Got(Some(vec![9; 200]))
-        );
-        assert_eq!(s2.op(&mut h2, "k", &get("x")).unwrap(), OpOut::Got(None));
-        assert_eq!(
-            s2.op(&mut h2, "k", &StoreOp::List).unwrap(),
-            OpOut::Listed(vec![(b"y".to_vec(), 200)])
-        );
-        assert!(matches!(s.export("nobody"), Err(ExportError::Missing)));
+        each_layout(|l| {
+            let blob = blob_with(&[("x", vec![1, 2, 3])], l);
+            let mut h = Host::new(2, l);
+            let mut s = Sessions::with_layout(false, l);
+            s.load(&mut h, "k", &blob).unwrap();
+            s.op(&mut h, "k", &get("x")).unwrap();
+            s.op(&mut h, "k", &StoreOp::List).unwrap();
+            assert!(
+                s.export("k").unwrap() == blob,
+                "read-only ops changed the store"
+            );
+            s.attach(&mut h, 1, Some("k")).unwrap();
+            s.op(&mut h, "k", &put("y", &[9; 200])).unwrap();
+            s.op(&mut h, "k", &StoreOp::Delete { name: "x".into() })
+                .unwrap();
+            let out = s.export("k").unwrap();
+            assert_eq!(
+                heads_to_blob(&MemStore::<CpuDevice>::snapshot_heads(&h.state(1))),
+                out,
+                "the slot carries what is exported"
+            );
+            let mut h2 = Host::new(1, l);
+            let mut s2 = Sessions::with_layout(false, l);
+            s2.load(&mut h2, "k", &out).unwrap();
+            assert_eq!(
+                s2.op(&mut h2, "k", &get("y")).unwrap(),
+                OpOut::Got(Some(vec![9; 200]))
+            );
+            assert_eq!(s2.op(&mut h2, "k", &get("x")).unwrap(), OpOut::Got(None));
+            assert_eq!(
+                s2.op(&mut h2, "k", &StoreOp::List).unwrap(),
+                OpOut::Listed(vec![(b"y".to_vec(), 200)])
+            );
+            assert!(matches!(s.export("nobody"), Err(ExportError::Missing)));
+        });
     }
 
     /// `memory_ephemeral`: the slot given to another key has its store heads zeroed (base heads
@@ -741,105 +853,157 @@ mod tests {
     /// zeroed store heads (and the store trailer), even if the heads were live.
     #[test]
     fn memserve_ephemeral_eviction_and_disk() {
-        let blob = blob_with(&[("secret", vec![42; 10])]);
-        let mut h = Host::new(2);
-        let mut s = Sessions::new(true);
-        s.load(&mut h, "k", &blob).unwrap();
-        s.attach(&mut h, 1, Some("k")).unwrap();
-        assert!(!heads_zero(&h, 1));
+        each_layout(|l| {
+            let blob = blob_with(&[("secret", vec![42; 10])], l);
+            let mut h = Host::new(2, l);
+            let mut s = Sessions::with_layout(true, l);
+            s.load(&mut h, "k", &blob).unwrap();
+            s.attach(&mut h, 1, Some("k")).unwrap();
+            assert!(!heads_zero(&h, 1));
 
-        // the disk tier, while the store is live in the slot
-        let meta = StoreMeta {
-            gdn_layer: 1,
-            layer: 3,
-        };
-        let live = h.state(1);
-        let hist = vec![0.25f32; 16];
-        let other_gdn = noise(99);
-        let parts: Vec<&[f32]> = vec![&other_gdn, &hist, &live, &hist, &[]];
-        let file = encode_state_file(&[1, 2, 3], &parts, &[&[7u8; 5]], Some(meta), true);
-        // parse it back: header, 3 ids, part count, then parts
-        let f32s = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect()
-        };
-        let mut at = 8 + 8 + 12 + 8;
-        let mut got = Vec::new();
-        for _ in 0..parts.len() {
-            let n = u64::from_le_bytes(file[at..at + 8].try_into().unwrap()) as usize;
-            got.push(f32s(&file[at + 8..at + 8 + 4 * n]));
-            at += 8 + 4 * n;
-        }
-        assert!(MemStore::<CpuDevice>::snapshot_heads(&got[2])
-            .iter()
-            .all(|&x| x == 0.0));
-        assert!(base_eq(&got[2], &live));
-        assert_eq!(
-            got[0], other_gdn,
-            "other GDN layers are written as they are"
-        );
-        let tail = &file[file.len() - meta.trailer().len()..];
-        assert_eq!(StoreMeta::from_trailer(tail), Some(meta));
+            // the disk tier, while the store is live in the slot
+            let meta = StoreMeta {
+                gdn_layer: 1,
+                layer: 3,
+                layout: l,
+            };
+            let live = h.state(1);
+            let hist = vec![0.25f32; 16];
+            let other_gdn = noise(99, l);
+            let parts: Vec<&[f32]> = vec![&other_gdn, &hist, &live, &hist, &[]];
+            let file = encode_state_file(&[1, 2, 3], &parts, &[&[7u8; 5]], Some(meta), true);
+            // parse it back: header, 3 ids, part count, then parts
+            let f32s = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            };
+            let mut at = 8 + 8 + 12 + 8;
+            let mut got = Vec::new();
+            for _ in 0..parts.len() {
+                let n = u64::from_le_bytes(file[at..at + 8].try_into().unwrap()) as usize;
+                got.push(f32s(&file[at + 8..at + 8 + 4 * n]));
+                at += 8 + 4 * n;
+            }
+            assert!(MemStore::<CpuDevice>::snapshot_heads(&got[2])
+                .iter()
+                .all(|&x| x == 0.0));
+            assert!(base_eq(&got[2], &live));
+            assert_eq!(
+                got[0], other_gdn,
+                "other GDN layers are written as they are"
+            );
+            let tail = &file[file.len() - meta.trailer().len()..];
+            assert_eq!(StoreMeta::from_trailer(tail), Some(meta));
 
-        // eviction: the slot goes to another key
-        let base = h.state(1);
-        s.attach(&mut h, 1, Some("other")).unwrap();
-        assert!(heads_zero(&h, 1));
-        assert!(base_eq(&h.state(1), &base));
-        assert!(!s.has("k"), "ephemeral store outlived its slot");
-        assert!(s.is_empty());
-        assert!(matches!(s.export("k"), Err(ExportError::Missing)));
+            // eviction: the slot goes to another key
+            let base = h.state(1);
+            s.attach(&mut h, 1, Some("other")).unwrap();
+            assert!(heads_zero(&h, 1));
+            assert!(base_eq(&h.state(1), &base));
+            assert!(!s.has("k"), "ephemeral store outlived its slot");
+            assert!(s.is_empty());
+            assert!(matches!(s.export("k"), Err(ExportError::Missing)));
 
-        // not ephemeral: the slot is zeroed but the session keeps its store
-        let mut s = Sessions::new(false);
-        s.load(&mut h, "k", &blob).unwrap();
-        s.attach(&mut h, 1, Some("k")).unwrap();
-        s.attach(&mut h, 1, None).unwrap();
-        assert!(heads_zero(&h, 1));
-        assert_eq!(s.export("k").unwrap(), blob);
-        // session end drops it either way
-        assert!(s.end(&mut h, "k").unwrap());
-        assert!(!s.has("k"));
+            // not ephemeral: the slot is zeroed but the session keeps its store
+            let mut s = Sessions::with_layout(false, l);
+            s.load(&mut h, "k", &blob).unwrap();
+            s.attach(&mut h, 1, Some("k")).unwrap();
+            s.attach(&mut h, 1, None).unwrap();
+            assert!(heads_zero(&h, 1));
+            assert_eq!(s.export("k").unwrap(), blob);
+            // session end drops it either way
+            assert!(s.end(&mut h, "k").unwrap());
+            assert!(!s.has("k"));
+        });
     }
 
     /// The audit runs before an export: a store whose slot took one model-like token (g < 1,
     /// dense k) is refused with the poisoned heads named; a poisoned blob is refused at load.
     #[test]
     fn memserve_audit_flags_poison_before_export() {
-        let blob = blob_with(&[("x", vec![1, 2, 3])]);
-        let mut h = Host::new(2);
-        let mut s = Sessions::new(false);
-        s.load(&mut h, "k", &blob).unwrap();
-        // poison the session's copy as a model token through its slot would
-        let mut heads = blob_to_heads(&blob).unwrap();
-        for x in heads.iter_mut().step_by(97) {
-            *x = *x * 0.93 + 0.01;
-        }
-        s.held.insert("k".into(), heads.clone());
-        match s.export("k") {
-            Err(ExportError::Poisoned(bad)) => assert!(!bad.is_empty()),
-            other => panic!("poisoned store exported: {:?}", other.map(|b| b.len())),
-        }
-        let mut s2 = Sessions::new(false);
-        assert!(s2.load(&mut h, "k", &heads_to_blob(&heads)).is_err());
-        assert!(s2.load(&mut h, "k", &blob[..100]).is_err());
+        each_layout(|l| {
+            let blob = blob_with(&[("x", vec![1, 2, 3])], l);
+            let mut h = Host::new(2, l);
+            let mut s = Sessions::with_layout(false, l);
+            s.load(&mut h, "k", &blob).unwrap();
+            // poison the session's copy as a model token through its slot would
+            let mut heads = blob_to_heads(&blob).unwrap().1;
+            for x in heads.iter_mut().step_by(97) {
+                *x = *x * 0.93 + 0.01;
+            }
+            s.held.insert("k".into(), heads.clone());
+            match s.export("k") {
+                Err(ExportError::Poisoned(bad)) => assert!(!bad.is_empty()),
+                other => panic!("poisoned store exported: {:?}", other.map(|b| b.len())),
+            }
+            let mut s2 = Sessions::with_layout(false, l);
+            assert!(s2.load(&mut h, "k", &heads_to_blob(&heads)).is_err());
+            assert!(s2.load(&mut h, "k", &blob[..100]).is_err());
+        });
     }
 
     #[test]
     fn memserve_dump_reads_names_and_ids() {
-        let blob = blob_with(&[("notes/a.md", vec![5, 6, 7]), ("b", vec![1])]);
-        let text = dump(
-            &blob,
-            Some(&|ids: &[u32]| Ok(format!("<{} ids>", ids.len()))),
-        )
-        .unwrap();
-        assert!(text.contains("2 files, 4 tokens"), "{text}");
-        assert!(
-            text.contains("== notes/a.md (3 tokens)\nids: 5 6 7\ntext: <3 ids>"),
-            "{text}"
-        );
-        assert!(text.contains("== b (1 tokens)\nids: 1"), "{text}");
+        each_layout(|l| {
+            let blob = blob_with(&[("notes/a.md", vec![5, 6, 7]), ("b", vec![1])], l);
+            let text = dump(
+                &blob,
+                Some(&|ids: &[u32]| Ok(format!("<{} ids>", ids.len()))),
+            )
+            .unwrap();
+            assert!(text.contains("2 files, 4 tokens"), "{text}");
+            assert!(
+                text.contains("== notes/a.md (3 tokens)\nids: 5 6 7\ntext: <3 ids>"),
+                "{text}"
+            );
+            assert!(text.contains("== b (1 tokens)\nids: 1"), "{text}");
+        });
+    }
+
+    /// A blob carries its layout: one from the other head shape is refused at load with an
+    /// error naming both, a truncated or relabelled one too, and the state-file trailer names
+    /// the layout. `check_shape` picks the layout from the GDN shape.
+    #[test]
+    fn memserve_refuses_cross_layout_blobs() {
+        assert_eq!(check_shape(16, 48).unwrap(), Layout::FLASH);
+        assert_eq!(check_shape(16, 32).unwrap(), Layout::CODER);
+        assert!(check_shape(16, 64).is_err());
+        let blobs = Layout::ALL.map(|l| (l, blob_with(&[("x", vec![1, 2, 3])], l)));
+        for (l, blob) in &blobs {
+            assert_eq!(blob.len(), blob_bytes(*l));
+            assert_eq!(blob_to_heads(blob).unwrap().0, *l);
+            for (other, ob) in &blobs {
+                let mut h = Host::new(1, *l);
+                assert_eq!(h.layout, *l);
+                let mut s = Sessions::with_layout(false, *l);
+                let r = s.load(&mut h, "k", ob);
+                if other == l {
+                    r.unwrap();
+                    assert_eq!(
+                        s.op(&mut h, "k", &get("x")).unwrap(),
+                        OpOut::Got(Some(vec![1, 2, 3]))
+                    );
+                } else {
+                    let e = r.unwrap_err().to_string();
+                    assert!(e.contains(other.name) && e.contains(l.name), "{e}");
+                    assert!(!s.has("k"));
+                }
+            }
+            // a header claiming the other layout over these heads: wrong size, refused
+            let mut forged = blobs.iter().find(|(o, _)| o != l).unwrap().1[..BLOB_HEADER].to_vec();
+            forged.extend_from_slice(&blob[BLOB_HEADER..]);
+            assert!(blob_to_heads(&forged).is_err());
+            let meta = StoreMeta {
+                gdn_layer: 0,
+                layer: 1,
+                layout: *l,
+            };
+            assert_eq!(StoreMeta::from_trailer(&meta.trailer()), Some(meta));
+        }
+        // the phase-1 headerless 48-head blob still reads as the 48-head layout
+        let raw = blobs[0].1[BLOB_HEADER..].to_vec();
+        assert_eq!(blob_to_heads(&raw).unwrap().0, Layout::FLASH);
     }
 
     /// The store windows through the CUDA device's `gdn_step` (what the engines route
@@ -858,7 +1022,7 @@ mod tests {
             eprintln!("no CUDA device: skipping");
             return;
         };
-        let cpu = Host::new(1);
+        let cpu = Host::new(1, Layout::FLASH);
         let init = cpu.state(0);
         let up = |v: &[f32]| gpu.upload_f32(v);
         let cp: Vec<Vec<f32>> = cpu.params.iter().map(|b| cpu.dev.download(b)).collect();
