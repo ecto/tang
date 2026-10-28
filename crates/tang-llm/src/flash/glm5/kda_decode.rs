@@ -827,6 +827,143 @@ mod tests {
         }
     }
 
+    /// REAL WEIGHTS of any projection type (TANG_GLM5_REAL_GGUF = shard 1 of e.g. the
+    /// requantized Q4_K / Q5_K KDA GGUF, tools/glm5-kda-requant.py): per-matrix kernel µs
+    /// (CUDA events, T = 1, median of 50) of g5f_gemv and — when the tables build (Q8_0 or
+    /// Q4_K) — k5_qgemv, each checked against the f32 dequant · x on the CPU (rel < 2e-2:
+    /// the int8-activation band); then G5F=1 vs 2 through 32 naive decode steps. Skips
+    /// without the env var.
+    #[test]
+    fn kda_quant_real_bench() {
+        let _env = super::super::env_read();
+        let Ok(real) = std::env::var("TANG_GLM5_REAL_GGUF") else {
+            eprintln!("skip: TANG_GLM5_REAL_GGUF not set");
+            return;
+        };
+        let g = Gpu::for_test().expect("GPU");
+        g.bind().unwrap();
+        let gguf = crate::gguf::Gguf::open(Path::new(&real)).unwrap();
+        let hp = super::super::super::Hparams::from_gguf(&gguf).unwrap();
+        let l = (0..hp.n_layer).find(|&l| hp.is_kda[l]).unwrap();
+        let cfg = KdaConfig {
+            heads: hp.n_head,
+            head_dim: hp.kda_head_dim,
+            d_conv: hp.ssm_d_conv,
+            gate_lower_bound: hp.kda_gate_lower_bound,
+            eps: hp.eps,
+        };
+        let n = hp.n_embd;
+        let mk = |g5f: u8| {
+            std::env::set_var("TANG_GLM5_KDA_G5F", g5f.to_string());
+            let d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
+            std::env::remove_var("TANG_GLM5_KDA_G5F");
+            d
+        };
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let xs: Vec<Vec<f32>> = (0..32).map(|_| (0..n).map(|_| rnd()).collect()).collect();
+        let d = mk(2);
+        let qg = d.segx.is_some() && d.sego.is_some();
+        let (di, hd, hid) = (d.d_inner, d.hd, d.hidden);
+        let yo: Vec<f32> = xs[0].iter().cycle().take(di).copied().collect();
+        d.xb.write(0, &xs[0]).unwrap();
+        d.yb.write(0, &yo).unwrap();
+        let (e0, e1) = (Event::new(true).unwrap(), Event::new(true).unwrap());
+        let time = |f: &dyn Fn()| -> f32 {
+            for _ in 0..5 {
+                f();
+            }
+            let mut v: Vec<f32> = (0..50)
+                .map(|_| {
+                    e0.record(&d.s).unwrap();
+                    f();
+                    e1.record(&d.s).unwrap();
+                    d.s.sync().unwrap();
+                    e1.since(&e0).unwrap() * 1e3
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[25]
+        };
+        let t = |s: &str| format!("blk.{l}.{s}");
+        let mats = [
+            ("q", &d.wq, "attn_q.weight", di, hid, d.xb.ptr, &xs[0]),
+            ("k", &d.wk, "attn_k.weight", di, hid, d.xb.ptr, &xs[0]),
+            ("v", &d.wv, "attn_v.weight", di, hid, d.xb.ptr, &xs[0]),
+            ("f_a", &d.fa, "ssm_f_a.weight", hd, hid, d.xb.ptr, &xs[0]),
+            ("g_a", &d.ga, "ssm_g_a.weight", hd, hid, d.xb.ptr, &xs[0]),
+            ("o", &d.wo, "attn_output.weight", hid, di, d.yb.ptr, &yo),
+        ];
+        let codes = d.xq8.ptr;
+        let (mut tf_sum, mut tq_sum, mut to) = (0f32, 0f32, 0f32);
+        let ybuf = tang_moe::gpu::DevBuf::zeroed_elems::<f32>(di.max(hid)).unwrap();
+        for (name, w, tn, rows, cols, x, xh) in mats {
+            let info = gguf.info(&t(tn)).unwrap();
+            let wf = gguf.dequantize(info).unwrap();
+            let want: Vec<f32> = (0..rows)
+                .map(|r| wf[r * cols..(r + 1) * cols].iter().zip(xh.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>() as f32)
+                .collect();
+            unsafe {
+                launch(d.gv.q8, ((cols / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![x, codes, cols as u32, d.max_t as u32]).unwrap();
+            }
+            let scales = codes + (d.max_t * cols) as u64;
+            let a = crate::flash::glm5::moe::gpu::Act { xf: x, xq: codes, xq2: 0, xd: scales, xs: cols };
+            let tf = time(&|| d.gv.fast.gemv(&d.s, w.w, 0, a, ybuf.ptr, rows, 1, rows, cols).unwrap());
+            d.s.sync().unwrap();
+            let ef = rel64(&ybuf.read::<f32>(0, rows).unwrap(), &want);
+            let mb = w.w.estride as f64 / 1e6;
+            let mut line = format!(
+                "quant bench {name:>3} {} {rows}x{cols} ({mb:.1} MB): g5f_gemv {tf:.1} us ({:.2} TB/s, rel {ef:.2e})",
+                info.ty.name(), mb / tf as f64
+            );
+            assert!(ef < 2e-2, "{name}: g5f_gemv rel {ef} vs the f32 dequant");
+            tf_sum += tf;
+            if qg {
+                let tab = tang_moe::gpu::DevBuf::from_slice(&[w.w.base, ybuf.ptr, w.w.row_bytes as u64 | ((rows as u64) << 32)]).unwrap();
+                let tq = time(&|| unsafe { d.qgemv_launch(&d.s, &tab, 1, w.w.row_bytes, rows, 0, codes, scales, cols).unwrap() });
+                d.s.sync().unwrap();
+                let eq = rel64(&ybuf.read::<f32>(0, rows).unwrap(), &want);
+                line += &format!(", k5_qgemv {tq:.1} us ({:.2} TB/s, rel {eq:.2e})", mb / tq as f64);
+                assert!(eq < 2e-2, "{name}: k5_qgemv rel {eq} vs the f32 dequant");
+                tq_sum += tq;
+                if name == "o" {
+                    to = tq;
+                }
+            }
+            eprintln!("{line}");
+        }
+        if qg {
+            unsafe {
+                launch(d.gv.q8, ((hid / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![d.xb.ptr, codes, hid as u32, d.max_t as u32]).unwrap();
+            }
+            let mb5: f64 = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga].iter().map(|w| w.w.estride as f64).sum::<f64>() / 1e6;
+            let tm = time(&|| unsafe {
+                d.qgemv_launch(&d.s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * di + 2 * hd, 0, codes, codes + (d.max_t * hid) as u64, hid).unwrap()
+            });
+            eprintln!("quant bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)", mb5 / tm as f64);
+            eprintln!("quant bench per layer: g5f_gemv {tf_sum:.1} us, k5_qgemv {tq_sum:.1} us; merged + o {:.1} us", tm + to);
+        } else {
+            eprintln!("quant bench per layer: g5f_gemv {tf_sum:.1} us (no k5_qgemv tables for this type)");
+        }
+        drop(d);
+        let run = |g5f: u8| {
+            let mut d = mk(g5f);
+            let mut conv = ConvState::zeros(&cfg, 1);
+            let ys: Vec<Vec<f32>> = xs.iter().map(|x| d.window(x, 1, &mut conv).unwrap()).collect();
+            let mut st = KdaState::zeros(&cfg, 1);
+            let mut hc = conv.clone();
+            d.read_back(&mut hc, &mut st).unwrap();
+            (ys.concat(), st)
+        };
+        let (a, b) = (run(1), run(2));
+        let (eo, es) = (rel64(&b.0, &a.0), rel64(&b.1 .0, &a.1 .0));
+        eprintln!("quant parity G5F=2 vs G5F=1 naive, 32 steps: out rel {eo:.3e}, state rel {es:.3e}");
+        assert!(eo < 1e-2 && es < 1e-2, "G5F=2 diverges from G5F=1");
+    }
+
     fn rel64(a: &[f32], b: &[f32]) -> f64 {
         if a.iter().any(|x| !x.is_finite()) {
             return f64::INFINITY;

@@ -142,10 +142,10 @@ pub struct DevLayer {
     /// f_a, g_a) and o_proj on the fast row kernels instead of k5_gemv8 / k5_gemv, on
     /// BOTH the naive and the fused path (the per-matrix rule: one kernel per matrix).
     /// 1 = `g5f_gemv` (one launch per matrix, k5_q8's codes); 2 = `k5_qgemv` (q|k|v|f_a|
-    /// g_a in one launch, T = 1, Q8_0 only — any other window or type takes 1).
+    /// g_a in one launch, T = 1, Q8_0 or Q4_K — any other window or type takes 1).
     /// Takes precedence over `gemv8` for those six matrices.
     pub g5f: u8,
-    /// k5_qgemv segment tables (G5F=2, built at load when every matrix is Q8_0 with
+    /// k5_qgemv segment tables (G5F=2, built at load when every matrix is Q8_0 (or every one Q4_K) with
     /// 16-byte-aligned rows): x's five matrices, o_proj.
     segx: Option<DevBuf>,
     sego: Option<DevBuf>,
@@ -286,7 +286,9 @@ impl DevLayer {
         let di = self.d_inner as u64;
         let ok = |ws: &[&super::moe::gpu::DevW]| {
             let rb = ws[0].w.row_bytes;
-            ws.iter().all(|w| w.w.ty == 8 && w.w.base % 16 == 0 && w.w.row_bytes == rb && rb % 16 == 0 && rb <= 17 * 32 * 16)
+            // Q8_0 (k5_qgemv9/17) or Q4_K (k5_qgemv_q4k5/9), one type per table
+            let cap = match ws[0].w.ty { 8 => 17, 12 => 9, _ => 0 } * 32 * 16;
+            ws.iter().all(|w| w.w.ty == ws[0].w.ty && w.w.base % 16 == 0 && w.w.row_bytes == rb && rb % 16 == 0 && rb <= cap)
         };
         let tab = |e: &[(&super::moe::gpu::DevW, u64, usize)]| -> Result<DevBuf> {
             let mut v: Vec<u64> = Vec::new();
@@ -317,7 +319,13 @@ impl DevLayer {
     unsafe fn qgemv_launch(&self, s: &Stream, tab: &DevBuf, nseg: usize, rb: u32, rows_total: usize,
         bytes: u64, codes: u64, scales: u64, cols: usize) -> Result<()> {
         let nw = (49152 / rb as usize).clamp(1, 8);
-        let f = if rb as usize <= 9 * 32 * 16 { self.gv.qgemv9 } else { self.gv.qgemv17 };
+        // a Q4_K row is cols/256 super-blocks of 144 B (a Q8_0 row: cols/32 blocks of 34 B)
+        let f = match (rb as usize == cols / 256 * 144, rb as usize <= 9 * 32 * 16) {
+            (true, true) if rb as usize <= 5 * 32 * 16 => self.gv.qgemv_q4k5,
+            (true, _) => self.gv.qgemv_q4k9,
+            (false, true) => self.gv.qgemv9,
+            (false, false) => self.gv.qgemv17,
+        };
         tang_moe::gpu::trace::bytes(bytes);
         unsafe {
             launch(
