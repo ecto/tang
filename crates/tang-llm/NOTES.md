@@ -4,6 +4,51 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MTP verify on the resident path: 85 -> 17-28 ms/pass, ids = plain, but only ~1.04x plain at best (branch claude/glm5-mtp-win)
+
+What was wrong: the MTP verify ran the host `window()` (~85 ms/pass) plus a host KDA snapshot
+and a rerun window after every partial accept, so MTP was ~19 tok/s vs plain ~83.
+
+Fix (resident.rs, mtp.rs):
+- `Glm5Engine::window_resident(toks)`: the t-row verify window as one resident pass on the
+  fused mHC stream: host embed of t rows (`begin_async` now takes t rows), per KDA layer the
+  t=1 decode once per row (D2D copies in/out of `xb`/`outb`; bit-identical to the step),
+  DSA `MlaProj::window_dev` at t (causal over cache + window), FFN `ffn_async` on t rows,
+  head norm + q8 + gemv8 + argmax per row (the t=1 head numerics). Returns the t argmax ids
+  + normed h rows (the only D2H). Captured per t as segment graphs split at the DSA cores
+  (12 segments on GLM-5.3-Flash); first window of a length runs eager. `TANG_GLM5_RES_WINDOW=0`
+  / `TANG_GLM5_RES_WINDOW_GRAPH=0` turn it / the graphs off.
+- Device rewind, no rerun: each KDA layer's (conv, state) is checkpointed D2D after every
+  row but the last; `rewind_resident(t, keep)` copies checkpoint `keep-1` back, sets the
+  DSA device watermarks (`append_done(pos, 0)`, pool watermark clamped to `pos/kpool`) and
+  truncates the host mirrors / tokens. tang-moe gpu.rs: new `copy_d2d_async` (one function).
+- mtp::generate uses it when available (falls back to the host window + snapshot path).
+
+Verification: mew 3090 `flash::glm5` 85 passed / 0 failed / 2 ignored, incl. new `engine_gpu_resident_window_matches_host`: t=3 resident vs host
+window ids identical, h rows max abs 0.0, the next window and a rewind-to-1-then-continue
+identical to host. B300 (shared pod), B flags, bench prompt; tok/s = tok/pass / (trunk +
+draft ms/pass) from the report lines; haiku `--mtp 2 -n 8` = oracle:
+
+| run | -n | accept d1/d2/d3 | tok/pass | trunk ms/pass | draft ms/pass | rewind ms | tok/s | ids md5 |
+|---|---|---|---|---|---|---|---|---|
+| plain | 128 | | | | | | 83.11 | 7174cdd6 |
+| K=1 | 128 | 89.6% | 1.896 | 17.26 | 7.90 | 0.271 | 75.4 | 7174cdd6 |
+| K=2 | 128 | 88.2/72.7% | 2.490 | 23.17 | 9.31 | 0.283 | 76.7 | 7174cdd6 |
+| K=3 | 128 | 88.4/76.3/62.1% | 2.953 | 28.95 | 13.55 | 0.356 | 69.5 | 7174cdd6 |
+| plain | 512 | | | | | | 82.83 | 1453cf0e |
+| K=1 | 512 | 80.9% | 1.806 | 17.33 | 3.57 | 0.209 | 86.4 | 1453cf0e |
+| K=2 | 512 | 77.3/60.2% | 2.231 | 22.72 | 5.94 | 0.256 | 77.8 | 1453cf0e |
+| K=3 | 512 | 77.8/61.4/56.2% | 2.517 | 27.94 | 7.88 | 0.214 | 70.3 | 1453cf0e |
+
+Every MTP run's ids equal plain decode (no divergence). The segment graphs bought ~1 ms
+(K=2 128: 23.92 eager -> 23.17). Target (>= 1.3x plain at K=2) NOT reached: each extra
+window row costs ~5.5 ms (t=2 17.3, t=3 22.7, t=4 27.9 vs the 12 ms t=1 step), so the
+window does not amortise weights: KDA runs t serial decodes (all its weights re-read per
+row) and the MoE's t rows route to mostly different experts. Next: KDA projections for
+the t rows in one batched GEMV (`window_rows`-style, not bit-identical: the windiff entry
+below), measured per stage with nsys (not done here); the draft (4-7 ms per draft token)
+is the other half of the gap.
+
 ## 2026-10-28 — MTP draft on the device (6.6 s -> ~10 ms/pass); verify windows made exact; MTP still 4x slower than plain (branch claude/glm5-mtp-dev)
 
 What was wrong: (1) the NextN block (blk.45) ran entirely on the host: ~6.6 s per draft pass
