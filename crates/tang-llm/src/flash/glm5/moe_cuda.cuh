@@ -354,16 +354,17 @@ __device__ __forceinline__ void g5f_decode8i(const unsigned char* row, int e0, i
 // per-32 scales; xq2 (null = off): the residual codes, x ~ d * (q + q2 / 254) (g5f_q8), which
 // takes the activation error from ~1e-2 to ~1e-5 for 2 (4 with K-quant mins) more dp4a per 8
 // weights — the decode is shared. xf: the token's f32 values (F32 / F16 rows).
-// unroll of the 8-weight row loop (Q8_0 shared expert / dense rows): same order, more loads in flight
+// unroll of the 8-weight row loop in g5f_gux / g5f_dot_anyn (Q8_0 shared expert / dense rows):
+// same order, more loads in flight. g5f_gemv keeps 1 (unrolling it was slower there).
 #ifndef G5F_LDU
 #define G5F_LDU 1
 #endif
-template <int TY>
+template <int TY, int U = 1>
 __device__ __forceinline__ float g5f_lane_dot(const unsigned char* w, const unsigned char* xq, const unsigned char* xq2,
                                              const float* xd, const float* xf, int k) {
     const int lane = threadIdx.x & 31;
     float acc = 0.f;
-    #pragma unroll G5F_LDU
+    #pragma unroll U
     for (int e0 = lane * 8; e0 < k; e0 += 256) {
         if (TY == 0 || TY == 1) {
             float v[8];
@@ -550,20 +551,21 @@ __device__ __forceinline__ float g5f_lane_dot32(const unsigned char* w, const un
     return g5f_lane_dot32x<TY>(w, 0, xq, xq2, xd, k).x;
 }
 
+template <int U = 1>
 __device__ __forceinline__ float g5f_dot_any(unsigned ty, const unsigned char* w, const unsigned char* xq,
                                             const unsigned char* xq2, const float* xd, const float* xf, int k) {
     switch (ty) {
-        case 0: return g5f_lane_dot<0>(w, xq, xq2, xd, xf, k);
-        case 1: return g5f_lane_dot<1>(w, xq, xq2, xd, xf, k);
-        case 6: return g5f_lane_dot<6>(w, xq, xq2, xd, xf, k);
-        case 8: return g5f_lane_dot<8>(w, xq, xq2, xd, xf, k);
+        case 0: return g5f_lane_dot<0, U>(w, xq, xq2, xd, xf, k);
+        case 1: return g5f_lane_dot<1, U>(w, xq, xq2, xd, xf, k);
+        case 6: return g5f_lane_dot<6, U>(w, xq, xq2, xd, xf, k);
+        case 8: return g5f_lane_dot<8, U>(w, xq, xq2, xd, xf, k);
         case 12:
             if (G5F_DOT32 && ((unsigned long long)w & 15) == 0 && (k & 255) == 0) return g5f_lane_dot32<12>(w, xq, xq2, xd, k);
-            return g5f_lane_dot<12>(w, xq, xq2, xd, xf, k);
+            return g5f_lane_dot<12, U>(w, xq, xq2, xd, xf, k);
         case 13:
             if (G5F_DOT32 && ((unsigned long long)w & 15) == 0 && (k & 255) == 0) return g5f_lane_dot32<13>(w, xq, xq2, xd, k);
-            return g5f_lane_dot<13>(w, xq, xq2, xd, xf, k);
-        case 14: return g5f_lane_dot<14>(w, xq, xq2, xd, xf, k);
+            return g5f_lane_dot<13, U>(w, xq, xq2, xd, xf, k);
+        case 14: return g5f_lane_dot<14, U>(w, xq, xq2, xd, xf, k);
         case 108: return g5f_lane_dot32<108>(w, xq, xq2, xd, k);
         case 114: return g5f_lane_dot32<114>(w, xq, xq2, xd, k);
         default: return __uint_as_float(0x7fc00000u);
@@ -1205,7 +1207,7 @@ __device__ __forceinline__ void g5f_dot_anyn(unsigned ty, const unsigned char* c
     if (ty == 108) { g5f_lane_dot32n<108, N>(w, xq, xq2, xd, k, acc); return; }
     if (ty == 114) { g5f_lane_dot32n<114, N>(w, xq, xq2, xd, k, acc); return; }
     #pragma unroll
-    for (int i = 0; i < N; i++) acc[i] = g5f_dot_any(ty, w[i], xq, xq2, xd, xf, k);
+    for (int i = 0; i < N; i++) acc[i] = g5f_dot_any<G5F_LDU>(ty, w[i], xq, xq2, xd, xf, k);
 }
 
 // g5f_gu with G5F_GUR rows a warp (gate and up of each: 2 * G5F_GUR streams). grid
@@ -1285,8 +1287,10 @@ extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down_splitn(
     const G5W down, const G5W sdown, const unsigned* ids, const float* wts, int k, int ne,
     const float* h, const unsigned char* hq, const unsigned char* hq2, const float* hd, int hs, float* yp, int ff,
     int ffs, int hid) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = blockIdx.y, t = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = blockIdx.z;
     const int nr = ids ? k : 1, ns = sdown.base ? 1 : 0, S = nr + ns;
+    // shared slot (Q8_0, slow 8-weight chain) as block row 0 so it is scheduled first, not as a tail
+    const int j = ns ? (blockIdx.y == 0 ? nr : (int)blockIdx.y - 1) : (int)blockIdx.y;
     const int c0 = (blockIdx.x * 4 + warp) * G5F_DNR;
     if (c0 >= hid) return;
     const bool sh = j >= nr;
@@ -1381,7 +1385,7 @@ extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_gux(
         const int rr = q >> 1;
         if (r0 + rr >= rows) break;
         const G5W v = (q & 1) ? u : g;
-        const float sres = g5f_warp_sum(g5f_dot_any(v.ty, g5f_row(v, e, r0 + rr), xqt, xq2t, xdt, xft, hid));
+        const float sres = g5f_warp_sum(g5f_dot_any<G5F_LDU>(v.ty, g5f_row(v, e, r0 + rr), xqt, xq2t, xdt, xft, hid));
         if (lane == 0) ab[q] = sres;
     }
     __syncthreads();
