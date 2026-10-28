@@ -2137,6 +2137,152 @@ mod tests {
         }
     }
 
+    /// Prefill at real shapes, t = 512 (manual: `--ignored --nocapture prefill_bench`): one
+    /// layer's routed MoE by the tiled grouped kernels (384 experts, top-6, d 5120, inter
+    /// 2304, fp4; 16 distinct weight sets aliased across the experts), and the t > 8 K-split
+    /// GEMV in one launch against 8-row launches (the previous path) for wq_b / wo_b shapes.
+    #[test]
+    #[ignore]
+    fn prefill_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        if k.exact {
+            return;
+        }
+        let s = Stream::blocking().unwrap();
+        let t: usize = std::env::var("DS_BENCH_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let time = |f: &mut dyn FnMut()| -> f64 {
+            f();
+            s.sync().unwrap();
+            let iters = 10;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            s.sync().unwrap();
+            t0.elapsed().as_secs_f64() / iters as f64 * 1e6
+        };
+        // linears
+        let mut keep = Vec::new();
+        for (name, rows, cols, fmt) in [("wq_b", 32768, 1024, 2), ("wo_b", 5120, 8192, 2)] {
+            let w = rand_w(fmt, rows, cols, 7, &mut keep);
+            let x = DevBuf::from_slice(&data(t * cols, 5, 2.0)).unwrap();
+            let y = DevBuf::alloc(t * rows * 4).unwrap();
+            let one = time(&mut || {
+                k.linear_ks(&s, &w, None, x.ptr, y.ptr, t, true, false, 0, 0.0)
+                    .unwrap()
+            });
+            let chunks = time(&mut || {
+                for t0 in (0..t).step_by(8) {
+                    let n = (t - t0).min(8);
+                    let (xo, yo) = (
+                        x.ptr + (t0 * cols * 4) as u64,
+                        y.ptr + (t0 * rows * 4) as u64,
+                    );
+                    k.linear_ks(&s, &w, None, xo, yo, n, true, false, 0, 0.0)
+                        .unwrap();
+                }
+            });
+            let fl = 2.0 * (t * rows * cols) as f64;
+            eprintln!(
+                "{name} [{rows}x{cols}] t {t}: one launch {one:.0} us ({:.1} TFLOP/s), 8-row launches {chunks:.0} us",
+                fl / one / 1e6
+            );
+        }
+        // MoE
+        let (ne, topk, d, inter, fmt) = (384usize, 6usize, 5120usize, 2304usize, 3);
+        let (mut w1, mut w3, mut w2) = (vec![], vec![], vec![]);
+        for e in 0..16u64 {
+            w1.push(rand_w(fmt, inter, d, 3 * e + 1, &mut keep));
+            w3.push(rand_w(fmt, inter, d, 3 * e + 2, &mut keep));
+            w2.push(rand_w(fmt, d, inter, 3 * e + 3, &mut keep));
+        }
+        let pick = |v: &Vec<DsW>| (0..ne).map(|e| v[e % 16]).collect::<Vec<_>>();
+        let (w1d, w3d, w2d) = (
+            DevBuf::from_slice(&pick(&w1)).unwrap(),
+            DevBuf::from_slice(&pick(&w3)).unwrap(),
+            DevBuf::from_slice(&pick(&w2)).unwrap(),
+        );
+        let n = t * topk;
+        let mut st = 0x2545F4914F6CDD1Du64;
+        let ids: Vec<i32> = (0..t)
+            .flat_map(|_| {
+                let mut v: Vec<i32> = vec![];
+                while v.len() < topk {
+                    st ^= st << 13;
+                    st ^= st >> 7;
+                    st ^= st << 17;
+                    let e = (st % ne as u64) as i32;
+                    if !v.contains(&e) {
+                        v.push(e);
+                    }
+                }
+                v
+            })
+            .collect();
+        let idd = DevBuf::from_slice(&ids).unwrap();
+        let wts = DevBuf::from_slice(&data(n, 9, 1.0)).unwrap();
+        let (counts, off) = (
+            DevBuf::alloc(ne * 4).unwrap(),
+            DevBuf::alloc((ne + 1) * 4).unwrap(),
+        );
+        let (rows, rw) = (DevBuf::alloc(n * 4).unwrap(), DevBuf::alloc(n * 4).unwrap());
+        k.route(
+            &s, idd.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+        )
+        .unwrap();
+        let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
+        let slots = n.min(ne);
+        let elist = DevBuf::alloc(slots * 4).unwrap();
+        let (nei, ci) = (ne as i32, slots as i32);
+        unsafe {
+            k.go(
+                "ds_moe_plan",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                &s,
+                tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+            )
+            .unwrap();
+        }
+        let x = DevBuf::from_slice(&data(t * d, 3, 2.0)).unwrap();
+        k.fp8_qdq(&s, x.ptr, t * d).unwrap();
+        let tiles = DevBuf::alloc(Kernels::moe_tile_cap(n, slots) * 4).unwrap();
+        let wide = n * d.max(inter);
+        let (codes, scales) = (
+            DevBuf::alloc(wide).unwrap(),
+            DevBuf::alloc(wide / 32 * 4).unwrap(),
+        );
+        let (h, part) = (
+            DevBuf::alloc(n * inter * 4).unwrap(),
+            DevBuf::alloc(n * d * 4).unwrap(),
+        );
+        let us = time(&mut || {
+            k.moe_tiled(
+                &s,
+                fmt,
+                (w1d.ptr, w3d.ptr, w2d.ptr),
+                (elist.ptr, slots, tiles.ptr),
+                (off.ptr, rows.ptr, rw.ptr),
+                (x.ptr, h.ptr, part.ptr),
+                (codes.ptr, scales.ptr),
+                (t, topk, d, inter),
+                10.0,
+            )
+            .unwrap()
+        });
+        let fl = 2.0 * (n * 3 * d * inter) as f64;
+        eprintln!(
+            "moe tiled t {t} ({n} pairs): {us:.0} us/layer ({:.1} TFLOP/s), 4 launches",
+            fl / us / 1e6
+        );
+    }
+
     /// One layer's routed MoE by the grouped kernels at the real shapes (384 experts, top-6,
     /// d = 5120, inter = 2304, fp4) with random weights: plan, GU, h quant, down, reduce
     /// (manual: `--ignored --nocapture moe_grouped_bench`). Bytes = the live experts' weights
