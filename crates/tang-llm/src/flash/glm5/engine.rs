@@ -2598,6 +2598,11 @@ mod tests {
         tang_verify::skip_or_fail(reason)
     }
 
+    /// Serialises the tests that set load-time env knobs around an engine load (the test
+    /// harness runs in parallel; an unguarded set/remove leaks into another test's load).
+    #[cfg(feature = "cuda")]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn seq1() -> Option<Vec<u32>> {
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").ok()?;
         let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
@@ -3178,6 +3183,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     fn gpu_slots_case(ids: &[u32], moe: &str) {
         let load = |slots: usize| {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // the batched KDA rows need it
             std::env::set_var("TANG_GLM5_MOE", moe);
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
@@ -3252,6 +3258,7 @@ mod tests {
             return;
         }
         let load = || {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // WIN_STEP lives on the PF2 core
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
             let ok = e.use_gpu().unwrap();
