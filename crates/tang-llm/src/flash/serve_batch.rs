@@ -218,6 +218,7 @@ impl FlashServe {
                     .min_by_key(|(_, s)| s.used)
                     .ok_or_else(|| anyhow::anyhow!("every slot is running"))?;
                 let old = self.slots.remove(i);
+                self.mem_detach(old.id)?;
                 self.e.free_slot(old.id);
                 self.e.alloc_slot()?
             }
@@ -265,6 +266,7 @@ impl FlashServe {
             );
         }
         let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        self.mem_attach(slot, req.cache_key.as_deref())?;
         let mut marks = self.marks(&ids, &text);
         marks.retain(|&(p, _)| p > reused);
         let limit = req

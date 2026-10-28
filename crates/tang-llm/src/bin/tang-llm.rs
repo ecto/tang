@@ -566,6 +566,9 @@ fn serve_flash(args: &[String]) -> Result<()> {
             .and_then(|v| v.parse::<f64>().ok())
             .map_or(12e9, |g| g * 1e9) as usize,
         dump: None,
+        memory_layer: None,
+        memory_ephemeral: std::env::var("TANG_MEMORY_EPHEMERAL")
+            .is_ok_and(|v| v == "1" || v == "true"),
     };
     let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
     let mut key = std::env::var("TANG_API_KEY").ok();
@@ -594,6 +597,9 @@ fn serve_flash(args: &[String]) -> Result<()> {
             "--no-suffix" => s.suffix = false,
             "--warm-dir" => s.warm_dir = Some(PathBuf::from(val()?)),
             "--batch" => s.batch = val()?.parse()?,
+            // GDN memstore (`/v1/memory*`): its GDN layer, and `memory_ephemeral=true`
+            "--memory-layer" => s.memory_layer = Some(val()?.parse()?),
+            "--memory-ephemeral" => s.memory_ephemeral = true,
             "--api-key-file" => {
                 let path = val()?;
                 key =

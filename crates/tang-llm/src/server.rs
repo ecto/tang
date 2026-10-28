@@ -23,7 +23,7 @@ use crate::node::{Need, Probe, Rates};
 use crate::queue::{Priority, Queue, Ticket};
 use crate::sample::Sampling;
 use crate::telemetry::{End, Trace};
-use axum::extract::{Request as HttpRequest, State};
+use axum::extract::{Query, Request as HttpRequest, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -70,6 +70,29 @@ enum Job {
     Unload {
         reply: oneshot::Sender<Reply>,
     },
+    Memory {
+        req: MemoryReq,
+        reply: oneshot::Sender<Result<MemoryReply, (StatusCode, String)>>,
+    },
+}
+
+/// A GDN memstore request (`/v1/memory*`, see `docs/design/gdn-memstore.md`, "Serve wiring"),
+/// for the session `key` (the `prompt_cache_key`).
+pub enum MemoryReq {
+    /// `POST /v1/memory/load`: the store blob (the store heads, little-endian f32).
+    Load { key: String, blob: Vec<u8> },
+    /// `GET /v1/memory`: the store blob, audited.
+    Export { key: String },
+    /// `POST /v1/memory/op`: `{op, name, ids}`.
+    Op { key: String, body: Value },
+    /// `POST /v1/memory/end`: the session is over.
+    End { key: String },
+}
+
+/// What a [`MemoryReq`] returns.
+pub enum MemoryReply {
+    Json(Value),
+    Blob(Vec<u8>),
 }
 
 /// A request's first run, when it gave way part way through its prefill.
@@ -203,6 +226,13 @@ pub trait Backend {
     fn expire(&mut self) {}
     /// Runs after the reply goes out, including failed requests.
     fn after(&mut self, _req: &Request, _result: &anyhow::Result<(Finish, Usage)>) {}
+    /// A GDN memstore request (backends with a store layer: `flash::serve`).
+    fn memory(&mut self, _req: MemoryReq) -> Result<MemoryReply, (StatusCode, String)> {
+        Err((
+            StatusCode::NOT_FOUND,
+            "this backend has no GDN memstore (flash serve with --memory-layer)".into(),
+        ))
+    }
 
     /// Most requests it runs at once (see `docs/batching.md`); 1 runs them one at a time
     /// with `complete_with`, and the methods below go unused.
@@ -442,6 +472,10 @@ where
         .route("/node", get(node_info))
         .route("/models/load", post(load_model))
         .route("/models/unload", post(unload_model))
+        .route("/v1/memory", get(memory_export))
+        .route("/v1/memory/load", post(memory_load))
+        .route("/v1/memory/op", post(memory_op))
+        .route("/v1/memory/end", post(memory_end))
         .with_state(app);
     if let Some(image) = image {
         api = api.merge(image.router);
@@ -632,6 +666,13 @@ where
                             StatusCode::BAD_REQUEST,
                             "this backend has a fixed model; restart to change it".into(),
                         ))
+                    };
+                    let _ = reply.send(result);
+                }
+                Job::Memory { req, reply } => {
+                    let result = match &mut self.engine {
+                        Some((_, e)) => e.memory(req),
+                        None => Err((StatusCode::SERVICE_UNAVAILABLE, "no model loaded".into())),
                     };
                     let _ = reply.send(result);
                 }
@@ -1267,6 +1308,106 @@ async fn load_model(State(app): State<App>, Json(body): Json<Value>) -> Response
 /// `POST /models/unload`: free the model's memory.
 async fn unload_model(State(app): State<App>) -> Response {
     control(&app, |reply| Job::Unload { reply }).await
+}
+
+/// The session a memory request is for: `?prompt_cache_key=`, the `x-prompt-cache-key`
+/// header, or the JSON body's `prompt_cache_key`.
+fn memory_key(
+    q: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
+    body: Option<&Value>,
+) -> Result<String, Response> {
+    q.get("prompt_cache_key")
+        .cloned()
+        .or_else(|| {
+            headers
+                .get("x-prompt-cache-key")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .or_else(|| {
+            body.and_then(|b| b["prompt_cache_key"].as_str())
+                .map(String::from)
+        })
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "prompt_cache_key is required"))
+}
+
+/// Run a memory request on the worker (after any running batch, like a load).
+async fn memory_job(app: &App, req: MemoryReq) -> Response {
+    let (tx, rx) = oneshot::channel();
+    app.node
+        .queue
+        .push(Priority::Interactive, None, Job::Memory { req, reply: tx });
+    match rx.await {
+        Ok(Ok(MemoryReply::Json(v))) => Json(v).into_response(),
+        Ok(Ok(MemoryReply::Blob(b))) => {
+            ([(header::CONTENT_TYPE, "application/octet-stream")], b).into_response()
+        }
+        Ok(Err((status, msg))) => error(status, msg),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "model worker stopped"),
+    }
+}
+
+/// `POST /v1/memory/load?prompt_cache_key=K`, body: the store blob (768 KiB).
+async fn memory_load(
+    State(app): State<App>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    match memory_key(&q, &headers, None) {
+        Ok(key) => {
+            memory_job(
+                &app,
+                MemoryReq::Load {
+                    key,
+                    blob: body.to_vec(),
+                },
+            )
+            .await
+        }
+        Err(r) => r,
+    }
+}
+
+/// `GET /v1/memory?prompt_cache_key=K`: the store blob (409 when the audit flags it).
+async fn memory_export(
+    State(app): State<App>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    match memory_key(&q, &headers, None) {
+        Ok(key) => memory_job(&app, MemoryReq::Export { key }).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /v1/memory/op {"prompt_cache_key": K, "op": "put"|"get"|"delete"|"list", "name", "ids"}`.
+async fn memory_op(
+    State(app): State<App>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match memory_key(&q, &headers, Some(&body)) {
+        Ok(key) => memory_job(&app, MemoryReq::Op { key, body }).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /v1/memory/end {"prompt_cache_key": K}`: drop the session's store.
+async fn memory_end(
+    State(app): State<App>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0);
+    match memory_key(&q, &headers, body.as_ref()) {
+        Ok(key) => memory_job(&app, MemoryReq::End { key }).await,
+        Err(r) => r,
+    }
 }
 
 /// Run a load or unload on the worker, when no request is running or waiting.

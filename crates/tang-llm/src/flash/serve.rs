@@ -21,6 +21,7 @@
 mod batch;
 
 use super::engine::{Engine, Opts, Positional, RunningState};
+use super::memserve::{OpOut, Sessions, StoreHost, StoreMeta, StoreOp};
 use super::tokenize::FlashTokenizer;
 use crate::chat::{Chunk, Detok, Parser, Piece, Tags};
 use crate::engine::{Control, Finish, Outcome, Request, ThinkBudget, Usage, WRAP_UP};
@@ -74,6 +75,12 @@ pub struct Settings {
     /// Seed the expert cache from this routing profile. Without one, `routing.bin` in `disk`
     /// (written after every request) seeds it.
     pub profile: Option<PathBuf>,
+    /// Keep per-session GDN memstores (`/v1/memory*`) in this GDN layer (index among the GDN
+    /// layers). `None`: no store, and serving is exactly as without this feature.
+    pub memory_layer: Option<usize>,
+    /// `memory_ephemeral=true`: a session's store is zeroed and forgotten when its slot is
+    /// evicted or the session ends, and never reaches the disk tier.
+    pub memory_ephemeral: bool,
 }
 
 /// What the server needs from an engine: the Flash-Next [`Engine`] or the qwen3next
@@ -181,6 +188,34 @@ pub trait ServeEngine {
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
     }
+    /// Keep a GDN memstore in GDN layer `gdn_layer` ([`super::memserve`]).
+    fn enable_store(&mut self, _gdn_layer: usize) -> Result<StoreMeta> {
+        bail!("this engine has no GDN memstore")
+    }
+    fn store_heads_at(&mut self, _slot: usize) -> Result<Vec<f32>> {
+        bail!("this engine has no GDN memstore")
+    }
+    fn set_store_heads_at(&mut self, _slot: usize, _heads: &[f32]) -> Result<()> {
+        bail!("this engine has no GDN memstore")
+    }
+    fn store_op_at(&mut self, _slot: usize, _op: &StoreOp) -> Result<OpOut> {
+        bail!("this engine has no GDN memstore")
+    }
+}
+
+/// [`StoreHost`] over a serve engine's slots.
+struct Host<'a>(&'a mut dyn ServeEngine);
+
+impl StoreHost for Host<'_> {
+    fn store_heads(&mut self, slot: usize) -> Result<Vec<f32>> {
+        self.0.store_heads_at(slot)
+    }
+    fn set_store_heads(&mut self, slot: usize, heads: &[f32]) -> Result<()> {
+        self.0.set_store_heads_at(slot, heads)
+    }
+    fn store_op(&mut self, slot: usize, op: &StoreOp) -> Result<OpOut> {
+        self.0.store_op_at(slot, op)
+    }
 }
 
 impl ServeEngine for Engine {
@@ -257,6 +292,19 @@ impl ServeEngine for Engine {
     }
     fn last_mtp_ms(&self) -> f64 {
         self.last_mtp_ms
+    }
+    fn enable_store(&mut self, gdn_layer: usize) -> Result<StoreMeta> {
+        Engine::enable_store(self, gdn_layer)?;
+        Ok(self.store.unwrap())
+    }
+    fn store_heads_at(&mut self, slot: usize) -> Result<Vec<f32>> {
+        Engine::store_heads_at(self, slot)
+    }
+    fn set_store_heads_at(&mut self, slot: usize, heads: &[f32]) -> Result<()> {
+        Engine::set_store_heads_at(self, slot, heads)
+    }
+    fn store_op_at(&mut self, slot: usize, op: &StoreOp) -> Result<OpOut> {
+        Engine::store_op_at(self, slot, op)
     }
 }
 
@@ -374,6 +422,19 @@ impl ServeEngine for super::coder::Coder {
         // H200, UD-Q4_K_XL: a T=8 verify window is ~3.3x a T=1 one (each token routes to its
         // own experts), so long drafts only pay when they're very likely.
         vec![(1, 1.0), (2, 1.35), (4, 1.9), (8, 3.3)]
+    }
+    fn enable_store(&mut self, gdn_layer: usize) -> Result<StoreMeta> {
+        super::coder::Coder::enable_store(self, gdn_layer)?;
+        Ok(self.store.unwrap())
+    }
+    fn store_heads_at(&mut self, slot: usize) -> Result<Vec<f32>> {
+        super::coder::Coder::store_heads_at(self, slot)
+    }
+    fn set_store_heads_at(&mut self, slot: usize, heads: &[f32]) -> Result<()> {
+        super::coder::Coder::set_store_heads_at(self, slot, heads)
+    }
+    fn store_op_at(&mut self, slot: usize, op: &StoreOp) -> Result<OpOut> {
+        super::coder::Coder::store_op_at(self, slot, op)
     }
 }
 
@@ -543,6 +604,9 @@ pub struct FlashServe {
     requests: usize,
     line: Line,
     drafts_mode: &'static str,
+    /// Per-session GDN memstores (`Settings::memory_layer`; `None`: off).
+    mem: Option<Sessions>,
+    store: Option<StoreMeta>,
 }
 
 /// Tool-call arguments as objects (the template wants mappings; OpenAI clients send strings).
@@ -652,6 +716,27 @@ impl FlashServe {
         let mut wrap_up = tok.encode(WRAP_UP)?;
         wrap_up.push(think.1);
         wrap_up.extend(tok.encode("\n\n")?);
+        let mut e = e;
+        let store = match s.memory_layer {
+            Some(n) => {
+                let m = e
+                    .enable_store(n)
+                    .with_context(|| format!("--memory-layer {n}"))?;
+                eprintln!(
+                    "tang-llm: GDN memstore in GDN layer {} (model layer {}), v heads {:?}{}",
+                    m.gdn_layer,
+                    m.layer,
+                    m.heads(),
+                    if s.memory_ephemeral {
+                        "; ephemeral (zeroed on eviction and session end, never on disk)"
+                    } else {
+                        ""
+                    }
+                );
+                Some(m)
+            }
+            None => None,
+        };
         let shape0 = e.save_running()?;
         let shape = shape0.parts().iter().map(|p| p.len()).collect();
         let gdn_layers = shape0.gdn_layers();
@@ -725,6 +810,8 @@ impl FlashServe {
             gdn_layers,
             requests: 0,
             line: Line::default(),
+            mem: store.map(|_| Sessions::new(s.memory_ephemeral)),
+            store,
         };
         // Capture the wide prefill graphs (64, 32, 16) now, not in the first request.
         if me.wide > 0 {
@@ -948,7 +1035,13 @@ impl FlashServe {
             return Ok(());
         }
         let t = Instant::now();
-        let state = self.e.save_running_at(slot)?;
+        let mut state = self.e.save_running_at(slot)?;
+        // A slot carrying a session's store: the saved prefix state (shared by every session,
+        // and maybe written to disk) gets the store heads zeroed.
+        let has_store = self.mem.as_ref().is_some_and(|m| m.resident(slot).is_some());
+        if has_store {
+            state.blank_store();
+        }
         let n = toks.len();
         // Only the positions past the longest saved state this one extends are copied.
         let base = (0..self.snaps.len())
@@ -964,7 +1057,7 @@ impl FlashServe {
         let tokens = toks;
         if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
             let full = self.e.save_positional_at(slot, 0, n)?;
-            self.save_disk(&tokens, &state, &full);
+            self.save_disk(&tokens, &state, &full, has_store);
         }
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
         self.snaps.push(Snap {
@@ -1070,7 +1163,10 @@ impl FlashServe {
     }
 
     /// Write a pinned state to disk (on a thread; the file appears complete or not at all).
-    fn save_disk(&self, ids: &[u32], s: &RunningState, pos: &Positional) {
+    /// With `blank_store` (the state came from a slot carrying a session's store), the store
+    /// heads are written as zeros; the file ends with the store's [`StoreMeta::trailer`] when
+    /// there is a store layer.
+    fn save_disk(&self, ids: &[u32], s: &RunningState, pos: &Positional, blank_store: bool) {
         let Some(path) = self.disk_path(ids) else {
             return;
         };
@@ -1078,25 +1174,14 @@ impl FlashServe {
             crate::retention::touch(&path);
             return;
         }
-        let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
-        bytes.extend_from_slice(b"TANGRS02");
-        bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
-        for &i in ids {
-            bytes.extend_from_slice(&i.to_le_bytes());
-        }
-        let parts = s.parts();
-        bytes.extend_from_slice(&(parts.len() as u64).to_le_bytes());
-        for p in parts {
-            bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
-            for &x in p {
-                bytes.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        bytes.extend_from_slice(&(pos.parts().len() as u64).to_le_bytes());
-        for p in pos.parts() {
-            bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(p);
-        }
+        let pos_parts: Vec<&[u8]> = pos.parts().iter().map(|p| p.as_slice()).collect();
+        let bytes = super::memserve::encode_state_file(
+            ids,
+            &s.parts(),
+            &pos_parts,
+            s.store.or(self.store),
+            blank_store,
+        );
         let budget = std::env::var("TANG_FLASH_DISK_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -1198,7 +1283,11 @@ impl FlashServe {
             }
             Ok(Snap {
                 tokens,
-                state: RunningState::from_parts(n, self.gdn_layers, parts)?,
+                state: {
+                    let mut st = RunningState::from_parts(n, self.gdn_layers, parts)?;
+                    st.store = self.store;
+                    st
+                },
                 pos: vec![Arc::new(Positional::from_parts(0, n, pos))],
                 pinned: true,
                 used: 0,
@@ -1391,6 +1480,7 @@ impl FlashServe {
             )?;
         }
         let (reused, cur) = self.prefill(&ids, &text)?;
+        self.mem_attach(0, req.cache_key.as_deref())?;
         let prefill_s = t0.elapsed().as_secs_f64();
         self.line.prompt = ids.len();
         self.line.reused = reused;
@@ -1731,7 +1821,81 @@ impl FlashServe {
     }
 }
 
+impl FlashServe {
+    /// A request of `key` runs in `slot` (its state restored or prefilled): see
+    /// [`Sessions::attach`]. Nothing happens without a store layer or session stores.
+    pub(super) fn mem_attach(&mut self, slot: usize, key: Option<&str>) -> Result<()> {
+        let Some(m) = self.mem.as_mut() else {
+            return Ok(());
+        };
+        if m.is_empty() {
+            return Ok(());
+        }
+        m.attach(&mut Host(&mut *self.e), slot, key)
+    }
+
+    /// `slot` is evicted or freed: [`Sessions::detach`].
+    pub(super) fn mem_detach(&mut self, slot: usize) -> Result<()> {
+        match self.mem.as_mut() {
+            Some(m) => m.detach(&mut Host(&mut *self.e), slot),
+            None => Ok(()),
+        }
+    }
+
+    fn memory(
+        &mut self,
+        req: crate::server::MemoryReq,
+    ) -> std::result::Result<crate::server::MemoryReply, (axum::http::StatusCode, String)> {
+        use crate::server::{MemoryReply, MemoryReq};
+        use axum::http::StatusCode;
+        let bad = |e: anyhow::Error| (StatusCode::BAD_REQUEST, format!("{e:#}"));
+        let (Some(m), Some(meta)) = (self.mem.as_mut(), self.store) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no GDN memstore: start the server with --memory-layer N".into(),
+            ));
+        };
+        let mut host = Host(&mut *self.e);
+        match req {
+            MemoryReq::Load { key, blob } => {
+                m.load(&mut host, &key, &blob).map_err(bad)?;
+                Ok(MemoryReply::Json(json!({
+                    "loaded": key,
+                    "bytes": blob.len(),
+                    "store": meta.to_json(),
+                })))
+            }
+            MemoryReq::Export { key } => match m.export(&key) {
+                Ok(b) => Ok(MemoryReply::Blob(b)),
+                Err(super::memserve::ExportError::Missing) => {
+                    Err((StatusCode::NOT_FOUND, format!("no store for {key}")))
+                }
+                Err(super::memserve::ExportError::Poisoned(h)) => Err((
+                    StatusCode::CONFLICT,
+                    format!("the store failed its audit: poisoned v heads {h:?}"),
+                )),
+            },
+            MemoryReq::Op { key, body } => {
+                let op = StoreOp::parse(&body).map_err(bad)?;
+                let out = m.op(&mut host, &key, &op).map_err(bad)?;
+                Ok(MemoryReply::Json(out.to_json()))
+            }
+            MemoryReq::End { key } => {
+                let had = m.end(&mut host, &key).map_err(bad)?;
+                Ok(MemoryReply::Json(json!({ "ended": key, "had_store": had })))
+            }
+        }
+    }
+}
+
 impl Backend for FlashServe {
+    fn memory(
+        &mut self,
+        req: crate::server::MemoryReq,
+    ) -> std::result::Result<crate::server::MemoryReply, (axum::http::StatusCode, String)> {
+        FlashServe::memory(self, req)
+    }
+
     fn model_path(&self, _spec: &str) -> Result<PathBuf> {
         Ok(self.gguf.clone())
     }
@@ -2366,6 +2530,8 @@ pub fn serve_replay(args: &[String]) -> Result<()> {
         warm_dir: None,
         batch: 0,
         profile,
+        memory_layer: None,
+        memory_ephemeral: false,
     };
     let mut me = FlashServe::load(&s)?;
     for f in &files {
