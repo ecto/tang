@@ -311,11 +311,11 @@ fn repacked_row_bytes(ty: u32, k: usize) -> usize {
     raw.next_multiple_of(16)
 }
 
-/// `TANG_GLM5_MOE_REPACK` (default on; `0` keeps the GGUF layout): repack the FFN's Q8_0 / Q6_K
+/// `TANG_GLM5_MOE_REPACK` (default off: the B300 A/B was 35.02 off vs 33.51 on; `1` opts in): repack the FFN's Q8_0 / Q6_K
 /// weights at upload.
 fn repack_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TANG_GLM5_MOE_REPACK").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("TANG_GLM5_MOE_REPACK").map_or(false, |v| v == "1"))
 }
 
 /// [`upload`] for the MoE / dense FFN weights: Q8_0 (k % 32 == 0) and Q6_K (k % 256 == 0) are

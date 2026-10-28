@@ -4,6 +4,32 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (integration round 2) — k5d_tail + FFN repack merged: B300 35.02 tok/s decode with repack off, now the default (branch claude/glm5-integrate2)
+
+Merged onto frog/glm5-forward 38bb2bed: claude/glm5-kda-kernels 1073e571 (k5d_tail, `TANG_GLM5_KDA_TAIL`
+default on) and claude/glm5-ffn-repack 3b96bac7 (Q8_0/Q6_K repack at upload, g5f_route,
+`TANG_GLM5_MOE_REPACK` default on). Only conflict: this file (both entries kept). CPU flash::glm5 40/40;
+mew 3090 CUDA flash::glm5 78/78 (engine_gpu_trace_is_transparent flaked in the parallel run, passed alone).
+
+B300 (all 45 FFN layers resident), scripts/glm5-bench.sh, 128-token decode on the 238-token prompt,
+ids = oracle `785 1196 6801 264 6386 38038 911 279` on every run. Base flags B = MOE=fast GEMV8=1
+KDA_PF2=1 MHC_FUSED=1 MLA_RESIDENT=1 GPU_HEAD=1 KDA_G5F=2 KDA_FUSED=1 KDA_GRAPH=1. Stage ms per token (wall):
+
+| run              | decode tok/s | kda  | dsa  | mhc  | ffn  | head |
+|------------------|-------------:|-----:|-----:|-----:|-----:|-----:|
+| B (round 1)      | 30.85        |      |      |      |      |      |
+| B                | 33.51        | 4.28 | 6.85 | 9.34 | 6.41 | 0.61 |
+| B + KDA_TAIL=0   | 33.01        | 6.80 | 6.60 | 8.25 | 5.92 | 0.51 |
+| B + MOE_REPACK=0 | 35.02        | 3.95 | 6.67 | 8.43 | 6.65 | 0.52 |
+| B (repeat)       | 33.51        | 4.29 | 6.84 | 9.40 | 6.40 | 0.57 |
+
+Tail: kda stage 6.80 → 4.28 ms/token, as the H200 bench predicted. Repack: the ffn stage itself is
+0.24 ms faster with it on, but the repack-on runs are slower overall (mhc_pre and dsa wall up ~1 ms,
+sync-copy 7.3 vs 5.6 ms). The B300 was shared with another agent's runs; the two B runs agree to
+0.01 tok/s, the A/Bs were single runs. Repack-off is the faster whole run (35.02 vs 33.51 x2), so `TANG_GLM5_MOE_REPACK`
+now defaults OFF; `=1` opts in (H200, where it measured 112 → 92 µs/routed layer). Why it loses on the
+B300 is unexplained. MoE shadow on the B300 (B, repack on, TANG_GLM5_MOE_DEBUG=1, -n 8): 360 calls checked, 0 failed, 0 routing, worst rel 9.7e-5, ids = oracle.
+
 ## 2026-10-27 (night) — k5d_tail: beta + gate2 + step + o_proj q8 in one launch, fused G5F step 175 → 87 µs/layer (H200, branch claude/glm5-kda-kernels)
 
 The fused G5F=2 step had seven launches. Four of them were never tuned: k5_beta, k5d_gate2, k5d_step
