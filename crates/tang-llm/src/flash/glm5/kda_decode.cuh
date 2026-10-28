@@ -185,10 +185,15 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     __shared__ __align__(16) unsigned char wb[K5D_HIDMAX / 32 * 34 + 16];
     __shared__ float g1s[KDA_D], g2s[KDA_D], q[KDA_D], k[KDA_D], eg[KDA_D], os[KDA_D];
     __shared__ float bs;
-    int df, dg, db;
+    __shared__ double sq[KDA_D];
+    // x for beta, staged with the weights (dynamic: HID * 4 + 16 B, the host sets the
+    // attribute) — warp 0's 16 serial L2 round trips for x were ~4 us of the critical path
+    extern __shared__ __align__(16) unsigned char xs[];
+    int df, dg, db, dx;
     k5d_stage(wf, (const unsigned char*)(fb.base + (unsigned long long)h * D * fb.row_bytes), D * K5D_RB, x, D, &df);
     k5d_stage(wg, (const unsigned char*)(gb.base + (unsigned long long)h * D * gb.row_bytes), D * K5D_RB, x, D, &dg);
     k5d_stage(wb, (const unsigned char*)(bp.base + (unsigned long long)h * bp.row_bytes), HID / 32 * 34, x, D, &db);
+    k5d_stage(xs, (const unsigned char*)X, HID * 4, x, D, &dx);
     g1s[x] = G1[x]; // f_a / g_a outputs are hd wide, shared by every head
     g2s[x] = G2A[x];
     // the state column this thread owns, read once (independent loads, all in flight)
@@ -260,8 +265,8 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
         for (int e0 = lane * 8; e0 < (int)HID; e0 += 256) {
             const unsigned char* bb = row + (e0 / 32) * 34;
             const float dw = g5_h2f(g5_u16(bb));
-            const float4 x0 = __ldg((const float4*)(X + e0)), x1 = __ldg((const float4*)(X + e0 + 4));
-            const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            const float* xp = (const float*)(xs + dx) + e0;
+            const float xv[8] = {xp[0], xp[1], xp[2], xp[3], xp[4], xp[5], xp[6], xp[7]};
 #pragma unroll
             for (int qq = 0; qq < 8; qq++) a = fmaf(dw * (float)(signed char)bb[2 + (e0 + qq) % 32], xv[qq], a);
         }
@@ -292,12 +297,17 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     }
     O[h * D + x] = o;
     os[x] = o;
+    // (double)o * (double)o is exact (24-bit mantissas), so ss + v*v rounds once either
+    // way: the squares are formed in parallel and thread 0 runs only the DADD chain
+    sq[x] = (double)o * (double)o;
     __syncthreads();
     // the f64 norm once per head (thread 0) and broadcast: every thread used to run the
-    // same 128-long f64 chain, and FP64 is scarce on the B300 (same expression: bit-equal)
+    // same 128-long f64 chain, and FP64 is scarce on the B300 (~65 cycles a dependent
+    // DADD): same sums in the same order, bit-equal
     if (x == 0) {
         double ss = 0.0;
-        for (unsigned int d = 0; d < D; d++) { double v = (double)os[d]; ss += v * v; }
+#pragma unroll
+        for (unsigned int d = 0; d < KDA_D; d++) ss += sq[d];
         g1s[0] = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
     }
     __syncthreads();

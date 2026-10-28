@@ -110,7 +110,14 @@ impl Fast {
         );
         let m = g.module(&src).map_err(|e| anyhow::anyhow!("kda_decode nvrtc: {e}"))?;
         let f = |n: &str| m.func(n).map_err(|e| anyhow::anyhow!("kda_decode {n}: {e}"));
-        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail: f("k5d_tail")?, graph: None, _m: m })
+        let tail = f("k5d_tail")?;
+        // k5d_tail stages x (HID * 4 + 16 B, HID <= K5D_HIDMAX = 4096) in dynamic shared
+        // memory on top of ~43 KB static: past the 48 KB default
+        let r = unsafe {
+            sys::cuFuncSetAttribute(tail, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
+        };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tail smem attribute: {r:?}");
+        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, graph: None, _m: m })
     }
 }
 
@@ -1009,7 +1016,7 @@ impl DevLayer {
                 fast.tail,
                 (self.nh as u32, 1, 1),
                 (self.hd as u32, 1, 1),
-                0,
+                (self.hidden * 4 + 16) as u32,
                 s,
                 args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
                     self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, h0, self.core.wconv.ptr, st,
