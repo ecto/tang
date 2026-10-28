@@ -196,6 +196,11 @@ steps, 156–157/220–225), sampled T=1.0 top-p 1.0 (DeepSeek's recommendation)
 152/240), direct path greedy 101.6; prefill 460–475 tok/s. Full GPU suite green on mew (19
 engine/EP/forward + 17 kernel tests).
 
+Wave 7b merged (+ attn3 split-K tensor-core attention and unrolled Sinkhorn, 3c44a203), 1017
+weights, 8× H100, 200 tokens: greedy **147.0 / 147.0** tok/s (46 steps, 158/225), sampled T=0.6
+141.3 / **152.7** (43–45 steps, 157–158/210–220), sampled T=1.0 145.8, direct greedy 109.6,
+prefill 460–470.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
