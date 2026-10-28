@@ -4,6 +4,68 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (integration round 3) — resident step merged; the step graph is now the default: B300 56.7 tok/s (branch frog/glm5-forward)
+
+Fast-forwarded frog/glm5-forward 9c49294d -> claude/glm5-resident 5c024107 (clean ff). Then:
+- 4825819d `glm5-bench.sh`: `GLM5_ROOT` (a private remote dir, default /root/tang-bench); the
+  launcher also holds /root/gpu.lock around the remote half.
+- 339ae535 `TANG_GLM5_STEP_GRAPH` default ON; `=0` runs the resident step eagerly.
+  `engine_gpu_resident_step_matches_host` now sets `=0` for its eager leg.
+
+Tests:
+- local CPU `flash::glm5`: 40 passed.
+- mew CUDA `flash::glm5`, parallel: 76 passed / 3 failed / 2 ignored, both with and without
+  `STEP_GRAPH=1`. The 3 (`engine_gpu_trace_is_transparent`, `engine_gpu_slots_batch_matches_single`,
+  `engine_gpu_resident_step_matches_host`) each pass alone. They race on process-global env
+  (`set_var` of `TANG_GLM5_STEP_GRAPH` / `TANG_GLM5_MOE` / `TANG_GLM5_RESIDENT` in sibling tests):
+  e.g. "step graph segments left 0 right 2", "naive: MoE kernel path left true right false".
+- mew CUDA `flash::glm5 -- --test-threads=1`: 79 passed / 0 failed / 2 ignored, before and after
+  the default flip.
+
+B300, tree 4825819d, `scripts/glm5-bench.sh` (`GLM5_ROOT=/root/tang-integrate3`), flags B
+(`MOE=fast GEMV8=1 KDA_PF2=1 MHC_FUSED=1 MLA_RESIDENT=1 GPU_HEAD=1 KDA_G5F=2 KDA_FUSED=1
+KDA_GRAPH=1`), bench prompt (238 tok), `-n 128 --temp 0`, `TANG_GLM5_TRACE=1`:
+
+| run | decode tok/s | wall/token | launches | H2D# | D2H# | syncs |
+|---|---|---|---|---|---|---|
+| (a) B (resident, eager) | 47.39 | 19.1 ms | 563 | 1 | 1 | 1 |
+| (b) B + `STEP_GRAPH=1` | **56.72** | 17.1 ms | 164 | 1 | 1 | 1 |
+| (c) B + `RESIDENT=0` | 35.05 | 26.4 ms | 561 | 182 | 226 | 216 |
+| (d) B + `STEP_GRAPH=1` (repeat) | 56.67 | 17.1 ms | 164 | 1 | 1 | 1 |
+| (e) B on 339ae535 (graph default) | 56.66 | 17.1 ms | 164 | 1 | 1 | 1 |
+
+Stages, wall ms/token (top-level trace rows; mhc_post = both `mhc_post.*` rows):
+
+| run | kda | dsa | dsa/o_proj | mhc_pre.attn | mhc_pre.ffn | mhc_post | ffn | head |
+|---|---|---|---|---|---|---|---|---|
+| (a) | 0.12 | 0.69 | 0.09 | 0.40 | 0.40 | 0.00 | 0.94 | 16.14 |
+| (b) | 0.03 | 0.61 | 0.08 | 0.00 | 0.00 | 0.00 | 0.01 | 15.91 |
+| (c) | 4.15 | 6.82 | 5.22 | 3.84 | 3.88 | 0.58 | 6.53 | 0.51 |
+| (d) | 0.03 | 1.01 | 0.14 | 0.01 | 0.01 | 0.00 | 0.01 | 15.49 |
+
+On the resident paths the stage rows are host enqueue time; the GPU time lands in `head`'s
+single sync (16.1 ms in (a), 15.9 in (b)). Only (c) is a per-stage cost breakdown. The trace's GPU-ms
+column is not usable here (as in the resident entry).
+
+Gates:
+- haiku `-n 8 --temp 0`: `785 1196 6801 264 6386 38038 911 279` for a, b, c, d, e.
+- `-n 128` id streams: md5 04e96df4 for a, b, c, d, e.
+- `-n 512` on the bench prompt, untraced: (a) 56.14 tok/s, (b) 57.43 tok/s, 512 ids each, md5
+  2ddf0aab for both. The step graph holds across the dense->sparse DSA switch on real weights.
+- MoE shadow, B + `STEP_GRAPH=1 MOE_DEBUG=1 -n 8`: 360 calls checked, 0 failed (0 routing), worst
+  rel 9.7e-5 (tol 2e-2), ids = the oracle. BUT `resident_ready` returns false whenever
+  `moe_dbg` is set, so this run took the host-staged path. It checks the MoE kernels, not
+  the step graph. The step graph's evidence is the id equality above.
+
+Decision: (b)/(d) agree within 0.1%, ids match (a) at -n 8 / 128 / 512, and the shadow passes.
+The step graph is now ON by default; `TANG_GLM5_STEP_GRAPH=0` opts out. Run (e) confirms the
+default takes the graph (164 launches).
+
+Not verified:
+- A shadow of the step graph itself (the MoE shadow forces the host path).
+- Multi-slot. Resident (and so the graph) is still gated to n_slots == 1.
+- The parallel env races in the test suite are not fixed.
+
 ## 2026-10-28 — device-resident decode step: B300 35.8 -> 47.7 tok/s, step graph 56.2 (branch claude/glm5-resident)
 
 The residual stream stays on the device for the whole decode token. Code: `glm5/resident.rs`, a
