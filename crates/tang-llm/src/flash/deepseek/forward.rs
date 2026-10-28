@@ -1419,12 +1419,20 @@ pub trait SpecPick {
     fn as_sampler(&mut self) -> Option<&mut SpecSampler> {
         None
     }
+    /// Whether [`Self::draft`] is the argmax (and consumes no state), so the engine may draw
+    /// drafts on the device.
+    fn greedy_draft(&self) -> bool {
+        false
+    }
 }
 
 /// Temperature 0: argmax drafts, a draft is kept iff it is the target's argmax.
 pub struct Greedy;
 
 impl SpecPick for Greedy {
+    fn greedy_draft(&self) -> bool {
+        true
+    }
     fn draft(&mut self, q: &[f32]) -> usize {
         argmax(q)
     }
@@ -1528,6 +1536,9 @@ impl SpecSampler {
 }
 
 impl SpecPick for SpecSampler {
+    fn greedy_draft(&self) -> bool {
+        self.greedy()
+    }
     fn as_sampler(&mut self) -> Option<&mut SpecSampler> {
         Some(self)
     }

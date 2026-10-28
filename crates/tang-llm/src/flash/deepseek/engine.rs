@@ -28,7 +28,7 @@
 //! `force` or `DS_TAP`; they run the same code directly. An NCCL `moe_reduce` only enqueues
 //! (`reduce_graphable`), so it is captured as a graph node with the step.
 
-use super::forward::{argmax, Model, SpecPick, SpecStep};
+use super::forward::{Model, SpecPick, SpecStep};
 use super::gpu::{blocks, DevW, DsW, Kernels};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
@@ -178,6 +178,8 @@ pub struct GpuModel {
     journal_steps: usize,
     journal: Vec<(usize, usize, Buf, Buf)>,
     snap: Option<(Vec<DevBuf>, HashMap<usize, (DevBuf, DevBuf)>)>,
+    /// DSpark's Markov embedding table [V][rank] f32, for the device-side greedy draft.
+    spark_tab: Option<DevBuf>,
     /// Expert parallelism ([`super::ep`]): the routed experts this rank runs. Others are
     /// skipped in `moe` and never uploaded. All of them when unsharded.
     pub owns_expert: Box<dyn Fn(usize) -> bool>,
@@ -321,6 +323,7 @@ impl GpuModel {
             journal_steps: 0,
             journal: Vec::new(),
             snap: None,
+            spark_tab: None,
             owns_expert: Box::new(|_| true),
             moe_reduce: None,
             moe_grouped: std::env::var("DS_MOE_LOOP").map_or(true, |v| v != "1"),
@@ -2193,14 +2196,14 @@ impl GpuModel {
         self.attn_out(p, q, (all, win + bl, 0), idx, bl, nk, lid, at(pos0))
     }
 
-    /// As [`Model::forward_spec`]: greedy drafts.
+    /// As [`Model::forward_spec`]: greedy drafts, drawn on the device.
     pub fn forward_spec(
         &mut self,
         token: usize,
         main_hidden: &[f32],
         sp: usize,
     ) -> Result<Option<super::forward::Draft>> {
-        self.forward_spec_with(token, main_hidden, sp, &mut argmax)
+        self.spark(token, main_hidden, sp, None)
     }
 
     /// As [`Model::forward_spec_with`]: each draft is `draw(logits)` (Markov bias included).
@@ -2211,6 +2214,20 @@ impl GpuModel {
         main_hidden: &[f32],
         sp: usize,
         draw: &mut dyn FnMut(&[f32]) -> usize,
+    ) -> Result<Option<super::forward::Draft>> {
+        self.spark(token, main_hidden, sp, Some(draw))
+    }
+
+    /// The DSpark draft. With `draw` the Markov head samples on the host, one row read back
+    /// per position; without, greedily on the device (`ds_spark_pick`: argmax, then the next
+    /// position's Markov embedding row) and the drafts, logits and hiddens come back in one
+    /// read at the end.
+    fn spark(
+        &mut self,
+        token: usize,
+        main_hidden: &[f32],
+        sp: usize,
+        draw: Option<&mut dyn FnMut(&[f32]) -> usize>,
     ) -> Result<Option<super::forward::Draft>> {
         let c = self.cpu.cfg.clone();
         let (hc, d, blk, n_mtp, v) = (
@@ -2247,42 +2264,110 @@ impl GpuModel {
             return Ok(None);
         }
         let last = format!("mtp.{}", n_mtp - 1);
-        let x = self.hc_pre(h, pre_mix, blk)?;
-        let xh = self.read(x, blk * d)?;
-        self.rms(x, blk, &format!("{last}.norm.weight"))?;
-        let dlogits = self.raw(x.ptr, blk, "head.weight")?;
-        // the Markov head samples left to right: each position's bias (its predecessor's
-        // Markov embedding through the head, a rank x V GEMV) on the device, the row read back
-        // for the draw; the confidence head (a dot product) on the host
         let rank = c.dspark_markov_rank;
         let memb_w = self.cpu.w(&format!("{last}.markov_head.embed.weight"))?;
         let mhead = format!("{last}.markov_head.head.weight");
         let proj = self.cpu.w(&format!("{last}.confidence_head.proj.weight"))?;
+        let x = self.hc_pre(h, pre_mix, blk)?;
+        // greedy: [logits blk*V | hiddens blk*D | drafts blk+1], read back once
+        let pack = match draw {
+            Some(_) => None,
+            None => Some(self.fbuf(blk * v + blk * d + blk + 1)?),
+        };
+        let xh = match pack {
+            Some(pk) => {
+                self.copy(pk.ptr + (blk * v * 4) as u64, x.ptr, blk * d)?;
+                Vec::new()
+            }
+            None => self.read(x, blk * d)?,
+        };
+        self.rms(x, blk, &format!("{last}.norm.weight"))?;
+        let dlogits = self.raw(x.ptr, blk, "head.weight")?;
+        let add = |me: &Self, row: Buf, bias: Buf| -> Result<()> {
+            let vn = v as i64;
+            unsafe {
+                me.k.go(
+                    "ds_add",
+                    blocks(v, 256),
+                    B256,
+                    0,
+                    &me.s,
+                    args![row.ptr, bias.ptr, vn],
+                )
+            }
+        };
+        let conf_of = |xh: &[f32], out: &[usize]| -> Vec<f32> {
+            (0..blk)
+                .map(|i| {
+                    let memb = &memb_w.data[out[i] * rank..(out[i] + 1) * rank];
+                    let feat: Vec<f32> =
+                        xh[i * d..(i + 1) * d].iter().chain(memb).copied().collect();
+                    super::forward::matmul(&feat, 1, &proj)[0]
+                })
+                .collect()
+        };
+        let Some(draw) = draw else {
+            let pk = pack.unwrap();
+            if self.spark_tab.is_none() {
+                self.spark_tab = Some(DevBuf::from_slice(&memb_w.data)?);
+            }
+            let tab = b(self.spark_tab.as_ref().unwrap()).ptr;
+            let idp = pk.ptr + ((blk * v + blk * d) * 4) as u64;
+            let memb = self.fbuf(rank)?;
+            let (vi, ri) = (v as i32, rank as i32);
+            let pick = |me: &Self, row: u64, slot: i32| -> Result<()> {
+                unsafe {
+                    me.k.go(
+                        "ds_spark_pick",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &me.s,
+                        args![row, vi, idp, slot, tab, ri, memb.ptr],
+                    )
+                }
+            };
+            self.fill(idp, token as i32, 1)?;
+            pick(self, 0, 0)?;
+            for i in 0..blk {
+                let bias = self.raw(memb.ptr, 1, &mhead)?;
+                let row = dlogits.at(i * v * 4);
+                add(self, row, bias)?;
+                pick(self, row.ptr, i as i32 + 1)?;
+            }
+            self.copy(pk.ptr, dlogits.ptr, blk * v)?;
+            let all = self.read(pk, blk * v + blk * d + blk + 1)?;
+            let out: Vec<usize> = all[blk * v + blk * d..]
+                .iter()
+                .map(|f| f.to_bits() as i32 as usize)
+                .collect();
+            let conf = conf_of(&all[blk * v..blk * v + blk * d], &out);
+            let mut logits = all;
+            logits.truncate(blk * v);
+            self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
+            self.obs.finish();
+            return Ok(Some(super::forward::Draft {
+                ids: out,
+                logits,
+                conf,
+            }));
+        };
+        // the Markov head samples left to right: each position's bias (its predecessor's
+        // Markov embedding through the head, a rank x V GEMV) on the device, the row read back
+        // for the draw; the confidence head (a dot product) on the host
         let mut logits = vec![0f32; blk * v];
         let mut out = vec![token];
-        let mut conf = Vec::with_capacity(blk);
         for i in 0..blk {
             let memb = &memb_w.data[out[i] * rank..(out[i] + 1) * rank];
             let mx = self.up(memb)?;
             let bias = self.raw(mx.ptr, 1, &mhead)?;
             let row = dlogits.at(i * v * 4);
-            let vn = v as i64;
-            unsafe {
-                self.k.go(
-                    "ds_add",
-                    blocks(v, 256),
-                    B256,
-                    0,
-                    &self.s,
-                    args![row.ptr, bias.ptr, vn],
-                )?
-            };
+            add(self, row, bias)?;
             let li = &mut logits[i * v..(i + 1) * v];
             li.copy_from_slice(&self.read(row, v)?);
             out.push(draw(li));
-            let feat: Vec<f32> = xh[i * d..(i + 1) * d].iter().chain(memb).copied().collect();
-            conf.push(super::forward::matmul(&feat, 1, &proj)[0]);
         }
+        let conf = conf_of(&xh, &out);
         self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
         self.obs.finish();
         Ok(Some(super::forward::Draft {
@@ -2375,9 +2460,12 @@ impl GpuModel {
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
         let (start, t0) = (std::time::SystemTime::now(), std::time::Instant::now());
-        let draft = self
-            .forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q))?
-            .context("decode_spec needs sp > 0")?;
+        let draft = if pick.greedy_draft() {
+            self.spark(token, main, sp, None)?
+        } else {
+            self.spark(token, main, sp, Some(&mut |q: &[f32]| pick.draft(q)))?
+        }
+        .context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
         edit(pos0 + 1, &mut ids[1..]);
         let t1 = std::time::Instant::now();
