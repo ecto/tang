@@ -357,52 +357,61 @@ __device__ __forceinline__ void g5f_decode8i(const unsigned char* row, int e0, i
 // unroll of the 8-weight row loop in g5f_gux / g5f_dot_anyn (Q8_0 shared expert / dense rows):
 // same order, more loads in flight. g5f_gemv keeps 1 (unrolling it was slower there).
 #ifndef G5F_LDU
-#define G5F_LDU 1
+#define G5F_LDU 0
 #endif
-template <int TY, int U = 1>
+// one 8-weight step of g5f_lane_dot (weights e0..e0+8) into acc
+template <int TY>
+__device__ __forceinline__ void g5f_lane_step(const unsigned char* w, const unsigned char* xq, const unsigned char* xq2,
+                                             const float* xd, const float* xf, int e0, float& acc) {
+    if (TY == 0 || TY == 1) {
+        float v[8];
+        if (TY == 0) {
+            const float4 a = *(const float4*)(w + 4 * e0), b = *(const float4*)(w + 4 * e0 + 16);
+            v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+        } else {
+            const unsigned long long q0 = g5f_rd64(w + 2 * e0), q1 = g5f_rd64(w + 2 * e0 + 8);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                v[i] = g5f_h2f((unsigned short)(q0 >> (16 * i)));
+                v[4 + i] = g5f_h2f((unsigned short)(q1 >> (16 * i)));
+            }
+        }
+        const float4 a = *(const float4*)(xf + e0), c = *(const float4*)(xf + e0 + 4);
+        acc = fmaf(v[0], a.x, acc); acc = fmaf(v[1], a.y, acc); acc = fmaf(v[2], a.z, acc); acc = fmaf(v[3], a.w, acc);
+        acc = fmaf(v[4], c.x, acc); acc = fmaf(v[5], c.y, acc); acc = fmaf(v[6], c.z, acc); acc = fmaf(v[7], c.w, acc);
+    } else {
+        int w0, w1;
+        float dw, mw;
+        g5f_decode8i<TY>(w, e0, w0, w1, dw, mw);
+        const uint2 xv = *(const uint2*)(xq + e0);
+        const float dx = xd[e0 / 32];
+        float sf = g5f_i2f(__dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0)));
+        uint2 xv2 = make_uint2(0u, 0u);
+        if (xq2) {
+            xv2 = *(const uint2*)(xq2 + e0);
+            sf = fmaf(g5f_i2f(__dp4a(w0, (int)xv2.x, __dp4a(w1, (int)xv2.y, 0))), 1.0f / 254.0f, sf);
+        }
+        if (TY == 12 || TY == 13) {
+            float sx = g5f_i2f(__dp4a(0x01010101, (int)xv.x, __dp4a(0x01010101, (int)xv.y, 0)));
+            if (xq2)
+                sx = fmaf(g5f_i2f(__dp4a(0x01010101, (int)xv2.x, __dp4a(0x01010101, (int)xv2.y, 0))), 1.0f / 254.0f, sx);
+            acc = fmaf(dx, fmaf(dw, sf, -mw * sx), acc);
+        } else {
+            acc = fmaf(dx * dw, sf, acc);
+        }
+    }
+}
+// U = 0: the compiler's own unrolling (g5f_gemv; the pre-G5F_LDU code); U > 0: #pragma unroll U
+template <int TY, int U = 0>
 __device__ __forceinline__ float g5f_lane_dot(const unsigned char* w, const unsigned char* xq, const unsigned char* xq2,
                                              const float* xd, const float* xf, int k) {
     const int lane = threadIdx.x & 31;
     float acc = 0.f;
-    #pragma unroll U
-    for (int e0 = lane * 8; e0 < k; e0 += 256) {
-        if (TY == 0 || TY == 1) {
-            float v[8];
-            if (TY == 0) {
-                const float4 a = *(const float4*)(w + 4 * e0), b = *(const float4*)(w + 4 * e0 + 16);
-                v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
-            } else {
-                const unsigned long long q0 = g5f_rd64(w + 2 * e0), q1 = g5f_rd64(w + 2 * e0 + 8);
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    v[i] = g5f_h2f((unsigned short)(q0 >> (16 * i)));
-                    v[4 + i] = g5f_h2f((unsigned short)(q1 >> (16 * i)));
-                }
-            }
-            const float4 a = *(const float4*)(xf + e0), c = *(const float4*)(xf + e0 + 4);
-            acc = fmaf(v[0], a.x, acc); acc = fmaf(v[1], a.y, acc); acc = fmaf(v[2], a.z, acc); acc = fmaf(v[3], a.w, acc);
-            acc = fmaf(v[4], c.x, acc); acc = fmaf(v[5], c.y, acc); acc = fmaf(v[6], c.z, acc); acc = fmaf(v[7], c.w, acc);
-        } else {
-            int w0, w1;
-            float dw, mw;
-            g5f_decode8i<TY>(w, e0, w0, w1, dw, mw);
-            const uint2 xv = *(const uint2*)(xq + e0);
-            const float dx = xd[e0 / 32];
-            float sf = g5f_i2f(__dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0)));
-            uint2 xv2 = make_uint2(0u, 0u);
-            if (xq2) {
-                xv2 = *(const uint2*)(xq2 + e0);
-                sf = fmaf(g5f_i2f(__dp4a(w0, (int)xv2.x, __dp4a(w1, (int)xv2.y, 0))), 1.0f / 254.0f, sf);
-            }
-            if (TY == 12 || TY == 13) {
-                float sx = g5f_i2f(__dp4a(0x01010101, (int)xv.x, __dp4a(0x01010101, (int)xv.y, 0)));
-                if (xq2)
-                    sx = fmaf(g5f_i2f(__dp4a(0x01010101, (int)xv2.x, __dp4a(0x01010101, (int)xv2.y, 0))), 1.0f / 254.0f, sx);
-                acc = fmaf(dx, fmaf(dw, sf, -mw * sx), acc);
-            } else {
-                acc = fmaf(dx * dw, sf, acc);
-            }
-        }
+    if (U == 0) {
+        for (int e0 = lane * 8; e0 < k; e0 += 256) g5f_lane_step<TY>(w, xq, xq2, xd, xf, e0, acc);
+    } else {
+        #pragma unroll (U > 0 ? U : 1)
+        for (int e0 = lane * 8; e0 < k; e0 += 256) g5f_lane_step<TY>(w, xq, xq2, xd, xf, e0, acc);
     }
     return acc;
 }
@@ -551,7 +560,7 @@ __device__ __forceinline__ float g5f_lane_dot32(const unsigned char* w, const un
     return g5f_lane_dot32x<TY>(w, 0, xq, xq2, xd, k).x;
 }
 
-template <int U = 1>
+template <int U = 0>
 __device__ __forceinline__ float g5f_dot_any(unsigned ty, const unsigned char* w, const unsigned char* xq,
                                             const unsigned char* xq2, const float* xd, const float* xf, int k) {
     switch (ty) {

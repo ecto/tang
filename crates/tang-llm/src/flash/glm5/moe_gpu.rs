@@ -168,7 +168,7 @@ impl Kernels {
         // TANG_GLM5_MOE_SEL2=0: the previous top-k select (smem scan, per-round global stores)
         let sel2 = i32::from(env_on("TANG_GLM5_MOE_SEL2", true));
         // TANG_GLM5_MOE_LDU: unroll of the 8-weight row loop (Q8_0 shared / dense rows; same order)
-        let ldu = rows("TANG_GLM5_MOE_LDU", 4).clamp(1, 16);
+        let ldu = rows("TANG_GLM5_MOE_LDU", 4).min(16);
         let src = format!(
             "#define G5F_GUX_R {}\n#define G5F_SEL2 {sel2}\n#define G5F_LDU {ldu}\n#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
             gux.max(1),
