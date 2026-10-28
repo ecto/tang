@@ -4,6 +4,22 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — KDA resident upload 462 s -> 17 s: NVRTC ran 3x per layer (branch claude/glm5-kda-load)
+
+What was wrong: `kda_dev::DevLayer::new_gguf` builds three CUDA modules per KDA layer
+(`kda_cuda::cuda::load`, `Kernels5::new`, `kda_decode::Fast::new`), and `tang_moe::gpu::Gpu::module`
+NVRTC-compiled the source every time — on B300 twice per module, since the CUDA 12.8 NVRTC
+rejects sm_103 and retries at sm_90. 34 layers x 3 compiles of identical sources = the ~13.5 s/layer.
+The weight uploads themselves were never the cost.
+
+Fix: `Gpu::module` memoises the PTX text per (arch, source) in a process-global map; every
+later load is just `cuModuleLoadData` of the same bytes. No kernel or numeric change.
+
+Evidence/verification (B300, B flag set, `scripts/glm5-bench.sh`, GLM5_ROOT=/root/tang-kda-load):
+before "8 KDA layers resident (104 s) … 34 … (462 s)", open 504 s; after "8 KDA layers resident
+(13 s)", "34 KDA layers resident on the GPU(s) (17 s)", "open 50.3 s". Gate ids OK, decode
+58.25 tok/s (baseline 58.28), ids md5 7174cdd6 (unchanged). mew (3090): flash::glm5 83 passed / 0 failed.
+
 ## 2026-10-28 (integration round 4) — merged on B300: whole-step graph default, 58.5 tok/s; MTP host draft is 6 s/pass (branch frog/glm5-forward)
 
 Pod: fresh B300 SXM6 (US-WA-2, 275 GB, CUDA 12.8 image, container disk). `scripts/glm5-bench.sh`

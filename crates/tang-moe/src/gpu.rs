@@ -109,6 +109,17 @@ impl Gpu {
         // (the whole point of an explicit arch — tang-compute's flash.rs compiles its
         // dp4a kernels at sm_86 for the same reason). PTX JITs to the actual device at
         // cuModuleLoadData.
+        // NVRTC is the expensive part of a load (seconds per big source, twice on an
+        // arch the wheel doesn't know). Per-layer owners (GLM-5's 34 resident KDA layers
+        // each build three modules) compile identical sources, so memoise the PTX text by
+        // (arch, source): the bytes handed to cuModuleLoadData are unchanged.
+        static PTX: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String), String>>> =
+            std::sync::OnceLock::new();
+        let cache = PTX.get_or_init(Default::default);
+        let key = (arch.to_string(), src.to_string());
+        if let Some(p) = cache.lock().unwrap().get(&key).cloned() {
+            return self.load_ptx(&p);
+        }
         let ptx = match cudarc::nvrtc::compile_ptx_with_opts(src, opts.clone()) {
             Ok(p) => p,
             Err(e) if format!("{e:?}").contains("INVALID_OPTION") || format!("{e:?}").contains("invalid value") => {
@@ -118,7 +129,13 @@ impl Gpu {
             }
             Err(e) => return Err(Error(format!("nvrtc: {e:?}"))),
         };
-        let src = CString::new(ptx.to_src()).unwrap();
+        let ptx = ptx.to_src();
+        cache.lock().unwrap().insert(key, ptx.clone());
+        self.load_ptx(&ptx)
+    }
+
+    fn load_ptx(&self, ptx: &str) -> Result<Module> {
+        let src = CString::new(ptx).unwrap();
         let mut m: sys::CUmodule = std::ptr::null_mut();
         ck!(sys::cuModuleLoadData(&mut m, src.as_ptr() as *const c_void))?;
         Ok(Module(m))
