@@ -222,10 +222,10 @@ impl DevLayer {
                 // xq8 still holds the previous step's o_proj codes (yb, d_inner wide), a
                 // stale read that diverged every output on the first real-weights rerun
                 if g8f {
-                    self.gemv8_launch(&self.fa, codes, hidden, self.g1b.ptr, hd, hd, 1)?;
+                    self.gemv8_launch_on(s, &self.fa, codes, hidden, self.g1b.ptr, hd, hd, 1)?;
                 }
                 if g8ga {
-                    self.gemv8_launch(&self.ga, codes, hidden, self.g2a.ptr, hd, hd, 1)?;
+                    self.gemv8_launch_on(s, &self.ga, codes, hidden, self.g2a.ptr, hd, hd, 1)?;
                 }
                 3 * di
             } else {
@@ -315,6 +315,14 @@ impl DevLayer {
     /// The decode input buffer (`[hidden]` f32): the resident step's mHC pre writes here.
     pub fn x_ptr(&self) -> u64 {
         self.xb.ptr
+    }
+
+    /// [`Self::decode_dev`]'s kernels enqueued directly on `s` (no graph launch): the
+    /// whole-step graph capture records them as its own nodes.
+    pub fn decode_enqueue(&self, s: &Stream) -> Result<()> {
+        ensure!(self.resident_ok(), "kda decode_enqueue: fused kernels off, naive mode, or a probe");
+        let g8 = |w: &super::super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
+        self.enqueue_decode(s, g8(&self.wq) && g8(&self.wk) && g8(&self.wv), None)
     }
 
     /// The decode output buffer (`[hidden]` f32), valid after [`Self::decode_dev`].

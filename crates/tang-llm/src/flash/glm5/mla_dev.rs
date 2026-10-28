@@ -271,6 +271,11 @@ impl MlaProj {
         Ok(self.scratch(t)?.x.ptr)
     }
 
+    /// The device output buffer of a `t`-row [`Self::window_dev`].
+    pub fn y_ptr(&self, t: usize) -> Result<u64> {
+        Ok(self.scratch(t)?.y.ptr)
+    }
+
     /// [`Self::window`] on the device-resident step: x is already in [`Self::x_ptr`]
     /// (written on `s`), every launch is async on `s`, the selection (sparse) stays on the
     /// device, and the host mirrors are NOT refreshed (only resized: the caller marks them

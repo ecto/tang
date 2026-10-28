@@ -634,6 +634,7 @@ impl GpuFfn {
     /// re-uploaded per window) but its `begin` holds a pointer set sized to one window,
     /// not per slot — it re-enables through `enable_mhc_fused` if the caller wants it.
     fn resize_slots(&mut self, slots: usize, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
+        self.resident = None; // its step graph points at the KDA layers rebuilt below
         use tang_moe::gpu::Gpu;
         let kda_cfg = KdaConfig {
             heads: hp.n_head,
@@ -1432,6 +1433,8 @@ impl Glm5Engine {
         ensure!(!ids.is_empty(), "empty window");
         ensure!(slot < self.n_slots, "slot {slot} >= {n} (use_gpu_slots?)", n = self.n_slots);
         let w0 = Instant::now();
+        #[cfg(feature = "cuda")]
+        self.drop_step_graph();
         let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
         let mut stage = |name: &str, t0: &std::time::Instant| {
             if prof {
@@ -1608,6 +1611,8 @@ impl Glm5Engine {
         if t == 1 {
             return self.window_slot(rows[0].0, &[rows[0].1]);
         }
+        #[cfg(feature = "cuda")]
+        self.drop_step_graph();
         let hp = self.m.hp.clone();
         let (n, hc) = (hp.n_embd, hp.hc);
         use super::trace::{span, span_l};
@@ -3149,6 +3154,15 @@ mod tests {
         };
         let a = run(&mut host, false);
         let b = run(&mut res, true);
+        // the step graph (TANG_GLM5_STEP_GRAPH=1): warm-up token eager, then segments
+        std::env::set_var("TANG_GLM5_STEP_GRAPH", "1");
+        let mut gr = mk();
+        let c = run(&mut gr, true);
+        std::env::remove_var("TANG_GLM5_STEP_GRAPH");
+        let segs = gr.gpu.as_ref().unwrap().resident.as_ref().and_then(|r| r.graphs.as_ref()).map_or(0, |g| g.len());
+        eprintln!("step graph: {segs} segments, ids {}", if c == a { "= host" } else { "DIFFER" });
+        assert_eq!(segs, gr.m.hp.is_kda.iter().filter(|&&k| !k).count() + 1, "step graph segments");
+        assert_eq!(a, c, "step graph vs host greedy ids");
         assert!(host.gpu.as_ref().unwrap().resident.is_none(), "the host run took the resident step");
         assert!(res.gpu.as_ref().unwrap().resident.is_some(), "the resident step never ran");
         eprintln!("resident step: host {a:?}\n               res  {b:?}");

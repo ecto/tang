@@ -1680,6 +1680,18 @@ pub mod cuda {
 
         /// Grow the ACTIVE sequence's latent cache to `rows` (bf16 rows). Realloc
         /// invalidates the watermark (the caller re-bases from its mirror).
+        /// Whether the active sequence's latent + indexer caches hold `rows` rows without a
+        /// regrow (a regrow re-uploads rows `[0, pos0)` from the caller's host mirrors).
+        pub fn rows_fit(&self, rows: usize) -> bool {
+            let lru = self.seqs.borrow();
+            let Some(e) = lru.entries.iter().find(|e| e.id == lru.active) else { return false };
+            let fits = |b: &Option<DevBuf>, need: usize| b.as_ref().is_some_and(|b| b.len >= need);
+            fits(&e.lat_d, rows * self.dl * 2)
+                && fits(&e.idk_d, rows * self.idxd * 4)
+                && fits(&e.idg_d, rows * self.idxd * 4)
+                && fits(&e.val_d, rows)
+        }
+
         fn ensure_lat(&self, rows: usize) -> Result<(), gpu::Error> {
             let mut lru = self.seqs.borrow_mut();
             let i = lru.active_idx();

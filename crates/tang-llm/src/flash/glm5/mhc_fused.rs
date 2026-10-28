@@ -559,6 +559,27 @@ impl MhcFused {
         Ok(())
     }
 
+    /// [`Self::begin`] with an async upload on [`Self::stream`] (the resident step: no
+    /// legacy-stream copy, so no implicit wait on the other blocking streams).
+    pub fn begin_async(&mut self, r: &[f32]) -> Result<()> {
+        if r.len() != 4 * self.n {
+            bail!("mhc fused begin_async: {} values", r.len());
+        }
+        self.r.write_async(0, r, &self.s).map_err(|e| anyhow!("mhc fused begin_async: {e}"))?;
+        self.set_window(1)
+    }
+
+    /// Set the window length and clear the pending post without touching the device (the
+    /// step graph's capture pass; `0` closes the window after a replay).
+    pub fn set_window(&mut self, t: usize) -> Result<()> {
+        if t > self.max_t || self.dbg.is_some() {
+            bail!("mhc fused set_window: t {t}, shadow {}", self.dbg.is_some());
+        }
+        self.t = t;
+        self.pending = false;
+        Ok(())
+    }
+
     /// The window's stream (every fused-mHC launch goes here).
     pub fn stream(&self) -> &Stream {
         &self.s

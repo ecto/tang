@@ -448,6 +448,23 @@ impl DevLayer {
         rows: usize,
         t: usize,
     ) -> Result<()> {
+        unsafe { self.gemv8_launch_on(&self.s, w, xq8, cols, y, ystride, rows, t) }
+    }
+
+    /// [`Self::gemv8_launch`] on stream `s` (the fused decode enqueues on its caller's
+    /// stream, which a whole-step graph capture records).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemv8_launch_on(
+        &self,
+        s: &Stream,
+        w: &super::moe::gpu::DevW,
+        xq8: u64,
+        cols: usize,
+        y: u64,
+        ystride: usize,
+        rows: usize,
+        t: usize,
+    ) -> Result<()> {
         let scales = xq8 + (self.max_t * cols) as u64;
         let smem = (K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
         // TANG_GLM5_TRACE: the weight bytes (the stream a decode GEMV is bound by)
@@ -458,7 +475,7 @@ impl DevLayer {
                 (rows.div_ceil(K5_WARPS) as u32, t as u32, 1),
                 (128, 1, 1),
                 smem,
-                &self.s,
+                s,
                 args![w.w, 0u32, xq8, scales, y, ystride as u32, t as u32, rows as u32, cols as u32],
             )?;
         }

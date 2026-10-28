@@ -73,6 +73,11 @@ pub(super) struct Resident {
     norm_w: DevBuf,
     tok: DevBuf,
     head: Option<(super::super::moe::gpu::DevW, super::super::moe::gpu::Kernels5, DevBuf, DevBuf)>,
+    /// One eager resident token has run since the last host window (every buffer the
+    /// step touches is allocated): the step graph may be captured.
+    warm: bool,
+    /// `TANG_GLM5_STEP_GRAPH=1`: the captured segments (see [`Glm5Engine::step_resident`]).
+    pub(super) graphs: Option<Vec<tang_moe::gpu::Graph>>,
 }
 
 impl Resident {
@@ -99,6 +104,8 @@ impl Resident {
             norm_w: DevBuf::from_slice(norm_w).map_err(ge)?,
             tok: DevBuf::zeroed_elems::<u32>(1).map_err(ge)?,
             head,
+            warm: false,
+            graphs: None,
         })
     }
 }
@@ -155,6 +162,12 @@ impl Glm5Engine {
 
     /// One greedy decode token on the resident step, or `None` when it doesn't apply
     /// (the caller runs the host path).
+    ///
+    /// `TANG_GLM5_STEP_GRAPH=1`: after one eager token (every buffer allocated), the step
+    /// is captured as `n_dsa + 1` graph segments split at the DSA attention cores, which
+    /// stay eager between the segment launches (their `pos0`/`kv_len`/cache-row pointers
+    /// move every token). Any host window drops the segments ([`Self::drop_step_graph`]):
+    /// a prefill can reallocate the scratch they point at.
     pub(super) fn step_resident(&mut self, slot: usize, tok: u32) -> Result<Option<u32>> {
         if !self.resident_ready(slot) {
             return Ok(None);
@@ -163,7 +176,7 @@ impl Glm5Engine {
         let (n, hc) = (hp.n_embd, hp.hc);
         ensure!((tok as usize) < hp.n_vocab, "token {tok} out of range");
         let pos0 = self.slot_tokens(slot).len();
-        use super::super::trace::{span, span_l};
+        use super::super::trace::span;
         let tr_root = super::super::trace::window_begin(1, pos0);
         let tr = span("embed");
         let embd = self.m.g.info("token_embd.weight")?;
@@ -184,6 +197,7 @@ impl Glm5Engine {
         } else {
             None
         };
+        let graph_on = std::env::var("TANG_GLM5_STEP_GRAPH").is_ok_and(|v| v == "1");
         let g = self.gpu.as_mut().context("resident step without a GPU")?;
         g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         if let Some(w) = norm_w {
@@ -192,57 +206,231 @@ impl Glm5Engine {
         }
         let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident: {e}");
         let mut f = g.mhc_f.take().context("fused mHC: no instance")?;
+        // a non-owning alias of the step stream (the fused mHC's): the launches below
+        // borrow `f` mutably while they enqueue on its stream
+        let s = std::mem::ManuallyDrop::new(tang_moe::gpu::Stream(f.stream().0));
+        let mut res = g.resident.take().unwrap();
+        let items = plan(&hp);
+        // debug: TANG_GLM5_STEP_GRAPH_EAGER=kda,ffn also runs those items eagerly between
+        // the segments (bisecting a replay mismatch)
+        let eager_kinds = std::env::var("TANG_GLM5_STEP_GRAPH_EAGER").unwrap_or_default();
+        let boundary = |it: &Item| match it {
+            Item::Dsa(_) => true,
+            Item::Kda(_) => eager_kinds.contains("kda"),
+            Item::Ffn(_) => eager_kinds.contains("ffn"),
+            _ => false,
+        };
+        let dsa = &mut self.dsa[slot];
         let out = (|| -> Result<u32> {
-            f.begin(&r, 1)?;
-            drop(tr);
-            let res = g.resident.as_ref().unwrap();
-            for l in 0..hp.n_layer {
-                let _tr_l = span_l("layer", l);
-                let mh = g.mhc_g[l].as_ref().context("mhc not resident")?;
-                // ---- attention half
-                if hp.is_kda[l] {
-                    let k = g.kda_l[l].as_mut().context("kda not resident")?;
-                    let tr = span("mhc_pre.attn");
-                    f.pre_dev(mh, l, 0, k.x_ptr())?;
-                    drop(tr);
-                    let tr = span("kda");
-                    k.decode_dev(f.stream())?;
-                    drop(tr);
-                    f.post_dev(k.y_ptr())?;
-                } else {
-                    let (cu, p) = (g.mla_k[l].as_ref().unwrap(), g.mla_p[l].as_ref().unwrap());
-                    let w = mla_w[l].as_ref().unwrap();
-                    cu.set_seq(slot as u64);
-                    let tr = span("mhc_pre.attn");
-                    f.pre_dev(mh, l, 0, p.x_ptr(1)?)?;
-                    drop(tr);
-                    let tr = span("dsa");
-                    let c = &mut self.dsa[slot][l];
-                    let (dl, idd) = (w.kv_lora, w.idx_dim);
-                    ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
-                    let kv_len = pos0 + 1;
-                    c.lat16.resize(kv_len * dl, 0);
-                    c.idx_k.resize(kv_len * idd, 0.0);
-                    c.idx_g.resize(kv_len * idd, 0.0);
-                    c.valid.resize(kv_len, 0);
-                    c.stale_from = Some(c.stale_from.map_or(pos0, |s| s.min(pos0)));
-                    let y = p.window_dev(cu, w, 1, pos0, &c.lat16, &c.idx_k, &c.idx_g, &c.valid, f.stream())?;
-                    drop(tr);
-                    f.post_dev(y)?;
+            if graph_on && res.warm && res.graphs.is_none() {
+                // capture pass: records only, so the mHC state machine is walked once with
+                // the DSA cores skipped; the replay below runs everything
+                let _tr = span("capture");
+                f.set_window(1)?;
+                let mut graphs = Vec::new();
+                let mut rest: &[Item] = &items;
+                loop {
+                    let cut = rest.iter().position(&boundary).unwrap_or(rest.len());
+                    let seg = &rest[..cut];
+                    let gr = tang_moe::gpu::Graph::capture(&s, |cs| {
+                        for it in seg {
+                            exec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, cs, Pass::Capture)
+                                .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| anyhow::anyhow!("step graph capture: {e}"))?;
+                    graphs.push(gr);
+                    if cut == rest.len() {
+                        break;
+                    }
+                    // the boundary item's host side (its mHC post) in capture order
+                    exec(rest[cut], &mut f, g, &res, dsa, &mla_w, &hp, pos0, &s, Pass::HostOnly)?;
+                    rest = &rest[cut + 1..];
                 }
-                // ---- FFN half
-                let tr = span("mhc_pre.ffn");
-                f.pre_dev(mh, l, 1, res.x.ptr)?;
-                drop(tr);
-                let tr = span("ffn");
-                let m = g.layers[l].as_ref().context("FFN not resident")?;
-                super::super::moe::gpu::ffn_async(&g.devs[0].1, f.stream(), m, res.x.ptr, res.y.ptr, 1)?;
-                drop(tr);
+                res.graphs = Some(graphs);
+                eprintln!("glm5: resident step graph captured ({} segments)", res.graphs.as_ref().unwrap().len());
+            }
+            f.begin_async(&r)?;
+            drop(tr);
+            if let Some(graphs) = res.graphs.as_ref().filter(|_| graph_on) {
+                let mut gi = graphs.iter();
+                gi.next().unwrap().launch(&s).map_err(ge)?;
+                for it in items.iter().filter(|it| boundary(it)) {
+                    exec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, &s, Pass::Replay)?;
+                    gi.next().context("step graph: segment count")?.launch(&s).map_err(ge)?;
+                }
+                // the replay skipped the host side of the mHC state machine
+                f.set_window(0)?;
+            } else {
+                for it in &items {
+                    exec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, &s, Pass::Eager)?;
+                }
+                res.warm = true;
+            }
+            if graph_on && std::env::var("TANG_GLM5_STEP_GRAPH_RECAPTURE").is_ok_and(|v| v == "1") {
+                res.graphs = None; // debug: a fresh capture every token
+            }
+            let tr = span("head");
+            let _tr = span("sync+read");
+            s.sync().map_err(ge)?;
+            let t = res.tok.read::<u32>(0, 1).map_err(ge)?[0];
+            drop(tr);
+            Ok(t)
+        })();
+        g.mhc_f = Some(f);
+        g.resident = Some(res);
+        let next = out?;
+        self.slot_tokens_mut(slot).push(tok);
+        super::super::trace::window_end(tr_root, 1, pos0);
+        Ok(Some(next))
+    }
+
+    /// Drop the captured step segments (any host window: it may reallocate their scratch).
+    pub(super) fn drop_step_graph(&mut self) {
+        if let Some(r) = self.gpu.as_mut().and_then(|g| g.resident.as_mut()) {
+            r.graphs = None;
+            r.warm = false;
+        }
+    }
+}
+
+/// One step of the resident decode, in order. `Dsa` is the eager part of a DSA layer (the
+/// graph segment boundary); everything else is position-independent.
+#[derive(Clone, Copy)]
+enum Item {
+    PreAttn(usize),
+    Kda(usize),
+    Dsa(usize),
+    PreFfn(usize),
+    Ffn(usize),
+    Head,
+}
+
+fn plan(hp: &super::super::Hparams) -> Vec<Item> {
+    let mut v = Vec::new();
+    for l in 0..hp.n_layer {
+        v.push(Item::PreAttn(l));
+        v.push(if hp.is_kda[l] { Item::Kda(l) } else { Item::Dsa(l) });
+        v.push(Item::PreFfn(l));
+        v.push(Item::Ffn(l));
+    }
+    v.push(Item::Head);
+    v
+}
+
+/// How [`exec`] runs an item.
+#[derive(Clone, Copy, PartialEq)]
+enum Pass {
+    /// Everything, eagerly (the no-graph step and the warm-up token).
+    Eager,
+    /// Inside a segment capture: KDA enqueues its fused kernels instead of launching its
+    /// own graph; a DSA item only does its mHC post (host state).
+    Capture,
+    /// Between segment launches: a boundary item runs its device work only.
+    Replay,
+    /// The capture pass at a boundary item (outside any capture): its mHC post only, so
+    /// the next segment's pre applies it (the replay runs its device work).
+    HostOnly,
+}
+
+/// Enqueue one [`Item`] on `s`.
+#[allow(clippy::too_many_arguments)]
+fn exec(
+    it: Item,
+    f: &mut super::super::mhc_fused::MhcFused,
+    g: &mut GpuFfn,
+    res: &Resident,
+    dsa: &mut [DsaCache],
+    mla_w: &[Option<std::sync::Arc<MlaWeights>>],
+    hp: &super::super::Hparams,
+    pos0: usize,
+    s: &tang_moe::gpu::Stream,
+    pass: Pass,
+) -> Result<()> {
+    let capture = pass == Pass::Capture;
+    if pass == Pass::HostOnly {
+        let y = match it {
+            Item::Kda(l) => g.kda_l[l].as_ref().context("kda not resident")?.y_ptr(),
+            Item::Dsa(l) => g.mla_p[l].as_ref().context("mla not resident")?.y_ptr(1)?,
+            Item::Ffn(_) => res.y.ptr,
+            _ => anyhow::bail!("step graph: only kda / dsa / ffn items can be boundaries"),
+        };
+        return f.post_dev(y);
+    }
+    use super::super::trace::span;
+    let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident: {e}");
+    let mh = |l: usize| g.mhc_g[l].as_ref().context("mhc not resident");
+    match it {
+        Item::PreAttn(l) => {
+            let _tr = span("mhc_pre.attn");
+            let dst = if hp.is_kda[l] {
+                g.kda_l[l].as_ref().context("kda not resident")?.x_ptr()
+            } else {
+                g.mla_p[l].as_ref().context("mla not resident")?.x_ptr(1)?
+            };
+            f.pre_dev(mh(l)?, l, 0, dst)?;
+        }
+        Item::Kda(l) => {
+            let _tr = span("kda");
+            let k = g.kda_l[l].as_mut().context("kda not resident")?;
+            if capture {
+                k.decode_enqueue(s)?;
+            } else {
+                k.decode_dev(s)?;
+            }
+            if pass != Pass::Replay {
+                f.post_dev(k.y_ptr())?;
+            }
+        }
+        Item::Dsa(l) => {
+            let (cu, p) = (g.mla_k[l].as_ref().unwrap(), g.mla_p[l].as_ref().unwrap());
+            ensure!(!capture, "step graph: a DSA item inside a capture");
+            {
+                let _tr = span("dsa");
+                let w = mla_w[l].as_ref().unwrap();
+                cu.set_seq(0);
+                let c = &mut dsa[l];
+                let (dl, idd) = (w.kv_lora, w.idx_dim);
+                ensure!(c.lat16.len() == pos0 * dl, "latent cache out of step");
+                let kv_len = pos0 + 1;
+                if !cu.rows_fit(kv_len) {
+                    // the append regrows the device caches and re-uploads [0, pos0) from the
+                    // host mirrors: bring the stale rows over first (rare: capacity doubles)
+                    if let Some(from) = c.stale_from.take().filter(|&f| f < pos0) {
+                        cu.refresh_mirrors(from, pos0 - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
+                            .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
+                    }
+                }
+                c.lat16.resize(kv_len * dl, 0);
+                c.idx_k.resize(kv_len * idd, 0.0);
+                c.idx_g.resize(kv_len * idd, 0.0);
+                c.valid.resize(kv_len, 0);
+                c.stale_from = Some(c.stale_from.map_or(pos0, |s| s.min(pos0)));
+                let y = p.window_dev(cu, w, 1, pos0, &c.lat16, &c.idx_k, &c.idx_g, &c.valid, s)?;
+                debug_assert_eq!(y, p.y_ptr(1)?);
+            }
+            // replay: the host mHC state is not walked (set_window resets it after)
+            if pass != Pass::Replay {
+                f.post_dev(p.y_ptr(1)?)?;
+            }
+        }
+        Item::PreFfn(l) => {
+            let _tr = span("mhc_pre.ffn");
+            f.pre_dev(mh(l)?, l, 1, res.x.ptr)?;
+        }
+        Item::Ffn(l) => {
+            let _tr = span("ffn");
+            let m = g.layers[l].as_ref().context("FFN not resident")?;
+            super::super::moe::gpu::ffn_async(&g.devs[0].1, s, m, res.x.ptr, res.y.ptr, 1)?;
+            if pass != Pass::Replay {
                 f.post_dev(res.y.ptr)?;
             }
-            let tr_head = span("head");
+        }
+        Item::Head => {
+            let _tr = span("head");
             let h = f.end_dev()?;
-            let s = f.stream();
+            let n = hp.n_embd;
             let nv = hp.n_vocab;
             let nf = res.m.func("rs_norm").map_err(ge)?;
             let af = res.m.func("rs_argmax").map_err(ge)?;
@@ -279,17 +467,7 @@ impl Glm5Engine {
             };
             let (nvi, tp) = (nv as i32, res.tok.ptr);
             unsafe { launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![logits, nvi, tp])? };
-            let tr = span("sync+read");
-            s.sync().map_err(ge)?;
-            let t = res.tok.read::<u32>(0, 1).map_err(ge)?[0];
-            drop(tr);
-            drop(tr_head);
-            Ok(t)
-        })();
-        g.mhc_f = Some(f);
-        let next = out?;
-        self.slot_tokens_mut(slot).push(tok);
-        super::super::trace::window_end(tr_root, 1, pos0);
-        Ok(Some(next))
+        }
     }
+    Ok(())
 }
