@@ -212,6 +212,20 @@ const MORE: &[&str] = &[
 /// [t][h]. Larger problems fall back to `ds_sparse_attn`.
 const ATTN_SCRATCH: usize = 6 << 20;
 
+/// A rope fused into the tiled attention ([`Kernels::sparse_attn_r`]): row r's position is
+/// `P[0] + add + r * stride` (`dg_rope`'s `At::Dev` with no fixed row), table `tab`, the last
+/// `rd` of each head.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct AttnRope {
+    pub tab: u64,
+    pub p: u64,
+    pub rd: i32,
+    pub add: i32,
+    pub stride: i32,
+    /// q too (else o only: q came rope'd)
+    pub q: bool,
+}
+
 /// Floats of cross-block K-split partials, and row-group counters.
 const KS_PART: usize = 1 << 21;
 const KS_CNT: usize = 1 << 13;
@@ -1441,8 +1455,14 @@ impl Kernels {
         d: usize,
         k: usize,
         scale: f32,
+        rope: Option<AttnRope>,
+        r0: usize,
     ) -> Result<()> {
         let (hi, di, ki) = (h as i32, d as i32, k as i32);
+        let r = rope.unwrap_or_default();
+        let (tab, pp, rd, ps) = (r.tab, r.p, r.rd, r.stride);
+        let add = r.add + r0 as i32 * r.stride;
+        let qtab = if r.q { tab } else { 0 };
         let part = self.scratch.ptr;
         let pr = part + (t * h * k * (d / 64) * 4) as u64;
         let den = pr + (t * h * k * 4) as u64;
@@ -1454,7 +1474,7 @@ impl Kernels {
                 (256, 1, 1),
                 0,
                 s,
-                tang_moe::args![q, kv, sp, kv1, idxs, part, hi, di, ki],
+                tang_moe::args![q, kv, sp, kv1, idxs, part, hi, di, ki, qtab, pp, rd, add, ps],
             )?;
             if self.attn_fuse {
                 // soft + pv in one launch: dsb slices a block, as few as keep ~all SMs busy
@@ -1474,7 +1494,10 @@ impl Kernels {
                     (256, 1, 1),
                     (9 * k * 4) as u32,
                     s,
-                    tang_moe::args![part, sink, kv, sp, kv1, idxs, o, hi, di, ki, scale, dsbi],
+                    tang_moe::args![
+                        part, sink, kv, sp, kv1, idxs, o, hi, di, ki, scale, dsbi, tab, pp, rd,
+                        add, ps
+                    ],
                 )?;
                 return Ok(());
             }
@@ -1492,12 +1515,13 @@ impl Kernels {
                 (256, 1, 1),
                 (9 * k * 4) as u32,
                 s,
-                tang_moe::args![pr, den, kv, sp, kv1, idxs, o, hi, di, ki],
+                tang_moe::args![pr, den, kv, sp, kv1, idxs, o, hi, di, ki, tab, pp, rd, add, ps],
             )?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sparse_attn(
         &self,
         s: &Stream,
@@ -1514,12 +1538,41 @@ impl Kernels {
         k: usize,
         scale: f32,
     ) -> Result<()> {
+        self.sparse_attn_r(s, q, kv, split, kv1, sink, idxs, o, t, h, d, k, scale, None)
+    }
+
+    /// Whether [`Kernels::sparse_attn`] takes the tiled path (and so [`AttnRope`]).
+    pub fn attn_tiled_ok(&self, h: usize, d: usize, k: usize) -> bool {
+        let per_row = h * k * (d / 64 + 1) + h;
+        !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 960 && per_row <= ATTN_SCRATCH
+    }
+
+    /// [`Kernels::sparse_attn`], with `rope` (tiled path only, [`Kernels::attn_tiled_ok`]):
+    /// q not yet rope'd (rotated as it loads) and o inverse-rope'd as it stores, both bit
+    /// for bit `dg_rope`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_attn_r(
+        &self,
+        s: &Stream,
+        q: u64,
+        kv: u64,
+        split: usize,
+        kv1: u64,
+        sink: u64,
+        idxs: u64,
+        o: u64,
+        t: usize,
+        h: usize,
+        d: usize,
+        k: usize,
+        scale: f32,
+        rope: Option<AttnRope>,
+    ) -> Result<()> {
         let (hi, di, ki) = (h as i32, d as i32, k as i32);
         let sp = split.min(i32::MAX as usize) as i32;
         // rows per pass that fit the scratch (prefill: many passes, each row independent)
         let per_row = h * k * (d / 64 + 1) + h;
-        if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 960 && per_row <= ATTN_SCRATCH
-        {
+        if self.attn_tiled_ok(h, d, k) {
             let tc = ATTN_SCRATCH / per_row;
             let mut t0 = 0;
             while t0 < t {
@@ -1529,11 +1582,17 @@ impl Kernels {
                     idxs + (t0 * k * 4) as u64,
                     o + (t0 * h * d * 4) as u64,
                 );
-                self.attn_tiled(s, qo, kv, sp, kv1, sink, io, oo, n, h, d, k, scale)?;
+                self.attn_tiled(
+                    s, qo, kv, sp, kv1, sink, io, oo, n, h, d, k, scale, rope, t0,
+                )?;
                 t0 += n;
             }
             return Ok(());
         }
+        anyhow::ensure!(
+            rope.is_none(),
+            "sparse_attn: a fused rope wants the tiled path"
+        );
         let threads = d.clamp(32, 1024) as u32;
         unsafe {
             super::obs::launch(
@@ -3187,6 +3246,87 @@ mod tests {
                 eq as f64 >= 0.9 * got.len() as f64,
                 "attn t {t} k {kk}: {eq} equal"
             );
+        }
+    }
+
+    /// The rope fused into the tiled attention (`sparse_attn_r`) is ds_rope on q, the
+    /// attention, then ds_rope inverse on o, bit for bit, on both tiled paths.
+    #[test]
+    fn tiled_attn_rope_fused_matches() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let mut k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (h, d, rd, p0) = (64, 512, 64, 37usize);
+        let tabv: Vec<f32> = (0..256 * rd / 2)
+            .flat_map(|e| {
+                let (pos, j) = ((e / (rd / 2)) as f32, (e % (rd / 2)) as f32);
+                let th = pos * 10000f32.powf(-2.0 * j / rd as f32);
+                [th.cos(), th.sin()]
+            })
+            .collect();
+        let tab = DevBuf::from_slice(&tabv).unwrap();
+        let pbuf = DevBuf::from_slice(&[p0 as i32]).unwrap();
+        for (t, kk, add, st) in [
+            (1, 640, 0, 1),
+            (6, 640, 0, 1),
+            (5, 100, 3, 1),
+            (2, 960, 1, 2),
+        ] {
+            for fuse in [false, true] {
+                k.attn_fuse = fuse;
+                let [q, kv, sink, ix] = attn_case(t, kk);
+                let o = DevBuf::alloc(t * h * d * 4).unwrap();
+                let scale = (d as f32).powf(-0.5);
+                let split = 134;
+                let kv1 = kv.ptr + (split * d * 4) as u64;
+                let q0 = q.read::<f32>(0, t * h * d).unwrap();
+                let rope = AttnRope {
+                    tab: tab.ptr,
+                    p: pbuf.ptr,
+                    rd: rd as i32,
+                    add: add as i32,
+                    stride: st as i32,
+                    q: true,
+                };
+                k.sparse_attn_r(
+                    &s,
+                    q.ptr,
+                    kv.ptr,
+                    split,
+                    kv1,
+                    sink.ptr,
+                    ix.ptr,
+                    o.ptr,
+                    t,
+                    h,
+                    d,
+                    kk,
+                    scale,
+                    Some(rope),
+                )
+                .unwrap();
+                s.sync().unwrap();
+                let got = o.read::<f32>(0, t * h * d).unwrap();
+                // q untouched by the fused path
+                assert_eq!(q.read::<f32>(0, t * h * d).unwrap(), q0);
+                k.rope(&s, q.ptr, tab.ptr, t, h, d, rd, p0 + add, st, None, false)
+                    .unwrap();
+                k.sparse_attn(
+                    &s, q.ptr, kv.ptr, split, kv1, sink.ptr, ix.ptr, o.ptr, t, h, d, kk, scale,
+                )
+                .unwrap();
+                k.rope(&s, o.ptr, tab.ptr, t, h, d, rd, p0 + add, st, None, true)
+                    .unwrap();
+                s.sync().unwrap();
+                let want = o.read::<f32>(0, t * h * d).unwrap();
+                let bad = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(bad, 0, "t {t} k {kk} fuse {fuse}: {bad} differ");
+            }
         }
     }
 

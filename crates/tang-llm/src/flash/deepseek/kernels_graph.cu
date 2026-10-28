@@ -38,9 +38,16 @@ extern "C" __global__ void dg_rope(float* v, const float2* tab, int rows, int pe
     t[2 * j + 1] = dg_bf(a * s + b * cs.x);
 }
 
-// As ds_win_idx modes 1 (decode) and 3 (verify window) at sp = P[0].
-extern "C" __global__ void dg_win_idx(int* out, int t, int stride, int n, int mode, const int* P, int win) {
+// As ds_win_idx modes 1 (decode) and 3 (verify window) at sp = P[0]; with src, also its [t][k]
+// rows into columns n.. (as ds_idx_cat), so the whole index row in one launch.
+extern "C" __global__ void dg_win_idx(int* out, int t, int stride, int n, int mode, const int* P, int win,
+                                      const int* src, int k) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (src && e >= t * n && e < t * (n + k)) {
+        int f = e - t * n;
+        out[(long long)(f / k) * stride + n + f % k] = src[f];
+        return;
+    }
     if (e >= t * n) return;
     int sp = P[0];
     int row = e / n, j = e % n, v;

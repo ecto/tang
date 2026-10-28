@@ -30,7 +30,7 @@
 //! (`reduce_graphable`), so it is captured as a graph node with the step.
 
 use super::forward::{Model, SpecPick, SpecSampler, SpecStep};
-use super::gpu::{blocks, DevW, DsW, Kernels};
+use super::gpu::{blocks, AttnRope, DevW, DsW, Kernels};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
 use anyhow::{bail, Context, Result};
@@ -796,7 +796,7 @@ impl GpuModel {
             self.idx_cat(idx, tk, t, kc, nw + kc, nw)?;
         }
         self.end(s);
-        self.attn_out(p, q, (kv, t, kv1), idx, t, nw + kc, lid, at0)
+        self.attn_out(p, q, true, (kv, t, kv1), idx, t, nw + kc, lid, at0)
     }
 
     /// The decode step's q and window kv on the K-split path, in 6 launches: x quantized once,
@@ -879,7 +879,7 @@ impl GpuModel {
         let q = self.fbuf(t * h * hd)?;
         self.k
             .ks_gemv(&self.s, &wqb, None, qc, qs, q.ptr, t, true, 0, 0.0)?;
-        self.rope(q, t, h, hd, lid, at, false)?;
+        // q's rope is attn_out's (fused into the tiled attention)
         self.end(sp);
         Ok(Some((qr, q, kv0, split, mode)))
     }
@@ -900,7 +900,6 @@ impl GpuModel {
                 let qr = self.lin(x, t, &format!("{p}.attn.wq_a.weight"))?;
                 self.rms(qr, t, &format!("{p}.attn.q_norm.weight"))?;
                 let q = self.lin(qr, t, &format!("{p}.attn.wq_b.weight"))?;
-                self.rope(q, t, h, hd, lid, at, false)?;
                 self.end(s);
                 let s = self.span("window_kv");
                 let kv = self.lin(x, t, &format!("{p}.attn.wkv.weight"))?;
@@ -941,22 +940,23 @@ impl GpuModel {
             self.p.ptr,
             win as i32,
         );
+        // the top-k columns in the same launch (ds_idx_cat's)
+        let (src, ki) = match kc {
+            0 => (0, 0),
+            _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
+        };
         unsafe {
             self.gk.go(
                 "dg_win_idx",
-                blocks(t * win, 256),
+                blocks(t * (win + kc), 256),
                 B256,
                 0,
                 &self.s,
-                args![idx.ptr, ti, st, ni, mi, pp, wi],
+                args![idx.ptr, ti, st, ni, mi, pp, wi, src, ki],
             )?
         };
-        if kc > 0 {
-            let tk = self.topk.as_ref().unwrap().0;
-            self.idx_cat(idx, tk, t, kc, win + kc, win)?;
-        }
         self.end(s);
-        self.attn_out(p, q, (kv0, split, kv1), idx, t, win + kc, lid, at)
+        self.attn_out(p, q, false, (kv0, split, kv1), idx, t, win + kc, lid, at)
     }
 
     fn idx_cat(&self, idx: Buf, src: Buf, t: usize, k: usize, st: usize, col: usize) -> Result<()> {
@@ -1050,6 +1050,7 @@ impl GpuModel {
         &self,
         p: &str,
         q: Buf,
+        q_roped: bool,
         kv: (Buf, usize, u64),
         di: Buf,
         t: usize,
@@ -1064,13 +1065,35 @@ impl GpuModel {
         let o = self.fbuf(t * h * hd)?;
         // the tiled kernels at the real shapes (see `Kernels::sparse_attn`), else the exact one
         let scale = (hd as f32).powf(-0.5);
-        self.k.sparse_attn(
-            &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale,
+        // q's rope and o's inverse rope fused into the tiled attention (bit for bit dg_rope)
+        let rd = c.rope_head_dim;
+        let rope = match at {
+            At::Dev {
+                add,
+                stride,
+                fixed_r: 0,
+            } if rd % 2 == 0 && rd <= hd && self.k.attn_tiled_ok(h, hd, k) => Some(AttnRope {
+                tab: self.tabs[lid].ptr,
+                p: self.p.ptr,
+                rd: rd as i32,
+                add: add as i32,
+                stride: stride as i32,
+                q: !q_roped,
+            }),
+            _ => None,
+        };
+        if !q_roped && rope.is_none() {
+            self.rope(q, t, h, hd, lid, at, false)?;
+        }
+        self.k.sparse_attn_r(
+            &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale, rope,
         )?;
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
         self.end(s);
         let s = self.span("wo");
-        self.rope(o, t, h, hd, lid, at, true)?;
+        if rope.is_none() {
+            self.rope(o, t, h, hd, lid, at, true)?;
+        }
         let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
         let mid = self.fbuf(t * g * ol)?;
         if self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol) {
@@ -3077,7 +3100,7 @@ impl GpuModel {
         let qr = self.lin(x, bl, &format!("{p}.attn.wq_a.weight"))?;
         self.rms(qr, bl, &format!("{p}.attn.q_norm.weight"))?;
         let q = self.lin(qr, bl, &format!("{p}.attn.wq_b.weight"))?;
-        self.rope(q, bl, h, hd, lid, dev(t), false)?;
+        // q's rope is attn_out's
         let kv = self.lin(x, bl, &format!("{p}.attn.wkv.weight"))?;
         self.rms(kv, bl, &format!("{p}.attn.kv_norm.weight"))?;
         self.rope(kv, bl, 1, hd, lid, dev(t), false)?;
@@ -3102,7 +3125,7 @@ impl GpuModel {
         let all = self.fbuf((win + bl) * hd)?;
         self.copy(all.ptr, ring.ptr, win * hd)?;
         self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, bl * hd)?;
-        self.attn_out(p, q, (all, win + bl, 0), idx, bl, nk, lid, dev(t))
+        self.attn_out(p, q, false, (all, win + bl, 0), idx, bl, nk, lid, dev(t))
     }
 
     /// As [`Model::forward_spec`]: greedy drafts, drawn on the device.
