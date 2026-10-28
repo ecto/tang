@@ -47,6 +47,12 @@ const B256: (u32, u32, u32) = (256, 1, 1);
 /// it (the kernels read it from `P[0]`): any host use gives wrong answers the tests catch.
 const DYN: usize = 1 << 40;
 
+/// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
+fn comp_batched() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("DS_COMP_SEQ").map_or(true, |v| v != "1"))
+}
+
 fn b(d: &DevBuf) -> Buf {
     Buf::from(d)
 }
@@ -536,7 +542,11 @@ impl GpuModel {
         let w = self.dw(name)?;
         let (k, n) = (w.v.cols as usize, w.v.rows as usize);
         let y = self.fbuf(t * n)?;
-        if self.fast && Kernels::fast_ok(&w.v) {
+        if self.fast && self.k.ks_ok(&w.v) {
+            // the K-split GEMV quantizes the activation itself (bit-identical to ds_fp8_qdq)
+            self.k
+                .linear_ks(&self.s, &w.v, None, x.ptr, y.ptr, t, true, false, 0, 0.0)?;
+        } else if self.fast && Kernels::fast_ok(&w.v) {
             let xq = self.qdq(x, t * k)?;
             self.k
                 .linear_fast(&self.s, &w.v, None, xq.ptr, y.ptr, t, true, false, 0, 0.0)?;
@@ -670,6 +680,91 @@ impl GpuModel {
         self.attn_out(p, q, (kv, t, kv1), idx, t, nw + kc, lid, at0)
     }
 
+    /// The decode step's q and window kv on the K-split path, in 6 launches: x quantized once,
+    /// the wq_a and wkv GEMVs, the pre-chunk ring copy (t > 1), `ds_qkv_post` (both rms, kv
+    /// rope + qdq + ring/window writes, qr's codes), the wq_b GEMV and q's rope. As the unfused
+    /// path bit for bit up to the K-split GEMVs. `None` when it does not apply (DS_EXACT, shapes).
+    #[allow(clippy::type_complexity)]
+    fn qkv_fused(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+    ) -> Result<Option<(Buf, Buf, Buf, usize, usize)>> {
+        let c = &self.cpu.cfg;
+        let (h, hd, win, rd, eps) = (
+            c.n_heads,
+            c.head_dim,
+            c.window_size,
+            c.rope_head_dim,
+            c.norm_eps,
+        );
+        let wqa = self.dw(&format!("{p}.attn.wq_a.weight"))?.v;
+        let wkv = self.dw(&format!("{p}.attn.wkv.weight"))?.v;
+        let wqb = self.dw(&format!("{p}.attn.wq_b.weight"))?.v;
+        let qn = self.dw(&format!("{p}.attn.q_norm.weight"))?.v;
+        let kn = self.dw(&format!("{p}.attn.kv_norm.weight"))?.v;
+        let ok = self.fast
+            && (1..=8).contains(&t)
+            && [wqa, wkv, wqb].iter().all(|w| self.k.ks_ok(w))
+            && wqa.cols == wkv.cols
+            && wkv.rows as usize == hd
+            && wqb.cols == wqa.rows
+            && wqb.rows as usize == h * hd
+            && qn.cols == wqa.rows
+            && kn.cols as usize == hd
+            && wqa.rows % 32 == 0
+            && hd % 32 == 0;
+        if !ok {
+            return Ok(None);
+        }
+        let (d, ql) = (wqa.cols as usize, wqa.rows as usize);
+        let at = At::Dev {
+            add: 0,
+            stride: 1,
+            fixed_r: 0,
+        };
+        let sp = self.span("q");
+        let (xc, xs) = self.k.ks_x_ptrs();
+        self.k.ks_quant_to(&self.s, x.ptr, xc, xs, t * d)?;
+        let (qr, kv) = (self.fbuf(t * ql)?, self.fbuf(t * hd)?);
+        self.k
+            .ks_gemv(&self.s, &wqa, None, xc, xs, qr.ptr, t, true, 0, 0.0)?;
+        self.k
+            .ks_gemv(&self.s, &wkv, None, xc, xs, kv.ptr, t, true, 0, 0.0)?;
+        self.end(sp);
+        let sp = self.span("window_kv");
+        let ring = b(&self.win[lid]);
+        let (kv0, split, mode, allp) = if t > 1 {
+            let all = self.fbuf((win + t) * hd)?;
+            self.copy(all.ptr, ring.ptr, win * hd)?;
+            (all, win + t, 3, all.ptr)
+        } else {
+            (ring, win, 1, 0)
+        };
+        let (qc, qs) = self.k.wo_x_ptrs();
+        let (tab, rdi, pp, wi) = (self.tabs[lid].ptr, rd as i32, self.p.ptr, win as i32);
+        unsafe {
+            self.k.go(
+                "ds_qkv_post",
+                (t as u32, 2, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, ring.ptr, wi, allp, eps],
+            )?
+        };
+        self.end(sp);
+        let sp = self.span("q");
+        let q = self.fbuf(t * h * hd)?;
+        self.k
+            .ks_gemv(&self.s, &wqb, None, qc, qs, q.ptr, t, true, 0, 0.0)?;
+        self.rope(q, t, h, hd, lid, at, false)?;
+        self.end(sp);
+        Ok(Some((qr, q, kv0, split, mode)))
+    }
+
     /// The decode step's attention (t = 1, or a verify window), position-free on the host.
     fn attention_dyn(&mut self, p: &str, lid: usize, x: Buf, t: usize) -> Result<Buf> {
         let c = self.cpu.cfg.clone();
@@ -679,30 +774,36 @@ impl GpuModel {
             stride: 1,
             fixed_r: 0,
         };
-        let s = self.span("q");
-        let qr = self.lin(x, t, &format!("{p}.attn.wq_a.weight"))?;
-        self.rms(qr, t, &format!("{p}.attn.q_norm.weight"))?;
-        let q = self.lin(qr, t, &format!("{p}.attn.wq_b.weight"))?;
-        self.rope(q, t, h, hd, lid, at, false)?;
-        self.end(s);
-        let s = self.span("window_kv");
-        let kv = self.lin(x, t, &format!("{p}.attn.wkv.weight"))?;
-        self.rms(kv, t, &format!("{p}.attn.kv_norm.weight"))?;
-        self.rope(kv, t, 1, hd, lid, at, false)?;
-        self.k.fp8_qdq(&self.s, kv.ptr, t * hd)?;
-        let ring = b(&self.win[lid]);
-        let (kv0, split, mode) = if t > 1 {
-            // a verify window (as forward.rs): the pre-chunk ring then the chunk's rows
-            let all = self.fbuf((win + t) * hd)?;
-            self.copy(all.ptr, ring.ptr, win * hd)?;
-            self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, t * hd)?;
-            self.ring_write(ring, kv, t, hd, win, 0)?;
-            (all, win + t, 3)
-        } else {
-            self.ring_write(ring, kv, 1, hd, win, 0)?;
-            (ring, win, 1)
+        let (qr, q, kv0, split, mode) = match self.qkv_fused(p, lid, x, t)? {
+            Some(v) => v,
+            None => {
+                let s = self.span("q");
+                let qr = self.lin(x, t, &format!("{p}.attn.wq_a.weight"))?;
+                self.rms(qr, t, &format!("{p}.attn.q_norm.weight"))?;
+                let q = self.lin(qr, t, &format!("{p}.attn.wq_b.weight"))?;
+                self.rope(q, t, h, hd, lid, at, false)?;
+                self.end(s);
+                let s = self.span("window_kv");
+                let kv = self.lin(x, t, &format!("{p}.attn.wkv.weight"))?;
+                self.rms(kv, t, &format!("{p}.attn.kv_norm.weight"))?;
+                self.rope(kv, t, 1, hd, lid, at, false)?;
+                self.k.fp8_qdq(&self.s, kv.ptr, t * hd)?;
+                let ring = b(&self.win[lid]);
+                let (kv0, split, mode) = if t > 1 {
+                    // a verify window (as forward.rs): the pre-chunk ring then the chunk's rows
+                    let all = self.fbuf((win + t) * hd)?;
+                    self.copy(all.ptr, ring.ptr, win * hd)?;
+                    self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, t * hd)?;
+                    self.ring_write(ring, kv, t, hd, win, 0)?;
+                    (all, win + t, 3)
+                } else {
+                    self.ring_write(ring, kv, 1, hd, win, 0)?;
+                    (ring, win, 1)
+                };
+                self.end(s);
+                (qr, q, kv0, split, mode)
+            }
         };
-        self.end(s);
         let (mut kc, mut kv1) = (0, 0);
         if c.compress_ratios[lid] > 0 {
             let s = self.span("compress");
@@ -1201,7 +1302,10 @@ impl GpuModel {
         } else {
             None
         };
-        for e in 0..t {
+        if comp_batched() {
+            self.compress_rows(p, lid, x, t, is_kv, is_idx)?;
+        }
+        for e in 0..if comp_batched() { 0 } else { t } {
             let xe = x.at(e * d * 4);
             let latent = if is_kv {
                 self.sh_ckv = lid;
@@ -1237,6 +1341,101 @@ impl GpuModel {
             self.cand = Some((cb, wmax));
         }
         Ok(self.sh_ckv)
+    }
+
+    /// The step's compressed rows of [`Self::compress_dyn`] for all `t` positions at once:
+    /// the compressor GEMMs over the batch, `ds_comp_pool` (pool + round + rms per position
+    /// against the ring as each position sees it), `ds_ring_last2`, the indexer key GEMV and
+    /// `ds_comp_post` (rope, fp4 qdq, cache rows). Bit for bit the per-position loop.
+    fn compress_rows(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+        is_kv: bool,
+        is_idx: bool,
+    ) -> Result<()> {
+        if !is_kv {
+            return Ok(());
+        }
+        let c = self.cpu.cfg.clone();
+        let (r, hd, ihd, rd, eps) = (
+            c.compress_ratios[lid],
+            c.head_dim,
+            c.index_head_dim,
+            c.rope_head_dim,
+            c.norm_eps,
+        );
+        self.sh_ckv = lid;
+        let norm = format!("{p}.attn.compressor.norm.weight");
+        let pp = self.p.ptr;
+        let lat = if r == 1 {
+            let kv = self.lin(x, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+            self.rms(kv, t, &norm)?;
+            kv
+        } else {
+            let kv = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+            let sc = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
+            let (kst, sst) = {
+                let (a, bb) = &self.cst[&lid];
+                (b(a), b(bb))
+            };
+            let lat = self.fbuf(t * hd)?;
+            let nw = self.dw(&norm)?.v;
+            let (ri, hdi) = (r as i32, hd as i32);
+            unsafe {
+                self.k.go(
+                    "ds_comp_pool",
+                    (t as u32, 1, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![kst.ptr, sst.ptr, kv.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps],
+                )?;
+                let ti = t as i32;
+                self.k.go(
+                    "ds_ring_last2",
+                    blocks(t * hd, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![kst.ptr, kv.ptr, sst.ptr, sc.ptr, ti, hdi, ri, pp],
+                )?;
+            }
+            for e in 0..t {
+                self.jrows
+                    .push((lid, e, kv.at(e * hd * 4), sc.at(e * hd * 4)));
+            }
+            lat
+        };
+        let key = if is_idx {
+            self.sh_idxk = lid;
+            Some(self.lin(lat, t, &format!("{p}.attn.indexer.wk.weight"))?)
+        } else {
+            None
+        };
+        let (kn, ikp, idxk) = match key {
+            Some(k) => (
+                self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
+                k.ptr,
+                self.idxk[&lid].ptr,
+            ),
+            None => (self.dw(&norm)?.v, 0, 0),
+        };
+        let (hdi, ihdi, rdi, ri, ti) = (hd as i32, ihd as i32, rd as i32, r as i32, t as i32);
+        let (ckv, tab) = (self.ckv[&lid].ptr, self.tabs[lid].ptr);
+        unsafe {
+            self.k.go(
+                "ds_comp_post",
+                (t as u32, 1 + key.is_some() as u32, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![lat.ptr, hdi, ckv, ikp, ihdi, kn, idxk, tab, rdi, pp, ri, ti, eps],
+            )?
+        };
+        Ok(())
     }
 
     /// One position's compressed latent (pre-RoPE): see [`Self::compress_dyn`].

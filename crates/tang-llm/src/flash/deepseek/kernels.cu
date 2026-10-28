@@ -812,6 +812,118 @@ extern "C" __global__ void ds_pool(const float* kv, const float* sc, float* out,
     out[e] = acc;
 }
 
+// The ratio-r compressor batched over a step's t positions P[0] + e (block e, 1024 threads as
+// ds_rms): ds_pool of the ring as it stands once position e's row is written (slot j holds the
+// batch's latest row at a position <= P[0] + e that is j mod r, else the old ring's), ds_round,
+// then ds_rms(nw), into lat[e]. Bit for bit the per-position ring_write + pool + round + rms.
+extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst, const float* sst, const float* kv,
+                                                                 const float* sc, float* lat, DsW nw, const int* P,
+                                                                 int r, int hd, float eps) {
+    __shared__ float red[32];
+    int e = blockIdx.x, p0 = P[0], pe = p0 + e;
+    float* out = lat + (long long)e * hd;
+    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+        float mx = -DS_INF;
+        for (int j = 0; j < r; j++) {
+            int q = pe - (pe - j) % r;
+            float sv = q >= p0 ? sc[(long long)(q - p0) * hd + c] : sst[(long long)j * hd + c];
+            mx = fmaxf(mx, sv);
+        }
+        float s = 0.f;
+        for (int j = 0; j < r; j++) {
+            int q = pe - (pe - j) % r;
+            float sv = q >= p0 ? sc[(long long)(q - p0) * hd + c] : sst[(long long)j * hd + c];
+            s += expf(sv - mx);
+        }
+        float acc = 0.f;
+        for (int j = 0; j < r; j++) {
+            int q = pe - (pe - j) % r;
+            bool nw_ = q >= p0;
+            float sv = nw_ ? sc[(long long)(q - p0) * hd + c] : sst[(long long)j * hd + c];
+            float kv_ = nw_ ? kv[(long long)(q - p0) * hd + c] : kst[(long long)j * hd + c];
+            acc += kv_ * (expf(sv - mx) / s);
+        }
+        out[c] = bf(acc);
+    }
+    __syncthreads();
+    float s = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) s += out[i] * out[i];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        s = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (threadIdx.x == 0) red[0] = s;
+    }
+    __syncthreads();
+    float rs = 1.f / sqrtf(red[0] / hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) out[i] = bf(wget(nw, 0, i) * (out[i] * rs));
+}
+
+// The rows a batch of t leaves in two rings of r slots (slot (P[0] + e) % r): only each slot's
+// last write, so the batch's rows never race.
+extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, const float* b, int t, int hd, int r,
+                                         const int* P) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)t * hd) return;
+    int e = i / hd, c = i % hd;
+    if (e + r < t) return;
+    long long o = (long long)((P[0] + e) % r) * hd + c;
+    ra[o] = a[i];
+    rb[o] = b[i];
+}
+
+// A step's compressed rows, batched (block (e, job), 1024 threads): job 0 the latent lat[e]
+// (hd), job 1 the indexer key ik[e] (ihd, after ds_rms(kn)); rope at max(P[0] + e + 1 - r, 0)
+// (dg_rope's fixed_r), fp4 qdq (latent: blocks of 16, e4m3 scale; key: 32, pow2) as
+// ds_fp4_qdq, into cache row (P[0] + e) / r, by the batch's last row for that cache row.
+extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int hd, float* ckv, float* ik, int ihd,
+                                                                 DsW kn, float* idxk, const float2* tab, int rd,
+                                                                 const int* P, int r, int t, float eps) {
+    __shared__ float red[32];
+    int e = blockIdx.x, job = blockIdx.y, p0 = P[0];
+    int n = job ? ihd : hd, blk = job ? 32 : 16;
+    float* x = job ? ik + (long long)e * ihd : lat + (long long)e * hd;
+    if (job) {
+        float s = 0.f;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i] * x[i];
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            s = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
+            for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (threadIdx.x == 0) red[0] = s;
+        }
+        __syncthreads();
+        float rs = 1.f / sqrtf(red[0] / n + eps);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] = bf(wget(kn, 0, i) * (x[i] * rs));
+        __syncthreads();
+    }
+    int half = rd / 2, pos = max(p0 + e + 1 - r, 0);
+    float* tp = x + (n - rd);
+    for (int j = threadIdx.x; j < half; j += blockDim.x) {
+        float2 cs = tab[(long long)pos * half + j];
+        float a = tp[2 * j], b = tp[2 * j + 1];
+        tp[2 * j] = bf(a * cs.x - b * cs.y);
+        tp[2 * j + 1] = bf(a * cs.y + b * cs.x);
+    }
+    __syncthreads();
+    for (int g = threadIdx.x; g < n / blk; g += blockDim.x) {
+        float* p = x + (long long)g * blk;
+        float amax = 0.f;
+        for (int i = 0; i < blk; i++) amax = fmaxf(amax, fabsf(p[i]));
+        float s = job ? pow2_ceil(fmaxf(amax, 6.f * 1.1754944e-38f) / 6.f)
+                      : round_e4m3(fmaxf(amax, 6.f * 0.001953125f) / 6.f);
+        for (int i = 0; i < blk; i++) p[i] = bf(round_fp4(fminf(fmaxf(p[i] / s, -6.f), 6.f)) * s);
+    }
+    __syncthreads();
+    if (e != t - 1 && (p0 + e + 1) % r != 0) return;
+    float* dst = (job ? idxk : ckv) + (long long)((p0 + e) / r) * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = x[i];
+}
+
 // The indexer's scores, warp per (t, j): score = bf(Σ_h bf(relu(bf(q_h·k_j)) * w[t][h])).
 extern "C" __global__ void ds_index_score(const float* q, const float* ik, const float* w, float* score,
                                           int t, int width, int nh, int ihd) {
@@ -1414,6 +1526,69 @@ DS_MOE_KS(3)
 DS_WO_KS(2)
 DS_WO_KS(3)
 
+// The q/kv epilogue of the decode attention, block (token, part) of 1024 threads (as ds_rms):
+// part 0 rms(qr) in place (bit for bit ds_rms) and its K-split codes/scales for wq_b (as
+// ds_ks_quant); part 1 rms(kv) (ds_rms), rope at P[0] + token (dg_rope), fp8 qdq
+// (ds_fp8_qdq), into kv, ring slot (P[0] + token) % win, and all[win + token] when all != 0.
+extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn, unsigned char* qc, float* qsc,
+                                                                float* kv, DsW kn, const float2* tab, int rd,
+                                                                const int* P, float* ring, int win, float* all,
+                                                                float eps) {
+    __shared__ float red[32];
+    int ti = blockIdx.x, isq = blockIdx.y == 0;
+    DsW w = isq ? qn : kn;
+    int n = w.cols;
+    float* r = (isq ? qr : kv) + (long long)ti * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += r[i] * r[i];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        s = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (threadIdx.x == 0) red[0] = s;
+    }
+    __syncthreads();
+    float rs = 1.f / sqrtf(red[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) r[i] = bf(wget(w, 0, i) * (r[i] * rs));
+    __syncthreads();
+    int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    if (isq) {
+        for (int g = wid; g < n / 32; g += nw) {
+            float xv = r[g * 32 + lane], a = fabsf(xv);
+#pragma unroll
+            for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+            float sc = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
+            qc[(long long)ti * n + g * 32 + lane] =
+                (unsigned char)e4m3_byte(round_e4m3(fminf(fmaxf(xv / sc, -448.f), 448.f)));
+            if (lane == 0) qsc[(long long)ti * (n / 32) + g] = sc;
+        }
+        return;
+    }
+    int half = rd / 2, pos = P[0] + ti;
+    float* tp = r + (n - rd);
+    for (int j = threadIdx.x; j < half; j += blockDim.x) {
+        float2 cs = tab[(long long)pos * half + j];
+        float a = tp[2 * j], b = tp[2 * j + 1];
+        tp[2 * j] = bf(a * cs.x - b * cs.y);
+        tp[2 * j + 1] = bf(a * cs.y + b * cs.x);
+    }
+    __syncthreads();
+    float* rr = ring + (long long)(pos % win) * n;
+    float* ar = all ? all + (long long)(win + ti) * n : 0;
+    for (int g = wid; g < n / 32; g += nw) {
+        float x = r[g * 32 + lane], amax = fabsf(x);
+#pragma unroll
+        for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        float sc = pow2_ceil(fmaxf(amax, 1e-4f) / 448.f);
+        float v = bf(round_e4m3(fminf(fmaxf(x / sc, -448.f), 448.f)) * sc);
+        r[g * 32 + lane] = v;
+        rr[g * 32 + lane] = v;
+        if (ar) ar[g * 32 + lane] = v;
+    }
+}
+
 // ---- tiled sparse attention (default; DS_EXACT=1 selects ds_sparse_attn) ---------------------
 //
 // Three launches over a scratch buffer, same numerics as ds_sparse_attn up to summation order:
@@ -1497,6 +1672,81 @@ extern "C" __global__ void ds_attn_soft(const float* part, const float* sink, co
 #pragma unroll
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     if (lane == 0) den[warp] = sum + expf(sink[hi] - mx);
+}
+
+// ds_attn_soft fused into ds_attn_pv (bit for bit the pair): block per (t, 8 heads, dsb
+// consecutive 64-wide d slices); warp m computes head g * 8 + m's softmax exactly as
+// ds_attn_soft into shared P and den, then the slices run ds_attn_pv's accumulation.
+extern "C" __global__ void __launch_bounds__(256) ds_attn_spv(const float* part, const float* sink,
+                                                              const float* kv0, int split, const float* kv1,
+                                                              const int* idxs, float* o, int h, int d, int k,
+                                                              float scale, int dsb) {
+    extern __shared__ float P[];  // [8][k], then the k indices
+    __shared__ float red[4][8][64];
+    __shared__ float dens[8];
+    int* Is = (int*)(P + 8 * k);
+    int nds = d / 64, hg = h / 8, nb = nds / dsb;
+    int b = blockIdx.x;
+    int db = b % nb, g = (b / nb) % hg, ti = b / (nb * hg);
+    int tid = threadIdx.x;
+    for (int e = tid; e < k; e += 256) Is[e] = idxs[(long long)ti * k + e];
+    __syncthreads();
+    {
+        int m = tid >> 5, lane = tid & 31, hi = g * 8 + m;
+        float* p = P + m * k;
+        float mx = -DS_INF;
+        for (int j = lane; j < k; j += 32) {
+            float s = 0.f;
+            for (int c = 0; c < nds; c++) s += part[(((long long)ti * nds + c) * h + hi) * k + j];
+            s = Is[j] >= 0 ? s * scale : -DS_INF;
+            p[j] = s;
+            mx = fmaxf(mx, s);
+        }
+#pragma unroll
+        for (int o2 = 16; o2; o2 >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o2));
+        mx = fmaxf(mx, -1e30f);
+        float sum = 0.f;
+        for (int j = lane; j < k; j += 32) {
+            float e = expf(p[j] - mx);
+            sum += e;
+            p[j] = bf(e);
+        }
+#pragma unroll
+        for (int o2 = 16; o2; o2 >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o2);
+        if (lane == 0) dens[m] = sum + expf(sink[hi] - mx);
+    }
+    __syncthreads();
+    int ks = tid >> 6, di = tid & 63;
+    for (int ds = db * dsb; ds < (db + 1) * dsb; ds++) {
+        int off = ds * 64 + di;
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int j0 = ks; j0 < k; j0 += 32) {
+            float v[8];
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                int j = j0 + 4 * u;
+                int r = j < k ? Is[j] : -1;
+                v[u] = r >= 0 ? DS_KROW(r)[off] : 0.f;
+            }
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                int j = j0 + 4 * u;
+                if (j < k)
+#pragma unroll
+                    for (int m = 0; m < 8; m++) acc[m] = fmaf(P[m * k + j], v[u], acc[m]);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < 8; m++) red[ks][m][di] = acc[m];
+        __syncthreads();
+        for (int e = tid; e < 8 * 64; e += 256) {
+            int m = e / 64, c = e % 64;
+            float s = red[0][m][c] + red[1][m][c] + red[2][m][c] + red[3][m][c];
+            int hi = g * 8 + m;
+            o[((long long)ti * h + hi) * d + ds * 64 + c] = bf(s / dens[m]);
+        }
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, const float* den, const float* kv0,
