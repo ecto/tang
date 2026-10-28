@@ -106,11 +106,36 @@ __device__ float g5_deq(unsigned ty, const unsigned char* row, int j) {
     return __uint_as_float(0x7fc00000u);
 }
 
+// The upload-repacked rows (moe_gpu.rs `repack_row`; the GGUF on disk is untouched), split so
+// every 32-weight quant payload is 16-byte aligned for g5f_lane_dot32. Row of k weights:
+//   108 (Q8_0):  int8 qs[k] | f16 d[k/32]                    (padded to 16 B)
+//   114 (Q6_K):  per 256-block {ql[128] qh[64]} x nb | int8 sc[16] x nb | f16 d x nb  (nb = k/256)
+// Same values as 8 / 14 (the bytes are only moved), so the element decode needs k.
+#define G5_Q8R 108u
+#define G5_Q6R 114u
+__device__ float g5_deq_r(unsigned ty, const unsigned char* row, int j, int k) {
+    if (ty == G5_Q8R) return g5_h2f(g5_u16(row + k + 2 * (j / 32))) * (float)(signed char)row[j];
+    if (ty == G5_Q6R) {
+        const int nb = k / 256, bi = j / 256, e = j % 256, n = e / 128, r = e % 128, qd = r / 32, l = r % 32;
+        const unsigned char* ql = row + bi * 192 + n * 64;
+        const unsigned char* qh = row + bi * 192 + 128 + n * 32;
+        const int lo = (ql[l + (qd & 1) * 32] >> ((qd & 2) ? 4 : 0)) & 0xF;
+        const int h2 = (qh[l] >> (2 * qd)) & 3;
+        const int sc = (signed char)row[nb * 192 + bi * 16 + n * 8 + (qd * 2 + l / 16)];
+        return g5_h2f(g5_u16(row + nb * 208 + 2 * bi)) * (float)sc * (float)((lo | (h2 << 4)) - 32);
+    }
+    return g5_deq(ty, row, j);
+}
+
 // dot(row r of matrix e of w, x[0..k))
 __device__ float g5_dot(const G5W w, unsigned e, int r, const float* x, int k) {
     const unsigned char* row = (const unsigned char*)(w.base + (unsigned long long)e * w.estride +
                                                       (unsigned long long)r * w.row_bytes);
     float acc = 0.f;
+    if (w.ty == G5_Q8R || w.ty == G5_Q6R) {
+        for (int j = 0; j < k; j++) acc += g5_deq_r(w.ty, row, j, k) * x[j];
+        return acc;
+    }
     for (int j = 0; j < k; j++) acc += g5_deq(w.ty, row, j) * x[j];
     return acc;
 }
@@ -438,6 +463,63 @@ __device__ __forceinline__ float g5f_lane_dot32(const unsigned char* w, const un
     return acc;
 }
 
+// The repacked Q8_0 (108) / Q6_K (114) rows at 32-weight granularity, lane L on chunks
+// c = L + 32 i as g5f_lane_dot32: two 16-byte payload loads per chunk (Q6_K: ql + qh, 32 B each),
+// scales from the row's tail. dot = dx * dw * sum(q x) (Q6_K: two 16-weight halves, one int8
+// scale each). k % 32 == 0 (108) / k % 256 == 0 (114); w 16-aligned (the repack guarantees both).
+__device__ __forceinline__ int g5f_dp8(const unsigned* n, const uint4 a, const uint4 b, int i0, int cnt) {
+    const unsigned xw[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    int s = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        if (i >= i0 && i < i0 + cnt) s = __dp4a((int)n[i], (int)xw[i], s);
+    return s;
+}
+template <int TY>
+__device__ __forceinline__ float g5f_lane_dot32r(const unsigned char* w, const unsigned char* xq, const unsigned char* xq2,
+                                                const float* xd, int k) {
+    const int lane = threadIdx.x & 31;
+    const int nb = k / 256;
+    float acc = 0.f;
+    for (int c = lane; c < k / 32; c += 32) {
+        unsigned n[8];
+        float d0, d1;
+        if (TY == 108) {
+            const uint4* qp = (const uint4*)(w + (size_t)c * 32);
+            const uint4 q0 = qp[0], q1 = qp[1];
+            n[0] = q0.x; n[1] = q0.y; n[2] = q0.z; n[3] = q0.w; n[4] = q1.x; n[5] = q1.y; n[6] = q1.z; n[7] = q1.w;
+            d0 = d1 = g5f_h2f(g5f_rd16(w + k + 2 * c));
+        } else {
+            const int bi = c >> 3, j = c & 7, hn = j >> 2, qt = j & 3;
+            const unsigned char* b = w + (size_t)bi * 192;
+            const uint4* lp = (const uint4*)(b + hn * 64 + 32 * (qt & 1));
+            const uint4* hp = (const uint4*)(b + 128 + hn * 32);
+            const uint4 l0 = lp[0], l1 = lp[1], h0 = hp[0], h1 = hp[1];
+            const unsigned lw[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+            const unsigned hw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            const int ls = 4 * (qt >> 1), hs = 2 * qt;
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                n[i] = __vsub4(((lw[i] >> ls) & 0x0F0F0F0Fu) | (((hw[i] >> hs) & 0x03030303u) << 4), 0x20202020u);
+            const float d = g5f_h2f(g5f_rd16(w + nb * 208 + 2 * bi));
+            const signed char* sc = (const signed char*)(w + nb * 192 + bi * 16 + hn * 8 + 2 * qt);
+            d0 = d * (float)sc[0];
+            d1 = d * (float)sc[1];
+        }
+        const uint4* xp = (const uint4*)(xq + (size_t)c * 32);
+        const uint4 x0 = xp[0], x1 = xp[1];
+        float f0 = (float)g5f_dp8(n, x0, x1, 0, 4), f1 = (float)g5f_dp8(n, x0, x1, 4, 4);
+        if (xq2) {
+            const uint4* x2p = (const uint4*)(xq2 + (size_t)c * 32);
+            const uint4 y0 = x2p[0], y1 = x2p[1];
+            f0 = fmaf((float)g5f_dp8(n, y0, y1, 0, 4), 1.0f / 254.0f, f0);
+            f1 = fmaf((float)g5f_dp8(n, y0, y1, 4, 4), 1.0f / 254.0f, f1);
+        }
+        acc = fmaf(xd[c], fmaf(d0, f0, d1 * f1), acc);
+    }
+    return acc;
+}
+
 __device__ __forceinline__ float g5f_dot_any(unsigned ty, const unsigned char* w, const unsigned char* xq,
                                             const unsigned char* xq2, const float* xd, const float* xf, int k) {
     switch (ty) {
@@ -452,6 +534,8 @@ __device__ __forceinline__ float g5f_dot_any(unsigned ty, const unsigned char* w
             if (G5F_DOT32 && ((unsigned long long)w & 15) == 0 && (k & 255) == 0) return g5f_lane_dot32<13>(w, xq, xq2, xd, k);
             return g5f_lane_dot<13>(w, xq, xq2, xd, xf, k);
         case 14: return g5f_lane_dot<14>(w, xq, xq2, xd, xf, k);
+        case 108: return g5f_lane_dot32r<108>(w, xq, xq2, xd, k);
+        case 114: return g5f_lane_dot32r<114>(w, xq, xq2, xd, k);
         default: return __uint_as_float(0x7fc00000u);
     }
 }

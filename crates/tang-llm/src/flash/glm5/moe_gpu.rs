@@ -255,6 +255,91 @@ pub fn upload(w: &W, n_mat: usize, rows: usize, cols: usize) -> Result<DevW> {
     }
 }
 
+/// Repacked row layouts (moe_cuda.cuh `G5_Q8R` / `G5_Q6R`): the same values with every 32-weight
+/// quant payload 16-byte aligned, so `g5f_lane_dot32r` streams them as 16-byte loads.
+pub const G5_Q8R: u32 = 108;
+pub const G5_Q6R: u32 = 114;
+
+/// One GGUF row of `k` weights (ggml type `ty`: 8 Q8_0 or 14 Q6_K) in its repacked layout,
+/// appended to `out` (padded to `repacked_row_bytes`).
+fn repack_row(ty: u32, row: &[u8], k: usize, out: &mut Vec<u8>) {
+    let start = out.len();
+    match ty {
+        8 => {
+            let nb = k / 32;
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 34 + 2..b * 34 + 34]);
+            }
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 34..b * 34 + 2]);
+            }
+        }
+        14 => {
+            let nb = k / 256;
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 210..b * 210 + 192]);
+            }
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 210 + 192..b * 210 + 208]);
+            }
+            for b in 0..nb {
+                out.extend_from_slice(&row[b * 210 + 208..b * 210 + 210]);
+            }
+        }
+        _ => unreachable!(),
+    }
+    out.resize(start + repacked_row_bytes(ty, k), 0);
+}
+
+fn repacked_row_bytes(ty: u32, k: usize) -> usize {
+    let raw = if ty == 8 { k / 32 * 34 } else { k / 256 * 210 };
+    raw.next_multiple_of(16)
+}
+
+/// `TANG_GLM5_MOE_REPACK` (default on; `0` keeps the GGUF layout): repack the FFN's Q8_0 / Q6_K
+/// weights at upload.
+fn repack_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TANG_GLM5_MOE_REPACK").map_or(true, |v| v != "0"))
+}
+
+/// [`upload`] for the MoE / dense FFN weights: Q8_0 (k % 32 == 0) and Q6_K (k % 256 == 0) are
+/// repacked to [`G5_Q8R`] / [`G5_Q6R`] (when [`repack_on`]); everything else as `upload`.
+pub fn upload_ffn(w: &W, n_mat: usize, rows: usize, cols: usize) -> Result<DevW> {
+    let W::Gguf(g, t) = *w else { return upload(w, n_mat, rows, cols) };
+    let ty = ggml_id(t)?;
+    let ok = match ty {
+        8 => cols % 32 == 0,
+        14 => cols % 256 == 0,
+        _ => false,
+    };
+    if !ok || !repack_on() {
+        return upload(w, n_mat, rows, cols);
+    }
+    ensure!(
+        t.dims[0] as usize == cols && t.dims.get(1).copied().unwrap_or(1) as usize == rows,
+        "{}: dims {:?}, want [{cols}, {rows}, ..]",
+        t.name,
+        t.dims
+    );
+    let rb = t.row_bytes()?;
+    let src = g.bytes(t);
+    ensure!(src.len() == n_mat * rows * rb, "{}: {} bytes, want {n_mat}x{rows}x{rb}", t.name, src.len());
+    let nrb = repacked_row_bytes(ty, cols);
+    let mut out = Vec::with_capacity(n_mat * rows * nrb);
+    for row in src.chunks_exact(rb) {
+        repack_row(ty, row, cols, &mut out);
+    }
+    let buf = DevBuf::from_slice(&out)?;
+    let w = G5W {
+        base: buf.ptr,
+        estride: (rows * nrb) as u64,
+        row_bytes: nrb as u32,
+        ty: if ty == 8 { G5_Q8R } else { G5_Q6R },
+    };
+    Ok(DevW { buf, w })
+}
+
 /// A layer's FFN on the device: geometry (weight handles cleared) plus uploaded weights.
 pub struct DevMoe {
     pub p: MoeParams<'static>,
@@ -279,9 +364,9 @@ fn up3(
         return Ok(None);
     };
     Ok(Some((
-        upload(&g, n, ff, hid)?,
-        upload(&u, n, ff, hid)?,
-        upload(&d, n, hid, ff)?,
+        upload_ffn(&g, n, ff, hid)?,
+        upload_ffn(&u, n, ff, hid)?,
+        upload_ffn(&d, n, hid, ff)?,
     )))
 }
 
