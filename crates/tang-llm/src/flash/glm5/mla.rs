@@ -1477,6 +1477,129 @@ extern "C" __global__ void mla_attn_abs2_p(const float* __restrict__ qa, const u
     const int pos = (int)posp[0];
     mla_attn_abs2_impl(qa, lat, wv, sel, out, pos + 1, pos, nh, dv, dl, sel == NULL ? pos + 1 : width, scale);
 }
+
+// ---------------- split absorbed MLA (fold_q2 / abs2 at full-GPU occupancy) ----------------
+// fold_q2 and abs2's W_v step are one GEMV per head over f32 weights (33.5 MB each per DSA
+// layer at nh 64 / dl 512 / dk = dv 256) run by only nh blocks: ~0.45 TB/s. mla_hgemv
+// spreads the rows over grid.y; each warp owns MLA_HR rows, every row summed exactly as the
+// fold_q2 / abs2 warps sum theirs (lane-strided over cols, fma in order, xor tree), so the
+// outputs are bit-identical. mla_attn_lat is abs2 up to the weighted latent sum, written in
+// place over the block's own qa row, with den to dn[qi][h].
+#define MLA_HR 4
+// grid (nh, ceil(rows / (8 * MLA_HR)), t), 256 threads. w [nh][rows][cols], x [t][nh][cols],
+// out [t][nh][rows]; dn (nullable) [t][nh]: out = dn > 0 ? a / dn : 0.
+extern "C" __global__ void mla_hgemv(const float* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, const float* __restrict__ dn, int nh, int rows, int cols)
+{
+    const int h = blockIdx.x, qi = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + warp) * MLA_HR;
+    if (r0 >= rows) return;
+    const float* xh = x + ((size_t)qi * nh + h) * cols;
+    const float* wh = w + ((size_t)h * rows + r0) * cols;
+    float a[MLA_HR];
+#pragma unroll
+    for (int r = 0; r < MLA_HR; r++) a[r] = 0.f;
+    if (r0 + MLA_HR <= rows) {
+        for (int d = lane; d < cols; d += 32) {
+            const float xv = xh[d];
+#pragma unroll
+            for (int r = 0; r < MLA_HR; r++) a[r] += wh[(size_t)r * cols + d] * xv;
+        }
+    } else {
+        for (int d = lane; d < cols; d += 32) {
+            const float xv = xh[d];
+            for (int r = 0; r < rows - r0; r++) a[r] += wh[(size_t)r * cols + d] * xv;
+        }
+    }
+    const float den = dn == NULL ? 1.f : dn[(size_t)qi * nh + h];
+    float* o = out + ((size_t)qi * nh + h) * rows + r0;
+#pragma unroll
+    for (int r = 0; r < MLA_HR; r++) {
+        float v = a[r];
+        for (int s2 = 16; s2 > 0; s2 >>= 1) v += __shfl_xor_sync(0xffffffffu, v, s2);
+        if (lane == 0 && r0 + r < rows) o[r] = dn == NULL ? v : (den > 0.f ? v / den : 0.f);
+    }
+}
+
+// grid (nh, t), 256 threads; dynamic smem = (2*dl + width) floats. abs2 through the weighted
+// latent sum; qa[qi][h] := lacc, dn[qi][h] := den. Then mla_hgemv(wv, qa, out, dn).
+__device__ __forceinline__ void mla_attn_lat_impl(float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const int* __restrict__ sel, float* __restrict__ dn, int nkv, int pos0, int nh, int dl, int width, float scale)
+{
+    const int h = blockIdx.x, qi = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int qpos = pos0 + qi;
+    extern __shared__ float sm[];
+    float* sq = sm;
+    float* lacc = sm + dl;
+    float* sc = sm + 2 * dl;
+    __shared__ float red[256];
+    float* qh = qa + ((size_t)qi * nh + h) * dl;
+    for (int l = threadIdx.x; l < dl; l += blockDim.x) { sq[l] = qh[l]; lacc[l] = 0.f; }
+    __syncthreads();
+    for (int w = warp; w < width; w += nw) {
+        int k;
+        if (sel == NULL) k = w <= qpos ? w : -1;
+        else k = sel[(size_t)qi * width + w];
+        float a = G5_NEG_INF_F;
+        if (k >= 0 && k < nkv) {
+            const unsigned short* kr = lat + (size_t)k * dl;
+            a = 0.f;
+            for (int l = lane; l < dl; l += 32) a += sq[l] * bf2f(kr[l]);
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            a *= scale;
+        }
+        if (lane == 0) sc[w] = a;
+    }
+    __syncthreads();
+    float m = G5_NEG_INF_F;
+    for (int w = threadIdx.x; w < width; w += blockDim.x) m = fmaxf(m, sc[w]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float den = 0.f;
+    for (int w = threadIdx.x; w < width; w += blockDim.x) {
+        const float p = sc[w] == G5_NEG_INF_F ? 0.f : expf(sc[w] - m);
+        sc[w] = p;
+        den += p;
+    }
+    red[threadIdx.x] = den;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    den = red[0];
+    for (int w = 0; w < width; w++) {
+        const float p = sc[w];
+        if (p == 0.f) continue;
+        const int k = sel == NULL ? w : sel[(size_t)qi * width + w];
+        const unsigned short* kr = lat + (size_t)k * dl;
+        for (int l = threadIdx.x; l < dl; l += blockDim.x) lacc[l] += p * bf2f(kr[l]);
+    }
+    for (int l = threadIdx.x; l < dl; l += blockDim.x) qh[l] = lacc[l];
+    if (threadIdx.x == 0) dn[(size_t)qi * nh + h] = den;
+}
+
+extern "C" __global__ void mla_attn_lat(float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const int* __restrict__ sel, float* __restrict__ dn, int nkv, int pos0, int nh, int dl, int width, float scale)
+{
+    mla_attn_lat_impl(qa, lat, sel, dn, nkv, pos0, nh, dl, width, scale);
+}
+
+extern "C" __global__ void mla_attn_lat_p(float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const int* __restrict__ sel, float* __restrict__ dn, int nh, int dl, int width, float scale,
+    const unsigned* __restrict__ posp)
+{
+    const int pos = (int)posp[0];
+    mla_attn_lat_impl(qa, lat, sel, dn, pos + 1, pos, nh, dl, sel == NULL ? pos + 1 : width, scale);
+}
 "#;
 
 /// The `#define` prelude for [`CUDA_SRC`] at this geometry.
@@ -1516,6 +1639,13 @@ pub mod cuda {
     /// MlaCuda caller on `Stream::new()`; every launcher now asserts it.
     const NON_BLOCKING_STREAM: &str =
         "MlaCuda needs a stream that orders against the legacy default stream: use Stream::blocking(), not Stream::new()";
+
+    /// `TANG_GLM5_MLA_SPLIT=0` restores the nh-block `mla_fold_q2` + `mla_attn_abs2`; the default
+    /// is the bit-identical split (`mla_hgemv` + `mla_attn_lat` + `mla_hgemv`).
+    fn mla_split() -> bool {
+        static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *S.get_or_init(|| std::env::var("TANG_GLM5_MLA_SPLIT").map(|v| v != "0").unwrap_or(true))
+    }
 
     /// Loaded kernels for one geometry (feature "cuda"; NVRTC at construction).
     pub struct MlaCuda {
@@ -1728,8 +1858,9 @@ pub mod cuda {
                 s_d: std::cell::RefCell::new(DevBuf::zeroed_elems::<i32>(
                     cap_t * (w.topk + w.kpool - 1),
                 )?),
+                // [cap_t][nh][dl] q' (lacc after mla_attn_lat), then den [cap_t][nh]
                 qa_d: std::cell::RefCell::new(DevBuf::zeroed_elems::<f32>(
-                    cap_t * w.n_head * w.kv_lora,
+                    cap_t * w.n_head * (w.kv_lora + 1),
                 )?),
                 hw_d: std::cell::RefCell::new(DevBuf::zeroed_elems::<f32>(cap_t * w.idx_heads)?),
                 iq_d: std::cell::RefCell::new(DevBuf::zeroed_elems::<f32>(
@@ -1882,7 +2013,7 @@ pub mod cuda {
                     *b = DevBuf::zeroed_elems::<i32>(t * width * 2 + 64)?;
                 }
             }
-            grow!(self.qa_d, t * self.nh * self.dl);
+            grow!(self.qa_d, t * self.nh * (self.dl + 1));
             grow!(self.hw_d, t * self.idxh);
             grow!(self.iq_d, t * self.idxh * self.idxd);
             {
@@ -2591,6 +2722,19 @@ pub mod cuda {
             let (nkv, p0) = (n_kv as i32, pos0 as i32);
             let scale = 1.0f32 / (self.dk as f32).sqrt();
             let (wkp, wvp) = (self.wk_d.ptr, self.wv_d.ptr);
+            if mla_split() {
+                gpu::trace::bytes((self.nh * self.dl * (self.dk + self.dv) * 4 + width * self.dl * 2) as u64);
+                let dn = qa_ptr + (t * self.nh * self.dl * 4) as u64;
+                self.hgemv(wkp, q, qa_ptr, 0, self.dl, self.dk, t, stream)?;
+                let f = self.m.func("mla_attn_lat")?;
+                let smem = ((2 * self.dl + width) * 4) as u32;
+                unsafe {
+                    gpu::launch(f, (self.nh as u32, t as u32, 1), (256, 1, 1), smem, stream,
+                        tang_moe::args![qa_ptr, ld_ptr, sel_ptr, dn, nkv, p0, nh, dl, wd, scale])?
+                };
+                self.hgemv(wvp, qa_ptr, od_ptr, dn, self.dv, self.dl, t, stream)?;
+                return Ok(od_ptr);
+            }
             let ff = self.m.func("mla_fold_q2")?;
             gpu::trace::bytes((self.nh * self.dl * self.dk * 4) as u64);
             unsafe {
@@ -2819,6 +2963,18 @@ pub mod cuda {
             Ok(sd)
         }
 
+        /// `mla_hgemv`: out [t][nh][rows] = W_h [rows][cols] . x [t][nh][cols] (/ dn when dn != 0).
+        #[allow(clippy::too_many_arguments)]
+        fn hgemv(&self, w: u64, x: u64, out: u64, dn: u64, rows: usize, cols: usize, t: usize, stream: &Stream) -> Result<(), gpu::Error> {
+            let f = self.m.func("mla_hgemv")?;
+            let (nh, r, c) = (self.nh as i32, rows as i32, cols as i32);
+            unsafe {
+                gpu::launch(f, (self.nh as u32, rows.div_ceil(32) as u32, t as u32), (256, 1, 1), 0, stream,
+                    tang_moe::args![w, x, out, dn, nh, r, c])?
+            };
+            Ok(())
+        }
+
         /// [`Self::attend_dev_sel`] at `*posp` (t = 1): `sel_ptr` 0 = dense causal.
         pub fn attend_pos(&self, q: u64, posp: u64, sel_ptr: u64, stream: &Stream) -> Result<u64, gpu::Error> {
             self.ensure_scratch(1)?;
@@ -2829,11 +2985,22 @@ pub mod cuda {
             let (nh, dk, dv, dl, wd) = (self.nh as i32, self.dk as i32, self.dv as i32, self.dl as i32, sw as i32);
             let scale = 1.0f32 / (self.dk as f32).sqrt();
             let (wkp, wvp) = (self.wk_d.ptr, self.wv_d.ptr);
+            // dense width <= topk (dense only while kv_len <= topk), sparse = sw
+            let smem = ((2 * self.dl + sw.max(self.topk)) * 4) as u32;
+            if mla_split() {
+                let dn = qa_ptr + (self.nh * self.dl * 4) as u64;
+                self.hgemv(wkp, q, qa_ptr, 0, self.dl, self.dk, 1, stream)?;
+                let f = self.m.func("mla_attn_lat_p")?;
+                unsafe {
+                    gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream,
+                        tang_moe::args![qa_ptr, lat, sel_ptr, dn, nh, dl, wd, scale, posp])?
+                };
+                self.hgemv(wvp, qa_ptr, od_ptr, dn, self.dv, self.dl, 1, stream)?;
+                return Ok(od_ptr);
+            }
             let ff = self.m.func("mla_fold_q2")?;
             unsafe { gpu::launch(ff, (self.nh as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![q, wkp, qa_ptr, nh, dk, dl])? };
             let f = self.m.func("mla_attn_abs2_p")?;
-            // dense width <= topk (dense only while kv_len <= topk), sparse = sw
-            let smem = ((2 * self.dl + sw.max(self.topk)) * 4) as u32;
             unsafe {
                 gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream, tang_moe::args![qa_ptr, lat, wvp, sel_ptr, od_ptr, nh, dv, dl, wd, scale, posp])?
             };
