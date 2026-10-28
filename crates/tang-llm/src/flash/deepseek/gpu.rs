@@ -5211,6 +5211,11 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
         let (hci, di, eps, neps) = (hc as i32, d as i32, 1e-6f32, 1e-6f32);
+        // DS_BENCH_HC_STUB: ds_hc_fused_ks's phases stubbed out (timing only, see the kernel)
+        let stub: i32 = std::env::var("DS_BENCH_HC_STUB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         for t in [1usize, 6, 13] {
             let ti = t as i32;
             let x = up(&data(t * hc * d, 1, 1.0));
@@ -5478,7 +5483,7 @@ mod tests {
                         tang_moe::args![
                             0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, qa.ptr, pre0.ptr, b[4].ptr,
                             w0, scale.ptr, base.ptr, b[1].ptr, b[2].ptr, b[3].ptr, cnt.ptr, ti,
-                            hci, di, it, eps, neps, neps
+                            hci, di, it, eps, neps, neps, stub
                         ],
                     )?;
                     k.go(
@@ -5490,7 +5495,7 @@ mod tests {
                         tang_moe::args![
                             ha.ptr, 0u64, x.ptr, b[2].ptr, b[3].ptr, b[5].ptr, w1, qf.ptr,
                             b[1].ptr, b[10].ptr, w0, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
-                            b[9].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps
+                            b[9].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps, stub
                         ],
                     )?;
                     k.go(
@@ -5505,6 +5510,26 @@ mod tests {
                     )?;
                 }
                 Ok(())
+            };
+            // one ds_hc_fused_ks launch alone (the first stage's), for the phase timings
+            let fk1 = |s: &Stream| -> Result<()> {
+                let b = &g4;
+                let (w0, wa) = (nv, fw(0));
+                let g = (gxf as u32, t.div_ceil(8) as u32, 1);
+                unsafe {
+                    k.go(
+                        "ds_hc_fused_ks",
+                        g,
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, qa.ptr, pre0.ptr, b[4].ptr,
+                            w0, scale.ptr, base.ptr, b[1].ptr, b[2].ptr, b[3].ptr, cnt.ptr, ti,
+                            hci, di, it, eps, neps, neps, stub
+                        ],
+                    )
+                }
             };
             old(&s).unwrap();
             new(&s).unwrap();
@@ -5522,7 +5547,7 @@ mod tests {
                 .enumerate()
                 .flat_map(|(i, n)| [(i, (n, &g3)), (i, (n, &g4))])
             {
-                if !one && std::ptr::eq(gb, &g4) {
+                if (!one && std::ptr::eq(gb, &g4)) || stub != 0 {
                     continue;
                 }
                 if i == 0 || i == 6 {
@@ -5568,6 +5593,7 @@ mod tests {
                 ("fused (5 launches/layer)", &new),
                 ("ks (5 launches/layer)", &ks),
                 ("fused ks (3 launches/layer)", &fk),
+                ("fused ks, 1 stage launch alone", &fk1),
             ] {
                 if !one && name.starts_with("fused ks") {
                     continue;
