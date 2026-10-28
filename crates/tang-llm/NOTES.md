@@ -4,6 +4,73 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-27 (night) — k5d_tail: beta + gate2 + step + o_proj q8 in one launch, fused G5F step 175 → 87 µs/layer (H200, branch claude/glm5-kda-kernels)
+
+The fused G5F=2 step had seven launches. Four of them were never tuned: k5_beta, k5d_gate2, k5d_step
+and k5_q8 over yb. Together they took ~108 µs/layer, against 62 µs for the two projection GEMVs.
+`k5d_tail` (kda_decode.cuh) replaces all four with ONE launch: grid nh=64, block hd=128.
+
+Why one block per head works: everything a head needs is head-local.
+- its 128 G/G2 rows (f_b/g_b over the shared, hd-wide g1/g2a);
+- beta[h] (b_proj row h);
+- the 3 conv channels each thread owns;
+- the state S[h].
+
+What the kernel does differently (the arithmetic is the same expressions in the same order):
+- The head's f_b/g_b rows (2×17 KB) and its b_proj row (4.3 KB) are staged into smem with
+  coalesced 16 B loads. k5d_gate2 had each thread stream its own 136 B row byte by byte.
+- The f16 scale is decoded once per 32 values, and expf(G) once per row.
+- The state column is read once into registers and written once: 8 MB/layer of traffic instead
+  of k5d_step's 16 MB, for a state of 64×128×128 fp32 = 4 MiB/layer.
+- The conv history is updated in place.
+- o_proj's Q8 codes are written straight into xq8, so o_proj runs k5_qgemv with no q8 pre-pass.
+
+Launch count per step: 7 → 4. `TANG_GLM5_KDA_TAIL=0` restores the old launches.
+Preconditions, checked on the host (if they fail, the old path runs): f_b/g_b/b_proj Q8_0 and
+hidden ≤ 4096, a multiple of 256.
+
+Bug on the first run: the tail read g1/g2a at `h*D + x`. Those vectors are hd wide and shared by
+every head, so only head 0 was right (8064/8192 g differed). The step-0 tap diff in the bench
+located it.
+
+H200, real layer 0, `kda_tail_real_bench`. CUDA events around each launch, back to back on one
+stream, median of 56 steps:
+
+| kernel | old µs | tail µs | MB moved (old) | TB/s (old) | launches |
+|---|---|---|---|---|---|
+| k5_q8 x | 5.5 | 5.5 | 0.02 | — | 1 / 1 |
+| k5_qgemv q\|k\|v\|f_a\|g_a | 39.4 | 39.2 | 108.1 | 2.74 | 1 / 1 |
+| k5_beta | 33.1 | — | 0.29 | 0.009 | 1 / — |
+| k5d_gate2 | 51.3 | — | 2.2 | 0.04 | 1 / — |
+| k5d_step | 17.8 | — | 16.8 (2× r+w state) + 1.1 conv | 1.0 | 1 / — |
+| k5_q8 yb | 5.4 | — | 0.04 | — | 1 / — |
+| **k5d_tail** | — | **19.0** | 2.5 weights + 8.4 state + 1.1 conv = 12.0 | 0.63 | — / 1 |
+| k5_qgemv o | 22.8 | 22.7 | 35.7 | 1.57 | 1 / 1 |
+| **step total** | **174.5** | **86.5** | | | 7 / 4 |
+
+decode_fast host wall: 104 µs/step fused, 103 µs/step graph (64 steps, including the capture).
+
+Parity, 64 steps against the old launches: 0 differing bits in beta/g/g2/o/y at step 0, and in
+output, state and conv over all 64 steps, for tail eager, decode_fast fused and decode_fast graph.
+The graph capture works with the tail.
+
+ids gate on H200 #2 (bin md5 b6a088bb). Flags: GPU_FFN=0 GEMV8=1 KDA_PF2=1 MHC_FUSED=1 MOE=fast
+MLA_RESIDENT=1 GPU_HEAD=1 KDA_G5F=2 KDA_FUSED=1 KDA_GRAPH=1. `-n 8 --temp 0` gives
+`785 1196 6801 264 6386 38038 911 279` = oracle at both KDA_TAIL=1 and 0. The TRACE `-n 32` ids are
+identical between the two.
+
+| KDA_TAIL | kda ms/token (wall, 34 layers) | launches |
+|---|---|---|
+| 0 | 8.60 | 15/34/34/69 |
+| 1 | **5.17** | 9/34/34/69 |
+
+The decode tok/s of these runs is dominated by the CPU FFN (GPU_FFN=0), so it is not a speed number.
+The B300 has not been run.
+
+What is left: k5d_tail is at 0.63 TB/s. Its floor is ~3 µs, but it only has 64 blocks and runs
+serial 128-long dot and fma chains. The next 10 µs are in the projections (62 µs), plus the two
+k5_q8 launches and the launch gaps.
+
 ## 2026-10-27 (integration) — batcher + kda-gemv + moe + bench + step-graph merged: B300 30.8 tok/s decode (branch claude/glm5-integrate)
 
 Merged onto frog/glm5-forward 66aa4b5e: frog/glm5-batcher, claude/glm5-kda-gemv, claude/glm5-moe,
