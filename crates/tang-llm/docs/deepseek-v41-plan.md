@@ -79,8 +79,35 @@ warm, ~5 min cold once per boot; `DS_ENGRAM_PREFAULT=0` skips it). The draft ste
 host-bound (120 ms host, 12 ms GPU): the Markov head added each position's bias with a
 256 × 129k GEMV on the CPU; it runs on the device now with one row read back per draw.
 
-Steady state after both: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a ~4 ms
-floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
+Wave 4 (three lanes, merged): grouped MoE on the tensor-core K-split path (6.3 → 0.97 ms per
+6-token layer on a 3090, 74% of peak; the loop's `ds_linear_csr` is exact so the grouped-vs-loop
+test is now a KL/argmax bar, 0.00 on the fixture), `ds_router` block-parallel (656 → 8.7 µs per
+layer; it was one serial thread per token recomputing sqrt-softplus six times) with a one-warp-
+per-row GEMV for t ≤ 8 raw linears, the NCCL reduce forked onto a side stream so the shared
+expert overlaps it, and one launch fewer per mHC mix. Same prompt: 25.1 greedy / 22.8 sampled
+(drafts 240/151, the K-split path rounds differently from the exact loop). Less than the lane
+benches add up to, so the next step is the per-request table (`DS_SERVE_PROFILE=1`) on the
+real model rather than more guessing.
+
+Also in this round: the Engram tables are copied into anonymous host memory at open
+(`St::pin`, one shared copy per process, ~200 GB, 7–10 min cold on the pod's network mount;
+the page cache that pre-faulting relied on was evicted within the hour), `DS41_CTX`/`--ctx`
+now reach the server's limit (it reported 4096 whatever was asked), prefill runs in
+`DS_PREFILL_CHUNK`-token chunks (a 10k-token prompt in one forward ran the device out of
+memory), and an EP rank that fails logs and exits instead of leaving its peers spinning in NCCL.
+
+**frog end to end** (`FROG_BASE_URL` at the pod's server through an SSH tunnel, `frog -m
+cloud/bull -p "Create hello.py that prints the first 10 Fibonacci numbers, then run it."`,
+ctx 32768): correct — set a title, tried Write (blocked under `-p`), wrote the file through a
+shell heredoc, ran it, summarized. 18.5 minutes wall: frog's prompt is ~17k tokens and each of
+its three turns prefilled it from position 0 (17272, 17483, 17626 prompt tokens; no prefix
+reuse) at ~50–60 tok/s. For agent use the prefill side now matters more than decode: prefix
+caching across turns (the KV is tiny: window ring + compressed) and a faster prefill (the
+indexer scores every chunk position against the whole compressed cache, so long prompts slow
+down as they grow).
+
+Steady state after the host fixes: verify ≈ 130 ms and draft ≈ 15 ms for 4.3 tokens, against a
+~4 ms floor. The verify step's remaining cost is the grouped MoE on the non-tensor-core `lin_fast`
 path (`moe.router` 28 ms and `moe.reduce` 10 ms per step are the next two line items), then
 the launch count (3.3k per verify step).
 
