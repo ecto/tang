@@ -851,10 +851,15 @@ impl GpuModel {
         self.end(s);
         let s = self.span("wo");
         self.rope(o, t, h, hd, lid, at, true)?;
-        self.k.fp8_qdq(&self.s, o.ptr, t * h * hd)?;
         let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
         let mid = self.fbuf(t * g * ol)?;
-        self.wo_a(o, &wo_a.v, mid, t, g, ol)?;
+        if self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol) {
+            // the quantize is ds_ks_quant's (bit-identical to ds_fp8_qdq)
+            self.k.wo_ks(&self.s, &wo_a.v, o.ptr, mid.ptr, t, g, ol)?;
+        } else {
+            self.k.fp8_qdq(&self.s, o.ptr, t * h * hd)?;
+            self.wo_a(o, &wo_a.v, mid, t, g, ol)?;
+        }
         let y = self.lin(mid, t, &format!("{p}.attn.wo_b.weight"));
         self.end(s);
         y

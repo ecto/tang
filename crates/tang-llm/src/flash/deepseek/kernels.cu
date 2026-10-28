@@ -1205,23 +1205,24 @@ template <int FMT, int GU>
 __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __restrict__ xc,
                                         const float* __restrict__ xsc, float* __restrict__ y, int t, int round,
                                         const float* __restrict__ rw, float lim, int S, int SB, int nbr, float* part,
-                                        int* cnt, const int* __restrict__ xi) {
+                                        int* cnt, const int* __restrict__ xi, int xst = 0, int yst = 0) {
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ float red[8][4][32];
     __shared__ int last;
     int cols = w.cols, nch = cols / 32, P = ((cols + 127) / 128) * 128 + 32;
+    long long xrs = xst ? xst : cols, srs = xst ? xst / 32 : nch, yrs = yst ? yst : w.rows;
     unsigned char* xs = smem;           // [t][P]
     float* sx = (float*)(smem + t * P);  // [t][nch], scale × 2^8 (code -> f16) × weight POW
     const float POW = (FMT == 3 ? 16384.f : 256.f) * 256.f;
     for (int e = threadIdx.x; e < t * cols / 16; e += blockDim.x) {
         int ti = e / (cols / 16), c = e % (cols / 16);
         long long xr = xi ? __ldg(xi + ti) : ti;
-        *(uint4*)(xs + ti * P + c * 16) = __ldg((const uint4*)(xc + xr * cols) + c);
+        *(uint4*)(xs + ti * P + c * 16) = __ldg((const uint4*)(xc + xr * xrs) + c);
     }
     for (int e = threadIdx.x; e < t * nch; e += blockDim.x) {
         int ti = e / nch, c = e % nch;
         long long xr = xi ? __ldg(xi + ti) : ti;
-        sx[e] = __ldg(xsc + xr * nch + c) * POW;
+        sx[e] = __ldg(xsc + xr * srs + c) * POW;
     }
     __syncthreads();
     int wib = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -1341,8 +1342,8 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
                     if (GU) b += red[rg * S + s][2 + i][ln];
                 }
             }
-            if (GU) y[(long long)j * w.rows + n] = swiglu1(bf(a), bf(b), rw ? rw + j : 0, lim);
-            else y[(long long)j * w.rows + n] = round ? bf(a) : a;
+            if (GU) y[(long long)j * yrs + n] = swiglu1(bf(a), bf(b), rw ? rw + j : 0, lim);
+            else y[(long long)j * yrs + n] = round ? bf(a) : a;
         }
     }
 }
@@ -1388,6 +1389,30 @@ DS_KS(3, 1)
     }
 DS_MOE_KS(2)
 DS_MOE_KS(3)
+
+// wo_a on the K-split path in one launch: block-diagonal over blockIdx.y = group gi (ol rows of
+// w, its gd = w.cols columns of the token-major activation [t][g * gd]), quantized once by
+// ds_ks_quant over the whole row (gd % 32 == 0, so the 32-groups are the per-group ones), into
+// mid [t][g * ol] directly: no perms. SB = 1, blockIdx.x strides the group's nbr row groups.
+#define DS_WO_KS(F)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(256) ds_wo_ks_f##F(DsW w, const unsigned char* xc,            \
+                                                                     const float* xsc, float* y, int t, int ol, \
+                                                                     int S, int nbr) {                          \
+        long long gi = blockIdx.y, gd = w.cols, g = gridDim.y;                                                  \
+        DsW v = w;                                                                                              \
+        v.rows = ol;                                                                                            \
+        if (F == 2) {                                                                                           \
+            v.w += gi * ol * gd;                                                                                \
+            v.s += (gi * ol / 32) * ((gd + 31) / 32);                                                           \
+        } else {                                                                                                \
+            v.w += gi * ol * gd / 2;                                                                            \
+            v.s += gi * ol * gd / 32;                                                                           \
+        }                                                                                                       \
+        lin_mma<F, 0>(v, v, xc + gi * gd, xsc + gi * (gd / 32), y + gi * ol, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0,   \
+                      (int)(g * gd), (int)(g * ol));                                                            \
+    }
+DS_WO_KS(2)
+DS_WO_KS(3)
 
 // ---- tiled sparse attention (default; DS_EXACT=1 selects ds_sparse_attn) ---------------------
 //
