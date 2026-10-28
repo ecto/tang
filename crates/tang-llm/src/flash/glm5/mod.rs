@@ -26,6 +26,9 @@ pub mod mla_debug;
 #[cfg(feature = "cuda")]
 pub mod mla_dev;
 pub mod moe;
+pub mod mtp;
+#[cfg(test)]
+mod mtp_tests;
 #[cfg(feature = "cuda")]
 pub mod moe_debug;
 #[cfg(feature = "cuda")]
