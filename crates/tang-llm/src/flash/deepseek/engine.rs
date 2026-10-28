@@ -3942,6 +3942,35 @@ mod tests {
     }
 
     /// Step 0 intermediates, device against the CPU reference on the same forced input.
+    /// The launch inventory of a verify window (t = 6) on the direct path: the fixture's
+    /// steps up to it, then that step between cuProfilerStart/Stop, for
+    /// `nsys profile --capture-range=cudaProfilerApi` (`DS_MEGA=1` for the megakernel).
+    #[test]
+    #[ignore]
+    fn gpu_tiny_inventory() {
+        std::env::set_var("DS_GRAPH", "0");
+        let Some((mut m, meta)) = open() else { return };
+        for step in meta["steps"].as_array().unwrap() {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            let mark = ids.len() == 6;
+            if mark {
+                m.s.sync().unwrap();
+                unsafe { cudarc::driver::sys::cuProfilerStart() };
+            }
+            m.forward(&ids, sp, None).unwrap();
+            if mark {
+                m.s.sync().unwrap();
+                unsafe { cudarc::driver::sys::cuProfilerStop() };
+            }
+        }
+    }
+
     /// `DS_MEGA=1`'s dense-glue megakernel against the separate launches: the same logits,
     /// bit for bit, over the fixture's steps (prefill, then decode and verify windows).
     #[test]

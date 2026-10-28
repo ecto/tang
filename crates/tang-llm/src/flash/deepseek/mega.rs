@@ -103,6 +103,8 @@ fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
 }
 
 const PART: usize = 1 << 21;
+/// `mg_glue`'s dynamic shared memory cap.
+const SMEM_MAX: usize = 96 * 1024;
 const CNT: usize = 1 << 13;
 
 /// The megakernel's module and persistent scratch.
@@ -122,6 +124,20 @@ impl Mega {
     pub fn new(g: &Gpu) -> Result<Self> {
         let m = g.module(SRC)?;
         let f = [m.func("mg_glue_f2")?, m.func("mg_glue_f3")?];
+        for &fi in &f {
+            // dynamic shared memory past the 48 KB default (the staged activation of a
+            // 5120-column projection at t = 8 is 46 KB, on top of the phases' static arrays)
+            gpu::check(
+                unsafe {
+                    sys::cuFuncSetAttribute(
+                        fi,
+                        sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        SMEM_MAX as i32,
+                    )
+                },
+                "cuFuncSetAttribute",
+            )?;
+        }
         let sms = g.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
             as usize;
         let env = |k: &str, d: usize| {
@@ -184,7 +200,7 @@ impl Mega {
         (a.s1, a.sb1, a.nb1) = split(&a.wqa);
         (a.s2, a.sb2, a.nb2) = split(&a.wkv);
         (a.s3, a.sb3, a.nb3) = split(&a.wqb);
-        ensure!(smem <= 48 * 1024, "mg_glue: {smem} B of shared memory");
+        ensure!(smem <= SMEM_MAX, "mg_glue: {smem} B of shared memory");
         [a.part1, a.part2, a.part3] = [self.part[0].ptr, self.part[1].ptr, self.part[2].ptr];
         [a.cnt1, a.cnt2, a.cnt3] = [self.cnt[0].ptr, self.cnt[1].ptr, self.cnt[2].ptr];
         a.gbar = self.bar.ptr;
@@ -321,6 +337,248 @@ mod tests {
                 )?)
             })?;
             println!("| {nb} x {th} | {:.2} |", (many - one) / (r - 1) as f32);
+        }
+        Ok(())
+    }
+
+    fn rnd(n: usize, seed: u64, f: impl Fn(u64) -> f32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                f(x)
+            })
+            .collect()
+    }
+
+    fn unif(x: u64) -> f32 {
+        (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    }
+
+    /// A random fp8 weight (e4m3 codes without NaN, unit e8m0 32 x 32 block scales).
+    fn fp8(rows: usize, cols: usize, seed: u64) -> (DevBuf, DevBuf, DsW) {
+        let b: Vec<u8> = rnd(rows * cols, seed, |x| (x >> 33) as f32)
+            .iter()
+            .map(|v| (*v as u32 as u8) & 0xb7)
+            .collect();
+        let sc = vec![127u8; rows.div_ceil(32) * cols.div_ceil(32)];
+        let (w, s) = (
+            DevBuf::from_slice(&b).unwrap(),
+            DevBuf::from_slice(&sc).unwrap(),
+        );
+        let mut v = DsW::default();
+        (v.w, v.s, v.rows, v.cols, v.fmt) = (w.ptr, s.ptr, rows as i32, cols as i32, 2);
+        (w, s, v)
+    }
+
+    fn f32w(rows: usize, cols: usize, seed: u64, amp: f32) -> (DevBuf, DsW) {
+        let w = DevBuf::from_slice(&rnd(rows * cols, seed, |x| amp * unif(x))).unwrap();
+        let mut v = DsW::default();
+        (v.w, v.rows, v.cols, v.fmt) = (w.ptr, rows as i32, cols as i32, 0);
+        (w, v)
+    }
+
+    /// `mg_glue` against the seven launches it replaces at the real model's shapes (dim
+    /// 5120, hc 4, q_lora 1280, 64 x 512 heads, window 128), one GPU: µs per layer, graph
+    /// replay of 40 layers' worth, and the outputs compared bit for bit.
+    /// `--ignored --nocapture`; `DS_MEGA_BPS` / `DS_MEGA_PF_MB` tune it.
+    #[test]
+    #[ignore]
+    fn mega_glue_bench() -> Result<()> {
+        use super::super::gpu::Kernels;
+        let Some(g) = Gpu::for_test() else {
+            return Ok(());
+        };
+        g.bind()?;
+        let k = Kernels::new(&g)?;
+        let mega = Mega::new(&g)?;
+        let s = Stream::new()?;
+        let (d, hc, ql, nh, hd, win, rd) = (
+            5120usize, 4usize, 1280usize, 64usize, 512usize, 128usize, 64usize,
+        );
+        let rows = (2 + hc) * hc;
+        let gx = d / (256 / hc);
+        let f = |n: usize, seed: u64, amp: f32| {
+            DevBuf::from_slice(&rnd(n, seed, |x| amp * unif(x))).unwrap()
+        };
+        let (_hw, hw) = f32w(rows, hc * d, 1, 0.02);
+        let (_nw, nw) = f32w(1, d, 2, 2.0);
+        let (_qn, qn) = f32w(1, ql, 3, 2.0);
+        let (_kn, kn) = f32w(1, hd, 4, 2.0);
+        // three weight sets, rotated over the layers (151 MB: no set stays in L2)
+        let sets: Vec<_> = (0..3u64)
+            .map(|i| {
+                (
+                    fp8(ql, d, 5 + 10 * i),
+                    fp8(hd, d, 6 + 10 * i),
+                    fp8(nh * hd, ql, 7 + 10 * i),
+                )
+            })
+            .collect();
+        let ws: Vec<[DsW; 3]> = sets.iter().map(|(a, b, c)| [a.2, b.2, c.2]).collect();
+        let scale = f(3, 8, 1.0);
+        let base = f(rows, 9, 1.0);
+        let tab = f(2 * 4096 * rd / 2, 10, 2.0);
+        let pp = DevBuf::from_slice(&[200i32])?;
+        println!("| t | separate µs | mg_glue µs | bit-exact |");
+        println!("|---|---|---|---|");
+        for t in [1usize, 6] {
+            let h = f(t * d, 11, 1.0);
+            let res = f(t * hc * d, 12, 1.0);
+            let post = f(t * hc, 13, 1.0);
+            let comb = f(t * hc * hc, 14, 0.5);
+            let pre = f(t * hc, 15, 1.0);
+            let ring0 = rnd(win * hd, 16, unif);
+            // outputs: [separate, mega]
+            let mk = || -> Result<Vec<DevBuf>> {
+                Ok(vec![
+                    DevBuf::zeroed(4 * t * hc * d)?,           // 0 xo
+                    DevBuf::zeroed(4 * t * gx * (rows + 2))?,  // 1 hpart
+                    DevBuf::zeroed(4 * t * hc)?,               // 2 pre_o
+                    DevBuf::zeroed(4 * t * hc)?,               // 3 post_o
+                    DevBuf::zeroed(4 * t * hc * hc)?,          // 4 comb_o
+                    DevBuf::zeroed(4 * t * d)?,                // 5 hin
+                    DevBuf::from_slice(&ring0)?,               // 6 ring
+                    DevBuf::zeroed(4 * (win + t) * hd)?,       // 7 all
+                    DevBuf::zeroed(4 * t * ql)?,               // 8 qr
+                    DevBuf::zeroed(4 * t * hd)?,               // 9 kv
+                    DevBuf::zeroed(4 * t * nh * hd)?,          // 10 q
+                    DevBuf::zeroed(t * d + 4 * t * d / 32)?,   // 11 xc | xs
+                    DevBuf::zeroed(t * ql + 4 * t * ql / 32)?, // 12 qc | qsc
+                ])
+            };
+            let (o1, o2) = (mk()?, mk()?);
+            let cnt = DevBuf::zeroed(8)?;
+            let all = |o: &[DevBuf]| if t > 1 { o[7].ptr } else { 0 };
+            let sep = |s: &Stream, l: usize| -> Result<()> {
+                let [wqa, wkv, wqb] = ws[l % 3];
+                let o = &o1;
+                let (ti, hci, di) = (t as i32, hc as i32, d as i32);
+                let (it, eps, neps) = (20i32, 1e-6f32, 1e-20f32);
+                let (h2, xc, xs) = (0u64, o[11].ptr, o[11].ptr + (t * d) as u64);
+                let (qc, qs) = (o[12].ptr, o[12].ptr + (t * ql) as u64);
+                unsafe {
+                    k.go(
+                        "ds_hc_fused_ks",
+                        (gx as u32, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        args![
+                            h.ptr, h2, res.ptr, post.ptr, comb.ptr, o[0].ptr, hw, o[1].ptr,
+                            pre.ptr, o[5].ptr, nw, scale.ptr, base.ptr, o[2].ptr, o[3].ptr,
+                            o[4].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps
+                        ],
+                    )?;
+                }
+                k.ks_quant_to(s, o[5].ptr, xc, xs, t * d)?;
+                k.ks_gemv(s, &wqa, None, xc, xs, o[8].ptr, t, true, 0, 0.0)?;
+                k.ks_gemv(s, &wkv, None, xc, xs, o[9].ptr, t, true, 0, 0.0)?;
+                if t > 1 {
+                    gpu::check(
+                        unsafe { sys::cuMemcpyDtoDAsync_v2(o[7].ptr, o[6].ptr, 4 * win * hd, s.0) },
+                        "copy",
+                    )?;
+                }
+                let (rdi, wi, allp) = (rd as i32, win as i32, all(o));
+                unsafe {
+                    k.go(
+                        "ds_qkv_post",
+                        (t as u32, 2, 1),
+                        (1024, 1, 1),
+                        0,
+                        s,
+                        args![
+                            o[8].ptr, qn, qc, qs, o[9].ptr, kn, tab.ptr, rdi, pp.ptr, o[6].ptr, wi,
+                            allp, neps
+                        ],
+                    )?;
+                }
+                k.ks_gemv(s, &wqb, None, qc, qs, o[10].ptr, t, true, 0, 0.0)?;
+                Ok(())
+            };
+            let o = &o2;
+            let a = MgArgs {
+                h: h.ptr,
+                res: res.ptr,
+                post: post.ptr,
+                comb: comb.ptr,
+                xo: o[0].ptr,
+                hpart: o[1].ptr,
+                pre_i: pre.ptr,
+                hin: o[5].ptr,
+                scale: scale.ptr,
+                base: base.ptr,
+                pre_o: o[2].ptr,
+                post_o: o[3].ptr,
+                comb_o: o[4].ptr,
+                xc: o[11].ptr,
+                xs: o[11].ptr + (t * d) as u64,
+                ring: o[6].ptr,
+                all: all(o),
+                qr: o[8].ptr,
+                kv: o[9].ptr,
+                qc: o[12].ptr,
+                qsc: o[12].ptr + (t * ql) as u64,
+                tab: tab.ptr,
+                p: pp.ptr,
+                q: o[10].ptr,
+                w: hw,
+                nw,
+                wqa: ws[0][0],
+                wkv: ws[0][1],
+                wqb: ws[0][2],
+                qn,
+                kn,
+                t: t as i32,
+                hc: hc as i32,
+                d: d as i32,
+                iters: 20,
+                gx: gx as i32,
+                rd: rd as i32,
+                win: win as i32,
+                ncopy: if t > 1 { (win * hd) as i32 } else { 0 },
+                eps: 1e-6,
+                neps: 1e-20,
+                reps: 1e-20,
+                qeps: 1e-20,
+                ..Default::default()
+            };
+            let meg = |s: &Stream, l: usize| {
+                let [wqa, wkv, wqb] = ws[l % 3];
+                mega.launch(s, MgArgs { wqa, wkv, wqb, ..a })
+            };
+            sep(&s, 0)?;
+            meg(&s, 0)?;
+            s.sync()?;
+            let mut same = true;
+            for i in [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+                let n = o1[i].len / 4;
+                let (x, y) = (o1[i].read::<u32>(0, n)?, o2[i].read::<u32>(0, n)?);
+                let bad = x.iter().zip(&y).filter(|(p, q)| p != q).count();
+                if bad > 0 {
+                    println!("t {t}: buffer {i}: {bad} of {n} words differ");
+                    same = false;
+                }
+            }
+            let layers = 40;
+            let g1 = Graph::capture(&s, |s| {
+                for l in 0..layers {
+                    sep(s, l).map_err(|e| gpu::Error(e.to_string()))?;
+                }
+                Ok(())
+            })?;
+            let g2 = Graph::capture(&s, |s| {
+                for l in 0..layers {
+                    meg(s, l).map_err(|e| gpu::Error(e.to_string()))?;
+                }
+                Ok(())
+            })?;
+            let us1 = time(&s, 20, || Ok(g1.launch(&s)?))? / layers as f32;
+            let us2 = time(&s, 20, || Ok(g2.launch(&s)?))? / layers as f32;
+            println!("| {t} | {us1:.1} | {us2:.1} | {same} |");
         }
         Ok(())
     }
