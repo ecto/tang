@@ -1317,7 +1317,8 @@ template <int FMT, int GU>
 __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __restrict__ xc,
                                         const float* __restrict__ xsc, float* __restrict__ y, int t, int round,
                                         const float* __restrict__ rw, float lim, int S, int SB, int nbr, float* part,
-                                        int* cnt, const int* __restrict__ xi, int xst = 0, int yst = 0) {
+                                        int* cnt, const int* __restrict__ xi, int xst = 0, int yst = 0,
+                                        int it0 = -1) {
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ float red[8][4][32];
     __shared__ int last;
@@ -1343,7 +1344,8 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
     const int R2 = GU ? 2 * w.rows : w.rows;
     long long rbytes = FMT == 3 ? cols / 2 : cols;
     int gpb = (nch + SB - 1) / SB;
-    for (int item = blockIdx.x; item < nbr * SB; item += gridDim.x) {
+    // it0 >= 0: this block takes that one item (the many-row prefill grid)
+    for (int item = it0 >= 0 ? it0 : blockIdx.x; item < nbr * SB; item += it0 >= 0 ? nbr * SB : gridDim.x) {
         int br = item / SB, sb = item % SB;
         int n0 = (br * RW + rwi) * OUT;
         int ra = n0 + g, rb = GU ? n0 + g : n0 + g + 8;
@@ -1466,6 +1468,23 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
         float lim, int S, int SB, int nbr, float* part, int* cnt) {                                             \
         lin_mma<F, G>(w, w3, xc, xsc, y, t, round, rw, lim, S, SB, nbr, part, cnt, 0);                           \
     }
+// The K-split GEMV over t > 8 rows in one launch (prefill): block b is row group b / nc of
+// 8-row chunk b % nc (chunks fastest, so a row group's weights are read from L2 by the nc
+// blocks after the first), SB = 1, each row's result that of the t <= 8 kernel on its chunk.
+// xc/xsc: the whole activation quantized once.
+#define DS_KST(F, G)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(256) ds_kst_f##F##_g##G(                                       \
+        DsW w, DsW w3, const unsigned char* xc, const float* xsc, float* y, int t, int round, const float* rw,  \
+        float lim, int S, int nbr) {                                                                            \
+        int nc = (t + 7) / 8, c = blockIdx.x % nc, br = blockIdx.x / nc, r0 = c * 8;                          \
+        lin_mma<F, G>(w, w3, xc + (long long)r0 * w.cols, xsc + (long long)r0 * (w.cols / 32),                 \
+                      y + (long long)r0 * w.rows, min(8, t - r0), round, rw ? rw + r0 : 0, lim, S, 1, nbr, 0, 0, \
+                      0, 0, 0, br);                                                                               \
+    }
+DS_KST(2, 0)
+DS_KST(3, 0)
+DS_KST(2, 1)
+DS_KST(3, 1)
 DS_KS(2, 0)
 DS_KS(3, 0)
 DS_KS(2, 1)
@@ -1588,6 +1607,47 @@ extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn
         if (ar) ar[g * 32 + lane] = v;
     }
 }
+
+// ---- grouped MoE over 8-row tiles of the CSR segments (prefill, t > 8) ----
+//
+// blockIdx.y is a tile of `tiles` (ds_moe_plan_tiles: expert e | chunk c << 16, -1 past
+// them): expert e's CSR rows off[e] + 8c .. min(off[e+1], off[e] + 8c + 8). Each tile is the
+// t <= 8 contract on its rows, so one launch per projection covers any segment length; rows
+// are independent, so per row the results are those of the per-expert loop (exact: bit for
+// bit; K-split: its relaxed bar).
+#define MOE_TILE                                                                                               \
+    int tl = tiles[blockIdx.y];                                                                                \
+    if (tl < 0) return;                                                                                        \
+    int e = tl & 0xffff, o = off[e] + 8 * (tl >> 16), n = min(8, off[e + 1] - o);                             \
+    if (n <= 0) return;
+#define DS_MOE_TILES(F)                                                                                        \
+    extern "C" __global__ void __launch_bounds__(128) ds_moe_tgu_f##F(                                         \
+        const DsW* w1s, const DsW* w3s, const int* tiles, const int* off, const int* rows, const float* rw,   \
+        const float* xq, float* h, float lim) {                                                                \
+        MOE_TILE DsW w = w1s[e];                                                                               \
+        lin_fast<F, 8, 1>(w, w3s[e], xq, h + (long long)o * w.rows, n, 1, 0, rw + o, lim, rows + o);           \
+    }                                                                                                          \
+    extern "C" __global__ void __launch_bounds__(128) ds_moe_tdown_f##F(                                       \
+        const DsW* w2s, const int* tiles, const int* off, const float* hq, float* part) {                     \
+        MOE_TILE DsW w = w2s[e];                                                                               \
+        lin_fast<F, 8, 0>(w, w, hq + (long long)o * w.cols, part + (long long)o * w.rows, n, 1, 0, 0, 0.f, 0); \
+    }                                                                                                          \
+    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_tgu_f##F(                                      \
+        const DsW* w1s, const DsW* w3s, const int* tiles, const int* off, const int* rows, const float* rw,   \
+        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) {                      \
+        MOE_TILE DsW w = w1s[e];                                                                               \
+        lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, n, 1, rw + o, lim, S, 1, nbr, 0, 0,       \
+                      rows + o);                                                                               \
+    }                                                                                                          \
+    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_tdown_f##F(                                    \
+        const DsW* w2s, const int* tiles, const int* off, const unsigned char* hc, const float* hsc,          \
+        float* part, int S, int nbr) {                                                                         \
+        MOE_TILE DsW w = w2s[e];                                                                               \
+        lin_mma<F, 0>(w, w, hc + (long long)o * w.cols, hsc + (long long)o * (w.cols / 32),                    \
+                      part + (long long)o * w.rows, n, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                         \
+    }
+DS_MOE_TILES(2)
+DS_MOE_TILES(3)
 
 // ---- tiled sparse attention (default; DS_EXACT=1 selects ds_sparse_attn) ---------------------
 //

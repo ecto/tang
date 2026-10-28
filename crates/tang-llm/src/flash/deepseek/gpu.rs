@@ -119,6 +119,8 @@ pub struct Kernels {
     ks_cnt: DevBuf,
     /// The quantized activation for the K-split GEMV: e4m3 codes [t][K], then scales.
     ks_x: DevBuf,
+    /// The quantized activation of a many-row (t > 8) K-split GEMV, grown on demand.
+    ks_big: std::sync::Mutex<Option<(usize, DevBuf)>>,
     ks_quant: Func,
     /// `ds_moe_gate`'s block arrival counter (left at zero by the last block).
     gate_cnt: DevBuf,
@@ -186,6 +188,19 @@ const MORE: &[&str] = &[
     "ds_moe_plan",
     "ds_moe_reduce",
     "ds_moe_gate",
+    "ds_moe_plan_tiles",
+    "ds_kst_f2_g0",
+    "ds_kst_f3_g0",
+    "ds_kst_f2_g1",
+    "ds_kst_f3_g1",
+    "ds_moe_tgu_f2",
+    "ds_moe_tgu_f3",
+    "ds_moe_tdown_f2",
+    "ds_moe_tdown_f3",
+    "ds_moe_ks_tgu_f2",
+    "ds_moe_ks_tgu_f3",
+    "ds_moe_ks_tdown_f2",
+    "ds_moe_ks_tdown_f3",
 ];
 
 /// Floats of attention scratch: partial scores [t][d/64][h][k], then P [t][h][k] and den
@@ -305,6 +320,7 @@ impl Kernels {
             ks_part: DevBuf::alloc(KS_PART * 4)?,
             ks_cnt: DevBuf::from_slice(&vec![0i32; KS_CNT])?,
             ks_x: DevBuf::alloc(KS_X)?,
+            ks_big: std::sync::Mutex::new(None),
             ks_quant: m.func("ds_ks_quant")?,
             gate_cnt: DevBuf::from_slice(&[0i32])?,
             moe_items: env_usize("DS_MOE_KS_ITEMS").unwrap_or(MOE_KS_ITEMS).max(1),
@@ -323,12 +339,20 @@ impl Kernels {
                     "ds_ks_f2_g1",
                     "ds_ks_f3_g0",
                     "ds_ks_f3_g1",
+                    "ds_kst_f2_g0",
+                    "ds_kst_f3_g0",
+                    "ds_kst_f2_g1",
+                    "ds_kst_f3_g1",
                     "ds_moe_ks_gu_f2",
                     "ds_moe_ks_gu_f3",
                     "ds_moe_ks_down_f2",
                     "ds_moe_ks_down_f3",
                     "ds_wo_ks_f2",
                     "ds_wo_ks_f3",
+                    "ds_moe_ks_tgu_f2",
+                    "ds_moe_ks_tgu_f3",
+                    "ds_moe_ks_tdown_f2",
+                    "ds_moe_ks_tdown_f3",
                 ] {
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
@@ -762,6 +786,9 @@ impl Kernels {
             return self.linear_exact(s, w, w3, x, y, t, round, qdq, rw, lim);
         }
         let _ = qdq; // quantized either way (idempotent on a quantized activation)
+        if t > 8 {
+            return self.linear_kst(s, w, w3, x, y, t, round as i32, rw, lim);
+        }
         let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
         let mut t0 = 0;
         while t0 < t {
@@ -922,7 +949,7 @@ impl Kernels {
                 tang_moe::args![x, codes, scales, ng],
             )?
         }
-        let (sp, nbr, gx) = Self::moe_ks_grid(ol, 16, gd);
+        let (sp, nbr, gx) = self.moe_ks_grid(ol, 16, gd);
         let (ti, oli, si, nbri) = (t as i32, ol as i32, sp as i32, nbr as i32);
         let smem = t * (gd.div_ceil(128) * 128 + 32) + t * (gd / 32) * 4;
         unsafe {
@@ -936,6 +963,69 @@ impl Kernels {
             )?;
         }
         Ok(())
+    }
+
+    /// [`Kernels::linear_ks`] for t > 8 rows in one launch (`ds_kst_*`): the activation
+    /// quantized once, a block per (row group, 8-row chunk), chunks adjacent so each row
+    /// group's weights come from L2 after the first chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_kst(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        w3: Option<&DsW>,
+        x: u64,
+        y: u64,
+        t: usize,
+        r: i32,
+        rw: u64,
+        lim: f32,
+    ) -> Result<()> {
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        let gu = w3.is_some() as usize;
+        let out = if gu == 1 { 8 } else { 16 };
+        let nch = cols / 32;
+        let need = t * cols + t * nch * 4;
+        let mut big = self.ks_big.lock().unwrap();
+        if big.as_ref().is_none_or(|(n, _)| *n < need) {
+            s.sync()?; // the old buffer may be in flight
+            *big = Some((need, DevBuf::alloc(need)?));
+        }
+        let buf = big.as_ref().unwrap().1.ptr;
+        let (codes, scales) = (buf, buf + (t * cols) as u64);
+        let ng = (t * nch) as i32;
+        unsafe {
+            super::obs::launch(
+                self.ks_quant,
+                blocks(t * nch * 32, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![x, codes, scales, ng],
+            )?
+        }
+        // S = 1: a block's 8 warps are 8 row tiles over all of K (most weight reuse per
+        // staged chunk); the many chunks give the parallelism
+        let sp = 1usize;
+        let nbr = rows.div_ceil(out).div_ceil(8 / sp);
+        let nc = t.div_ceil(8);
+        let smem = 8 * (cols.div_ceil(128) * 128 + 32) + 8 * nch * 4;
+        let (wv, w3v) = (*w, *w3.unwrap_or(w));
+        let (ti, si, nbri) = (t as i32, sp as i32, nbr as i32);
+        let name = [
+            ["ds_kst_f2_g0", "ds_kst_f2_g1"],
+            ["ds_kst_f3_g0", "ds_kst_f3_g1"],
+        ][w.fmt as usize - 2][gu];
+        unsafe {
+            self.go(
+                name,
+                ((nbr * nc) as u32, 1, 1),
+                (256, 1, 1),
+                smem as u32,
+                s,
+                tang_moe::args![wv, w3v, codes, scales, y, ti, r, rw, lim, si, nbri],
+            )
+        }
     }
 
     /// Whether the grouped K-split kernels take `t` <= 8 tokens per expert over `cols`
@@ -1109,6 +1199,132 @@ impl Kernels {
         Ok(())
     }
 
+    /// Upper bound on the 8-row tiles of `slots` expert segments holding `n` rows in all.
+    pub fn moe_tile_cap(n: usize, slots: usize) -> usize {
+        n / 8 + slots
+    }
+
+    /// Whether [`Kernels::moe_tiled`] takes the K-split kernels over `d` / `inter`: they
+    /// quantize their activations themselves, so no fp8 qdq pass is needed before.
+    pub fn moe_tiled_ks(&self, d: usize, inter: usize) -> bool {
+        let fits = |cols: usize| {
+            let pitch = cols.div_ceil(128) * 128 + 32;
+            cols % 32 == 0 && 8 * pitch + 8 * (cols / 32) * 4 <= self.smem_max
+        };
+        !self.exact && fits(d) && fits(inter)
+    }
+
+    /// The grouped MoE for any rows per expert (prefill): `ds_moe_plan_tiles` of `elist` into
+    /// `tiles` [`Kernels::moe_tile_cap`], then gate/up + SwiGLU into `h` [n][inter], its fp8
+    /// quantization, and down into `part` [n][d] (`n` = t * topk), per 8-row tile of each
+    /// segment. `codes` holds n * max(d, inter) bytes and `scales` n * max(d, inter) / 32
+    /// floats (the K-split activation). The K-split kernels unless exact (or too wide to
+    /// stage); per row, the t <= 8 kernels' results.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tiled(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        (w1s, w3s, w2s): (u64, u64, u64),
+        (elist, slots, tiles): (u64, usize, u64),
+        (off, rows, rw): (u64, u64, u64),
+        (xq, h, part): (u64, u64, u64),
+        (codes, scales): (u64, u64),
+        (t, topk, d, inter): (usize, usize, usize, usize),
+        lim: f32,
+    ) -> Result<()> {
+        let n = t * topk;
+        let cap = Self::moe_tile_cap(n, slots);
+        if cap > 65535 {
+            bail!("moe_tiled: {cap} tiles");
+        }
+        let (si, ci) = (slots as i32, cap as i32);
+        unsafe {
+            self.go(
+                "ds_moe_plan_tiles",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                s,
+                tang_moe::args![elist, off, tiles, si, ci],
+            )?
+        };
+        let f = fmt;
+        let ks = self.moe_tiled_ks(d, inter);
+        let quant = |x: u64, rows: usize, cols: usize| -> Result<()> {
+            let ng = (rows * cols / 32) as i32;
+            unsafe {
+                super::obs::launch(
+                    self.ks_quant,
+                    blocks(rows * cols, 256),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![x, codes, scales, ng],
+                )?
+            }
+            Ok(())
+        };
+        let smem = |cols: usize| (8 * (cols.div_ceil(128) * 128 + 32) + 8 * (cols / 32) * 4) as u32;
+        if ks {
+            quant(xq, t, d)?;
+            let (sp, nbr, gx) = self.moe_ks_grid(inter, 8, d);
+            let (spi, nbri) = (sp as i32, nbr as i32);
+            unsafe {
+                self.go(
+                    ["ds_moe_ks_tgu_f2", "ds_moe_ks_tgu_f3"][f as usize - 2],
+                    (gx as u32, cap as u32, 1),
+                    (256, 1, 1),
+                    smem(d),
+                    s,
+                    tang_moe::args![
+                        w1s, w3s, tiles, off, rows, rw, codes, scales, h, lim, spi, nbri
+                    ],
+                )?
+            };
+        } else {
+            unsafe {
+                self.go(
+                    ["ds_moe_tgu_f2", "ds_moe_tgu_f3"][f as usize - 2],
+                    (inter.div_ceil(2).div_ceil(4) as u32, cap as u32, 1),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![w1s, w3s, tiles, off, rows, rw, xq, h, lim],
+                )?
+            };
+        }
+        // h stays fp8-quantized (the contract: down's input, read back by callers)
+        self.fp8_qdq(s, h, n * inter)?;
+        if ks {
+            quant(h, n, inter)?;
+            let (sp, nbr, gx) = self.moe_ks_grid(d, 16, inter);
+            let (spi, nbri) = (sp as i32, nbr as i32);
+            unsafe {
+                self.go(
+                    ["ds_moe_ks_tdown_f2", "ds_moe_ks_tdown_f3"][f as usize - 2],
+                    (gx as u32, cap as u32, 1),
+                    (256, 1, 1),
+                    smem(inter),
+                    s,
+                    tang_moe::args![w2s, tiles, off, codes, scales, part, spi, nbri],
+                )?
+            };
+        } else {
+            unsafe {
+                self.go(
+                    ["ds_moe_tdown_f2", "ds_moe_tdown_f3"][f as usize - 2],
+                    (d.div_ceil(4).div_ceil(4) as u32, cap as u32, 1),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![w2s, tiles, off, h, part],
+                )?
+            };
+        }
+        Ok(())
+    }
+
     pub fn fp8_qdq(&self, s: &Stream, v: u64, n: usize) -> Result<()> {
         let g = (n / 32) as i32;
         unsafe {
@@ -1203,6 +1419,80 @@ impl Kernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The three tiled-attention launches over `t` rows (t * per-row scratch must fit).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_tiled(
+        &self,
+        s: &Stream,
+        q: u64,
+        kv: u64,
+        sp: i32,
+        kv1: u64,
+        sink: u64,
+        idxs: u64,
+        o: u64,
+        t: usize,
+        h: usize,
+        d: usize,
+        k: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let (hi, di, ki) = (h as i32, d as i32, k as i32);
+        let part = self.scratch.ptr;
+        let pr = part + (t * h * k * (d / 64) * 4) as u64;
+        let den = pr + (t * h * k * 4) as u64;
+        let ti = t as i32;
+        unsafe {
+            super::obs::launch(
+                self.attn_qk,
+                ((t * (h / 64) * k.div_ceil(32) * (d / 64)) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![q, kv, sp, kv1, idxs, part, hi, di, ki],
+            )?;
+            if self.attn_fuse {
+                // soft + pv in one launch: dsb slices a block, as few as keep ~all SMs busy
+                let nds = d / 64;
+                let mut dsb = nds;
+                while dsb > 1 && t * (h / 8) * (nds / dsb) < self.sms {
+                    dsb -= 1;
+                    while nds % dsb != 0 {
+                        dsb -= 1;
+                    }
+                }
+                let dsbi = dsb as i32;
+                let f = self.more["ds_attn_spv"];
+                super::obs::launch(
+                    f,
+                    ((t * (h / 8) * (nds / dsb)) as u32, 1, 1),
+                    (256, 1, 1),
+                    (9 * k * 4) as u32,
+                    s,
+                    tang_moe::args![part, sink, kv, sp, kv1, idxs, o, hi, di, ki, scale, dsbi],
+                )?;
+                return Ok(());
+            }
+            super::obs::launch(
+                self.attn_soft,
+                blocks(t * h * 32, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![part, sink, idxs, pr, den, ti, hi, di, ki, scale],
+            )?;
+            super::obs::launch(
+                self.attn_pv,
+                ((t * (h / 8) * (d / 64)) as u32, 1, 1),
+                (256, 1, 1),
+                (9 * k * 4) as u32,
+                s,
+                tang_moe::args![pr, den, kv, sp, kv1, idxs, o, hi, di, ki],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn sparse_attn(
         &self,
         s: &Stream,
@@ -1221,59 +1511,21 @@ impl Kernels {
     ) -> Result<()> {
         let (hi, di, ki) = (h as i32, d as i32, k as i32);
         let sp = split.min(i32::MAX as usize) as i32;
-        let need = t * h * k * (d / 64 + 1) + t * h;
-        if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 960 && need <= ATTN_SCRATCH {
-            let part = self.scratch.ptr;
-            let pr = part + (t * h * k * (d / 64) * 4) as u64;
-            let den = pr + (t * h * k * 4) as u64;
-            let ti = t as i32;
-            unsafe {
-                super::obs::launch(
-                    self.attn_qk,
-                    ((t * (h / 64) * k.div_ceil(32) * (d / 64)) as u32, 1, 1),
-                    (256, 1, 1),
-                    0,
-                    s,
-                    tang_moe::args![q, kv, sp, kv1, idxs, part, hi, di, ki],
-                )?;
-                if self.attn_fuse {
-                    // soft + pv in one launch: dsb slices a block, as few as keep ~all SMs busy
-                    let nds = d / 64;
-                    let mut dsb = nds;
-                    while dsb > 1 && t * (h / 8) * (nds / dsb) < self.sms {
-                        dsb -= 1;
-                        while nds % dsb != 0 {
-                            dsb -= 1;
-                        }
-                    }
-                    let dsbi = dsb as i32;
-                    let f = self.more["ds_attn_spv"];
-                    super::obs::launch(
-                        f,
-                        ((t * (h / 8) * (nds / dsb)) as u32, 1, 1),
-                        (256, 1, 1),
-                        (9 * k * 4) as u32,
-                        s,
-                        tang_moe::args![part, sink, kv, sp, kv1, idxs, o, hi, di, ki, scale, dsbi],
-                    )?;
-                    return Ok(());
-                }
-                super::obs::launch(
-                    self.attn_soft,
-                    blocks(t * h * 32, 256),
-                    (256, 1, 1),
-                    0,
-                    s,
-                    tang_moe::args![part, sink, idxs, pr, den, ti, hi, di, ki, scale],
-                )?;
-                super::obs::launch(
-                    self.attn_pv,
-                    ((t * (h / 8) * (d / 64)) as u32, 1, 1),
-                    (256, 1, 1),
-                    (9 * k * 4) as u32,
-                    s,
-                    tang_moe::args![pr, den, kv, sp, kv1, idxs, o, hi, di, ki],
-                )?;
+        // rows per pass that fit the scratch (prefill: many passes, each row independent)
+        let per_row = h * k * (d / 64 + 1) + h;
+        if !self.exact && h % 64 == 0 && d % 64 == 0 && k > 0 && k <= 960 && per_row <= ATTN_SCRATCH
+        {
+            let tc = ATTN_SCRATCH / per_row;
+            let mut t0 = 0;
+            while t0 < t {
+                let n = (t - t0).min(tc);
+                let (qo, io, oo) = (
+                    q + (t0 * h * d * 4) as u64,
+                    idxs + (t0 * k * 4) as u64,
+                    o + (t0 * h * d * 4) as u64,
+                );
+                self.attn_tiled(s, qo, kv, sp, kv1, sink, io, oo, n, h, d, k, scale)?;
+                t0 += n;
             }
             return Ok(());
         }
@@ -1646,7 +1898,7 @@ mod tests {
             };
             assert!(Kernels::fast_ok(&w.v), "{name}");
             let (rows, cols) = (w.v.rows as usize, w.v.cols as usize);
-            for t in [1, 2, 3, 4, 5, 6, 8, 11] {
+            for t in [1, 2, 3, 4, 5, 6, 8, 11, 64, 137] {
                 let x = acts(t * cols, 11 + t as u64);
                 let want = slow(&k, &s, &w.v, &x, t);
                 let dy = DevBuf::alloc(t * rows * 4).unwrap();
@@ -1699,7 +1951,7 @@ mod tests {
             let w1 = DevW::upload(&m.st, &format!("{p}.w1.weight")).unwrap();
             let w3 = DevW::upload(&m.st, &format!("{p}.w3.weight")).unwrap();
             let (inter, cols) = (w1.v.rows as usize, w1.v.cols as usize);
-            for t in [1, 2, 5, 6, 8, 11] {
+            for t in [1, 2, 5, 6, 8, 11, 64, 137] {
                 for routed in [false, true] {
                     let x = acts(t * cols, 21 + t as u64);
                     let g = DevBuf::from_slice(&slow(&k, &s, &w1.v, &x, t)).unwrap();
@@ -1924,6 +2176,363 @@ mod tests {
             }
             eprintln!("fmt {fmt}: grouped K-split within the fast-path bar");
         }
+    }
+
+    /// The 8-row tiled grouped MoE (prefill, t > 8, many rows per expert) against a
+    /// per-expert loop of the exact `linear_fast` over each CSR segment: bit for bit under
+    /// the exact kernels, within the K-split bar otherwise.
+    #[test]
+    fn moe_tiled_matches_loop() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let mut k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (ne, topk, d, inter) = (16usize, 4usize, 512usize, 256usize);
+        let ks_avail = !k.exact;
+        for fmt in [2, 3] {
+            let mut keep = Vec::new();
+            let (mut w1, mut w3, mut w2) = (vec![], vec![], vec![]);
+            for e in 0..ne as u64 {
+                w1.push(rand_w(fmt, inter, d, 3 * e + 1, &mut keep));
+                w3.push(rand_w(fmt, inter, d, 3 * e + 2, &mut keep));
+                w2.push(rand_w(fmt, d, inter, 3 * e + 3, &mut keep));
+            }
+            let (w1d, w3d, w2d) = (
+                DevBuf::from_slice(&w1).unwrap(),
+                DevBuf::from_slice(&w3).unwrap(),
+                DevBuf::from_slice(&w2).unwrap(),
+            );
+            let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
+            for t in [9, 64, 200, 512] {
+                let n = t * topk;
+                // skewed: expert 0 takes every token, the rest spread unevenly
+                let ids: Vec<i32> = (0..n)
+                    .map(|i| {
+                        let (ti, j) = (i / topk, i % topk);
+                        if j == 0 {
+                            0
+                        } else {
+                            (1 + (ti * ti + 3 * j) % (ne - 1)) as i32
+                        }
+                    })
+                    .collect();
+                // distinct ids per token
+                let ids: Vec<i32> = ids
+                    .chunks(topk)
+                    .flat_map(|c| {
+                        let mut v: Vec<i32> = vec![];
+                        for &e in c {
+                            let mut e = e;
+                            while v.contains(&e) {
+                                e = 1 + e % (ne as i32 - 1);
+                            }
+                            v.push(e);
+                        }
+                        v
+                    })
+                    .collect();
+                let wts = DevBuf::from_slice(&data(n, 9 + t as u64, 1.0)).unwrap();
+                let idd = DevBuf::from_slice(&ids).unwrap();
+                let (counts, off) = (
+                    DevBuf::alloc(ne * 4).unwrap(),
+                    DevBuf::alloc((ne + 1) * 4).unwrap(),
+                );
+                let (rows, rw) = (DevBuf::alloc(n * 4).unwrap(), DevBuf::alloc(n * 4).unwrap());
+                k.route(
+                    &s, idd.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+                )
+                .unwrap();
+                let x = DevBuf::from_slice(&data(t * d, 3 + t as u64, 2.0)).unwrap();
+                k.fp8_qdq(&s, x.ptr, t * d).unwrap();
+                let slots = n.min(ne);
+                let elist = DevBuf::alloc(slots * 4).unwrap();
+                let (nei, ci) = (ne as i32, slots as i32);
+                unsafe {
+                    k.go(
+                        "ds_moe_plan",
+                        (1, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+                    )
+                    .unwrap();
+                }
+                s.sync().unwrap();
+                let offh = off.read::<i32>(0, ne + 1).unwrap();
+                let rowsh = rows.read::<i32>(0, n).unwrap();
+                let rwh = rw.read::<f32>(0, n).unwrap();
+                let xh = x.read::<f32>(0, t * d).unwrap();
+                let tiles = DevBuf::alloc(Kernels::moe_tile_cap(n, slots) * 4).unwrap();
+                let wide = n * d.max(inter);
+                let (codes, scales) = (
+                    DevBuf::alloc(wide).unwrap(),
+                    DevBuf::alloc(wide / 32 * 4).unwrap(),
+                );
+                let mut tiled = |exact: bool| -> (Vec<f32>, Vec<f32>) {
+                    k.exact = exact;
+                    let h = DevBuf::from_slice(&vec![0f32; n * inter]).unwrap();
+                    let part = DevBuf::from_slice(&vec![0f32; n * d]).unwrap();
+                    k.moe_tiled(
+                        &s,
+                        fmt,
+                        (w1d.ptr, w3d.ptr, w2d.ptr),
+                        (elist.ptr, slots, tiles.ptr),
+                        (off.ptr, rows.ptr, rw.ptr),
+                        (x.ptr, h.ptr, part.ptr),
+                        (codes.ptr, scales.ptr),
+                        (t, topk, d, inter),
+                        10.0,
+                    )
+                    .unwrap();
+                    s.sync().unwrap();
+                    (
+                        h.read::<f32>(0, n * inter).unwrap(),
+                        part.read::<f32>(0, n * d).unwrap(),
+                    )
+                };
+                let (he, pe) = tiled(true);
+                let (hk, pk) = if ks_avail {
+                    tiled(false)
+                } else {
+                    (he.clone(), pe.clone())
+                };
+                k.exact = true;
+                // the loop: gate/up from x, down from a given (quantized) h
+                let gu_ref = || -> Vec<f32> {
+                    let mut out = vec![0f32; n * inter];
+                    for e in 0..ne {
+                        let (o, m) = (offh[e] as usize, (offh[e + 1] - offh[e]) as usize);
+                        if m == 0 {
+                            continue;
+                        }
+                        let xs: Vec<f32> = (0..m)
+                            .flat_map(|j| {
+                                let r = rowsh[o + j] as usize;
+                                xh[r * d..(r + 1) * d].to_vec()
+                            })
+                            .collect();
+                        let (xd, rwd) = (
+                            DevBuf::from_slice(&xs).unwrap(),
+                            DevBuf::from_slice(&rwh[o..o + m]).unwrap(),
+                        );
+                        let y = DevBuf::alloc(m * inter * 4).unwrap();
+                        k.linear_fast(
+                            &s,
+                            &w1[e],
+                            Some(&w3[e]),
+                            xd.ptr,
+                            y.ptr,
+                            m,
+                            true,
+                            false,
+                            rwd.ptr,
+                            10.0,
+                        )
+                        .unwrap();
+                        s.sync().unwrap();
+                        out[o * inter..(o + m) * inter]
+                            .copy_from_slice(&y.read::<f32>(0, m * inter).unwrap());
+                    }
+                    out
+                };
+                let down_ref = |h: &[f32]| -> Vec<f32> {
+                    let hq = DevBuf::from_slice(h).unwrap();
+                    k.fp8_qdq(&s, hq.ptr, n * inter).unwrap();
+                    let mut out = vec![0f32; n * d];
+                    for e in 0..ne {
+                        let (o, m) = (offh[e] as usize, (offh[e + 1] - offh[e]) as usize);
+                        if m == 0 {
+                            continue;
+                        }
+                        let y = DevBuf::alloc(m * d * 4).unwrap();
+                        let xo = hq.ptr + (o * inter * 4) as u64;
+                        k.linear_fast(&s, &w2[e], None, xo, y.ptr, m, true, false, 0, 0.0)
+                            .unwrap();
+                        s.sync().unwrap();
+                        out[o * d..(o + m) * d].copy_from_slice(&y.read::<f32>(0, m * d).unwrap());
+                    }
+                    out
+                };
+                // moe_tiled leaves h fp8-quantized (down's input)
+                let hr = {
+                    let b = DevBuf::from_slice(&gu_ref()).unwrap();
+                    k.fp8_qdq(&s, b.ptr, n * inter).unwrap();
+                    s.sync().unwrap();
+                    b.read::<f32>(0, n * inter).unwrap()
+                };
+                let what = format!("fmt {fmt} t {t}");
+                let bits = |a: &[f32], b: &[f32], w: &str| {
+                    let bad: Vec<usize> = (0..a.len())
+                        .filter(|&i| a[i].to_bits() != b[i].to_bits())
+                        .collect();
+                    assert!(
+                        bad.is_empty(),
+                        "{w}: {} of {} differ, first {:?} ({} vs {})",
+                        bad.len(),
+                        a.len(),
+                        bad.first(),
+                        a[bad[0]],
+                        b[bad[0]]
+                    );
+                };
+                bits(&he, &hr, &format!("{what} exact gu"));
+                bits(&pe, &down_ref(&he), &format!("{what} exact down"));
+                if ks_avail {
+                    check_abs(&hk, &hr, &format!("{what} ks gu"));
+                    check_abs(&pk, &down_ref(&hk), &format!("{what} ks down"));
+                }
+                assert!(he.iter().any(|&v| v != 0.0) && pe.iter().any(|&v| v != 0.0));
+                k.exact = !ks_avail;
+            }
+            eprintln!("fmt {fmt}: tiled grouped MoE matches the loop");
+        }
+    }
+
+    /// Prefill at real shapes, t = 512 (manual: `--ignored --nocapture prefill_bench`): one
+    /// layer's routed MoE by the tiled grouped kernels (384 experts, top-6, d 5120, inter
+    /// 2304, fp4; 16 distinct weight sets aliased across the experts), and the t > 8 K-split
+    /// GEMV in one launch against 8-row launches (the previous path) for wq_b / wo_b shapes.
+    #[test]
+    #[ignore]
+    fn prefill_bench() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        if k.exact {
+            return;
+        }
+        let s = Stream::blocking().unwrap();
+        let t: usize = std::env::var("DS_BENCH_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let time = |f: &mut dyn FnMut()| -> f64 {
+            f();
+            s.sync().unwrap();
+            let iters = 10;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            s.sync().unwrap();
+            t0.elapsed().as_secs_f64() / iters as f64 * 1e6
+        };
+        // linears
+        let mut keep = Vec::new();
+        for (name, rows, cols, fmt) in [("wq_b", 32768, 1024, 2), ("wo_b", 5120, 8192, 2)] {
+            let w = rand_w(fmt, rows, cols, 7, &mut keep);
+            let x = DevBuf::from_slice(&data(t * cols, 5, 2.0)).unwrap();
+            let y = DevBuf::alloc(t * rows * 4).unwrap();
+            let one = time(&mut || {
+                k.linear_ks(&s, &w, None, x.ptr, y.ptr, t, true, false, 0, 0.0)
+                    .unwrap()
+            });
+            let chunks = time(&mut || {
+                for t0 in (0..t).step_by(8) {
+                    let n = (t - t0).min(8);
+                    let (xo, yo) = (
+                        x.ptr + (t0 * cols * 4) as u64,
+                        y.ptr + (t0 * rows * 4) as u64,
+                    );
+                    k.linear_ks(&s, &w, None, xo, yo, n, true, false, 0, 0.0)
+                        .unwrap();
+                }
+            });
+            let fl = 2.0 * (t * rows * cols) as f64;
+            eprintln!(
+                "{name} [{rows}x{cols}] t {t}: one launch {one:.0} us ({:.1} TFLOP/s), 8-row launches {chunks:.0} us",
+                fl / one / 1e6
+            );
+        }
+        // MoE
+        let (ne, topk, d, inter, fmt) = (384usize, 6usize, 5120usize, 2304usize, 3);
+        let (mut w1, mut w3, mut w2) = (vec![], vec![], vec![]);
+        for e in 0..16u64 {
+            w1.push(rand_w(fmt, inter, d, 3 * e + 1, &mut keep));
+            w3.push(rand_w(fmt, inter, d, 3 * e + 2, &mut keep));
+            w2.push(rand_w(fmt, d, inter, 3 * e + 3, &mut keep));
+        }
+        let pick = |v: &Vec<DsW>| (0..ne).map(|e| v[e % 16]).collect::<Vec<_>>();
+        let (w1d, w3d, w2d) = (
+            DevBuf::from_slice(&pick(&w1)).unwrap(),
+            DevBuf::from_slice(&pick(&w3)).unwrap(),
+            DevBuf::from_slice(&pick(&w2)).unwrap(),
+        );
+        let n = t * topk;
+        let mut st = 0x2545F4914F6CDD1Du64;
+        let ids: Vec<i32> = (0..t)
+            .flat_map(|_| {
+                let mut v: Vec<i32> = vec![];
+                while v.len() < topk {
+                    st ^= st << 13;
+                    st ^= st >> 7;
+                    st ^= st << 17;
+                    let e = (st % ne as u64) as i32;
+                    if !v.contains(&e) {
+                        v.push(e);
+                    }
+                }
+                v
+            })
+            .collect();
+        let idd = DevBuf::from_slice(&ids).unwrap();
+        let wts = DevBuf::from_slice(&data(n, 9, 1.0)).unwrap();
+        let (counts, off) = (
+            DevBuf::alloc(ne * 4).unwrap(),
+            DevBuf::alloc((ne + 1) * 4).unwrap(),
+        );
+        let (rows, rw) = (DevBuf::alloc(n * 4).unwrap(), DevBuf::alloc(n * 4).unwrap());
+        k.route(
+            &s, idd.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+        )
+        .unwrap();
+        let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
+        let slots = n.min(ne);
+        let elist = DevBuf::alloc(slots * 4).unwrap();
+        let (nei, ci) = (ne as i32, slots as i32);
+        unsafe {
+            k.go(
+                "ds_moe_plan",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                &s,
+                tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+            )
+            .unwrap();
+        }
+        let x = DevBuf::from_slice(&data(t * d, 3, 2.0)).unwrap();
+        k.fp8_qdq(&s, x.ptr, t * d).unwrap();
+        let tiles = DevBuf::alloc(Kernels::moe_tile_cap(n, slots) * 4).unwrap();
+        let wide = n * d.max(inter);
+        let (codes, scales) = (
+            DevBuf::alloc(wide).unwrap(),
+            DevBuf::alloc(wide / 32 * 4).unwrap(),
+        );
+        let (h, part) = (
+            DevBuf::alloc(n * inter * 4).unwrap(),
+            DevBuf::alloc(n * d * 4).unwrap(),
+        );
+        let us = time(&mut || {
+            k.moe_tiled(
+                &s,
+                fmt,
+                (w1d.ptr, w3d.ptr, w2d.ptr),
+                (elist.ptr, slots, tiles.ptr),
+                (off.ptr, rows.ptr, rw.ptr),
+                (x.ptr, h.ptr, part.ptr),
+                (codes.ptr, scales.ptr),
+                (t, topk, d, inter),
+                10.0,
+            )
+            .unwrap()
+        });
+        let fl = 2.0 * (n * 3 * d * inter) as f64;
+        eprintln!(
+            "moe tiled t {t} ({n} pairs): {us:.0} us/layer ({:.1} TFLOP/s), 4 launches",
+            fl / us / 1e6
+        );
     }
 
     /// One layer's routed MoE by the grouped kernels at the real shapes (384 experts, top-6,

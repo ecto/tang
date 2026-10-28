@@ -262,6 +262,20 @@ extern "C" __global__ void ds_moe_plan(const int* counts, const int* mask, int* 
     for (; j < cap; j++) elist[j] = -1;
 }
 
+// The 8-row tiles of the elist experts' CSR segments, one thread: tiles[0..cap) = e | c << 16
+// for each slot's expert e and chunk c < ceil(rows / 8), then -1 (cap >= slots + rows / 8).
+extern "C" __global__ void ds_moe_plan_tiles(const int* elist, const int* off, int* tiles, int slots, int cap) {
+    if (threadIdx.x || blockIdx.x) return;
+    int j = 0;
+    for (int s = 0; s < slots; s++) {
+        int e = elist[s];
+        if (e < 0) break;
+        int nc = (off[e + 1] - off[e] + 7) / 8;
+        for (int c = 0; c < nc && j < cap; c++) tiles[j++] = e | (c << 16);
+    }
+    for (; j < cap; j++) tiles[j] = -1;
+}
+
 // y [t][d] = Σ over token ti's local experts in ascending id of part[slot] (slot = the token's
 // CSR position under that expert): the per-expert loop's scatter order, from 0.
 extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
