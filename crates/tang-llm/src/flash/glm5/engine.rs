@@ -1233,6 +1233,18 @@ impl Glm5Engine {
                 }
                 let dbg = self.kda_dbg.as_mut().filter(|d| d.wants(l));
                 let Some(dbg) = dbg else {
+                    // a short window (MTP verify, t <= WIN_STEP) runs row by row: the t=1
+                    // projections + core are what the decode step runs, and the batched
+                    // t>1 projections are not bit-identical to them under the B300 flags
+                    // (windiff: l00 attn_out row 0 rel 9.9e-5 with identical input)
+                    if t > 1 && t <= super::mtp::win_step() {
+                        let n = x.len() / t;
+                        let mut y = Vec::with_capacity(x.len());
+                        for i in 0..t {
+                            y.extend(dev.window_at(slot, &x[i * n..(i + 1) * n], 1, &mut st.0)?);
+                        }
+                        return Ok(y);
+                    }
                     return dev.window_at(slot, x, t, &mut st.0);
                 };
                 // shadow check: the device's state going in, the window with taps, the
