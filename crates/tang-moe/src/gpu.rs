@@ -701,6 +701,15 @@ impl Drop for DevBuf {
     }
 }
 
+/// Async device-to-device copy of `bytes` from `src` to `dst` on `s` (capturable as a
+/// graph memcpy node). Both are raw device addresses the caller keeps valid.
+pub fn copy_d2d_async(dst: u64, src: u64, bytes: usize, s: &Stream) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    ck!(sys::cuMemcpyDtoDAsync_v2(dst, src, bytes, s.0))
+}
+
 /// Launch `f`. `args` are pointers to each kernel argument's value.
 ///
 /// # Safety

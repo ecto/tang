@@ -371,6 +371,11 @@ pub struct Stats {
     pub tokens: usize,
     pub draft_s: f64,
     pub trunk_s: f64,
+    /// verify windows that ran on the resident path ([`Glm5Engine::window_resident`]),
+    /// the device rewinds after a partial accept, and their time (inside `trunk_s`)
+    pub res_windows: usize,
+    pub res_rewinds: usize,
+    pub rewind_s: f64,
 }
 
 impl Stats {
@@ -396,6 +401,16 @@ impl Stats {
             self.draft_s,
             self.trunk_s
         );
+        if self.res_windows > 0 {
+            s += &format!(
+                "mtp: resident verify: {} windows, {} device rewinds ({:.3} ms each); trunk {:.2} ms/pass, draft {:.2} ms/pass\n",
+                self.res_windows,
+                self.res_rewinds,
+                1e3 * self.rewind_s / self.res_rewinds.max(1) as f64,
+                1e3 * self.trunk_s / passes.max(1) as f64,
+                1e3 * self.draft_s / passes.max(1) as f64
+            );
+        }
         s
     }
 }
@@ -443,9 +458,41 @@ pub fn generate(
         drafts.truncate(kk);
         st.draft_s += td.elapsed().as_secs_f64();
         let tt = Instant::now();
-        let snap = e.snapshot()?;
         let mut win = vec![cur];
         win.extend_from_slice(&drafts);
+        // the resident verify window: one device pass, per-row ids + h, device rewind
+        #[cfg(feature = "cuda")]
+        if let Some((g, hrows)) = e.window_resident(&win)? {
+            st.verify += 1;
+            st.res_windows += 1;
+            let mut a = 0;
+            while a < drafts.len() && drafts[a] == g[a] {
+                a += 1;
+            }
+            for d in 0..drafts.len().min(a + 1) {
+                st.proposed[d] += 1;
+                if d < a {
+                    st.accepted[d] += 1;
+                }
+            }
+            if a < drafts.len() {
+                let tr = Instant::now();
+                e.rewind_resident(win.len(), a + 1)?;
+                st.rewind_s += tr.elapsed().as_secs_f64();
+                st.res_rewinds += 1;
+            }
+            let new = g[..=a].to_vec();
+            let h = &hrows[..(a + 1) * e.m.hp.n_embd];
+            st.trunk_s += tt.elapsed().as_secs_f64();
+            let td = Instant::now();
+            dr.observe(e, h, &new)?;
+            st.draft_s += td.elapsed().as_secs_f64();
+            cur = *new.last().unwrap();
+            gen.extend_from_slice(&new);
+            st.tokens += new.len();
+            continue;
+        }
+        let snap = e.snapshot()?;
         let lg = e.window(&win)?;
         st.verify += 1;
         let g: Vec<u32> = (0..win.len())

@@ -623,11 +623,15 @@ impl MhcFused {
     /// [`Self::begin`] with an async upload on [`Self::stream`] (the resident step: no
     /// legacy-stream copy, so no implicit wait on the other blocking streams).
     pub fn begin_async(&mut self, r: &[f32]) -> Result<()> {
-        if r.len() != 4 * self.n {
+        if r.is_empty() || r.len() % (4 * self.n) != 0 {
             bail!("mhc fused begin_async: {} values", r.len());
         }
+        let t = r.len() / (4 * self.n);
+        if t > self.max_t {
+            bail!("mhc fused begin_async: t {t} > max {}", self.max_t);
+        }
         self.r.write_async(0, r, &self.s).map_err(|e| anyhow!("mhc fused begin_async: {e}"))?;
-        self.set_window(1)
+        self.set_window(t)
     }
 
     /// Set the window length and clear the pending post without touching the device (the
