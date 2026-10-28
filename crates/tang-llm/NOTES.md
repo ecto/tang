@@ -137,6 +137,29 @@ Not verified:
 - The mirror-refresh-on-regrow path (rows_fit false) on real weights.
 - Multi-slot: the resident path is gated to n_slots == 1.
 
+## 2026-10-28 (mtp-ready) — MTP + WIN_STEP bisect fix merged onto 9c49294d; WIN_STEP = K+1 by default under --mtp (branch claude/glm5-mtp-ready)
+- Merge of claude/glm5-mtp-bisect (contains claude/glm5-mtp) onto frog/glm5-forward 9c49294d.
+  Conflicts: this file (all entries kept), engine.rs CLI (`--slots` and `--mtp` both kept,
+  now mutually exclusive), kda_dev.rs `core_pf2` (the WIN_STEP serial loop now passes the
+  batcher's `slot`). Semantic conflict: `Snap`/`snapshot`/`restore` ported to the per-slot
+  `kda[slot][layer]` / `dsa[slot][layer]` layout — MTP rewinds slot 0 only.
+- `TANG_GLM5_KDA_WIN_STEP` unset now falls back to `mtp::WIN_STEP_DEFAULT`, which
+  `mtp::cli_run` sets to K+1 (the verify window), so `--mtp K` is exact by default; env
+  still overrides (`=0` restores the chunked core). Plain decode: default 0, unchanged.
+- Test `engine_gpu_win_step_window_matches_steps` (tiny, PF2): one t-token window with
+  win_step >= t vs t single decode steps, t = 2,3,4 — every logit row max abs 0 (bitwise),
+  and the step after the window also 0. Its PF2 env set/remove raced
+  `engine_gpu_slots_batch_matches_single` in the parallel run (slot 0 max abs 9.8); fixed
+  with a test `ENV_LOCK` around both loads.
+- Verified: local CPU `flash::glm5` 42/0. mew 3090 (TANG_REQUIRE_CUDA=1) 80 passed / 1
+  failed — the known `engine_gpu_trace_is_transparent` parallel flake (passes alone).
+- H200 #1 (/root/w-mtp, B flags): haiku -n 8 --temp 0 ids gate plain = oracle
+  `785 1196 6801 264 6386 38038 911 279`; --mtp 1 = oracle (accept 4/4, win_step=2 logged).
+  --mtp 2, --mtp 3 and --mtp 3 with WIN_STEP=0 exited rc=0 but their ids were NOT read
+  back: the box was stopped externally before the logs could be fetched. The tok/s bench
+  (plain, --mtp 1/2/3, and the WIN_STEP=0 vs default cost at depth 3) never ran — the GPU
+  lock was contended by other agents for ~3 h. OPEN: rerun all of it on a live H200.
+
 ## 2026-10-28 (integration round 2) — k5d_tail + FFN repack merged: B300 35.02 tok/s decode with repack off, now the default (branch claude/glm5-integrate2)
 
 Merged onto frog/glm5-forward 38bb2bed: claude/glm5-kda-kernels 1073e571 (k5d_tail, `TANG_GLM5_KDA_TAIL`
@@ -611,6 +634,66 @@ Ops: two copies of a run script once interleaved on one status file and target d
 second launch while the first was mid-queue) — run scripts now take an instance lock
 (`flock -n` on a run lock). `pkill -f <pattern>` over ssh matches the ssh's own shell and
 other workers' jobs: kill by cwd/pid only.
+## 2026-10-28 — MTP near-tie bisected: the KDA chunked core (t>1) vs the recurrent step (branch claude/glm5-mtp-bisect)
+Tool: `TANG_GLM5_WINDIFF=S,T` (engine.rs `windiff`): step-decode to gen[S], snapshot, then
+(A) T single steps, (A2) again, (B) one T-token window over the same tokens; per-layer taps
+(attn in/out, ffn in/out, l2 rel per row) + logits top-2. H200 /root/w-bisect, fast env
+(GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT GPU_HEAD), haiku prompt.
+- A vs A2: 0 everywhere (steps deterministic; snapshot/restore exact).
+- Near-tie (S=59, feeding `42612 11 30957 11`, row 1 = the token after `…42612 11`): step
+  30957 19.2940 vs 342 19.2044, **margin 0.0897**; window flips it: 342 19.4025 vs 30957
+  19.2110. Row logits window-vs-step rel 1.3e-2, max abs 0.24.
+- First difference: **l00 attn_out (KDA), row 0, rel 2.7e-7** with bit-identical input
+  (attn_in 0). Grows through the stack: l01 attn_out ~1e-3, l02 2.5e-3, l06 ffn_out 3e-2 (one
+  row jumps — MoE routing amplifies), l07–l10 up to 1e-1 on that row, settling ~5e-3–1e-2.
+  (Table at S=56: l00 attn_out 2.6e-7, ffn_out 1.1e-5, l01 attn_out 6.3e-4, l04 3.8e-3, l06
+  ffn_out 3.0e-2, l07 ffn_out 1.0e-1, l09 ffn_out 1.0e-1, l12 1.9e-2, l19 ~5e-3.)
+- Cause: `kda_dev::core_pf2` runs t>1 through `prefill_dev` (conv_ip + PF2 chunked WY form),
+  t=1 through `decode_dev` (fused conv + recurrent delta step). Same math, different fp
+  order. Everything else (gemv8/xq8 projections, gates, MoE fast tile, fused mHC, resident
+  MLA, GPU head) is already per-token bit-identical between t=4 and 4×t=1 — proven by the fix:
+- Fix (flag): `TANG_GLM5_KDA_WIN_STEP=N` — windows with t ≤ N run the core as t
+  `decode_dev` launches (token offsets into qkvb/gb_out/bb/ob). With N=4 at S=59: **every tap
+  of all 45 layers and all 4 logit rows bit-identical (0.0)**.
+- Verified: `--mtp 3 -n 64` with WIN_STEP=4 ids == plain decode, all 64 (ends `42612 11 30957
+  11 342`); 1.75 tok/pass (23 verify + 13 rerun). Gate -n 8: plain and --mtp 3 both `785 1196
+  6801 264 6386 38038 911 279`.
+- Cost: t serial step launches per KDA layer per window instead of one chunk (tiny at t≤4;
+  not timed). Default off. Unverified: prefill/long windows untouched (still chunked, so a
+  prefill-vs-decode difference of the same ~1e-2 logit band remains by design); bound
+  otherwise is logits ~1e-2 rel / ~0.3 abs, so near-ties with margin < ~0.3 can flip.
+
+## 2026-10-27 (late) — MTP: the NextN layer drafts at 85–93% (branch claude/glm5-mtp)
+GGUF facts (unsloth UD-Q4_K_XL, dumped on the H200): `nextn_predict_layers = 1`,
+`block_count = 46`; `blk.45` is the NextN block — `nextn.eh_proj` [8192→4096] Q8_0,
+`nextn.{enorm,hnorm,shared_head_norm}` F32, a full DSA attention (MLA + indexer tensors) and
+the 288-expert MoE + shared expert. No `nextn.embed_tokens` / `shared_head.head` (uses
+`token_embd` / `output`), no mHC tensors. `index_share_mtp = true`. Forward per llama.cpp
+`graph_mtp` (/private/tmp/llamacpp-ref/glm5-next.cpp): `eh_proj @ [enorm(embed(x_{i+1})) ;
+hnorm(h_i)]`, plain-residual DSA + MoE, `shared_head_norm`, `output`. `h_i` is the trunk's
+**post-output_norm** hidden; a chain step's `h` is the previous MTP cell's post-shared_head_norm.
+Code: `mtp.rs` (CPU drafter + greedy draft-and-verify, `--mtp K` / `TANG_GLM5_MTP=K`),
+`mtp_tests.rs`; engine.rs hooks `last_h`, `snapshot`/`restore` (KDA host copies, read back
+from resident layers first; DSA caches truncate), and the GPU head now runs every window row.
+A partial accept rewinds and re-runs the accepted prefix (no per-token KDA checkpoints).
+Results (H200, fast env: GEMV8 PF2 MHC_FUSED MOE=fast GPU_FFN_LAYERS=0-29 MLA_RESIDENT
+GPU_HEAD, k=3, -n 128; depth d rate is conditional on depths < d accepted):
+- gate "Write a haiku about the sea." -n 8 --mtp 3: ids `785 1196 6801 264 6386 38038 911 279`
+  (= oracle), 2 verify passes, 100% accept.
+- code: d1 88.4% d2 78.4% d3 62.1%; 1.91 tok/pass actual, 2.98 verify-only.
+- prose: d1 84.8% d2 64.1% d3 75.0%; 1.75 actual, 2.78 verify-only.
+- chat: d1 93.0% d2 70.0% d3 57.1%; 1.81 actual, 2.95 verify-only.
+- haiku -n 64: 1.85 actual / 2.86 verify-only.
+NOT identical at -n 64: MTP on/off agree for 60 tokens, then plain gives `30957 11 342`, MTP
+`342 69898 11` (inside an accepted verify window). Not the head (same with the per-row GPU
+head, logs2). It's a t=4-window vs t=1-step numerics difference in the trunk (KDA fused
+decode / MoE fast / mHC t=1 paths vs window paths) at a near-tie; unbisected.
+Tiny fixture (CPU): output == plain greedy for MTP / junk / oracle drafters, k=1..3; the
+oracle is never rewound. Drafting is CPU (~2 s/cell at 4096: CPU MoE for blk.45).
+GPU version needs: blk.45 resident (MLA via mla_dev + its MoE in GpuFfn + eh_proj gemv +
+device head/argmax, no host round trip per cell); per-token KDA state checkpoints in the
+window kernel (drop the re-run: 1.8 → 2.9 tok/pass); trunk window rows bitwise equal to t=1
+decode (or bisect the near-tie flip first).
 
 ## 2026-10-27 — the absorbed + device-append MLA resident path verified (H200, r16)
 The worker session died twice mid-iteration; the manager committed its dirty tree as
