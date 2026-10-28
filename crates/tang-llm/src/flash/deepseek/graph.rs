@@ -224,6 +224,7 @@ const NAMES: &[&str] = &[
     "dg_win_idx",
     "dg_ring_write",
     "dg_row_write",
+    "dg_spark_idx",
     "dg_index_score",
     "dg_mask_scores",
     "dg_candidates",

@@ -302,11 +302,12 @@ extern "C" __global__ void ds_copy_u8(unsigned char* dst, const unsigned char* s
     if (i < n) dst[i] = src[i];
 }
 
-// DSpark's greedy Markov draw on the device: ids[slot] = argmax(row) (the first maximum, as
-// the host `argmax`), or with row == nullptr keep ids[slot]; then, when memb != nullptr, the
+// DSpark's greedy Markov draw on the device: row += bias (when given; the Markov bias, as
+// ds_add), ids[slot] = argmax(row) (the first maximum, as the host `argmax`), or with
+// row == nullptr keep ids[slot] (first set to set[0] when given); then, when memb != nullptr, the
 // Markov embedding row of that id: memb[0..rank] = tab[id * rank ..]. One block of 1024.
-extern "C" __global__ void ds_spark_pick(const float* row, int v, int* ids, int slot, const float* tab, int rank,
-                                         float* memb) {
+extern "C" __global__ void ds_spark_pick(float* row, int v, int* ids, int slot, const float* tab, int rank,
+                                         float* memb, const float* bias, const int* set) {
     __shared__ float sv[1024];
     __shared__ int si[1024];
     __shared__ int pick;
@@ -316,6 +317,7 @@ extern "C" __global__ void ds_spark_pick(const float* row, int v, int* ids, int 
         int bi = 0x7fffffff;
         for (int j = tid; j < v; j += blockDim.x) {
             float x = row[j];
+            if (bias) row[j] = x = x + bias[j];
             if (x > bv) {
                 bv = x;
                 bi = j;
@@ -341,7 +343,193 @@ extern "C" __global__ void ds_spark_pick(const float* row, int v, int* ids, int 
             pick = a;
         }
     } else if (tid == 0) {
+        if (set) ids[slot] = set[0];
         pick = ids[slot];
+    }
+    __syncthreads();
+    if (memb)
+        for (int j = tid; j < rank; j += blockDim.x) memb[j] = tab[(long long)pick * rank + j];
+}
+
+// ---- DSpark's sampled Markov draw on the device (`SpecSampler::sample`, same transform) ----
+
+// The 15 sums of a thread's `loc` over the block (1024 threads), in a fixed order (so every
+// EP rank gets the same bits); the results in `out` for all threads.
+__device__ void ds_ss_sum15(double* loc, double (*red)[15], double* out) {
+    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    for (int k = 0; k < 15; k++) {
+        double x = loc[k];
+        for (int o = 16; o > 0; o >>= 1) x += __shfl_down_sync(0xffffffff, x, o);
+        if (lane == 0) red[wid][k] = x;
+    }
+    __syncthreads();
+    if (tid < 15) {
+        double s = 0.0;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) s += red[w][tid];
+        out[tid] = s;
+    }
+    __syncthreads();
+}
+
+// The largest key k (w's bits: w >= 0, so they order as w does) with G(k) = sum of w over
+// keys >= k at least `target` and positive, 4 bits a pass.
+__device__ unsigned long long ds_ss_search(const double* w, int v, double target, double (*red)[15],
+                                  double* out) {
+    unsigned long long kap = 0;
+    double loc[15];
+    for (int sh = 60; sh >= 0; sh -= 4) {
+        for (int k = 0; k < 15; k++) loc[k] = 0.0;
+        for (int j = threadIdx.x; j < v; j += blockDim.x) {
+            unsigned long long key = (unsigned long long)__double_as_longlong(w[j]);
+            double x = w[j];
+            for (int k = 0; k < 15; k++)
+                if (key >= (kap | ((unsigned long long)(k + 1) << sh))) loc[k] += x;
+        }
+        ds_ss_sum15(loc, red, out);
+        int best = 0;
+        for (int k = 0; k < 15; k++)
+            if (out[k] >= target && out[k] > 0.0) best = k + 1;
+        kap |= (unsigned long long)best << sh;
+        __syncthreads();
+    }
+    return kap;
+}
+
+// G(> kap) and the number of keys == kap.
+__device__ void ds_ss_above(const double* w, int v, unsigned long long kap, double (*red)[15], double* out,
+                            double* above, int* ties) {
+    double loc[15];
+    for (int k = 0; k < 15; k++) loc[k] = 0.0;
+    for (int j = threadIdx.x; j < v; j += blockDim.x) {
+        unsigned long long key = (unsigned long long)__double_as_longlong(w[j]);
+        if (key > kap) loc[0] += w[j];
+        if (key == kap) loc[1] += 1.0;
+    }
+    ds_ss_sum15(loc, red, out);
+    *above = out[0];
+    *ties = (int)out[1];
+    __syncthreads();
+}
+
+// The n-th (1-based) token, in id order, with key == kap.
+__device__ int ds_ss_nth(const double* w, int v, unsigned long long kap, int n, int* cnt, int* res) {
+    int tid = threadIdx.x, nt = blockDim.x;
+    int cs = (v + nt - 1) / nt, lo = tid * cs, hi = min(v, lo + cs);
+    int c = 0;
+    for (int j = lo; j < hi; j++) c += (unsigned long long)__double_as_longlong(w[j]) == kap;
+    cnt[tid] = c;
+    if (tid == 0) *res = -1;
+    __syncthreads();
+    if (tid == 0) {
+        int acc = 0;
+        for (int i = 0; i < nt; i++) {
+            int x = cnt[i];
+            cnt[i] = acc;
+            acc += x;
+        }
+    }
+    __syncthreads();
+    int before = cnt[tid];
+    if (before < n && before + c >= n) {
+        int k = before;
+        for (int j = lo; j < hi; j++)
+            if ((unsigned long long)__double_as_longlong(w[j]) == kap && ++k == n) {
+                *res = j;
+                break;
+            }
+    }
+    __syncthreads();
+    return *res;
+}
+
+// ids[slot] = a draw from SpecSampler::dist(row) (temperature `temp` > 0, top-p `top_p`):
+// w = exp((row - max) / temp) in f64, the smallest prefix by decreasing w (ties by id) holding
+// top_p of the mass, one uniform from the splitmix64 state *rng (advanced), the first prefix
+// token whose cumulative mass reaches it. `w` is [v] f64 scratch; `bias` (when given) is
+// first added to row, as ds_spark_pick. Then, as ds_spark_pick, the
+// Markov embedding row of the draw. One block of 1024.
+extern "C" __global__ void __launch_bounds__(1024) ds_spark_sample(float* row, int v, int* ids, int slot,
+                                           const float* tab, int rank, float* memb, float temp,
+                                           float top_p, unsigned long long* rng, double* w,
+                                           const float* bias) {
+    __shared__ double red[32][15];
+    __shared__ double out[15];
+    __shared__ float smx[32];
+    __shared__ int cnt[1024];
+    __shared__ int res;
+    __shared__ double sz, su;
+    __shared__ int pick;
+    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    float mx = -DS_INF;
+    for (int j = tid; j < v; j += blockDim.x) {
+        float x = row[j];
+        if (bias) row[j] = x = x + bias[j];
+        mx = fmaxf(mx, x);
+    }
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
+    if (lane == 0) smx[wid] = mx;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smx[0];
+        for (int i = 1; i < (int)(blockDim.x >> 5); i++) m = fmaxf(m, smx[i]);
+        smx[0] = m;
+    }
+    __syncthreads();
+    mx = smx[0];
+    double loc[15];
+    for (int k = 0; k < 15; k++) loc[k] = 0.0;
+    for (int j = tid; j < v; j += blockDim.x) {
+        double x = exp((double)__fdiv_rn(__fsub_rn(row[j], mx), temp));
+        w[j] = x;
+        loc[0] += x;
+    }
+    __syncthreads();
+    ds_ss_sum15(loc, red, out);
+    if (tid == 0) {
+        sz = out[0];
+        unsigned long long s = *rng + 0x9E3779B97F4A7C15ull;
+        *rng = s;
+        unsigned long long z = s;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        su = (double)(z >> 11) / (double)(1ull << 53);
+    }
+    __syncthreads();
+    double z = sz, u = su;
+    // the kept prefix: keys above kc, then the first m ties at kc
+    unsigned long long kc = 0;
+    double above = 0.0, total = z;
+    int ties = 0, m = 0;
+    bool cut = top_p < 1.0f;
+    if (cut) {
+        double tgt = (double)top_p * z;
+        kc = ds_ss_search(w, v, tgt, red, out);
+        ds_ss_above(w, v, kc, red, out, &above, &ties);
+        double wc = __longlong_as_double((long long)kc);
+        m = wc > 0.0 ? (int)ceil((tgt - above) / wc) : ties;
+        m = max(1, min(m, ties));
+        total = above + m * wc;
+    }
+    double r = fmin(u * total, total);
+    int tok;
+    if (cut && r > above) {
+        double wc = __longlong_as_double((long long)kc);
+        int n = wc > 0.0 ? (int)ceil((r - above) / wc) : m;
+        tok = ds_ss_nth(w, v, kc, max(1, min(n, m)), cnt, &res);
+    } else {
+        unsigned long long kd = ds_ss_search(w, v, r, red, out);
+        double ab;
+        int nt;
+        ds_ss_above(w, v, kd, red, out, &ab, &nt);
+        double wd = __longlong_as_double((long long)kd);
+        int n = wd > 0.0 ? (int)ceil((r - ab) / wd) : nt;
+        tok = ds_ss_nth(w, v, kd, max(1, min(n, nt)), cnt, &res);
+    }
+    if (tid == 0) {
+        if (tok < 0) tok = 0;
+        ids[slot] = tok;
+        pick = tok;
     }
     __syncthreads();
     if (memb)

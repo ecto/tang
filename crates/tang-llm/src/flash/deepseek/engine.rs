@@ -7,7 +7,7 @@
 //! launch for every id and exit early when empty), and the attention index rows. On the
 //! host: Engram's hashing and row gather (the tables stay mapped on the host: 101 GB each
 //! for the real model), uploaded through pinned staging; DSpark's left-to-right Markov
-//! sampling; and, only when `DS_EXPERT_SLOTS` bounds the expert LRU, the routed-expert
+//! sampling only for a non-[`SpecSampler`] pick (`forward_spec_with`); and, only when `DS_EXPERT_SLOTS` bounds the expert LRU, the routed-expert
 //! counts. Weights upload lazily on first use, in their checkpoint format.
 //!
 //! Scratch and syncs ([`super::graph`]): a step's temporaries come from a per-model arena
@@ -22,13 +22,14 @@
 //! candidate masks, top-k) are launched for their maximum (`max_seq_len / r`, `index_topk`)
 //! and bounded on the device, and short top-k rows are padded with -1 holes, which the
 //! attention skips exactly. So the step is captured once per t (after a warm-up run that
-//! uploads the weights and sizes the arena) and replayed per token. Not captured: prefill,
-//! DSpark's `forward_spec`, and steps with the expert LRU (`DS_EXPERT_SLOTS`), a host-side
+//! uploads the weights and sizes the arena) and replayed per token. The DSpark draft
+//! (sp > 0, drawn on the device) is captured too, per (main rows, sampler). Not captured:
+//! prefill, `forward_spec_with`, and steps with the expert LRU (`DS_EXPERT_SLOTS`), a host-side
 //! expert-parallel `moe_reduce` (one that syncs: `reduce_graphable` unset), a hook,
 //! `force` or `DS_TAP`; they run the same code directly. An NCCL `moe_reduce` only enqueues
 //! (`reduce_graphable`), so it is captured as a graph node with the step.
 
-use super::forward::{Model, SpecPick, SpecStep};
+use super::forward::{Model, SpecPick, SpecSampler, SpecStep};
 use super::gpu::{blocks, DevW, DsW, Kernels};
 use super::graph::{Arena, Buf, GKernels, Staging, Upload, SEL};
 use super::quant::{e4m3_to_f32, e8m0_to_f32};
@@ -75,6 +76,55 @@ struct MoeTab {
 enum Attn {
     Main,
     Spark(Buf, usize),
+}
+
+/// A draft's staged inputs: the target hiddens [t][targets][D], the block's ids, the
+/// one-hot pre-mix, the sampler's RNG state.
+struct SparkIn {
+    mh: Buf,
+    idb: Buf,
+    oh: Buf,
+    rb: Buf,
+    t: usize,
+}
+
+/// The draft's read-back, in f32 words: [logits blk*V | hiddens blk*D | drafts blk+1 | RNG
+/// state 2 (8-byte aligned)].
+struct SparkPack {
+    hid: usize,
+    ids: usize,
+    rng: usize,
+    len: usize,
+}
+
+impl SparkPack {
+    fn new(blk: usize, v: usize, d: usize) -> Self {
+        let (hid, ids) = (blk * v, blk * v + blk * d);
+        let rng = (ids + blk + 2) & !1;
+        Self {
+            hid,
+            ids,
+            rng,
+            len: rng + 2,
+        }
+    }
+}
+
+/// A captured draft (see [`GpuModel::spark`]): its pack in the arena.
+struct SparkGraph {
+    g: Graph,
+    pk: Buf,
+    gen: (u64, u64),
+}
+
+/// How [`GpuModel::spark`] picks the drafts.
+enum Draw<'a> {
+    /// Argmax, on the device.
+    Greedy,
+    /// The sampler's draws, on the device; its RNG state advances as on the host.
+    Sample(&'a mut SpecSampler),
+    /// `draw(logits)` on the host.
+    Host(&'a mut dyn FnMut(&[f32]) -> usize),
 }
 
 /// mHC coefficients on the device: pre [T][hc], post [T][hc], comb [T][hc][hc].
@@ -177,6 +227,9 @@ pub struct GpuModel {
     stage: RefCell<Staging>,
     graphs: HashMap<(usize, bool), Captured>,
     warm: HashMap<(usize, bool), (u64, u64)>,
+    /// Captured drafts by (main rows, sampler (temperature, top-p) bits), and their warm-ups.
+    spark_graphs: HashMap<(usize, Option<(u32, u32)>), SparkGraph>,
+    spark_warm: HashMap<(usize, Option<(u32, u32)>), (u64, u64)>,
     /// Debugging: each backbone layer's input stream and pre-mix (as [`Model::force`]).
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     /// Intermediates read back by name when `DS_TAP` is set (as [`Model::taps`]).
@@ -233,6 +286,7 @@ impl Drop for GpuModel {
         let _ = self.s.sync();
         let _ = self.side.sync();
         self.graphs.clear();
+        self.spark_graphs.clear();
     }
 }
 
@@ -333,6 +387,8 @@ impl GpuModel {
             stage: RefCell::new(Staging::default()),
             graphs: HashMap::new(),
             warm: HashMap::new(),
+            spark_graphs: HashMap::new(),
+            spark_warm: HashMap::new(),
             force: None,
             taps: RefCell::new(Vec::new()),
             journal_on: false,
@@ -431,6 +487,7 @@ impl GpuModel {
         self.stage.borrow_mut().reset()?;
         let g = self.gen();
         self.graphs.retain(|_, c| c.gen == g);
+        self.spark_graphs.retain(|_, c| c.gen == g);
         Ok(())
     }
 
@@ -2427,6 +2484,10 @@ impl GpuModel {
     // dspark
 
     #[allow(clippy::too_many_arguments)]
+    /// DSpark attention over the ring and the block. `sp` is 0 (seeding: the main rows into
+    /// the ring only) or [`DYN`]: the position is `P[0]` on the device, and the index rows are
+    /// launched for the ring's full width (`-1` past the rows written), so a draft captures.
+    #[allow(clippy::too_many_arguments)]
     fn dspark_attention(
         &mut self,
         p: &str,
@@ -2439,41 +2500,57 @@ impl GpuModel {
     ) -> Result<Buf> {
         let c = self.cpu.cfg.clone();
         let (h, hd, win) = (c.n_heads, c.head_dim, c.window_size);
-        let at = |pos0| At::Host {
-            pos0,
+        let dev = |add| At::Dev {
+            add,
             stride: 1,
-            fixed: None,
+            fixed_r: 0,
         };
         let mkv = self.lin(main_x, t, &format!("{p}.attn.wkv.weight"))?;
         self.rms(mkv, t, &format!("{p}.attn.kv_norm.weight"))?;
-        self.rope(mkv, t, 1, hd, lid, at(sp), false)?;
-        self.k.fp8_qdq(&self.s, mkv.ptr, t * hd)?;
         if sp == 0 {
+            let at0 = At::Host {
+                pos0: 0,
+                stride: 1,
+                fixed: None,
+            };
+            self.rope(mkv, t, 1, hd, lid, at0, false)?;
+            self.k.fp8_qdq(&self.s, mkv.ptr, t * hd)?;
             self.ring_seed(lid, mkv, t)?;
             return self.fbuf(1);
         }
-        let pos0 = sp + t;
+        anyhow::ensure!(sp == DYN, "dspark_attention: sp > 0 reads P[0]");
+        self.rope(mkv, t, 1, hd, lid, dev(0), false)?;
+        self.k.fp8_qdq(&self.s, mkv.ptr, t * hd)?;
+        // the block's rows sit at P[0] + t ..
         let qr = self.lin(x, bl, &format!("{p}.attn.wq_a.weight"))?;
         self.rms(qr, bl, &format!("{p}.attn.q_norm.weight"))?;
         let q = self.lin(qr, bl, &format!("{p}.attn.wq_b.weight"))?;
-        self.rope(q, bl, h, hd, lid, at(pos0), false)?;
+        self.rope(q, bl, h, hd, lid, dev(t), false)?;
         let kv = self.lin(x, bl, &format!("{p}.attn.wkv.weight"))?;
         self.rms(kv, bl, &format!("{p}.attn.kv_norm.weight"))?;
-        self.rope(kv, bl, 1, hd, lid, at(pos0), false)?;
+        self.rope(kv, bl, 1, hd, lid, dev(t), false)?;
         self.k.fp8_qdq(&self.s, kv.ptr, bl * hd)?;
-        // the ring holds positions < sp + t once the t main rows are written (mode 2 counts
-        // `sp + 1` ring rows, so pass the last written position)
-        let nk = win.min(sp + t) + bl;
-        let idx = self.win_idx(bl, nk, nk, 2, sp + t - 1, bl)?;
-        let ring = self.win[lid].ptr;
-        for i in 0..t {
-            let s = ((sp + i) % win * hd * 4) as u64;
-            self.copy(ring + s, mkv.ptr + (i * hd * 4) as u64, hd)?;
-        }
+        // the ring holds positions < P[0] + t once the t main rows are written: its
+        // min(win, P[0] + t) rows, then the block's, then -1 holes (as ds_win_idx mode 2)
+        let nk = win + bl;
+        let idx = self.fbuf(bl * nk)?;
+        let (bi, ni, pp, ai, wi) = (bl as i32, nk as i32, self.p.ptr, t as i32 - 1, win as i32);
+        unsafe {
+            self.gk.go(
+                "dg_spark_idx",
+                blocks(bl * nk, 256),
+                B256,
+                0,
+                &self.s,
+                args![idx.ptr, bi, ni, pp, ai, wi],
+            )?
+        };
+        let ring = b(&self.win[lid]);
+        self.ring_write(ring, mkv, t, hd, win, 0)?;
         let all = self.fbuf((win + bl) * hd)?;
-        self.copy(all.ptr, ring, win * hd)?;
+        self.copy(all.ptr, ring.ptr, win * hd)?;
         self.copy(all.ptr + (win * hd * 4) as u64, kv.ptr, bl * hd)?;
-        self.attn_out(p, q, (all, win + bl, 0), idx, bl, nk, lid, at(pos0))
+        self.attn_out(p, q, (all, win + bl, 0), idx, bl, nk, lid, dev(t))
     }
 
     /// As [`Model::forward_spec`]: greedy drafts, drawn on the device.
@@ -2483,11 +2560,11 @@ impl GpuModel {
         main_hidden: &[f32],
         sp: usize,
     ) -> Result<Option<super::forward::Draft>> {
-        self.spark(token, main_hidden, sp, None)
+        self.spark(token, main_hidden, sp, Draw::Greedy)
     }
 
-    /// As [`Model::forward_spec_with`]: each draft is `draw(logits)` (Markov bias included).
-    /// Not captured: it runs directly, then samples on the host.
+    /// As [`Model::forward_spec_with`]: each draft is `draw(logits)` (Markov bias included),
+    /// sampled on the host.
     pub fn forward_spec_with(
         &mut self,
         token: usize,
@@ -2495,87 +2572,70 @@ impl GpuModel {
         sp: usize,
         draw: &mut dyn FnMut(&[f32]) -> usize,
     ) -> Result<Option<super::forward::Draft>> {
-        self.spark(token, main_hidden, sp, Some(draw))
+        self.spark(token, main_hidden, sp, Draw::Host(draw))
     }
 
-    /// The DSpark draft. With `draw` the Markov head samples on the host, one row read back
-    /// per position; without, greedily on the device (`ds_spark_pick`: argmax, then the next
-    /// position's Markov embedding row) and the drafts, logits and hiddens come back in one
-    /// read at the end.
+    /// The DSpark draft. On the device (greedy: `ds_spark_pick`, argmax; a [`SpecSampler`]:
+    /// `ds_spark_sample`, its draw from the shared RNG state): each position's Markov bias
+    /// added and its draft picked, then the next position's Markov embedding row; the
+    /// drafts, logits, hiddens (and the advanced RNG) come back in one read at the end, and
+    /// the whole draft is a CUDA graph per (main rows, sampler) when decode steps are (see
+    /// the module doc). With [`Draw::Host`] the host samples, one row read back per position.
     fn spark(
         &mut self,
         token: usize,
         main_hidden: &[f32],
         sp: usize,
-        draw: Option<&mut dyn FnMut(&[f32]) -> usize>,
+        mut how: Draw,
     ) -> Result<Option<super::forward::Draft>> {
         let c = self.cpu.cfg.clone();
-        let (hc, d, blk, n_mtp, v) = (
-            c.hc_mult,
-            c.dim,
-            c.dspark_block_size,
-            c.n_mtp_layers,
-            c.vocab_size,
-        );
+        let (d, blk, v) = (c.dim, c.dspark_block_size, c.vocab_size);
         self.begin_step()?;
         self.obs.begin(&self.s, "draft", blk, sp);
         let t = main_hidden.len() / (d * c.dspark_target_layer_ids.len());
-        let mh = self.up(main_hidden)?;
-        let main_x = self.lin(mh, t, "mtp.0.main_proj.weight")?;
-        self.rms(main_x, t, "mtp.0.main_norm.weight")?;
+        let last = format!("mtp.{}", c.n_mtp_layers - 1);
+        let rank = c.dspark_markov_rank;
+        let memb_w = self.cpu.w(&format!("{last}.markov_head.embed.weight"))?;
+        if self.spark_tab.is_none() {
+            self.spark_tab = Some(DevBuf::from_slice(&memb_w.data)?);
+        }
+        // the inputs, staged in a fixed order (a captured draft's uploads read these slots)
+        let mut copies = Vec::new();
+        let (p, u) = self.stage(&[sp as i32, 0, 0, 0])?;
+        copies.push(u);
+        self.p = p;
+        let (mh, u) = self.stage(main_hidden)?;
+        copies.push(u);
         let mut ids = vec![c.dspark_noise_token_id as i32; blk];
         ids[0] = token as i32;
-        let idb = self.up(&ids)?;
-        let mut h = self.embed_hc(idb, blk, hc)?;
-        let mut pre_mix = self.up(&self.one_hot(blk))?;
-        for s in 0..n_mtp {
-            let (lid, p) = (c.n_layers + s, format!("mtp.{s}"));
-            if sp == 0 {
-                self.dspark_attention(&p, lid, h, blk, 0, main_x, t)?;
-                continue;
-            }
-            let (nh, npm) = self.block(&p, lid, h, blk, sp, pre_mix, Attn::Spark(main_x, t))?;
-            h = nh;
-            pre_mix = npm;
-        }
+        let (idb, u) = self.stage(&ids)?;
+        copies.push(u);
+        let (oh, u) = self.stage(&self.one_hot(blk))?;
+        copies.push(u);
+        let rng0 = match &how {
+            Draw::Sample(sm) => sm.rng,
+            _ => 0,
+        };
+        let (rb, u) = self.stage(&[rng0])?;
+        copies.push(u);
+        let ins = SparkIn { mh, idb, oh, rb, t };
         if sp == 0 {
+            // seeding: the main rows into the MTP layers' rings, nothing drafted
+            for u in &copies {
+                u.enqueue(&self.s)?;
+            }
+            let main_x = self.lin(mh, t, "mtp.0.main_proj.weight")?;
+            self.rms(main_x, t, "mtp.0.main_norm.weight")?;
+            let h = self.embed_hc(idb, blk, c.hc_mult)?;
+            for s in 0..c.n_mtp_layers {
+                let (lid, p) = (c.n_layers + s, format!("mtp.{s}"));
+                self.dspark_attention(&p, lid, h, blk, 0, main_x, t)?;
+            }
             self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
             self.obs.finish();
             return Ok(None);
         }
-        let last = format!("mtp.{}", n_mtp - 1);
-        let rank = c.dspark_markov_rank;
-        let memb_w = self.cpu.w(&format!("{last}.markov_head.embed.weight"))?;
-        let mhead = format!("{last}.markov_head.head.weight");
         let proj = self.cpu.w(&format!("{last}.confidence_head.proj.weight"))?;
-        let x = self.hc_pre(h, pre_mix, blk)?;
-        // greedy: [logits blk*V | hiddens blk*D | drafts blk+1], read back once
-        let pack = match draw {
-            Some(_) => None,
-            None => Some(self.fbuf(blk * v + blk * d + blk + 1)?),
-        };
-        let xh = match pack {
-            Some(pk) => {
-                self.copy(pk.ptr + (blk * v * 4) as u64, x.ptr, blk * d)?;
-                Vec::new()
-            }
-            None => self.read(x, blk * d)?,
-        };
-        self.rms(x, blk, &format!("{last}.norm.weight"))?;
-        let dlogits = self.raw(x.ptr, blk, "head.weight")?;
-        let add = |me: &Self, row: Buf, bias: Buf| -> Result<()> {
-            let vn = v as i64;
-            unsafe {
-                me.k.go(
-                    "ds_add",
-                    blocks(v, 256),
-                    B256,
-                    0,
-                    &me.s,
-                    args![row.ptr, bias.ptr, vn],
-                )
-            }
-        };
         let conf_of = |xh: &[f32], out: &[usize]| -> Vec<f32> {
             (0..blk)
                 .map(|i| {
@@ -2586,44 +2646,42 @@ impl GpuModel {
                 })
                 .collect()
         };
-        let Some(draw) = draw else {
-            let pk = pack.unwrap();
-            if self.spark_tab.is_none() {
-                self.spark_tab = Some(DevBuf::from_slice(&memb_w.data)?);
+        if let Draw::Host(draw) = &mut how {
+            // the Markov head samples left to right: each position's bias (its predecessor's
+            // Markov embedding through the head, a rank x V GEMV) on the device, the row read
+            // back for the draw; the confidence head (a dot product) on the host
+            self.obs.path(false, false);
+            for u in &copies {
+                u.enqueue(&self.s)?;
             }
-            let tab = b(self.spark_tab.as_ref().unwrap()).ptr;
-            let idp = pk.ptr + ((blk * v + blk * d) * 4) as u64;
-            let memb = self.fbuf(rank)?;
-            let (vi, ri) = (v as i32, rank as i32);
-            let pick = |me: &Self, row: u64, slot: i32| -> Result<()> {
-                unsafe {
-                    me.k.go(
-                        "ds_spark_pick",
-                        (1, 1, 1),
-                        (1024, 1, 1),
-                        0,
-                        &me.s,
-                        args![row, vi, idp, slot, tab, ri, memb.ptr],
-                    )
-                }
-            };
-            self.fill(idp, token as i32, 1)?;
-            pick(self, 0, 0)?;
+            let x = self.spark_trunk(&ins)?;
+            let xh = self.read(x, blk * d)?;
+            self.rms(x, blk, &format!("{last}.norm.weight"))?;
+            let dlogits = self.raw(x.ptr, blk, "head.weight")?;
+            let mhead = format!("{last}.markov_head.head.weight");
+            let mut logits = vec![0f32; blk * v];
+            let mut out = vec![token];
             for i in 0..blk {
-                let bias = self.raw(memb.ptr, 1, &mhead)?;
+                let memb = &memb_w.data[out[i] * rank..(out[i] + 1) * rank];
+                let mx = self.up(memb)?;
+                let bias = self.raw(mx.ptr, 1, &mhead)?;
                 let row = dlogits.at(i * v * 4);
-                add(self, row, bias)?;
-                pick(self, row.ptr, i as i32 + 1)?;
+                let vn = v as i64;
+                unsafe {
+                    self.k.go(
+                        "ds_add",
+                        blocks(v, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![row.ptr, bias.ptr, vn],
+                    )?
+                };
+                let li = &mut logits[i * v..(i + 1) * v];
+                li.copy_from_slice(&self.read(row, v)?);
+                out.push(draw(li));
             }
-            self.copy(pk.ptr, dlogits.ptr, blk * v)?;
-            let all = self.read(pk, blk * v + blk * d + blk + 1)?;
-            let out: Vec<usize> = all[blk * v + blk * d..]
-                .iter()
-                .map(|f| f.to_bits() as i32 as usize)
-                .collect();
-            let conf = conf_of(&all[blk * v..blk * v + blk * d], &out);
-            let mut logits = all;
-            logits.truncate(blk * v);
+            let conf = conf_of(&xh, &out);
             self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
             self.obs.finish();
             return Ok(Some(super::forward::Draft {
@@ -2631,30 +2689,180 @@ impl GpuModel {
                 logits,
                 conf,
             }));
-        };
-        // the Markov head samples left to right: each position's bias (its predecessor's
-        // Markov embedding through the head, a rank x V GEMV) on the device, the row read back
-        // for the draw; the confidence head (a dot product) on the host
-        let mut logits = vec![0f32; blk * v];
-        let mut out = vec![token];
-        for i in 0..blk {
-            let memb = &memb_w.data[out[i] * rank..(out[i] + 1) * rank];
-            let mx = self.up(memb)?;
-            let bias = self.raw(mx.ptr, 1, &mhead)?;
-            let row = dlogits.at(i * v * 4);
-            add(self, row, bias)?;
-            let li = &mut logits[i * v..(i + 1) * v];
-            li.copy_from_slice(&self.read(row, v)?);
-            out.push(draw(li));
         }
-        let conf = conf_of(&xh, &out);
+        let samp = match &how {
+            Draw::Sample(sm) => Some((sm.temp, sm.top_p)),
+            _ => None,
+        };
+        let key = (t, samp.map(|(a, b)| (a.to_bits(), b.to_bits())));
+        let gen = self.gen();
+        let lay = SparkPack::new(blk, v, d);
+        let pk = if self.graphable(sp, false) {
+            if let Some(cg) = self.spark_graphs.get(&key) {
+                self.obs.path(true, false);
+                super::obs::replay();
+                super::obs::h2d(copies.iter().map(|u| u.n).sum());
+                cg.g.launch(&self.s)?;
+                self.graph_stats.replays += 1;
+                cg.pk
+            } else if self.spark_warm.get(&key) == Some(&gen) {
+                let s = ManuallyDrop::new(Stream(self.s.0));
+                self.obs.path(true, true);
+                super::obs::capture();
+                self.arena.borrow_mut().frozen = true;
+                let mut out = None;
+                let g = Graph::capture(&s, |s| {
+                    let r = (|| -> Result<Buf> {
+                        for u in &copies {
+                            u.enqueue(s)?;
+                        }
+                        self.spark_device(&ins, samp)
+                    })();
+                    let ok = r.is_ok();
+                    out = Some(r);
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(tang_moe::gpu::Error("draft capture body failed".into()))
+                    }
+                });
+                self.arena.borrow_mut().frozen = false;
+                let pk = out.context("capture")?.context("captured draft")?;
+                let g = g?;
+                g.launch(&self.s)?;
+                self.graph_stats.captures += 1;
+                self.spark_graphs.insert(key, SparkGraph { g, pk, gen });
+                pk
+            } else {
+                self.obs.path(false, false);
+                for u in &copies {
+                    u.enqueue(&self.s)?;
+                }
+                let pk = self.spark_device(&ins, samp)?;
+                self.spark_warm.insert(key, self.gen_after());
+                pk
+            }
+        } else {
+            self.obs.path(false, false);
+            for u in &copies {
+                u.enqueue(&self.s)?;
+            }
+            self.spark_device(&ins, samp)?
+        };
         self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
+        let all = self.read(pk, lay.len)?;
+        let out: Vec<usize> = all[lay.ids..lay.ids + blk + 1]
+            .iter()
+            .map(|f| f.to_bits() as i32 as usize)
+            .collect();
+        if let Draw::Sample(sm) = &mut how {
+            sm.rng = all[lay.rng].to_bits() as u64 | (all[lay.rng + 1].to_bits() as u64) << 32;
+        }
+        let conf = conf_of(&all[lay.hid..lay.ids], &out);
+        let mut logits = all;
+        logits.truncate(blk * v);
         self.obs.finish();
         Ok(Some(super::forward::Draft {
             ids: out,
             logits,
             conf,
         }))
+    }
+
+    /// The draft's MTP layers over the staged inputs (position from `P[0]`): the last
+    /// layer's pre-norm hiddens [blk][D].
+    fn spark_trunk(&mut self, ins: &SparkIn) -> Result<Buf> {
+        let c = self.cpu.cfg.clone();
+        let (blk, t) = (c.dspark_block_size, ins.t);
+        let main_x = self.lin(ins.mh, t, "mtp.0.main_proj.weight")?;
+        self.rms(main_x, t, "mtp.0.main_norm.weight")?;
+        let mut h = self.embed_hc(ins.idb, blk, c.hc_mult)?;
+        let mut pre_mix = ins.oh;
+        for s in 0..c.n_mtp_layers {
+            let (lid, p) = (c.n_layers + s, format!("mtp.{s}"));
+            let (nh, npm) = self.block(&p, lid, h, blk, DYN, pre_mix, Attn::Spark(main_x, t))?;
+            h = nh;
+            pre_mix = npm;
+        }
+        self.hc_pre(h, pre_mix, blk)
+    }
+
+    /// The device draft after the uploads: the trunk, the head into the pack, and the
+    /// left-to-right picks (greedy, or `samp` = (temperature, top-p) draws). Host code
+    /// independent of the position and the inputs' values, so it captures.
+    fn spark_device(&mut self, ins: &SparkIn, samp: Option<(f32, f32)>) -> Result<Buf> {
+        let c = self.cpu.cfg.clone();
+        let (d, blk, v, rank) = (
+            c.dim,
+            c.dspark_block_size,
+            c.vocab_size,
+            c.dspark_markov_rank,
+        );
+        let last = format!("mtp.{}", c.n_mtp_layers - 1);
+        let mhead = format!("{last}.markov_head.head.weight");
+        let x = self.spark_trunk(ins)?;
+        let lay = SparkPack::new(blk, v, d);
+        let pk = self.fbuf(lay.len)?;
+        let at = |o: usize| pk.ptr + (o * 4) as u64;
+        self.copy(at(lay.hid), x.ptr, blk * d)?;
+        self.rms(x, blk, &format!("{last}.norm.weight"))?;
+        // the head writes the logits straight into the pack
+        let hw = self.dw("head.weight")?;
+        self.k.linear(&self.s, &hw.v, x.ptr, pk.ptr, blk, false)?;
+        let tab = b(self.spark_tab.as_ref().context("spark_tab")?).ptr;
+        let idp = at(lay.ids);
+        let memb = self.fbuf(rank)?;
+        let (vi, ri) = (v as i32, rank as i32);
+        let null = 0u64;
+        // slot 0 = the token (from the staged ids), and its Markov embedding row
+        let s0 = 0i32;
+        unsafe {
+            self.k.go(
+                "ds_spark_pick",
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![null, vi, idp, s0, tab, ri, memb.ptr, null, ins.idb.ptr],
+            )?
+        };
+        let sampled = match samp {
+            Some((temp, top_p)) => {
+                let rng = at(lay.rng);
+                self.copy(rng, ins.rb.ptr, 2)?;
+                Some((rng, self.fbuf(2 * v)?, temp, top_p))
+            }
+            None => None,
+        };
+        for i in 0..blk {
+            let bias = self.raw(memb.ptr, 1, &mhead)?;
+            let row = pk.ptr + (i * v * 4) as u64;
+            let slot = i as i32 + 1;
+            unsafe {
+                match sampled {
+                    None => self.k.go(
+                        "ds_spark_pick",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![row, vi, idp, slot, tab, ri, memb.ptr, bias.ptr, null],
+                    )?,
+                    Some((rng, w, temp, top_p)) => self.k.go(
+                        "ds_spark_sample",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![
+                            row, vi, idp, slot, tab, ri, memb.ptr, temp, top_p, rng, w.ptr,
+                            bias.ptr
+                        ],
+                    )?,
+                }
+            };
+        }
+        Ok(pk)
     }
 
     // speculative decoding
@@ -2741,9 +2949,11 @@ impl GpuModel {
         let pos0 = sp + main.len() / w;
         let (start, t0) = (std::time::SystemTime::now(), std::time::Instant::now());
         let draft = if pick.greedy_draft() {
-            self.spark(token, main, sp, None)?
+            self.spark(token, main, sp, Draw::Greedy)?
+        } else if let Some(sm) = pick.as_sampler() {
+            self.spark(token, main, sp, Draw::Sample(sm))?
         } else {
-            self.spark(token, main, sp, Some(&mut |q: &[f32]| pick.draft(q)))?
+            self.spark(token, main, sp, Draw::Host(&mut |q: &[f32]| pick.draft(q)))?
         }
         .context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
