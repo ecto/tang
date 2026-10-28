@@ -4,6 +4,50 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 (integration round 4 prep) — mtp-ready + stepgraph2 + kda-q4 merged; one test env lock; suite green in parallel (branch claude/glm5-integrate4)
+
+No real weights this round (no pods). Base frog/glm5-forward 75249bda, then `--no-ff` merges in order:
+1. claude/glm5-mtp-ready 6383697b. Textual conflict: this file only (both kept). engine.rs / kda_dev.rs
+   auto-merged; builds as is.
+2. claude/glm5-stepgraph2 b236d771. Conflicts: this file; `resident.rs` `step_resident`'s mode parse
+   (forward made segments the default with `=0` eager; stepgraph2 had `=1` opt-in and added `=2`).
+   Now: unset / `1` = segments (default), `2` = whole step, `0` = eager.
+3. claude/glm5-kda-q4 32d84547. Conflict: this file. The Q4_K `k5_qgemv_q4k5/9` tables are picked by
+   tensor type at load (every KDA matrix Q4_K), so the default Q8_0 GGUF path is unchanged.
+
+Env lock: there were two Mutexes (stepgraph2's `glm5::ENV_LOCK`, mtp-ready's engine-tests one) and
+only the setters held them, so readers still raced. Now `glm5::ENV_LOCK` is an `RwLock`; every test in
+engine.rs, kda_dev.rs, kda_decode.rs, mla.rs, mhc_fused.rs, moe_tests.rs, mtp_tests.rs holds exactly one
+guard for its body: `env_write()` if it sets / removes `TANG_GLM5_*` or toggles the trace
+(real_weights_gpu_matches_cpu, slots_batch_matches_single, win_step_window_matches_steps,
+resident_step_matches_host, trace_is_transparent, glm5_kda_layer_bench_real, kda_g5f_real_bench,
+kda_quant_real_bench), else `env_read()`. Not re-entrant: `gpu_slots_case` no longer locks.
+
+MTP vs resident (decision): MTP stays on the host `window()` path entirely: prefill, the t>1 verify
+window, and the rerun of the accepted prefix (including t=1 reruns) all call `window()`, which drops the
+step graph and refreshes stale DSA mirrors. The resident step can't serve MTP anyway: it doesn't produce
+`last_h`, which the drafter needs. `restore` clears `kda_dev_fresh` (so `resident_ready` is false until a
+window re-seeds), now also calls `drop_step_graph()` (segments, whole graphs, `[tok,pos]`, cap) and
+clamps `DsaCache::stale_from` to the rewind point. A plain decode after an MTP rewind takes one eager
+resident token, then recaptures.
+
+Tests:
+- local CPU `flash::glm5`: 42 passed.
+- mew 3090 CUDA `flash::glm5` (TANG_REQUIRE_CUDA=1), PARALLEL: 83 passed / 0 failed / 2 ignored (the two
+  `#[ignore]` real-weight benches, not flakes). Same with `TANG_GLM5_STEP_GRAPH=2`: 83/0/2, and `=0`: 83/0/2.
+  Caveat: tests that set STEP_GRAPH themselves remove it after, so later tests in those runs see the default.
+- mew tiny f32, prompt `3 17 42 7 99 5`, `-n 40`, flags MOE=fast KDA_PF2 KDA_GRAPH GEMV8 MHC_FUSED
+  MLA_RESIDENT KDA_FUSED: plain greedy ids md5 bc55ff4b under graph default (2 segments captured),
+  `=2` (dense + sparse whole graphs captured) and `=0`. `--mtp 1/2/3` ids = plain under all three.
+  The tiny drafter accepts 0% (random weights), so every pass rewinds + reruns: restore is exercised
+  39 times per run; accept rate / tok/s mean nothing here.
+
+Still needs a B300:
+- graph=2 real-weights gate: haiku `-n 8` ids = oracle, `-n 512` md5 vs graph=1, tok/s and launches.
+- `--mtp 1/2/3`: ids vs plain, tok/s, accept rate per depth.
+- WIN_STEP cost at depth 3 (default K+1 vs `TANG_GLM5_KDA_WIN_STEP=0`).
+- kda-q4: Q4_K-requantized KDA GGUF vs Q8_0, tok/s A/B and the ids/perplexity gate.
+
 ## 2026-10-28 (integration round 3) — resident step merged; the step graph is now the default: B300 56.7 tok/s (branch frog/glm5-forward)
 
 Fast-forwarded frog/glm5-forward 9c49294d -> claude/glm5-resident 5c024107 (clean ff). Then:
