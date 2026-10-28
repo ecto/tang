@@ -105,8 +105,87 @@ heads travel alone: `snapshot_heads` (768 KiB) and `restore_heads` splice them i
 conversation's state, like the repo's `store_snapshot.restore` fills only the persistent heads
 of a fresh cache. Tested, including that the new conversation's base heads are untouched.
 
-Wiring still needed: a `memstore` field in the serve session (layer index + snapshot), written to
-the disk tier next to the prefix states, and restored into slot 0 at session start.
+The serve wiring (next section) puts this to use per session.
+
+## Serve wiring
+
+Code: `crates/tang-llm/src/flash/memserve.rs` (CPU-buildable: blobs, `StoreMeta`, `run_op`,
+`Sessions`, the state-file encoder, `memory dump`), the engines' `store_*_at` methods
+(`engine.rs` for Flash-Next, `coder.rs` for qwen3next), `flash/serve.rs` + `serve_batch.rs`
+(hooks), `server.rs` (routes).
+
+**Which heads.** `tang-llm serve <gguf> --memory-layer N` keeps the store in GDN layer `N` (index
+among the GDN layers). `RunningState.store: Option<StoreMeta>` names it: the store is
+`parts()[2·N]`, v heads 12–15, 28–31, 44–47 (k heads 12–15); `RunningState::store_heads` /
+`blank_store` read or zero just those. A disk-tier state file ends with a `MEMS` trailer (gdn
+layer, model layer, the v heads) after its positional parts, so the heads are identifiable on
+disk too (older readers ignore trailing bytes). Without `--memory-layer` nothing below runs and
+serving is byte-for-byte what it was.
+
+**Shape.** The memstore layout needs GDN layers of 16 k / 48 v heads (Flash-Next, `qwen4exp`).
+Qwen3-Coder-Next (`qwen3next`) has 16 k / 32 v heads, so `Coder::enable_store` refuses it and
+the server won't start with `--memory-layer` on Coder-Next; the Coder path is wired and checked
+for a 48-v-head `qwen3next`-architecture model only. A Coder-Next store needs a 32-head layout
+(or the widened layer of the phase-2 design) — not done.
+
+**Store windows in the engine.** `store_op_at(slot, op)` opens a `MemStore` on the slot's live
+state buffer of the store layer and runs the op through the engine's own device
+(`CudaComputeDevice::gdn_step`, the layer's `dt_bias`/`ssm_a`/`ssm_norm`, the engine's eps):
+≤ 8-token windows on that one layer, nothing through the other layers, the LM head, the KV/QSA
+caches, the MTP layer or the sampler, and the slot's tokens are unchanged. Opening rebuilds the
+free list by a directory scan, so each op costs 16 windows plus its own (~2). Tested: the same
+op sequence on the CUDA device and the CPU device leaves bitwise-equal states and equal results
+(`memserve_cuda_ops_match_cpu_bitwise`, synthetic layer params, RTX 3090).
+
+**Endpoints** (session = `prompt_cache_key`, from `?prompt_cache_key=`, the `x-prompt-cache-key`
+header or the JSON body; all run on the model worker after any running batch):
+
+| | body | reply |
+|---|---|---|
+| `POST /v1/memory/load` | the store blob, 786,432 bytes (12 × 128 × 128 f32 LE, `snapshot_heads` order `[i][head][j]`) | `{loaded, bytes, store}`; 400 if the size is wrong or the blob fails `audit` |
+| `GET /v1/memory` | — | the blob (`application/octet-stream`); 404 no store; **409 if `audit` flags it** (poisoned heads named) |
+| `POST /v1/memory/op` | `{"op": "put"\|"get"\|"delete"\|"list", "name", "ids"}` (ids < 2^18) | `{ok}` / `{found, ids}` / `{deleted}` / `{files: [{name, tokens}]}` |
+| `POST /v1/memory/end` | `{prompt_cache_key}` | `{ended, had_store}`; the session's store is dropped |
+
+**Lifecycle (`Sessions`).** The session's copy of its store (host RAM, 768 KiB) changes only by
+`load` and ops; every op runs on a slot's live state — the key's slot when a request of the key
+holds one, else slot 0 borrowed (its own heads saved before and put back after, bitwise; slot 0
+is free in batch mode, the live sequence otherwise). When a request of the key runs, its slot
+gets the store spliced in after the state is restored/prefilled (`attach`); a slot that goes to
+another key or is evicted is `detach`ed: its store heads are zeroed. In phase 1 the store heads
+are real model heads, so the copy is not refreshed from the slot after a request (a model
+token poisons the heads, and `audit` would refuse the export); ops are what change it.
+
+**`memory_ephemeral=true`** (`--memory-ephemeral`, or `TANG_MEMORY_EPHEMERAL=1`): a session's
+store is zeroed and forgotten when its slot is evicted or given to another key, or the session
+ends, and is never written to disk. Enforced at:
+
+1. `Sessions::detach` (memserve.rs): zeroes the slot's store heads and, ephemeral, drops the
+   session's copy. Called from `Sessions::attach` when a slot changes key (batch `take_slot`
+   reuse, `batch_admit` → `FlashServe::mem_attach`; single sequence: `generate` → `mem_attach(0)`),
+   from `take_slot`'s LRU eviction before `free_slot` (`serve_batch.rs`), and from
+   `Sessions::end` (`POST /v1/memory/end`).
+2. `FlashServe::snapshot_at` (serve.rs): a state saved from a slot carrying a store is
+   `blank_store`d before it becomes a prefix state — RAM snapshots are shared across sessions,
+   so this holds with or without the flag.
+3. `FlashServe::save_disk` → `memserve::encode_state_file(.., blank = true)`: the disk tier
+   writes the store heads of such a state as zeros (a second guard on 2).
+4. Nothing else writes the store: the session copy lives only in `Sessions` (RAM); there is no
+   disk path for it.
+
+Not done: TTL expiry of idle session copies (they stay until `end` or, ephemeral, eviction), an
+HTTP-level test of the routes (the handlers are thin; `Sessions` is tested on the CPU device),
+and an engine-level test with real weights (no Flash-Next or 48-v-head `qwen3next` GGUF on the
+test box; the engine methods are exercised only through `run_op` on the CUDA device).
+
+**What the frog client sends per session.** At session start (before or after the first chat
+request, with the same `prompt_cache_key`): `POST /v1/memory/load` with the 768 KiB blob it
+kept from last time (skip it on a first session; ops then start from an empty store). During
+the session: `POST /v1/memory/op` for each put/get (≈18 windows, a few ms). At session end:
+`GET /v1/memory` (768 KiB; 409 means the store was poisoned — keep the previous blob) and save
+it client-side, then `POST /v1/memory/end`. `tang-llm memory dump <blob> [--tokenizer
+tokenizer.json|model.gguf]` prints what a blob remembers: each file's name, length, token ids
+and, with a tokenizer, the text.
 
 ## How it plugs into frog's memory
 
