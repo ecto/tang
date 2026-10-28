@@ -272,6 +272,89 @@ a host callback), so EP steps run the direct path with its syncs; (2) the MoE lo
 ~5 kernels for each of the 384 experts per layer (~80k launches a forward) instead of one
 grouped launch over the routing CSR.
 
+## Wave 8 mega lane: the per-step floor and the megakernel question (2026-10-28, 8× H100)
+
+**Launch floor** (`mega::tests::mega_launch_floor`, one H100, 132 SMs, CUDA 12.8): a captured
+graph of N dependent trivial kernels, µs per node, flat in N (300–2400):
+
+| chain | µs / node |
+|---|---|
+| graph, 1-block kernels | 0.91 |
+| graph, 132-block kernels | 1.10 |
+| graph, 132-block, a memcpy node every 10 | 1.08 |
+| plain stream launches, 1 block | 1.81 |
+| plain stream launches, 132 blocks | 1.99 |
+| grid barrier inside one persistent kernel, 132 × 256 (ds_hc_fused_ks's) | 2.08 |
+| grid barrier, 132 × 1024 / 264 × 256 / 64 × 256 / 8 × 256 | 2.10 / 2.71 / 1.97 / 1.69 |
+
+So the verify graph's ~1188 nodes cost **~1.3 ms** of its 23 ms replay as pure node overhead.
+The rest is ~19 µs per node of kernel bodies, mostly latency-bound: memory round trips,
+serial phases, and tails on kernels that move a few MB. **A grid barrier costs as much as two
+graph nodes.** A persistent kernel saves nothing on synchronization; it only wins where it
+overlaps work across what used to be kernel boundaries.
+
+**Per-layer launch inventory** (nsys on the tiny fixture, verify window t = 6, direct path,
+254 kernels over 8 layers + head, ~30 per layer; the real model at 948 direct launches per
+verify is ~24 per layer): mHC 2 (`ds_hc_fused_ks` attn + ffn, plus `ds_mean_hc` on DSpark
+target layers); attention prologue 5 + 1 memcpy (`ds_ks_quant`, wq_a and wkv `ds_ks`, ring copy,
+`ds_qkv_post`, wq_b `ds_ks`); compressor/indexer 3–8 on compressing layers (`ds_linear_t8`,
+`dg_rope`, `dg_index_score`, `dg_topk`, ...); attention core 1–2 (`ds_attn_fdm` + comb, or
+`dg_win_idx` + sparse attn); wo 2–3 (`ds_wo_ks`, wo_b quant + `ds_ks`); MoE 5 (`ds_router`,
+`ds_route_plan_q`, grouped gu, grouped down, `ds_moe_reduce_sh` + the NCCL all-reduce).
+
+**The dense-glue megakernel** (`mg_glue` in kernels_mega.cu, `DS_MEGA=1`, e93df959 + 3e4e8677): the 6
+launches + 1 memcpy from the MoE all-reduce of layer l−1 to the attention core of layer l
+(the attention mHC stage, the block input's quantization folded into its store, wq_a, wkv, the
+ring copy, `ds_qkv_post` with its 1024-thread reductions replayed in order by 256 threads,
+wq_b) as one persistent launch with 3 grid barriers (+ one among the mHC blocks), idle blocks
+prefetching the projections' weights into L2. **Bit for bit** the separate launches
+(`gpu_tiny_mega_matches` on mew and H100; `mega_glue_bench` at real shapes). Measured:
+
+| | separate | mg_glue |
+|---|---|---|
+| bench, real shapes, t = 1 / t = 6, µs per layer (graph of 40, weights rotated past L2) | 89.6 / 103.0 | 105.1 / 117.9 (2 blocks/SM; 1/SM: 126 / 137; L2 prefetch 0–40 MB: ±2) |
+| server, direct verify: launches | 948 | 744 |
+| server, direct op table: glue stretch per layer | ~119 µs (hc attn stage + q + window_kv) | 126 µs (`layer.attn.glue`) |
+| server, graph verify / draft gpu ms | 22.98 / 3.89 | 23.58 / 3.90 |
+| greedy 200 tok/s (×2 warm) / acceptance | 148.4 / 153 of 235 | 143.9 / 153 of 235 |
+
+So it is **slower by ~15 µs per layer and stays off**. Why: the separate `ds_ks` launches
+each size their grid from their own occupancy (3–4 blocks per SM for the small wq_a/wkv
+staging), the megakernel must keep every block co-resident for its barriers and so runs all
+phases at the worst phase's occupancy (2 per SM, set by wq_a's 35 KB activation staging and
+the mHC phase's static arrays); its 3 barriers (~2 µs each) replace 6 nodes (~1.1 µs each); and
+L2 prefetch buys nothing because the phases are latency-bound, not bandwidth-bound (wq_b's
+42 MB at 3.35 TB/s is 12.5 µs of the ~100).
+
+**Plan for the next wave.** The step is ~23 ms of graph against a ~3 ms HBM floor and a ~1.3 ms
+node floor; launch count is worth ≤ 1.3 ms in total, so neither a full per-layer megakernel
+nor fewer launches alone gets near 4.3 ms. The time is in latency-bound kernel bodies: the
+glue stretch moves ~51 MB a layer (15 µs at HBM rate) in ~100 µs; MoE ~264 µs a layer for
+~1/8 of 6 × 3 fp4 experts + the shared one.
+
+- *Full per-layer persistent megakernel* (one launch per layer, ~10 phases, ~10 barriers):
+  saves ≤ 24 nodes × 1.1 µs − 10 × 2.1 µs ≈ 5 µs a layer, 0.2 ms a step, before the
+  occupancy penalty measured above, and the NCCL all-reduce cannot live inside it (it needs a
+  device-initiated reduce: NVSHMEM or a hand-rolled NVLink P2P reduce over mapped peer
+  memory, itself a wave). Estimated step: 22–23 ms. Not worth scheduling as is.
+- *Few big kernels per layer* (≈ 4: mHC+prologue GEMVs, attention+wo, router+route+grouped
+  MoE, reduce+post-mix), each a **stream-K / split-K GEMV that keeps every SM busy and
+  overlaps the next weight stream with the current reduction** (the real win of fusion, which
+  needs per-phase occupancy, not one co-resident grid): the target is each kernel at ≥ 60% of
+  HBM rate. At that rate a layer's ~55 MB dense + ~8 MB expert bytes per rank is ~30 µs, a step
+  ~1.5–3 ms of bandwidth + ~0.2 ms of nodes + the all-reduces (40 × ~30 µs = 1.2 ms today on
+  NVLink; overlap with the shared expert already exists). Estimated step ~5–6 ms, the
+  realistic road to 1000 tok/s. Concretely: (1) make `ds_ks` / `lin_mma` bandwidth-bound at
+  t ≤ 8 (measure each projection's achieved GB/s with `mega_glue_bench`'s harness; wq_b is
+  42 MB in ~25 µs today); (2) chain kernels with programmatic dependent launch
+  (`cudaLaunchAttributeProgrammaticStreamSerialization`, graph-capturable) so a kernel's weight
+  loads start under its predecessor's tail, which is the overlap a megakernel would buy
+  without its occupancy cost; (3) only then fuse the tiny ones (`ds_ks_quant` into its
+  producer, as `mg_glue` does bit for bit).
+
+Code: `flash/deepseek/mega.rs` (benches, `Mega`), `kernels_mega.cu`, `mega_engine.rs` (the
+deferral hooks in `block_ks` / `qkv_fused`; flushes before any other reader of the stage).
+
 ## How to profile a step
 
 The step timeline (`flash/deepseek/obs.rs`, [observability.md](observability.md#deepseek-v41-flash-the-step-timeline-flashdeepseekobsrs))

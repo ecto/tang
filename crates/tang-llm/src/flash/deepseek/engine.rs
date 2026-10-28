@@ -42,6 +42,9 @@ use std::rc::Rc;
 use tang_moe::args;
 use tang_moe::gpu::{DevBuf, Event, Gpu, Graph, Stream};
 
+#[path = "mega_engine.rs"]
+mod mega_engine;
+
 const B256: (u32, u32, u32) = (256, 1, 1);
 
 /// Stands in for the start position in a decode step's host code, which must not depend on
@@ -347,6 +350,10 @@ pub struct GpuModel {
     join: Event,
     /// `ds_hc_fused_ks`'s grid barrier: arrivals (zero between launches) and generation.
     hc_cnt: DevBuf,
+    /// `DS_MEGA=1`: the dense-glue megakernel ([`super::mega`]) and the deferred mHC stage
+    /// it takes over (see mega_engine.rs).
+    mega: Option<super::mega::Mega>,
+    pend_glue: Option<mega_engine::GluePend>,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -428,6 +435,11 @@ impl GpuModel {
             fork: Event::new(false)?,
             join: Event::new(false)?,
             hc_cnt: DevBuf::from_slice(&[0i32; 2])?,
+            mega: match super::mega::on() {
+                true => Some(super::mega::Mega::new(&g)?),
+                false => None,
+            },
+            pend_glue: None,
             _g: g,
             w: RefCell::new(HashMap::new()),
             experts: RefCell::new(ExpertCache::default()),
@@ -860,7 +872,11 @@ impl GpuModel {
             && wqa.rows % 32 == 0
             && hd % 32 == 0;
         if !ok {
+            self.glue_flush()?;
             return Ok(None);
+        }
+        if let Some(r) = self.glue_qkv(p, lid, x, t, [wqa, wkv, wqb, qn, kn])? {
+            return Ok(Some(r));
         }
         let (d, ql) = (wqa.cols as usize, wqa.rows as usize);
         let at = At::Dev {
@@ -2790,6 +2806,9 @@ impl GpuModel {
         let s = self.span("hc");
         let next = self.next_hc.take();
         let norm = format!("{p}.attn_norm.weight");
+        if !matches!(attn, Attn::Main) || sp == 0 {
+            self.glue_flush()?;
+        }
         let (am, h) = match self.pend_stage.take() {
             Some(st) => st,
             None => {
@@ -2820,8 +2839,10 @@ impl GpuModel {
         let x = match next {
             Some(np) => {
                 let norm = format!("{np}.attn_norm.weight");
-                let (x, nm, nh) =
-                    self.hc_fused(h, sh, x, Some(&fm), t, &np, "attn", fm.pre, &norm)?;
+                let (x, nm, nh) = match self.mega.is_some() {
+                    true => self.glue_defer(h, sh, x, &fm, t, &np, fm.pre)?,
+                    false => self.hc_fused(h, sh, x, Some(&fm), t, &np, "attn", fm.pre, &norm)?,
+                };
                 self.pend_stage = Some((nm, nh));
                 x
             }
@@ -3198,6 +3219,7 @@ impl GpuModel {
         let mut mains: Vec<Buf> = Vec::new();
         self.pend_mixes = None;
         self.pend_stage = None;
+        self.pend_glue = None;
         for i in 0..c.n_layers {
             let p = format!("layers.{i}");
             let sp_layer = self.obs.span(&self.s, "layer", Some(i));
@@ -3212,6 +3234,7 @@ impl GpuModel {
                 self.end(se);
             }
             if c.dspark_target_layer_ids.contains(&i) {
+                self.glue_flush()?;
                 let sh = self.span("hc");
                 let m = self.fbuf(t * d)?;
                 let (ti, hci, di) = (t as i32, hc as i32, d as i32);
@@ -3238,6 +3261,7 @@ impl GpuModel {
             pre_mix = npm;
             self.end(sp_layer);
             if let Some(hk) = hook.as_mut() {
+                self.glue_flush()?;
                 hk(&format!("layer{i}"), &self.read(h, t * hc * d)?);
             }
         }
@@ -3930,6 +3954,71 @@ mod tests {
     }
 
     /// Step 0 intermediates, device against the CPU reference on the same forced input.
+    /// The launch inventory of a verify window (t = 6) on the direct path: the fixture's
+    /// steps up to it, then that step between cuProfilerStart/Stop, for
+    /// `nsys profile --capture-range=cudaProfilerApi` (`DS_MEGA=1` for the megakernel).
+    #[test]
+    #[ignore]
+    fn gpu_tiny_inventory() {
+        std::env::set_var("DS_GRAPH", "0");
+        let Some((mut m, meta)) = open() else { return };
+        for step in meta["steps"].as_array().unwrap() {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            let mark = ids.len() == 6;
+            if mark {
+                m.s.sync().unwrap();
+                unsafe { cudarc::driver::sys::cuProfilerStart() };
+            }
+            m.forward(&ids, sp, None).unwrap();
+            if mark {
+                m.s.sync().unwrap();
+                unsafe { cudarc::driver::sys::cuProfilerStop() };
+            }
+        }
+    }
+
+    /// `DS_MEGA=1`'s dense-glue megakernel against the separate launches: the same logits,
+    /// bit for bit, over the fixture's steps (prefill, then decode and verify windows).
+    #[test]
+    fn gpu_tiny_mega_matches() {
+        let Some((mut a, meta)) = open() else { return };
+        if a.k.exact || a.hc_exact {
+            eprintln!("skip: exact kernels");
+            return;
+        }
+        let mut b = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+        a.mega = Some(super::super::mega::Mega::new(&Gpu::at(0).unwrap()).unwrap());
+        let n0 = super::super::mega::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        for (s, step) in meta["steps"].as_array().unwrap().iter().enumerate() {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            for rep in 0..2 {
+                let (la, _) = a.forward(&ids, sp, None).unwrap();
+                let (lb, _) = b.forward(&ids, sp, None).unwrap();
+                let diff = la.iter().zip(&lb).filter(|(x, y)| x != y).count();
+                eprintln!(
+                    "step {s} (t {}, sp {sp}) rep {rep}: {diff} logits differ",
+                    ids.len()
+                );
+                assert_eq!(la, lb, "step {s} rep {rep}");
+            }
+        }
+        let n = super::super::mega::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed) - n0;
+        eprintln!("{n} mg_glue launches");
+        assert!(n > 0, "the megakernel never ran");
+    }
+
     #[test]
     #[ignore]
     fn gpu_tiny_taps() {

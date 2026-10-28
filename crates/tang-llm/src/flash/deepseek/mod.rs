@@ -25,6 +25,8 @@ pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]
+pub mod mega;
+#[cfg(feature = "cuda")]
 pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod obs;
