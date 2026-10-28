@@ -167,6 +167,21 @@ impl Shadow {
             cpu.put("state.in", ss.0.clone());
         }
         let _ = super::kda::kda_layer_taps(x, w, kcfg, sc, ss, 1, t, Some(&mut cpu))?;
+        // `TANG_GLM5_GATE_DUMP=/dir`: append this window's real gates, `l{L}_g.f32` (pre-exp
+        // log decay, `[t][nh·hd]`) and `l{L}_beta.f32` (`[t][nh]`), raw LE f32, for
+        // `scripts/glm5_gate_stats.py` (how long a poked state row survives real traffic)
+        if let Ok(dir) = std::env::var("TANG_GLM5_GATE_DUMP") {
+            use std::io::Write as _;
+            for name in [tap::G, tap::BETA] {
+                let v = cpu.get(name).unwrap_or_default();
+                let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{dir}/l{l}_{name}.f32"))?
+                    .write_all(&bytes)?;
+            }
+        }
         // state after: device vs shadow; conv: device h0 vs shadow vs the host copy
         gpu.put("state", dev_state.0.clone());
         cpu.put("state", ss.0.clone());
