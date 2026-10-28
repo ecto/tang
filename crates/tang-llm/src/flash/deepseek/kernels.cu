@@ -152,6 +152,118 @@ extern "C" __global__ void ds_linear_t8(DsW w, const float* x, float* y, int t, 
     }
 }
 
+// The vocab head: y[i][n] = x[i]·w[n] for bf16 `w` [rows][cols], t <= 8 rows of f32 `x`,
+// 4 output columns per warp (each x load feeds 4 weight rows), 16-byte loads. Each lane sums
+// its 8-column runs in ascending order, then the warp's shuffle tree: every row's result is
+// independent of t (a 1-token decode and a verify window agree bit for bit), but not of
+// `ds_linear`'s order. Needs cols % 8 == 0 and 16-byte-aligned rows of x.
+extern "C" __global__ void ds_head_bf16(const unsigned short* w, int rows, int cols,
+                                        const float* x, float* y, int t) {
+    int n0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 4, lane = threadIdx.x & 31;
+    if (n0 >= rows) return;
+    float s[4][8];
+#pragma unroll
+    for (int r = 0; r < 4; r++)
+#pragma unroll
+        for (int i = 0; i < 8; i++) s[r][i] = 0.f;
+    const unsigned short* wr[4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) wr[r] = w + (long long)min(n0 + r, rows - 1) * cols;
+    int nv = cols & ~255;
+#pragma unroll 2
+    for (int c = lane * 8; c < nv; c += 256) {
+        float wf[4][8];
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            uint4 v = __ldcs((const uint4*)(wr[r] + c));
+            unsigned int u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                wf[r][2 * j] = __uint_as_float(u[j] << 16);
+                wf[r][2 * j + 1] = __uint_as_float(u[j] & 0xffff0000u);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i >= t) break;
+            const float4* xp = (const float4*)(x + (long long)i * cols + c);
+            float4 a = xp[0], b = xp[1];
+            float xv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) s[r][i] = fmaf(xv[j], wf[r][j], s[r][i]);
+        }
+    }
+    for (int k = nv + lane; k < cols; k += 32) {
+        float wf[4];
+#pragma unroll
+        for (int r = 0; r < 4; r++) wf[r] = __uint_as_float(((unsigned int)wr[r][k]) << 16);
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (i < t) {
+                float xv = x[(long long)i * cols + k];
+#pragma unroll
+                for (int r = 0; r < 4; r++) s[r][i] = fmaf(xv, wf[r], s[r][i]);
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i >= t) break;
+            float v = s[r][i];
+            for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0 && n0 + r < rows) y[(long long)i * rows + n0 + r] = v;
+        }
+    }
+}
+
+// Per-row argmax of x [rows][n], one 1024-thread block per row, as the host `argmax`: the
+// first index of the maximum, NaN never greater (a NaN at index 0 wins, as the host fold).
+extern "C" __global__ void ds_argmax_rows(const float* x, int n, int* out) {
+    const float* r = x + (long long)blockIdx.x * n;
+    float bv = -DS_INF;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = r[i];
+        if (v != v) v = i == 0 ? DS_INF : -DS_INF;
+        if (bi == 0x7fffffff || v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    for (int o = 16; o; o >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    if (lane == 0) {
+        sv[w] = bv;
+        si[w] = bi;
+    }
+    __syncthreads();
+    if (w == 0) {
+        bv = lane < nw ? sv[lane] : -DS_INF;
+        bi = lane < nw ? si[lane] : 0x7fffffff;
+        for (int o = 16; o; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) out[blockIdx.x] = bi;
+    }
+}
+
 // In place: fp8 quant-dequant per 32 with power-of-two scales (warp per group, lane per value).
 extern "C" __global__ void ds_fp8_qdq(float* v, int n_groups) {
     int g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;

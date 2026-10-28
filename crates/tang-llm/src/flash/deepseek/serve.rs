@@ -429,6 +429,7 @@ impl Backend for DsServe {
         let spec = std::env::var("DS_SPEC").map_or(true, |v| v != "0");
         let eos: Vec<usize> = self.eos.iter().map(|&e| e as usize).collect();
         let (tok, tags, stop) = (&self.tok, &self.tags, &req.stop);
+        let stop_toks = stop.iter().map(|s| s.len()).max().unwrap_or(0) + 4;
         let decode = |ids: &[u32]| -> Result<String> {
             tok.decode(ids, false)
                 .map_err(|e| anyhow::anyhow!("decode: {e}"))
@@ -461,7 +462,10 @@ impl Backend for DsServe {
                     }
                 }
                 if !stop.is_empty() {
-                    match decode(&out) {
+                    // every (byte-level BPE) token is at least one byte of the text, so the
+                    // last `longest stop + 4` tokens hold any stop the text ends with (the
+                    // 4 cover a split UTF-8 char at the cut); not the whole output each token
+                    match decode(&out[out.len().saturating_sub(stop_toks)..]) {
                         Ok(text) if stop.iter().any(|s| text.ends_with(s.as_str())) => {
                             return Some(Finish::Stop)
                         }
