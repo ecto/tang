@@ -6221,6 +6221,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-chip"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "memmap2",
+ "safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tang-compile"
 version = "0.1.0"
 dependencies = [
@@ -6339,6 +6351,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tang-ad",
+ "tang-chip",
  "tang-compute",
  "tang-moe",
  "tang-otel",

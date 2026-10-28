@@ -1,0 +1,21 @@
+[package]
+name = "tang-chip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# tang's code: MIT OR Apache-2.0. The port follows qwenputer (MIT, Copyright (c) 2026 Divyansh
+# Agrawal) and data/ holds IR exported from it: see NOTICE.
+license = "MIT OR Apache-2.0"
+description = "A compiler from a circuit IR to Gated DeltaNet decoder-layer weights (a Rust port of qwenputer's q35 lowering)"
+repository.workspace = true
+include = ["src/**/*", "data/**/*", "NOTICE", "README.md"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1"
+flate2 = "1"
+anyhow = "1"
+
+[dev-dependencies]
+safetensors = { workspace = true }
+memmap2 = "0.9"
