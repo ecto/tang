@@ -1600,6 +1600,135 @@ extern "C" __global__ void mla_attn_lat_p(float* __restrict__ qa, const unsigned
     const int pos = (int)posp[0];
     mla_attn_lat_impl(qa, lat, sel, dn, pos + 1, pos, nh, dl, sel == NULL ? pos + 1 : width, scale);
 }
+
+// ---- mla_attn_lat_p split over keys (TANG_GLM5_ATTN_SPLITK, default on): bit-identical to
+// mla_attn_lat_p. The one-block-per-head kernel walked every key in one block (scores 8 keys
+// at a time, then the weighted latent sum one key per step), so a decode token's DSA cost
+// grew with context. Here the scores spread over (nh, key-chunk) blocks with the same
+// warp-per-key dot, and the weighted sum spreads over (nh, column-chunk) blocks: each column
+// still sums its keys in key order from 0, the max is order-free, and den repeats the old
+// 256-thread strided partials + tree. So every float matches the old kernel.
+#define MLA_SK_KEYS 64
+// grid (nh, ceil(width/MLA_SK_KEYS)), 256 threads. sc [nh][swd] := scaled score (-inf invalid).
+extern "C" __global__ void mla_attn_sc_p(const float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const int* __restrict__ sel, float* __restrict__ sc, int nh, int dl, int width, int swd, float scale,
+    const unsigned* __restrict__ posp)
+{
+    const int pos = (int)posp[0];
+    const int nkv = pos + 1, wd = sel == NULL ? pos + 1 : width;
+    const int h = blockIdx.x, w0 = blockIdx.y * MLA_SK_KEYS;
+    if (w0 >= wd) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    extern __shared__ float sq[];
+    const float* qh = qa + (size_t)h * dl;
+    for (int l = threadIdx.x; l < dl; l += blockDim.x) sq[l] = qh[l];
+    __syncthreads();
+    const int w1 = min(wd, w0 + MLA_SK_KEYS);
+    for (int w = w0 + warp; w < w1; w += nw) {
+        int k;
+        if (sel == NULL) k = w <= pos ? w : -1;
+        else k = sel[w];
+        float a = G5_NEG_INF_F;
+        if (k >= 0 && k < nkv) {
+            const unsigned short* kr = lat + (size_t)k * dl;
+            a = 0.f;
+            for (int l = lane; l < dl; l += 32) a += sq[l] * bf2f(kr[l]);
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            a *= scale;
+        }
+        if (lane == 0) sc[(size_t)h * swd + w] = a;
+    }
+}
+
+#define MLA_SK_COLS 32
+#define MLA_SK_TILE 256
+// grid (nh, ceil(dl/MLA_SK_COLS)), 256 threads (the den emulation needs exactly 256);
+// dynamic smem = width floats. qa[h][cols] := weighted latent sum, dn[h] := den.
+extern "C" __global__ void mla_attn_acc_p(float* __restrict__ qa, const unsigned short* __restrict__ lat,
+    const int* __restrict__ sel, const float* __restrict__ sc, float* __restrict__ dn, int nh, int dl, int width,
+    int swd, const unsigned* __restrict__ posp)
+{
+    const int pos = (int)posp[0];
+    const int wd = sel == NULL ? pos + 1 : width;
+    const int h = blockIdx.x, c0 = blockIdx.y * MLA_SK_COLS;
+    extern __shared__ float ps[];
+    __shared__ float red[256];
+    const float* sh = sc + (size_t)h * swd;
+    float m = G5_NEG_INF_F;
+    for (int w = threadIdx.x; w < wd; w += blockDim.x) { const float v = sh[w]; ps[w] = v; m = fmaxf(m, v); }
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float den = 0.f;
+    for (int w = threadIdx.x; w < wd; w += blockDim.x) {
+        const float p = ps[w] == G5_NEG_INF_F ? 0.f : expf(ps[w] - m);
+        ps[w] = p;
+        den += p;
+    }
+    red[threadIdx.x] = den;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    den = red[0];
+    // stage key tiles of this block's columns in shared memory with all 256 threads (the
+    // loads are what cost: one thread per column walking keys serially is load-latency
+    // bound), then one thread per column runs the key-ordered chain from shared memory
+    __shared__ float tile[MLA_SK_TILE][MLA_SK_COLS + 1];
+    const int l = c0 + (threadIdx.x & (MLA_SK_COLS - 1));
+    float acc = 0.f;
+    for (int t0 = 0; t0 < wd; t0 += MLA_SK_TILE) {
+        const int tn = min(MLA_SK_TILE, wd - t0);
+        __syncthreads();
+        // one key per thread: its MLA_SK_COLS bf16 columns as 16-byte loads (c0 is a
+        // multiple of 32 and rows are dl*2 bytes, so the vectors are aligned)
+        for (int j = threadIdx.x; j < tn; j += blockDim.x) {
+            const float p = ps[t0 + j];
+            float* tr = tile[j];
+            if (p != 0.f) {
+                const int k = sel == NULL ? t0 + j : sel[t0 + j];
+                const uint4* src = (const uint4*)(lat + (size_t)k * dl + c0);
+                uint4 q[MLA_SK_COLS / 8];
+#pragma unroll
+                for (int u = 0; u < MLA_SK_COLS / 8; u++) q[u] = src[u];
+#pragma unroll
+                for (int u = 0; u < MLA_SK_COLS / 8; u++) {
+                    const unsigned wv[4] = {q[u].x, q[u].y, q[u].z, q[u].w};
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        tr[u * 8 + 2 * e] = bf2f((unsigned short)(wv[e] & 0xffffu));
+                        tr[u * 8 + 2 * e + 1] = bf2f((unsigned short)(wv[e] >> 16));
+                    }
+                }
+            } else {
+                for (int c = 0; c < MLA_SK_COLS; c++) tr[c] = 0.f;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < MLA_SK_COLS) {
+            int j = 0;
+            for (; j + 16 <= tn; j += 16) {
+                float pp[16], vv[16];
+#pragma unroll
+                for (int u = 0; u < 16; u++) { pp[u] = ps[t0 + j + u]; vv[u] = tile[j + u][threadIdx.x]; }
+#pragma unroll
+                for (int u = 0; u < 16; u++) if (pp[u] != 0.f) acc += pp[u] * vv[u];
+            }
+            for (; j < tn; j++) {
+                const float p = ps[t0 + j];
+                if (p != 0.f) acc += p * tile[j][threadIdx.x];
+            }
+        }
+    }
+    if (threadIdx.x < MLA_SK_COLS && l < dl) qa[(size_t)h * dl + l] = acc;
+    if (blockIdx.y == 0 && threadIdx.x == 0) dn[h] = den;
+}
 "#;
 
 /// The `#define` prelude for [`CUDA_SRC`] at this geometry.
@@ -1645,6 +1774,13 @@ pub mod cuda {
     fn mla_split() -> bool {
         static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *S.get_or_init(|| std::env::var("TANG_GLM5_MLA_SPLIT").map(|v| v != "0").unwrap_or(true))
+    }
+
+    /// `TANG_GLM5_ATTN_SPLITK=0` restores the one-block-per-head `mla_attn_lat_p` on the
+    /// device-position decode path; the default splits keys/columns over blocks (bit-identical).
+    fn attn_splitk() -> bool {
+        static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *S.get_or_init(|| std::env::var("TANG_GLM5_ATTN_SPLITK").map(|v| v != "0").unwrap_or(true))
     }
 
     /// Loaded kernels for one geometry (feature "cuda"; NVRTC at construction).
@@ -2013,7 +2149,8 @@ pub mod cuda {
                     *b = DevBuf::zeroed_elems::<i32>(t * width * 2 + 64)?;
                 }
             }
-            grow!(self.qa_d, t * self.nh * (self.dl + 1));
+            // + [nh][width.max(topk)] f32 scores for the split-key decode attention
+            grow!(self.qa_d, t * self.nh * (self.dl + 1) + self.nh * width.max(self.topk));
             grow!(self.hw_d, t * self.idxh);
             grow!(self.iq_d, t * self.idxh * self.idxd);
             {
@@ -2990,11 +3127,28 @@ pub mod cuda {
             if mla_split() {
                 let dn = qa_ptr + (self.nh * self.dl * 4) as u64;
                 self.hgemv(wkp, q, qa_ptr, 0, self.dl, self.dk, 1, stream)?;
-                let f = self.m.func("mla_attn_lat_p")?;
-                unsafe {
-                    gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream,
-                        tang_moe::args![qa_ptr, lat, sel_ptr, dn, nh, dl, wd, scale, posp])?
-                };
+                if attn_splitk() && self.dl % 32 == 0 {
+                    // scores at qa + nh*(dl+1) (ensure_scratch reserves nh*swd after the dn row)
+                    let swd = sw.max(self.topk);
+                    let scp = qa_ptr + (self.nh * (self.dl + 1) * 4) as u64;
+                    let swd_i = swd as i32;
+                    let fs = self.m.func("mla_attn_sc_p")?;
+                    unsafe {
+                        gpu::launch(fs, (self.nh as u32, swd.div_ceil(64) as u32, 1), (256, 1, 1), (self.dl * 4) as u32, stream,
+                            tang_moe::args![qa_ptr, lat, sel_ptr, scp, nh, dl, wd, swd_i, scale, posp])?
+                    };
+                    let fa = self.m.func("mla_attn_acc_p")?;
+                    unsafe {
+                        gpu::launch(fa, (self.nh as u32, self.dl.div_ceil(32) as u32, 1), (256, 1, 1), (swd * 4) as u32, stream,
+                            tang_moe::args![qa_ptr, lat, sel_ptr, scp, dn, nh, dl, wd, swd_i, posp])?
+                    };
+                } else {
+                    let f = self.m.func("mla_attn_lat_p")?;
+                    unsafe {
+                        gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream,
+                            tang_moe::args![qa_ptr, lat, sel_ptr, dn, nh, dl, wd, scale, posp])?
+                    };
+                }
                 self.hgemv(wvp, qa_ptr, od_ptr, dn, self.dv, self.dl, 1, stream)?;
                 return Ok(od_ptr);
             }
