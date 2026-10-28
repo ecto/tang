@@ -4,6 +4,83 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — KDA projections requantized Q8_0 → Q4_K / Q5_K: quality, sizes, kernel µs (H200, branch claude/glm5-kda-q4)
+
+The 34 KDA layers' q/k/v/o/f_a/g_a (204 tensors) are Q8_0 in UD-Q4_K_XL: 4.886 GB read per
+token, more than the MoE's active experts. `tools/glm5-kda-requant.py` rewrites ONLY those tensors
+(gguf-py dequant → ggml's `ggml_quantize_chunk`, no imatrix); every other tensor and every KV is
+copied verbatim, shards without a target (1, 6) are symlinked. The MLA layers' attn_output
+(16384 wide) is untouched. No loader change was needed: `moe::gpu::upload` and every KDA GEMV path
+(k5_gemv / g5_dot, g5f_gemv) already take any G5W type; gemv8 is per-matrix Q8_0-only and falls back.
+
+| KDA proj type | KDA bytes/token | whole GGUF |
+|---|---|---|
+| Q8_0 (as shipped) | 4.886 GB | 199.71 GB |
+| Q5_K | 3.162 GB | 197.98 GB |
+| Q4_K | 2.587 GB | 197.41 GB |
+
+Quality: llama.cpp `llama-perplexity` (8ca4060, CUDA, experts on the CPU) on
+`bench/glm5-ppl/eval.txt` (prose + chat + Rust/Python, 3072 tokens scored: `-c 512 --chunks 6`),
+KL against the original's logits on the same chunks. The CPU reference (`glm5-ref`) was tried
+first: >10 min for 36 tokens, single-threaded — not usable for this.
+
+| KDA proj | PPL | PPL ratio | mean KLD | same top-1 | RMS Δp |
+|---|---|---|---|---|---|
+| Q8_0 | 3.4315 ± 0.188 | — | — | — | — |
+| Q5_K | 3.4807 ± 0.194 | 1.0143 ± 0.0082 | 0.0329 | 92.8 % | 5.7 % |
+| Q4_K | 3.4850 ± 0.195 | 1.0156 ± 0.0095 | 0.0431 | 92.5 % | 6.5 % |
+
+Q5_K and Q4_K are indistinguishable on PPL here (the gap is inside the error); Q4_K costs ~30 %
+more KLD than Q5_K. Both cost ~1.5 % PPL, which is the price of dropping the imatrix-free
+Q8_0 → 4/5-bit step on 1/4 of the per-token weight bytes; an imatrix requant was not tried.
+
+tang engine, Q4_K GGUF (`G5F=2 GEMV8 KDA_PF2 MOE=fast GPU_FFN_LAYERS=0-29`):
+- ids gate `-n 8 --temp 0` = `785 1196 6801 264 6386 38038 911 279` = the oracle, also with
+  GPU_FFN=0. The requant does not move the first 8 greedy tokens.
+- 3 greedy `-n 128` generations vs the original (scripts/glm5-kda-q4-eval.sh; logs in
+  /root/w-q4/out on the H200). Common prefix: code (Rust fibonacci) 72/128, prose (harbor town)
+  2/128, chat (sourdough tips) 49/128. Every divergence is a paraphrase at the same plan step
+  ("u64 or u128, or discuss overflow" vs "u64 or u128 for larger values, though u64 overflows at
+  F(93)"; "is asking me to describe" vs "wants a description of"); the content, structure and
+  code that follow are the same in kind. Q5_K generations were not run (lock time).
+
+Kernel: `kda_quant_real_bench` (new, kda_decode.rs): layer 0, CUDA events, T=1, median of 50; both
+kernels checked against the CPU f32 dequant · x (rel 3.4e-3 … 3.8e-3 everywhere = the int8
+activation band, same as Q8_0). `k5_qgemv_q4k5/9` (new, kda_k5.cuh) is k5_qgemv with a Q4_K dot
+(lane = 32-wide sub-block, d·sc·Σq·x − dmin·m·Σx), so G5F=2 keeps its one launch for
+q|k|v|f_a|g_a. Q5_K has no qgemv variant and runs on g5f_gemv.
+
+| µs (TB/s) | Q8_0 g5f | Q8_0 qgemv | Q5_K g5f | Q4_K g5f | Q4_K qgemv |
+|---|---|---|---|---|---|
+| q / k / v | 19.8 (1.80) | 16.7 (2.13) | 16.0 (1.44) | 15.1 (1.25) | 13.4 (1.41) |
+| f_a / g_a | 9.6 | 7.0 | 8.4 | 8.5 | 7.3 |
+| o | 16.8 (2.12) | 18.8 (1.89) | 15.8 (1.46) | 14.3 (1.32) | 13.6 (1.38) |
+| merged q\|k\|v\|f_a\|g_a | — | 39.4 (2.74) | — | — | 26.8 (2.13) |
+| per layer (G5F=2 = merged + o) | 95.3 | **58.2** | 80.7 | 76.6 | **40.4** |
+| × 34 layers, ms/token | | 1.98 | 2.74 | | **1.37** |
+
+G5F=2 vs G5F=1, 32 naive decode steps on Q4_K and Q5_K: 0 difference (Q8_0: 1.7e-5). Not
+understood yet; the per-matrix timings differ, so the two kernels did run.
+
+Reading:
+- Q4_K + qgemv saves 0.61 ms/token of KDA projection time on the H200 (−31 %), not the −47 % the
+  bytes promise: the 4-bit dot is ALU-heavier and the kernels sit at 1.4–2.1 TB/s instead of
+  2.1–2.7. Still the best KDA config measured.
+- Q5_K is SLOWER than today's Q8_0 G5F=2 (80.7 vs 58.2 µs/layer) until it gets a qgemv variant;
+  even then its byte saving is 35 %, not 47 %.
+
+Recommendation: ship Q4_K KDA projections with G5F=2 (k5_qgemv_q4k) as an opt-in GGUF, not Q5_K:
+same PPL within error, 0.6 ms/token less on the H200 (expect similar on the B300), the ids gate
+holds. Before making it default: an imatrix requant (UD's own recipe for the rest of the file),
+a longer PPL text (3072 tokens gives ±0.9 % on the ratio), and the B300 A/B tok/s.
+NOT verified: B300; fused/graph path bit-equality on Q4_K (decode_fast uses the same
+k5_qgemv via g5f_x/g5f_o, so it should hold); Q5_K generations; multi-slot batched decode (T>1
+takes g5f_gemv, which handles Q4_K).
+
+Ops: the network volume is quota-limited (~290 GB; a second 200 GB copy failed at 100 GB), and
+/dev/shm is noexec — the requant shards were split over /workspace, /root and /dev/shm via
+symlinks, one variant at a time, and deleted after. llama-perplexity with experts on the CPU took
+~7 min to load and ~400 s per 512-token chunk under the other agents' CPU load.
 ## 2026-10-28 (integration round 2) — k5d_tail + FFN repack merged: B300 35.02 tok/s decode with repack off, now the default (branch claude/glm5-integrate2)
 
 Merged onto frog/glm5-forward 38bb2bed: claude/glm5-kda-kernels 1073e571 (k5d_tail, `TANG_GLM5_KDA_TAIL`
