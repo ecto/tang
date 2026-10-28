@@ -214,7 +214,11 @@ pub unsafe fn launch(
     args: &mut [*mut c_void],
 ) -> gpu::Result<()> {
     bump(|c| c.launches += 1);
-    gpu::launch(f, grid, block, smem, s, args)
+    let r = gpu::launch(f, grid, block, smem, s, args);
+    if r.is_err() {
+        eprintln!("tang-llm: launch failed: grid {grid:?} block {block:?} smem {smem}");
+    }
+    r
 }
 
 // records
