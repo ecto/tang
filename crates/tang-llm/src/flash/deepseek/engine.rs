@@ -1482,14 +1482,18 @@ impl GpuModel {
         self.k.route(
             &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
         )?;
-        let tab = if self.moe_grouped && self.expert_slots == 0 && t <= 8 {
+        let tab = if self.moe_grouped && self.expert_slots == 0 {
             self.moe_tab(p, lid, ne)?
         } else {
             None
         };
         self.end(s);
         if let Some(tab) = tab {
-            let y = self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?;
+            let y = if t <= 8 {
+                self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?
+            } else {
+                self.moe_grouped_tiled(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?
+            };
             return self.moe_finish(p, x, t, y);
         }
         // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
@@ -1606,6 +1610,81 @@ impl GpuModel {
         self.k.moe_down(
             &self.s, tab.fmt, tab.w2.ptr, elist.ptr, off.ptr, h.ptr, part.ptr, t, slots, d, inter,
             topk,
+        )?;
+        let y = self.fbuf(t * d)?;
+        let (ti, ki, di) = (t as i32, topk as i32, d as i32);
+        unsafe {
+            self.k.go(
+                "ds_moe_reduce",
+                blocks(t * d, 256),
+                B256,
+                0,
+                &self.s,
+                args![
+                    y.ptr,
+                    part.ptr,
+                    ids.ptr,
+                    off.ptr,
+                    rows.ptr,
+                    tab.mask.ptr,
+                    ti,
+                    ki,
+                    di
+                ],
+            )?
+        };
+        self.end(s);
+        Ok(y)
+    }
+
+    /// [`Self::moe_grouped_routed`] for t > 8 (prefill): the same plan and ordered reduce,
+    /// the projections over 8-row tiles of each expert's segment ([`Kernels::moe_tiled`]),
+    /// one launch per projection for the layer.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_tiled(
+        &self,
+        tab: &MoeTab,
+        x: Buf,
+        t: usize,
+        topk: usize,
+        ne: usize,
+        ids: Buf,
+        counts: Buf,
+        off: Buf,
+        rows: Buf,
+        rw: Buf,
+    ) -> Result<Buf> {
+        let d = self.cpu.cfg.dim;
+        let (n, inter) = (t * topk, tab.inter);
+        let slots = n.min(tab.local);
+        let s = self.span("grouped_tiled");
+        let elist = self.fbuf(slots)?;
+        let (nei, ci) = (ne as i32, slots as i32);
+        unsafe {
+            self.k.go(
+                "ds_moe_plan",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                &self.s,
+                args![counts.ptr, tab.mask.ptr, elist.ptr, nei, ci],
+            )?
+        };
+        let tiles = self.fbuf(Kernels::moe_tile_cap(n, slots))?;
+        let xq = self.qdq(x, t * d)?;
+        let (h, part) = (self.fbuf(n * inter)?, self.fbuf(n * d)?);
+        let wide = n * d.max(inter);
+        let (codes, scales) = (self.bytes(wide)?, self.fbuf(wide / 32)?);
+        self.k.moe_tiled(
+            &self.s,
+            tab.fmt,
+            (tab.w1.ptr, tab.w3.ptr, tab.w2.ptr),
+            (elist.ptr, slots, tiles.ptr),
+            (off.ptr, rows.ptr, rw.ptr),
+            (xq.ptr, h.ptr, part.ptr),
+            (codes.ptr, scales.ptr),
+            (t, topk, d, inter),
+            self.cpu.cfg.swiglu_limit,
         )?;
         let y = self.fbuf(t * d)?;
         let (ti, ki, di) = (t as i32, topk as i32, d as i32);
@@ -2978,7 +3057,7 @@ mod tests {
     }
 
     /// The grouped MoE kernels against the per-expert loop (exact `ds_linear_csr`), on decode
-    /// steps and 6-token verify windows (prefill takes the loop in both): bit for bit under
+    /// steps, 6-token verify windows and the prefill (the 8-row tiled kernels at t > 8): bit for bit under
     /// DS_EXACT=1; on the K-split path (one bf16 ulp in rare elements per GEMV, compounding
     /// through the layers) the same argmax, logits KL < 1e-3 and hiddens rel < 2e-2.
     #[test]
@@ -3007,9 +3086,9 @@ mod tests {
             assert!(kd < 1e-3, "{what}: KL {kd:e}");
             assert!(rh < 2e-2, "{what}: hiddens rel {rh:e}");
         };
-        let (la, _) = a.forward(&ids, 0, None).unwrap();
-        let (lb, _) = b.forward(&ids, 0, None).unwrap();
-        assert_eq!(la, lb, "prefill");
+        let (la, ma) = a.forward(&ids, 0, None).unwrap();
+        let (lb, mb) = b.forward(&ids, 0, None).unwrap();
+        same(&la, &lb, &ma, &mb, "prefill");
         let mut tok = argmax(&la);
         let mut pos = n;
         for i in 0..6 {
