@@ -3163,6 +3163,17 @@ mod tests {
         eprintln!("step graph: {segs} segments, ids {}", if c == a { "= host" } else { "DIFFER" });
         assert_eq!(segs, gr.m.hp.is_kda.iter().filter(|&&k| !k).count() + 1, "step graph segments");
         assert_eq!(a, c, "step graph vs host greedy ids");
+        // the whole-step graph (TANG_GLM5_STEP_GRAPH=2): one replay per token, the device
+        // position counter / embed gather; dense and sparse graphs across the switch
+        std::env::set_var("TANG_GLM5_STEP_GRAPH", "2");
+        let mut gw = mk();
+        let d = run(&mut gw, true);
+        std::env::remove_var("TANG_GLM5_STEP_GRAPH");
+        let whole = gw.gpu.as_ref().unwrap().resident.as_ref().map_or([0, 0], |r| r.whole_replays);
+        eprintln!("whole step graph: replays [dense, sparse] {whole:?}, ids {}", if d == a { "= host" } else { "DIFFER" });
+        eprintln!("                  host  {a:?}\n                  whole {d:?}");
+        assert!(whole[0] > 0 && whole[1] > 0 && whole[0] + whole[1] == 39, "whole graph replays {whole:?}");
+        assert_eq!(a, d, "whole step graph vs host greedy ids");
         assert!(host.gpu.as_ref().unwrap().resident.is_none(), "the host run took the resident step");
         assert!(res.gpu.as_ref().unwrap().resident.is_some(), "the resident step never ran");
         eprintln!("resident step: host {a:?}\n               res  {b:?}");

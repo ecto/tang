@@ -580,6 +580,12 @@ impl MhcFused {
         Ok(())
     }
 
+    /// The device stream buffer `r` (`[4][n]` f32 for a 1-row window): the whole-step
+    /// graph's device embed gather writes it in place of [`Self::begin_async`]'s upload.
+    pub fn r_ptr(&self) -> u64 {
+        self.r.ptr
+    }
+
     /// The window's stream (every fused-mHC launch goes here).
     pub fn stream(&self) -> &Stream {
         &self.s
