@@ -185,6 +185,7 @@ const MORE: &[&str] = &[
     "ds_fill_i32",
     "ds_copy_u8",
     "ds_spark_pick",
+    "ds_spark_sample",
     "ds_moe_plan",
     "ds_moe_reduce",
     "ds_moe_gate",

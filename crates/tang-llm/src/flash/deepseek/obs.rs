@@ -298,6 +298,10 @@ struct Open {
     h0: Instant,
     start: SystemTime,
     c0: Counts,
+    /// The counters at [`Obs::finish`]: a step emitted later must not take in what ran
+    /// between its finish and the next step's start (the next step's leading sync, a
+    /// verify's row reads, the rewind).
+    c1: Option<Counts>,
     wall: Option<f64>,
     e1: Option<usize>,
     arena: u64,
@@ -395,6 +399,7 @@ impl Obs {
             h0,
             start,
             c0: counts(),
+            c1: None,
             wall: None,
             e1: None,
             arena: 0,
@@ -503,6 +508,7 @@ impl Obs {
         }
         if let Some(o) = self.st.borrow_mut().open.as_mut() {
             o.wall.get_or_insert(o.h0.elapsed().as_secs_f64() * 1e3);
+            o.c1.get_or_insert_with(counts);
         }
         self.on.set(false);
         self.interior.set(false);
@@ -576,7 +582,7 @@ impl Obs {
                 host_ms: (wall - gpu_ms).max(0.0),
                 reduce_wait_ms,
                 arena_bytes: o.arena,
-                counts: counts().minus(o.c0),
+                counts: o.c1.unwrap_or_else(counts).minus(o.c0),
                 start: o.start,
                 spans,
             }

@@ -285,3 +285,13 @@ extern "C" __global__ void dg_sparse_attn(const float* q, const float* kv0, int 
         o[((long long)t * h + hi) * d + i] = dg_bf(acc / den_s);
     }
 }
+
+// As ds_win_idx mode 2 (a DSpark block of t rows: the ring's min(win, sp + 1) rows, then the
+// block's t) at sp = P[0] + add, for n = win + t columns: the rest -1.
+extern "C" __global__ void dg_spark_idx(int* out, int t, int n, const int* P, int add, int win) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= t * n) return;
+    int j = e % n, n1 = min(win, P[0] + add + 1), v;
+    v = j < n1 ? j : (j - n1 < t ? win + (j - n1) : -1);
+    out[e] = v;
+}
