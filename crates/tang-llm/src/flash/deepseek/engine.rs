@@ -1919,12 +1919,12 @@ impl GpuModel {
             .map(|(l, m, _)| (l, m))
     }
 
-    /// A verify window that leaves its logits on the device: each row's argmax and the DSpark
-    /// target hiddens come back (a few bytes instead of [T][V] f32); [`Self::logits_row`]
-    /// reads single rows of this window on demand.
-    pub fn verify_window(&mut self, ids: &[usize], sp: usize) -> Result<(Vec<usize>, Vec<f32>)> {
+    /// A verify window that leaves its outputs on the device: only each row's argmax comes
+    /// back (a few bytes instead of [T][V] f32 and the hiddens); [`Self::logits_row`] and
+    /// [`Self::window_mains`] read parts of this window on demand.
+    pub fn verify_window(&mut self, ids: &[usize], sp: usize) -> Result<Vec<usize>> {
         self.forward_impl(ids, sp, None, true, false)
-            .map(|(_, m, a)| (a, m))
+            .map(|(_, _, a)| a)
     }
 
     /// Row `r` of the last [`Self::verify_window`]'s logits.
@@ -1935,7 +1935,7 @@ impl GpuModel {
             bail!("logits_row: row {r} of {}", out.rows);
         }
         super::obs::d2h(v * 4);
-        Ok(out.logits.dev().read::<f32>(r * v, v)?)
+        Ok(out.logits.dev().read::<f32>(r * v * 4, v)?)
     }
 
     /// Whether a step at `sp` with these settings is captured (see the module doc).
@@ -2067,24 +2067,44 @@ impl GpuModel {
             super::obs::d2h((out.rows * v + out.mains.len() * t * d) * 4);
             (out.logits.dev().read::<f32>(0, out.rows * v)?, Vec::new())
         } else {
-            super::obs::d2h((out.rows + out.mains.len() * t * d) * 4);
+            super::obs::d2h(out.rows * 4);
             let a = out.amax.dev().read::<i32>(0, out.rows)?;
             (Vec::new(), a.into_iter().map(|i| i as usize).collect())
         };
+        let main = if full {
+            Self::read_mains(&out, t, d)?
+        } else {
+            self.last = Some(out);
+            Vec::new()
+        };
+        self.obs.finish();
+        Ok((logits, main, amax))
+    }
+
+    /// The first `rows` positions' DSpark target hiddens of `out`, [rows][targets][d].
+    fn read_mains(out: &StepOut, rows: usize, d: usize) -> Result<Vec<f32>> {
         let n = out.mains.len();
-        let mut main = vec![0f32; t * d * n];
+        let mut main = vec![0f32; rows * d * n];
         for (j, m) in out.mains.iter().enumerate() {
-            let mv = m.dev().read::<f32>(0, t * d)?;
-            for ti in 0..t {
+            let mv = m.dev().read::<f32>(0, rows * d)?;
+            for ti in 0..rows {
                 main[(ti * n + j) * d..(ti * n + j + 1) * d]
                     .copy_from_slice(&mv[ti * d..(ti + 1) * d]);
             }
         }
-        if !full {
-            self.last = Some(out);
-        }
-        self.obs.finish();
-        Ok((logits, main, amax))
+        Ok(main)
+    }
+
+    /// The first `rows` positions' DSpark target hiddens of the last [`Self::verify_window`]
+    /// (the accepted prefix: the rest are never read back).
+    pub fn window_mains(&self, rows: usize) -> Result<Vec<f32>> {
+        let out = self
+            .last
+            .as_ref()
+            .context("window_mains: no verify window")?;
+        let d = self.cpu.cfg.dim;
+        super::obs::d2h(rows * d * out.mains.len() * 4);
+        Self::read_mains(out, rows, d)
     }
 
     /// The generation the next step will start at (one more when this one overflowed).
@@ -2435,7 +2455,7 @@ impl GpuModel {
         edit(pos0 + 1, &mut ids[1..]);
         let t1 = std::time::Instant::now();
         let snap = self.snapshot()?;
-        let (amax, mains) = self.verify_window(&ids, pos0)?;
+        let amax = self.verify_window(&ids, pos0)?;
         let n = ids.len();
         let (k, tokens) = if pick.greedy() {
             super::forward::verify_greedy(&amax, &ids)
@@ -2454,6 +2474,7 @@ impl GpuModel {
             }
             r
         };
+        let main = self.window_mains(k + 1)?;
         let t2 = std::time::Instant::now();
         self.rewind(&snap, pos0 + k + 1, pos0 + n)?;
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
@@ -2472,7 +2493,7 @@ impl GpuModel {
             tokens,
             drafted: n - 1,
             accepted: k,
-            main: mains[..(k + 1) * w].to_vec(),
+            main,
             sp: pos0,
         })
     }
