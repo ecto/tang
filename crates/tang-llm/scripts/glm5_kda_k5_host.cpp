@@ -21,6 +21,7 @@ static K5Dim blockIdx, blockDim, threadIdx;
 static inline float __uint_as_float(unsigned u) { float f; std::memcpy(&f, &u, 4); return f; }
 
 #include "../src/flash/glm5/moe_cuda.cuh"
+#define K5_HOST_CHECK 1
 #include "../src/flash/glm5/kda_k5.cuh"
 
 static int failures = 0;
