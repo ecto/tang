@@ -270,6 +270,49 @@ H100, 200 tokens: greedy **192.2 / 193.0** (42 steps, 159/246, identical accepta
 ~3.4 ms between graphs, verify → draft was 0.83 ms (readbacks, ~60 host-launched rewind copies,
 spark_setup staging) and draft → verify 2.24 ms (draft-pack readback, snapshot copies, `inputs()`).
 
+## Status at pause (2026-10-29)
+
+Paused with the 8× H100 pod (bs81p9ixg3coxz, EUR-NO-2) EXITED: the RunPod balance ran out
+(restart returns 402). `/workspace` keeps the 1017 weights, the Engram metadata, `measure.sh`,
+`bench.sh` and `LANES.md`; `/root` (binaries, build dirs, lane scripts) will be gone on restart.
+
+Measured progression (greedy, 200 tokens, same prompt): 57 (wave 5, 4× H200) → 131 (wave 6,
+8× H100) → 154 (7e) → 156 (8a) → 160 (8b) → 179 (8d) → **193 (8e, 70928d3b)**. Sampled T=0.6
+moved from 69 to the 150–190 range; sampled runs swing ±20 tok/s with acceptance.
+
+Merged after 70928d3b but **not yet measured on the real model** (all pass the mew GPU tests):
+moe3's persistent one-wave expert grid (ee3d0c44, bit-identical, default on); attn3's EP load
+deadline (`DS_LOAD_TIMEOUT`), batched snapshot/rewind (`ds_copy_many`), MADV_HUGEPAGE on the
+pinned Engram copy; `DS_PIPE=1` device-resident accepted hiddens (off by default); the
+`ds_engram_gather` UVA kernel and benchmark (not wired, never run).
+
+Where a verify step goes (nsys node trace, wave 8c/8d): ~20 ms of kernels in the verify graph
+with <0.5 ms of gaps, ~4 ms draft, ~3.4 ms between graphs before the 8e host fixes (~1–1.5 ms
+after). Largest kernel rows: mHC `ds_hc_fused_ks` 2.9 ms, `ds_ks` 2.8, `ds_attn_fdm` 2.5,
+expert gu 2.6 + down 1.7, NCCL all-reduce 1.8 on rank 0 and 3.2–3.9 ms on ranks 1–7.
+
+Open work, in value order:
+1. **Rank-0 skew.** Rank 0 spends 4.2 ms/step in expert kernels vs 2.3–2.6 on ranks 1–7, and
+   the others wait for it at every layer's all-reduce. Likely cause: the folded shared expert
+   runs on rank 0 only. WIP on `lane/moe3` (7ccb7670, unfinished, EP tests were being
+   bisected): spread it over all ranks (bit-exact form: every rank does shared gu, down only
+   for its 1/8 of output columns, zeros elsewhere).
+2. **Expert kernels at 30–44% of HBM.** Next lever: warps covering 2–4 row tiles per mma group
+   so the activation decode is shared; bench with real routing (`DS_ROUTE_DUMP`,
+   `mega_moe_slots` with `DS_ROUTE_FILE`).
+3. **Big fp8 projections at 31–51% of HBM** (wq_b, wo_b, wo_a). Repack for 16-byte loads was
+   bit-exact but no faster (parked on `lane/attn3-repack`); the limit looks like per-item ramp
+   and tail.
+4. **Between graphs.** Measure `DS_PIPE=1` and the UVA Engram gather; full device pipelining is
+   a multi-day refactor worth ~4–6% and is deferred.
+Measured as no gain and left off: the `mg_glue` megakernel (`DS_MEGA`), programmatic dependent
+launch (`DS_PDL`), NCCL protocol/algorithm/channel settings, draft lengths above 6.
+
+To resume: add RunPod funds, start the pod, rsync `frog/deepseek-v41` to /workspace/tang-obs,
+`cargo build --release -p tang-llm --features ep,otel --target-dir /root/target-obs`, then
+`flock /workspace/gpu.lock /workspace/measure.sh <tag> <bin>`; measure the unmeasured merges
+above first. On mew, build with `--no-run` outside `~/tang-gpu.lock` and lock only GPU filters.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
