@@ -2316,6 +2316,10 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     let mut diverse = false;
     // --mtp K: draft K tokens per trunk pass with the NextN layer (super::mtp); 0 = plain
     let mut mtp_k = std::env::var("TANG_GLM5_MTP").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    if std::env::var("TANG_GLM5_MTP").is_ok_and(|v| v == "auto") {
+        super::mtp::AUTO.store(true, std::sync::atomic::Ordering::Relaxed);
+        mtp_k = 3;
+    }
     let push = |ids: &mut Vec<u32>, s: &str| -> Result<()> {
         for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
             if !w.is_empty() {
@@ -2349,7 +2353,16 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
                 ensure!(t == 0.0, "glm5: only greedy (--temp 0) for now");
             }
             "--eager" | "--no-think" => {}
-            "--mtp" => mtp_k = val()?.parse()?,
+            "--mtp" => {
+                let v = val()?;
+                if v == "auto" {
+                    super::mtp::AUTO.store(true, std::sync::atomic::Ordering::Relaxed);
+                    mtp_k = 3;
+                } else {
+                    mtp_k = v.parse()?;
+                }
+            }
+            "--mtp-auto" => super::mtp::AUTO.store(true, std::sync::atomic::Ordering::Relaxed),
             "--draft" | "--seed" | "--ctx" | "--bw" => {
                 val()?;
             }
