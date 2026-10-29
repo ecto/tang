@@ -1196,3 +1196,162 @@ mod tail_tests {
         }
     }
 }
+
+impl DevLayer {
+    /// The resident MTP window's batched KDA layer (`TANG_GLM5_RES_KDA_ROWS`, default on):
+    /// `xb` holds `t` consecutive rows of slot 0. The projections, gates, gated norm and
+    /// o_proj run ONCE over the t rows (each weight read once); only the recurrent core —
+    /// conv + delta rule, the t=1 step kernel — runs row by row on slot 0's state (the
+    /// WIN_STEP form of `core_pf2`). After row `i < t - 1` the slot's state is copied to
+    /// `ck.0 + i * ck.1` (the window's rewind checkpoints). Everything on `s`, device
+    /// pointers only (capturable); `outb` holds y `[t][hidden]`. Not bit-identical to the
+    /// t=1 decode step (batched GEMVs; the windiff note in NOTES.md).
+    pub fn rows_enqueue(&self, s: &Stream, t: usize, ck: Option<(u64, usize)>) -> Result<()> {
+        ensure!(self.pf2 && t >= 1 && t <= self.max_t, "kda rows_enqueue: pf2 {} t {t}", self.pf2);
+        let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
+        let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
+        let f = std::mem::size_of::<f32>() as u64;
+        let qkv = self.qkvb.ptr;
+        let g8 = |w: &super::super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
+        let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv);
+        unsafe {
+            let g5 = self.g5f_x(s, t)?;
+            if !g5 {
+                if gemv8 {
+                    launch(
+                        self.gv.q8,
+                        ((hidden / 32) as u32, t as u32, 1),
+                        (32, 1, 1),
+                        0,
+                        s,
+                        args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],
+                    )?;
+                    for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                        self.gemv8_launch_on(s, w, self.xq8.ptr, hidden, qkv + off, 3 * di, di, t)?;
+                    }
+                } else {
+                    for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                        launch(
+                            self.gv.gemv,
+                            grid(t * di),
+                            (128, 1, 1),
+                            0,
+                            s,
+                            args![w.w, 0u32, self.xb.ptr, qkv + off, (3 * di) as u32, t as u32, di as u32, hidden as u32],
+                        )?;
+                    }
+                }
+                if gemv8 && g8(&self.fa) {
+                    self.gemv8_launch_on(s, &self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, t)?;
+                } else {
+                    launch(
+                        self.gv.gemv,
+                        grid(t * hd),
+                        (128, 1, 1),
+                        0,
+                        s,
+                        args![self.fa.w, 0u32, self.xb.ptr, self.g1b.ptr, hd as u32, t as u32, hd as u32, hidden as u32],
+                    )?;
+                }
+            }
+            launch(
+                self.gv.gemv,
+                grid(t * di),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.fb.w, 0u32, self.g1b.ptr, self.gb_out.ptr, di as u32, t as u32, di as u32, hd as u32],
+            )?;
+            launch(
+                self.gv.gate,
+                grid(t * di),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.gb_out.ptr, self.dt.ptr, self.rate.ptr, nh as u32, hd as u32, lb, t as u32],
+            )?;
+            launch(
+                self.gv.beta,
+                ((t * nh).div_ceil(super::K5_WARPS) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.bproj.w, self.xb.ptr, self.bb.ptr, t as u32, hidden as u32, nh as u32],
+            )?;
+            // g_a (unless g5f_x wrote it): before o_proj re-quantises xq8
+            if !g5 {
+                if gemv8 && g8(&self.ga) {
+                    self.gemv8_launch_on(s, &self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, t)?;
+                } else {
+                    launch(
+                        self.gv.gemv,
+                        grid(t * hd),
+                        (128, 1, 1),
+                        0,
+                        s,
+                        args![self.ga.w, 0u32, self.xb.ptr, self.g2a.ptr, hd as u32, t as u32, hd as u32, hidden as u32],
+                    )?;
+                }
+            }
+        }
+        // the core, row by row on slot 0
+        let regs = self.core.slot_state_regions(0);
+        for i in 0..t as u64 {
+            self.core.decode_dev(
+                &self.kers,
+                s,
+                0,
+                qkv + i * (3 * di) as u64 * f,
+                self.gb_out.ptr + i * di as u64 * f,
+                self.bb.ptr + i * nh as u64 * f,
+                self.ob.ptr + i * di as u64 * f,
+            )?;
+            if let (Some((base, stride)), true) = (ck, (i as usize) + 1 < t) {
+                let b = base + i * stride as u64;
+                tang_moe::gpu::copy_d2d_async(b, regs[0].0, regs[0].1, s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                tang_moe::gpu::copy_d2d_async(b + regs[0].1 as u64, regs[1].0, regs[1].1, s)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        }
+        unsafe {
+            launch(
+                self.gv.gemv,
+                grid(t * di),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.gb.w, 0u32, self.g2a.ptr, self.g2b.ptr, di as u32, t as u32, di as u32, hd as u32],
+            )?;
+            launch(
+                self.gv.norm,
+                grid(t * di),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32, hd as u32, self.cfg.eps, t as u32],
+            )?;
+            if self.g5f_o(s, t)? {
+            } else if g8(&self.wo) {
+                launch(
+                    self.gv.q8,
+                    ((di / 32) as u32, t as u32, 1),
+                    (32, 1, 1),
+                    0,
+                    s,
+                    args![self.yb.ptr, self.xq8.ptr, di as u32, self.max_t as u32],
+                )?;
+                self.gemv8_launch_on(s, &self.wo, self.xq8.ptr, di, self.outb.ptr, hidden, hidden, t)?;
+            } else {
+                launch(
+                    self.gv.gemv,
+                    grid(t * hidden),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, t as u32, hidden as u32, di as u32],
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
