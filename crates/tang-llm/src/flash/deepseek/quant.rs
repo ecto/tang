@@ -30,6 +30,12 @@ pub fn e4m3_to_f32(v: u8) -> f32 {
     }
 }
 
+/// [`e4m3_to_f32`] of every byte (the same values, looked up).
+pub fn e4m3_lut() -> &'static [f32; 256] {
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::array::from_fn(|i| e4m3_to_f32(i as u8)))
+}
+
 /// e8m0: a bare exponent, bias 127 (0xff is NaN).
 pub fn e8m0_to_f32(v: u8) -> f32 {
     if v == 0xFF {

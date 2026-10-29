@@ -264,6 +264,9 @@ pub struct GpuModel {
     /// The fast GEMV path (`ds_lin_*`: fused activation quant and SwiGLU), bit-identical to
     /// the naive `ds_linear` path kept for A/B (`DS_SLOW=1` turns it off).
     pub fast: bool,
+    /// Whether the device draft's logits come back (`decode_spec` clears it when its verify
+    /// never reads them: 3 MB of the per-step read)
+    draft_logits: bool,
     /// Capture decode steps as CUDA graphs (`DS_GRAPH=0` turns it off; see the module doc).
     pub graph: bool,
     pub graph_stats: GraphStats,
@@ -467,6 +470,7 @@ impl GpuModel {
                 Some(n) => n.max(3),
             },
             fast: std::env::var_os("DS_SLOW").is_none(),
+            draft_logits: true,
             graph: std::env::var("DS_GRAPH").map_or(true, |v| v != "0"),
             graph_stats: GraphStats::default(),
             tabs,
@@ -2900,11 +2904,16 @@ impl GpuModel {
             .cpu
             .st
             .bytes(&format!("{}scale", name.strip_suffix("weight").unwrap()))?;
+        // the same products as e4m3_to_f32(w) * e8m0_to_f32(s), table-driven (host time per
+        // verify step: ~1.3 ms with the per-byte decode)
+        let lut = super::quant::e4m3_lut();
         let mut out = Vec::with_capacity(rows.len() * ehd);
         for &r in rows {
             let r = r as usize;
-            for i in 0..ehd {
-                out.push(e4m3_to_f32(w[r * ehd + i]) * e8m0_to_f32(s[r * (ehd / 32) + i / 32]));
+            let (wr, sr) = (&w[r * ehd..(r + 1) * ehd], &s[r * (ehd / 32)..]);
+            for (g, ch) in wr.chunks(32).enumerate() {
+                let sc = e8m0_to_f32(sr[g]);
+                out.extend(ch.iter().map(|&b| lut[b as usize] * sc));
             }
         }
         Ok(out)
@@ -3615,16 +3624,19 @@ impl GpuModel {
             self.spark_device(&ins, samp)?
         };
         self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
-        let all = self.read(pk, lay.len)?;
-        let out: Vec<usize> = all[lay.ids..lay.ids + blk + 1]
+        // the pack from `o` on: everything, or only the hiddens, ids and RNG
+        let o = if self.draft_logits { 0 } else { lay.hid };
+        let all = self.read(pk.at(o * 4), lay.len - o)?;
+        let out: Vec<usize> = all[lay.ids - o..lay.ids - o + blk + 1]
             .iter()
             .map(|f| f.to_bits() as i32 as usize)
             .collect();
         if let Draw::Sample(sm) = &mut how {
-            sm.rng = all[lay.rng].to_bits() as u64 | (all[lay.rng + 1].to_bits() as u64) << 32;
+            let r = lay.rng - o;
+            sm.rng = all[r].to_bits() as u64 | (all[r + 1].to_bits() as u64) << 32;
         }
-        let conf = conf_of(&all[lay.hid..lay.ids], &out);
-        let mut logits = all;
+        let conf = conf_of(&all[lay.hid - o..lay.ids - o], &out);
+        let mut logits = if o == 0 { all } else { Vec::new() };
         logits.truncate(blk * v);
         self.obs.finish();
         Ok(Some(super::forward::Draft {
@@ -3875,6 +3887,9 @@ impl GpuModel {
         // the drafter's block for this mode (the spark reads it from the config)
         let greedy = pick.greedy();
         self.cpu.cfg.dspark_block_size = c.draft_block(greedy);
+        // only the host walk (verify_rows_with) reads the draft's logits; a sampled step may
+        // fall back to it when the device walk overflows, so only greedy skips them
+        self.draft_logits = !greedy;
         let draft = if pick.greedy_draft() {
             self.spark(token, main, sp, Draw::Greedy)
         } else if let Some(sm) = pick.as_sampler() {
@@ -3883,6 +3898,7 @@ impl GpuModel {
             self.spark(token, main, sp, Draw::Host(&mut |q: &[f32]| pick.draft(q)))
         };
         self.cpu.cfg.dspark_block_size = c.dspark_block_size;
+        self.draft_logits = true;
         let draft = draft?.context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
         ids.truncate(1 + c.draft_keep(&draft.conf, greedy));
