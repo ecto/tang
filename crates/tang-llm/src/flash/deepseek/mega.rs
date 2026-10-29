@@ -103,8 +103,10 @@ fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
 }
 
 const PART: usize = 1 << 21;
-/// `mg_glue`'s dynamic shared memory cap.
-const SMEM_MAX: usize = 96 * 1024;
+/// `mg_glue`'s dynamic shared memory cap (the largest staged activation is ~47 KB; leaves
+/// room under the 99 KB opt-in for the phases' static arrays, which grew when mg_hc took
+/// ds_hc_fused_ks's shared body).
+const SMEM_MAX: usize = 64 * 1024;
 const CNT: usize = 1 << 13;
 
 /// The megakernel's module and persistent scratch.
@@ -469,7 +471,7 @@ mod tests {
                         args![
                             h.ptr, h2, res.ptr, post.ptr, comb.ptr, o[0].ptr, hw, o[1].ptr,
                             pre.ptr, o[5].ptr, nw, scale.ptr, base.ptr, o[2].ptr, o[3].ptr,
-                            o[4].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps
+                            o[4].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps, 0i32
                         ],
                     )?;
                 }
@@ -800,15 +802,20 @@ mod tests {
         g.bind()?;
         let k = Kernels::new(&g)?;
         let s = Stream::new()?;
-        let t = 6usize;
+        let t = std::env::var("DS_BW_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6usize);
         let x = DevBuf::from_slice(&rnd(t * 32768, 3, unif))?;
         let y = DevBuf::zeroed(4 * t * 129280)?;
+        let y2 = DevBuf::zeroed(4 * t * 129280)?;
         let (xc, xs) = k.ks_x_ptrs();
         // (name, rows, cols, fmt, kind): kind 0 ks_gemv, 1 ks_gemv gu (w1 + w3), 2 wo_ks,
-        // 3 linear, 4 head, 5 gemv_bf16
+        // 3 linear, 4 head, 5 ks_gemv2 (w and a 512-row wkv on one activation), 6 gemv_bf16
         let rows: &[(&str, usize, usize, i32, u8)] = &[
             ("wq_a (fp8, ds_ks)", 1280, 5120, 2, 0),
             ("wkv (fp8, ds_ks)", 512, 5120, 2, 0),
+            ("wq_a + wkv (fp8, ds_ks2)", 1280, 5120, 2, 5),
             ("wq_b (fp8, ds_ks)", 32768, 1280, 2, 0),
             ("wo_a (fp8, ds_wo_ks, 8 groups)", 8192, 4096, 2, 2),
             ("wo_b (fp8, ds_ks)", 5120, 8192, 2, 0),
@@ -817,7 +824,7 @@ mod tests {
             ("compressor wgate (bf16, ds_linear_t8)", 512, 5120, 1, 3),
             ("indexer weights_proj (bf16, ds_linear_t8)", 32, 5120, 1, 3),
             ("router gate (bf16, ds_linear_t8)", 384, 5120, 1, 3),
-            ("router gate (bf16, ds_gemv_bf16_r1)", 384, 5120, 1, 5),
+            ("router gate (bf16, ds_gemv_bf16_r1)", 384, 5120, 1, 6),
             ("hc mixes (f32, ds_linear_t8)", 24, 20480, 0, 3),
             ("expert gu, one slot (fp4, ds_ks gu)", 2304, 5120, 3, 1),
             ("expert down, one slot (fp4, ds_ks)", 5120, 2304, 3, 0),
@@ -831,11 +838,15 @@ mod tests {
             let ws: Vec<_> = (0..copies)
                 .map(|i| {
                     let a = bytes_w(r, c, fmt, 10 + i as u64);
-                    let b = (kind == 1).then(|| bytes_w(r, c, fmt, 1000 + i as u64));
+                    let b = match kind {
+                        1 => Some(bytes_w(r, c, fmt, 1000 + i as u64)),
+                        5 => Some(bytes_w(512, c, fmt, 1000 + i as u64)),
+                        _ => None,
+                    };
                     (a, b)
                 })
                 .collect();
-            if kind <= 1 {
+            if kind <= 1 || kind == 5 {
                 k.ks_quant_to(&s, x.ptr, xc, xs, t * c)?;
             }
             let run = |s: &Stream, i: usize| -> Result<()> {
@@ -858,11 +869,14 @@ mod tests {
                     2 => k.wo_ks(s, w, x.ptr, y.ptr, t, 8, 1024)?,
                     3 => k.linear(s, w, x.ptr, y.ptr, t, false)?,
                     4 => k.head(s, w, x.ptr, y.ptr, t)?,
+                    5 => {
+                        k.ks_gemv2(s, w, &b.as_ref().unwrap().1, xc, xs, y.ptr, y2.ptr, t, true)?
+                    }
                     _ => k.gemv_bf16(s, w, x.ptr, y.ptr, t)?,
                 }
                 Ok(())
             };
-            if kind <= 1 {
+            if kind <= 1 || kind == 5 {
                 ensure!(k.ks_ok(&ws[0].0 .1), "{name}: not on the K-split path");
             }
             run(&s, 0)?;
@@ -875,7 +889,11 @@ mod tests {
                 Ok(())
             })?;
             let us = time(&s, 10, || Ok(gr.launch(&s)?))? / n as f32;
-            let bytes = one * if kind == 1 { 2 } else { 1 };
+            let bytes = match kind {
+                1 => 2 * one,
+                5 => one + one * 512 / r,
+                _ => one,
+            };
             let gbs = bytes as f32 / us / 1e3;
             println!(
                 "| {name} | {r} x {c} | {:.1} | {us:.1} | {gbs:.0} | {:.0}% |",
