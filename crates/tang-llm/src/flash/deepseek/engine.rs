@@ -2889,11 +2889,16 @@ impl GpuModel {
             .cpu
             .st
             .bytes(&format!("{}scale", name.strip_suffix("weight").unwrap()))?;
+        // the same products as e4m3_to_f32(w) * e8m0_to_f32(s), table-driven (host time per
+        // verify step: ~1.3 ms with the per-byte decode)
+        let lut = super::quant::e4m3_lut();
         let mut out = Vec::with_capacity(rows.len() * ehd);
         for &r in rows {
             let r = r as usize;
-            for i in 0..ehd {
-                out.push(e4m3_to_f32(w[r * ehd + i]) * e8m0_to_f32(s[r * (ehd / 32) + i / 32]));
+            let (wr, sr) = (&w[r * ehd..(r + 1) * ehd], &s[r * (ehd / 32)..]);
+            for (g, ch) in wr.chunks(32).enumerate() {
+                let sc = e8m0_to_f32(sr[g]);
+                out.extend(ch.iter().map(|&b| lut[b as usize] * sc));
             }
         }
         Ok(out)
