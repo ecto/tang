@@ -4,6 +4,25 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 (integration round 6) — forward 405a5194 on the B300: plain 98.4 / 113.7 tok/s; MTP 104.3 at -n 128 (branch frog/glm5-forward)
+
+405a5194 = forward + claude/glm5-mhc3 d92ab5b2 + claude/glm5-mtp-win a0557c96 (device DraftCell) +
+claude/glm5-kda4 fcc769c4 (t-row KDA window). B flags, bench prompt. Plain decode via
+scripts/glm5-bench.sh: -n 128 **98.39 tok/s** (ids md5 7174cdd6), -n 512 **113.67** (1453cf0e); the
+471e67b9 build gave 100.57 / 113.61. MTP (`--mtp K`, tok/s = tok/pass ÷ (trunk + draft ms/pass)
+from the `mtp: resident verify` line):
+
+| K | -n | tok/pass | trunk ms/pass | draft ms/pass | tok/s | ids md5 |
+|---|---|---|---|---|---|---|
+| 1 | 128 | 1.896 | 13.86 | 4.32 | **104.3** | 7174cdd6 |
+| 2 | 128 | 2.490 | 17.96 | 6.08 | 103.6 | 7174cdd6 |
+| 3 | 128 | 2.953 | 22.14 | 8.84 | 95.3 | 7174cdd6 |
+| 2 | 512 | 2.231 | 19.19 | 2.71 | 101.9 | 1453cf0e |
+
+Haiku `--mtp 2 -n 8` = oracle. Every MTP run equals plain greedy. MTP now wins at -n 128 (1.06×) and
+still loses at -n 512 (0.90× of 113.7). The draft (~2 ms/cell at K=2 at short context) is the
+lever: with a free draft K=2 at -n 128 is 2.49 / 17.96 ms = 139 tok/s.
+
 ## 2026-10-28 — KDA t-row window path for the MTP verify: KDA per t=3 window 6.64 -> 3.93 ms, K=2 trunk 23.0 -> 20.2 ms/pass, ids = plain (branch claude/glm5-kda4, round 3)
 
 What was slow: `window_resident` ran a KDA item as t serial t=1 decodes, so every extra row
