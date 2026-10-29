@@ -50,5 +50,8 @@ fn dense_ffn_matches_hf() {
     for (a, b) in y.iter().zip(&want) {
         max = max.max((a - b).abs());
     }
-    assert!(max <= 1e-4 * (1.0 + want.iter().map(|v| v.abs()).fold(0f32, f32::max)), "max abs err {max}");
+    assert!(
+        max <= 1e-4 * (1.0 + want.iter().map(|v| v.abs()).fold(0f32, f32::max)),
+        "max abs err {max}"
+    );
 }

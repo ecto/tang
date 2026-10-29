@@ -157,7 +157,12 @@ pub(super) struct Resident {
     /// `[token, position]` u32: `rs_argmax` writes the token; on the whole-step graph it
     /// also advances the position, which every DSA kernel of the next replay reads.
     tok: DevBuf,
-    head: Option<(super::super::moe::gpu::DevW, super::super::moe::gpu::Kernels5, DevBuf, DevBuf)>,
+    head: Option<(
+        super::super::moe::gpu::DevW,
+        super::super::moe::gpu::Kernels5,
+        DevBuf,
+        DevBuf,
+    )>,
     /// One eager resident token has run since the last host window (every buffer the
     /// step touches is allocated): the step graph may be captured.
     warm: bool,
@@ -207,7 +212,12 @@ struct WinBufs {
 }
 
 impl Resident {
-    fn new(gpu: &tang_moe::gpu::Gpu, g: &crate::gguf::Gguf, norm_w: &[f32], own_head: bool) -> Result<Self> {
+    fn new(
+        gpu: &tang_moe::gpu::Gpu,
+        g: &crate::gguf::Gguf,
+        norm_w: &[f32],
+        own_head: bool,
+    ) -> Result<Self> {
         let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident: {e}");
         let n = norm_w.len();
         let head = if own_head {
@@ -217,9 +227,19 @@ impl Resident {
             };
             let (rows, cols) = (info.dims[1] as usize, info.dims[0] as usize);
             ensure!(cols == n, "lm head: {cols} cols, hidden {n}");
-            let dw = super::super::moe::gpu::upload(&super::super::moe::W::Gguf(g, info), 1, rows, cols)?;
+            let dw = super::super::moe::gpu::upload(
+                &super::super::moe::W::Gguf(g, info),
+                1,
+                rows,
+                cols,
+            )?;
             let k5 = super::super::moe::gpu::Kernels5::new(gpu)?;
-            Some((dw, k5, DevBuf::zeroed_elems::<f32>(n).map_err(ge)?, DevBuf::zeroed_elems::<f32>(rows).map_err(ge)?))
+            Some((
+                dw,
+                k5,
+                DevBuf::zeroed_elems::<f32>(n).map_err(ge)?,
+                DevBuf::zeroed_elems::<f32>(rows).map_err(ge)?,
+            ))
         } else {
             None
         };
@@ -261,7 +281,9 @@ impl Glm5Engine {
         if self.kda_dbg.is_some() || self.moe_dbg.is_some() || self.mla_dbg.is_some() {
             return false;
         }
-        let Some(g) = self.gpu.as_ref() else { return false };
+        let Some(g) = self.gpu.as_ref() else {
+            return false;
+        };
         if g.devs.len() != 1 || !g.devs[0].1.fast || g.mhc_f.is_none() {
             return false;
         }
@@ -280,16 +302,32 @@ impl Glm5Engine {
     /// Before a host path touches DSA layer `l`'s mirrors: pull the rows the resident step
     /// left on the device only.
     pub(super) fn refresh_stale_dsa(&mut self, slot: usize, l: usize) -> Result<()> {
-        let Some(from) = self.dsa[slot][l].stale_from else { return Ok(()) };
-        let Some(g) = self.gpu.as_ref() else { return Ok(()) };
-        let Some(cu) = g.mla_k[l].as_ref() else { return Ok(()) };
-        g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        let Some(from) = self.dsa[slot][l].stale_from else {
+            return Ok(());
+        };
+        let Some(g) = self.gpu.as_ref() else {
+            return Ok(());
+        };
+        let Some(cu) = g.mla_k[l].as_ref() else {
+            return Ok(());
+        };
+        g.devs[g.dev_of[l]]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         cu.set_seq(slot as u64);
         let c = &mut self.dsa[slot][l];
         let rows = c.valid.len();
         if rows > from {
-            cu.refresh_mirrors(from, rows - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
-                .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
+            cu.refresh_mirrors(
+                from,
+                rows - from,
+                &mut c.lat16,
+                &mut c.idx_k,
+                &mut c.idx_g,
+                &mut c.valid,
+            )
+            .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
         }
         c.stale_from = None;
         Ok(())
@@ -348,12 +386,17 @@ impl Glm5Engine {
             (w.topk, w.kpool)
         });
         ensure!(
-            dsa_l.iter().all(|&l| mla_w[l].as_ref().is_some_and(|w| w.topk == topk && w.kpool == kpool)),
+            dsa_l.iter().all(|&l| mla_w[l]
+                .as_ref()
+                .is_some_and(|w| w.topk == topk && w.kpool == kpool)),
             "resident step: DSA layers disagree on topk / kpool"
         );
         let sparse = !super::super::mla::indexer_is_dense(pos0 + 1, topk);
         let g = self.gpu.as_mut().context("resident step without a GPU")?;
-        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        g.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         if let Some(w) = norm_w {
             let own = g.head_dev.is_none();
             g.resident = Some(Resident::new(&g.devs[0].0, &self.m.g, &w, own)?);
@@ -377,7 +420,23 @@ impl Glm5Engine {
         let dsa = &mut self.dsa[slot];
         let out = (|| -> Result<u32> {
             if whole_on && res.warm {
-                if let Some(t) = step_whole(&mut f, g, &mut res, dsa, &mla_w, &hp, &items, &dsa_l, pos0, tok, sparse, &s, gguf, embd, &host_embed)? {
+                if let Some(t) = step_whole(
+                    &mut f,
+                    g,
+                    &mut res,
+                    dsa,
+                    &mla_w,
+                    &hp,
+                    &items,
+                    &dsa_l,
+                    pos0,
+                    tok,
+                    sparse,
+                    &s,
+                    gguf,
+                    embd,
+                    &host_embed,
+                )? {
                     return Ok(t);
                 }
                 // past the graphs' cache capacity: this token runs eagerly (and regrows)
@@ -395,8 +454,19 @@ impl Glm5Engine {
                     let seg = &rest[..cut];
                     let gr = tang_moe::gpu::Graph::capture(&s, |cs| {
                         for it in seg {
-                            exec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, cs, Pass::Capture)
-                                .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))?;
+                            exec(
+                                *it,
+                                &mut f,
+                                g,
+                                &res,
+                                dsa,
+                                &mla_w,
+                                &hp,
+                                pos0,
+                                cs,
+                                Pass::Capture,
+                            )
+                            .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))?;
                         }
                         Ok(())
                     })
@@ -406,11 +476,25 @@ impl Glm5Engine {
                         break;
                     }
                     // the boundary item's host side (its mHC post) in capture order
-                    exec(rest[cut], &mut f, g, &res, dsa, &mla_w, &hp, pos0, &s, Pass::HostOnly)?;
+                    exec(
+                        rest[cut],
+                        &mut f,
+                        g,
+                        &res,
+                        dsa,
+                        &mla_w,
+                        &hp,
+                        pos0,
+                        &s,
+                        Pass::HostOnly,
+                    )?;
                     rest = &rest[cut + 1..];
                 }
                 res.graphs = Some(graphs);
-                eprintln!("glm5: resident step graph captured ({} segments)", res.graphs.as_ref().unwrap().len());
+                eprintln!(
+                    "glm5: resident step graph captured ({} segments)",
+                    res.graphs.as_ref().unwrap().len()
+                );
             }
             f.begin_async(&host_embed()?)?;
             drop(tr);
@@ -418,14 +502,39 @@ impl Glm5Engine {
                 let mut gi = graphs.iter();
                 gi.next().unwrap().launch(&s).map_err(ge)?;
                 for it in items.iter().filter(|it| boundary(it)) {
-                    exec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, &s, Pass::Replay)?;
-                    gi.next().context("step graph: segment count")?.launch(&s).map_err(ge)?;
+                    exec(
+                        *it,
+                        &mut f,
+                        g,
+                        &res,
+                        dsa,
+                        &mla_w,
+                        &hp,
+                        pos0,
+                        &s,
+                        Pass::Replay,
+                    )?;
+                    gi.next()
+                        .context("step graph: segment count")?
+                        .launch(&s)
+                        .map_err(ge)?;
                 }
                 // the replay skipped the host side of the mHC state machine
                 f.set_window(0)?;
             } else {
                 for it in &items {
-                    exec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, &s, Pass::Eager)?;
+                    exec(
+                        *it,
+                        &mut f,
+                        g,
+                        &res,
+                        dsa,
+                        &mla_w,
+                        &hp,
+                        pos0,
+                        &s,
+                        Pass::Eager,
+                    )?;
                 }
                 res.warm = true;
             }
@@ -458,7 +567,9 @@ impl Glm5Engine {
     /// `None` when the resident path does not apply (the caller runs [`Self::window`]).
     /// The tokens are appended to slot 0.
     pub(crate) fn window_resident(&mut self, toks: &[u32]) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
-        Ok(self.window_resident_src(toks, None)?.map(|(_, ids, hn)| (ids, hn)))
+        Ok(self
+            .window_resident_src(toks, None)?
+            .map(|(_, ids, hn)| (ids, hn)))
     }
 
     /// [`Self::window_resident`] whose rows after `toks` come from the device: `dev =
@@ -483,7 +594,10 @@ impl Glm5Engine {
     ) -> Result<Option<(Vec<u32>, Vec<u32>, Vec<f32>)>> {
         let slot = 0;
         let t = toks.len() + dev.map_or(0, |d| d.1);
-        if t == 0 || std::env::var("TANG_GLM5_RES_WINDOW").is_ok_and(|v| v == "0") || !self.resident_ready(slot) {
+        if t == 0
+            || std::env::var("TANG_GLM5_RES_WINDOW").is_ok_and(|v| v == "0")
+            || !self.resident_ready(slot)
+        {
             return Ok(None);
         }
         let hp = self.m.hp.clone();
@@ -519,7 +633,10 @@ impl Glm5Engine {
         if g.mhc_f.as_ref().is_none_or(|f| f.max_t() < t) {
             return Ok(None);
         }
-        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        g.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         if let Some(w) = norm_w {
             let own = g.head_dev.is_none();
             g.resident = Some(Resident::new(&g.devs[0].0, &self.m.g, &w, own)?);
@@ -576,7 +693,8 @@ impl Glm5Engine {
             }
             let items = plan(&hp);
             let is_dsa = |it: &Item| matches!(it, Item::Dsa(_));
-            let graph_on = !prof_on() && !std::env::var("TANG_GLM5_RES_WINDOW_GRAPH").is_ok_and(|v| v == "0");
+            let graph_on =
+                !prof_on() && !std::env::var("TANG_GLM5_RES_WINDOW_GRAPH").is_ok_and(|v| v == "0");
             let have = res.wgraphs.iter().any(|(tt, _)| *tt == t);
             if graph_on && !have && res.wwarm.contains(&t) {
                 // capture pass: records only (the mHC host state walked once, DSA cores
@@ -590,8 +708,20 @@ impl Glm5Engine {
                     let seg = &rest[..cut];
                     let gr = tang_moe::gpu::Graph::capture(&s, |cs| {
                         for it in seg {
-                            wexec(*it, &mut f, g, res_ro, dsa, &mla_w, &hp, pos0, t, cs, Pass::Capture)
-                                .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))?;
+                            wexec(
+                                *it,
+                                &mut f,
+                                g,
+                                res_ro,
+                                dsa,
+                                &mla_w,
+                                &hp,
+                                pos0,
+                                t,
+                                cs,
+                                Pass::Capture,
+                            )
+                            .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))?;
                         }
                         Ok(())
                     })
@@ -600,11 +730,26 @@ impl Glm5Engine {
                     if cut == rest.len() {
                         break;
                     }
-                    wexec(rest[cut], &mut f, g, res_ro, dsa, &mla_w, &hp, pos0, t, &s, Pass::HostOnly)?;
+                    wexec(
+                        rest[cut],
+                        &mut f,
+                        g,
+                        res_ro,
+                        dsa,
+                        &mla_w,
+                        &hp,
+                        pos0,
+                        t,
+                        &s,
+                        Pass::HostOnly,
+                    )?;
                     rest = &rest[cut + 1..];
                 }
                 res.wgraphs.push((t, graphs));
-                eprintln!("glm5: resident window graph captured (t {t}, {} segments)", res.wgraphs.last().unwrap().1.len());
+                eprintln!(
+                    "glm5: resident window graph captured (t {t}, {} segments)",
+                    res.wgraphs.last().unwrap().1.len()
+                );
             }
             match dev {
                 None => f.begin_async(&r)?,
@@ -612,7 +757,11 @@ impl Glm5Engine {
                     if res.embd.is_none() {
                         let rb = embd.row_bytes()? as u64;
                         let ty = embed_ty(embd.ty).unwrap();
-                        res.embd = Some(Some((DevBuf::from_slice(gguf.bytes(embd)).map_err(ge)?, rb, ty)));
+                        res.embd = Some(Some((
+                            DevBuf::from_slice(gguf.bytes(embd)).map_err(ge)?,
+                            rb,
+                            ty,
+                        )));
                     }
                     let (tab, rbb, ty) = {
                         let e = res.embd.as_ref().unwrap().as_ref().context("embed table")?;
@@ -625,20 +774,51 @@ impl Glm5Engine {
                     let ef = res.m.func("rs_embed").map_err(ge)?;
                     let (ni, hci) = (n as i32, hc as i32);
                     for i in 0..t {
-                        let (tp, rp) = (wb.wtok.ptr + 4 * i as u64, f.r_ptr() + (i * hc * n * 4) as u64);
-                        unsafe { launch(ef, (n.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, &s, args![tab, rbb, ty, tp, rp, ni, hci])? };
+                        let (tp, rp) = (
+                            wb.wtok.ptr + 4 * i as u64,
+                            f.r_ptr() + (i * hc * n * 4) as u64,
+                        );
+                        unsafe {
+                            launch(
+                                ef,
+                                (n.div_ceil(256) as u32, 1, 1),
+                                (256, 1, 1),
+                                0,
+                                &s,
+                                args![tab, rbb, ty, tp, rp, ni, hci],
+                            )?
+                        };
                     }
                     f.set_window(t)?;
                 }
             }
-            let gi = res.wgraphs.iter().position(|(tt, _)| *tt == t).filter(|_| graph_on);
+            let gi = res
+                .wgraphs
+                .iter()
+                .position(|(tt, _)| *tt == t)
+                .filter(|_| graph_on);
             if let Some(gi) = gi {
                 let graphs = &res.wgraphs[gi].1;
                 let mut it_g = graphs.iter();
                 it_g.next().unwrap().launch(&s).map_err(ge)?;
                 for it in items.iter().filter(|it| is_dsa(it)) {
-                    wexec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, t, &s, Pass::Replay)?;
-                    it_g.next().context("window graph: segment count")?.launch(&s).map_err(ge)?;
+                    wexec(
+                        *it,
+                        &mut f,
+                        g,
+                        &res,
+                        dsa,
+                        &mla_w,
+                        &hp,
+                        pos0,
+                        t,
+                        &s,
+                        Pass::Replay,
+                    )?;
+                    it_g.next()
+                        .context("window graph: segment count")?
+                        .launch(&s)
+                        .map_err(ge)?;
                 }
                 f.set_window(0)?;
             } else {
@@ -655,7 +835,19 @@ impl Glm5Engine {
                         let _ = s.sync();
                         std::time::Instant::now()
                     });
-                    wexec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, t, &s, Pass::Eager)?;
+                    wexec(
+                        *it,
+                        &mut f,
+                        g,
+                        &res,
+                        dsa,
+                        &mla_w,
+                        &hp,
+                        pos0,
+                        t,
+                        &s,
+                        Pass::Eager,
+                    )?;
                     if let Some(t0) = t0 {
                         s.sync().map_err(ge)?;
                         let k = match it {
@@ -667,14 +859,23 @@ impl Glm5Engine {
                         };
                         prof_add(k, t0.elapsed().as_secs_f64());
                         // the routed experts' union over the t rows (one line per layer)
-                        if let (Item::Ffn(l), true) = (it, std::env::var("TANG_GLM5_WIN_PROF_UNION").is_ok_and(|v| v == "1")) {
+                        if let (Item::Ffn(l), true) = (
+                            it,
+                            std::env::var("TANG_GLM5_WIN_PROF_UNION").is_ok_and(|v| v == "1"),
+                        ) {
                             if let Some(m) = g.layers[*l].as_ref().filter(|m| m.exps.is_some()) {
                                 let nr = m.p.top_k;
-                                if let Some(ids) = super::super::moe::gpu::last_route_ids(&g.devs[0].1, t * nr)? {
+                                if let Some(ids) =
+                                    super::super::moe::gpu::last_route_ids(&g.devs[0].1, t * nr)?
+                                {
                                     let mut u = ids.clone();
                                     u.sort_unstable();
                                     u.dedup();
-                                    eprintln!("prof union l{l} t {t}: {} distinct of {} routed", u.len(), t * nr);
+                                    eprintln!(
+                                        "prof union l{l} t {t}: {} distinct of {} routed",
+                                        u.len(),
+                                        t * nr
+                                    );
                                     prof_add("win.moe_union", u.len() as f64 / (t * nr) as f64);
                                 }
                             }
@@ -689,7 +890,11 @@ impl Glm5Engine {
             s.sync().map_err(ge)?;
             let ids = wb.ids.read::<u32>(0, t).map_err(ge)?;
             let hn = wb.hn.read::<f32>(0, t * n).map_err(ge)?;
-            let all = if dev.is_some() { wb.wtok.read::<u32>(0, t).map_err(ge)? } else { toks.to_vec() };
+            let all = if dev.is_some() {
+                wb.wtok.read::<u32>(0, t).map_err(ge)?
+            } else {
+                toks.to_vec()
+            };
             Ok((all, ids, hn))
         })();
         if out.is_err() {
@@ -711,7 +916,10 @@ impl Glm5Engine {
     /// layers drop their device watermarks (latent / indexer rows, pools) and host mirrors
     /// back to the kept position, and slot 0's tokens are truncated. Nothing re-runs.
     pub(crate) fn rewind_resident(&mut self, t: usize, keep: usize) -> Result<()> {
-        ensure!(keep >= 1 && keep <= t, "rewind_resident: keep {keep} of {t}");
+        ensure!(
+            keep >= 1 && keep <= t,
+            "rewind_resident: keep {keep} of {t}"
+        );
         if keep == t {
             return Ok(());
         }
@@ -724,12 +932,21 @@ impl Glm5Engine {
             }
         }
         let g = self.gpu.as_mut().context("rewind_resident without a GPU")?;
-        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        g.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident rewind: {e}");
         let f = g.mhc_f.as_ref().context("fused mHC: no instance")?;
         let s = f.stream();
-        let res = g.resident.as_mut().context("rewind_resident: no resident window")?;
-        let wb = res.win.as_ref().context("rewind_resident: no window buffers")?;
+        let res = g
+            .resident
+            .as_mut()
+            .context("rewind_resident: no resident window")?;
+        let wb = res
+            .win
+            .as_ref()
+            .context("rewind_resident: no window buffers")?;
         ensure!(wb.cap >= t, "rewind_resident: window cap {}", wb.cap);
         for l in 0..hp.n_layer {
             if hp.is_kda[l] {
@@ -737,7 +954,8 @@ impl Glm5Engine {
                 let regs = k.state_regions(0);
                 let base = wb.ck[l].as_ref().unwrap().ptr + ((keep - 1) * wb.ck_bytes[l]) as u64;
                 tang_moe::gpu::copy_d2d_async(regs[0].0, base, regs[0].1, s).map_err(ge)?;
-                tang_moe::gpu::copy_d2d_async(regs[1].0, base + regs[0].1 as u64, regs[1].1, s).map_err(ge)?;
+                tang_moe::gpu::copy_d2d_async(regs[1].0, base + regs[0].1 as u64, regs[1].1, s)
+                    .map_err(ge)?;
             } else {
                 let cu = g.mla_k[l].as_ref().context("mla not resident")?;
                 cu.set_seq(0);
@@ -762,15 +980,24 @@ impl Glm5Engine {
     /// resident state exists (the caller reads the logits back instead). The MTP drafter.
     pub(crate) fn head_top(&self, hn: &[f32]) -> Result<Option<Vec<u32>>> {
         let (n, nv) = (self.m.hp.n_embd, self.m.hp.n_vocab);
-        let Some(g) = self.gpu.as_ref() else { return Ok(None) };
-        let (Some(hd), Some(res)) = (g.head_dev.as_ref(), g.resident.as_ref()) else { return Ok(None) };
-        let Some(wb) = res.win.as_ref() else { return Ok(None) };
+        let Some(g) = self.gpu.as_ref() else {
+            return Ok(None);
+        };
+        let (Some(hd), Some(res)) = (g.head_dev.as_ref(), g.resident.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(wb) = res.win.as_ref() else {
+            return Ok(None);
+        };
         let t = hn.len() / n;
         if t == 0 || t > wb.cap {
             return Ok(None);
         }
         let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 head_top: {e}");
-        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        g.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
         let s = &hd.s;
         // the draft rows go through the window's h buffer (free between windows)
         wb.hn.write_async(0, hn, s).map_err(ge)?;
@@ -778,14 +1005,31 @@ impl Glm5Engine {
         for i in 0..t {
             let xi = wb.hn.ptr + (i * n * 4) as u64;
             unsafe {
-                launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![xi, hd.xq8.ptr, n as u32, 1u32])?;
+                launch(
+                    hd.k5.q8,
+                    ((n / 32) as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    s,
+                    args![xi, hd.xq8.ptr, n as u32, 1u32],
+                )?;
                 launch(
                     hd.k5.gemv8,
                     (nv.div_ceil(K5_WARPS) as u32, 1, 1),
                     (128, 1, 1),
                     (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                     s,
-                    args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr, nv as u32, 1u32, nv as u32, n as u32],
+                    args![
+                        hd.dw.w,
+                        0u32,
+                        hd.xq8.ptr,
+                        hd.xq8.ptr + n as u64,
+                        hd.out.ptr,
+                        nv as u32,
+                        1u32,
+                        nv as u32,
+                        n as u32
+                    ],
                 )?;
                 let (lg, nvi, tp, inc) = (hd.out.ptr, nv as i32, wb.ids.ptr + 4 * i as u64, 0i32);
                 launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![lg, nvi, tp, inc])?;
@@ -808,15 +1052,25 @@ impl Glm5Engine {
 
     /// The last resident step's normed h row, read back (the host drafter's fallback).
     pub(crate) fn step_h_read(&self) -> Result<Option<Vec<f32>>> {
-        let Some(g) = self.gpu.as_ref() else { return Ok(None) };
-        let Some(hd) = g.head_dev.as_ref() else { return Ok(None) };
-        Ok(Some(hd.xf.read::<f32>(0, self.m.hp.n_embd).map_err(|e| anyhow::anyhow!("step h: {e}"))?))
+        let Some(g) = self.gpu.as_ref() else {
+            return Ok(None);
+        };
+        let Some(hd) = g.head_dev.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            hd.xf
+                .read::<f32>(0, self.m.hp.n_embd)
+                .map_err(|e| anyhow::anyhow!("step h: {e}"))?,
+        ))
     }
 
     /// Order the next trunk launch (the fused mHC stream) after `ev`.
     pub(crate) fn trunk_wait(&self, ev: &tang_moe::gpu::Event) -> Result<()> {
         if let Some(f) = self.gpu.as_ref().and_then(|g| g.mhc_f.as_ref()) {
-            f.stream().wait(ev).map_err(|e| anyhow::anyhow!("trunk wait: {e}"))?;
+            f.stream()
+                .wait(ev)
+                .map_err(|e| anyhow::anyhow!("trunk wait: {e}"))?;
         }
         Ok(())
     }
@@ -824,10 +1078,18 @@ impl Glm5Engine {
     /// After a resident step: copy its greedy token and normed h row into `dst` (`[tok u32]`
     /// then `[h f32; n]`) ON the trunk stream (in order: the next step cannot overwrite them
     /// first), and return an event recorded after the copy.
-    pub(crate) fn step_out_stage(&self, dst_tok: u64, dst_h: u64) -> Result<Option<tang_moe::gpu::Event>> {
+    pub(crate) fn step_out_stage(
+        &self,
+        dst_tok: u64,
+        dst_h: u64,
+    ) -> Result<Option<tang_moe::gpu::Event>> {
         let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("step stage: {e}");
-        let Some((tp, hp)) = self.step_out_ptrs() else { return Ok(None) };
-        let Some(f) = self.gpu.as_ref().and_then(|g| g.mhc_f.as_ref()) else { return Ok(None) };
+        let Some((tp, hp)) = self.step_out_ptrs() else {
+            return Ok(None);
+        };
+        let Some(f) = self.gpu.as_ref().and_then(|g| g.mhc_f.as_ref()) else {
+            return Ok(None);
+        };
         let s = f.stream();
         tang_moe::gpu::copy_d2d_async(dst_tok, tp, 4, s).map_err(ge)?;
         tang_moe::gpu::copy_d2d_async(dst_h, hp, self.m.hp.n_embd * 4, s).map_err(ge)?;
@@ -895,7 +1157,10 @@ fn step_whole(
                 Some((DevBuf::from_slice(gguf.bytes(embd)).map_err(ge)?, rb, ty))
             }
             None => {
-                eprintln!("glm5: step graph 2: token_embd is {}, embed stays a host gather", embd.ty.name());
+                eprintln!(
+                    "glm5: step graph 2: token_embd is {}, embed stays a host gather",
+                    embd.ty.name()
+                );
                 None
             }
         });
@@ -924,7 +1189,12 @@ fn step_whole(
         res.whole_cap = cap;
         let _tr = span("capture");
         f.set_window(1)?;
-        let dev_embed = res.embd.as_ref().unwrap().as_ref().map(|(b, rb, ty)| (b.ptr, *rb, *ty));
+        let dev_embed = res
+            .embd
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .map(|(b, rb, ty)| (b.ptr, *rb, *ty));
         let rp = f.r_ptr();
         let res_ro: &Resident = res;
         let gr = tang_moe::gpu::Graph::capture(s, |cs| {
@@ -933,10 +1203,30 @@ fn step_whole(
                     let ef = res_ro.m.func("rs_embed").map_err(ge)?;
                     let (tp, ni, hci) = (res_ro.tok.ptr, hp.n_embd as i32, hp.hc as i32);
                     let grid = hp.n_embd.div_ceil(256) as u32;
-                    unsafe { launch(ef, (grid, 1, 1), (256, 1, 1), 0, cs, args![tab, rb, ty, tp, rp, ni, hci])? };
+                    unsafe {
+                        launch(
+                            ef,
+                            (grid, 1, 1),
+                            (256, 1, 1),
+                            0,
+                            cs,
+                            args![tab, rb, ty, tp, rp, ni, hci],
+                        )?
+                    };
                 }
                 for it in items {
-                    exec(*it, f, g, res_ro, dsa, mla_w, hp, pos0, cs, Pass::Whole(sparse))?;
+                    exec(
+                        *it,
+                        f,
+                        g,
+                        res_ro,
+                        dsa,
+                        mla_w,
+                        hp,
+                        pos0,
+                        cs,
+                        Pass::Whole(sparse),
+                    )?;
                 }
                 Ok(())
             };
@@ -945,7 +1235,10 @@ fn step_whole(
         .map_err(|e| anyhow::anyhow!("whole step graph capture: {e}"))?;
         f.set_window(0)?;
         res.whole[sp] = Some(gr);
-        eprintln!("glm5: whole step graph captured ({}, DSA cache cap {cap} rows)", if sparse { "sparse" } else { "dense" });
+        eprintln!(
+            "glm5: whole step graph captured ({}, DSA cache cap {cap} rows)",
+            if sparse { "sparse" } else { "dense" }
+        );
     }
     let tr = span("embed");
     if res.dev_tp != Some((tok, pos0)) {
@@ -967,7 +1260,8 @@ fn step_whole(
             let np = pos0 / w.kpool;
             if cu.pool_upto() < np {
                 let c = &dsa[l];
-                cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, pos0, 0, np, &mut [], s).map_err(ge)?;
+                cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, pos0, 0, np, &mut [], s)
+                    .map_err(ge)?;
             }
         }
     }
@@ -1032,7 +1326,11 @@ pub(crate) fn prof_add(k: &'static str, secs: f64) {
 
 /// The accumulated stages: `name total_ms calls`, one line each.
 pub(crate) fn prof_report() -> String {
-    PROF.lock().unwrap().iter().map(|(k, s, c)| format!("prof {k}: {:.2} ms total, {c} calls\n", s * 1e3)).collect()
+    PROF.lock()
+        .unwrap()
+        .iter()
+        .map(|(k, s, c)| format!("prof {k}: {:.2} ms total, {c} calls\n", s * 1e3))
+        .collect()
 }
 
 /// One [`Item`] of [`Glm5Engine::window_resident`] (t rows) on `s`. `Pass` as for
@@ -1058,7 +1356,9 @@ fn wexec(
     let (n, nv) = (hp.n_embd, hp.n_vocab);
     let rb = n * 4;
     if pass == Pass::HostOnly {
-        let Item::Dsa(l) = it else { anyhow::bail!("window graph: only DSA items are boundaries") };
+        let Item::Dsa(l) = it else {
+            anyhow::bail!("window graph: only DSA items are boundaries")
+        };
         return f.post_dev(g.mla_p[l].as_ref().context("mla not resident")?.y_ptr(t)?);
     }
     let capture = pass == Pass::Capture;
@@ -1066,8 +1366,14 @@ fn wexec(
         Item::PreAttn(l) => {
             let dst = if hp.is_kda[l] {
                 let k = g.kda_l[l].as_ref().context("kda not resident")?;
-                if kda_rows() || k.rows_fast_ok(t) { k.x_ptr() } else { wb.kx.ptr }
-            } else { g.mla_p[l].as_ref().context("mla not resident")?.x_ptr(t)? };
+                if kda_rows() || k.rows_fast_ok(t) {
+                    k.x_ptr()
+                } else {
+                    wb.kx.ptr
+                }
+            } else {
+                g.mla_p[l].as_ref().context("mla not resident")?.x_ptr(t)?
+            };
             f.pre_dev(g.mhc_g[l].as_ref().context("mhc not resident")?, l, 0, dst)?;
         }
         Item::Kda(l) => {
@@ -1096,7 +1402,10 @@ fn wexec(
         }
         Item::Dsa(l) => {
             ensure!(!capture, "window graph: a DSA item inside a capture");
-            let (cu, p) = (g.mla_k[l].as_ref().unwrap(), g.mla_p[l].as_ref().context("mla not resident")?);
+            let (cu, p) = (
+                g.mla_k[l].as_ref().unwrap(),
+                g.mla_p[l].as_ref().context("mla not resident")?,
+            );
             let w = mla_w[l].as_ref().unwrap();
             cu.set_seq(0);
             let c = &mut dsa[l];
@@ -1105,8 +1414,15 @@ fn wexec(
             let kv_len = pos0 + t;
             if !cu.rows_fit(kv_len) {
                 if let Some(from) = c.stale_from.take().filter(|&fr| fr < pos0) {
-                    cu.refresh_mirrors(from, pos0 - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
-                        .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
+                    cu.refresh_mirrors(
+                        from,
+                        pos0 - from,
+                        &mut c.lat16,
+                        &mut c.idx_k,
+                        &mut c.idx_g,
+                        &mut c.valid,
+                    )
+                    .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
                 }
             }
             c.lat16.resize(kv_len * dl, 0);
@@ -1120,7 +1436,12 @@ fn wexec(
             }
         }
         Item::PreFfn(l) => {
-            f.pre_dev(g.mhc_g[l].as_ref().context("mhc not resident")?, l, 1, wb.fx.ptr)?;
+            f.pre_dev(
+                g.mhc_g[l].as_ref().context("mhc not resident")?,
+                l,
+                1,
+                wb.fx.ptr,
+            )?;
         }
         Item::Ffn(l) => {
             let m = g.layers[l].as_ref().context("FFN not resident")?;
@@ -1137,22 +1458,53 @@ fn wexec(
                 let (xf, logits) = unsafe {
                     if let Some(hd) = g.head_dev.as_ref() {
                         let xf = hd.xf.ptr;
-                        launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![hi, nw, xf, ni, eps])?;
-                        launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32])?;
+                        launch(
+                            nf,
+                            (1, 1, 1),
+                            (1024, 1, 1),
+                            0,
+                            s,
+                            args![hi, nw, xf, ni, eps],
+                        )?;
+                        launch(
+                            hd.k5.q8,
+                            ((n / 32) as u32, 1, 1),
+                            (32, 1, 1),
+                            0,
+                            s,
+                            args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32],
+                        )?;
                         launch(
                             hd.k5.gemv8,
                             (nv.div_ceil(K5_WARPS) as u32, 1, 1),
                             (128, 1, 1),
-                            (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                            (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16)
+                                as u32,
                             s,
-                            args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
-                                nv as u32, 1u32, nv as u32, n as u32],
+                            args![
+                                hd.dw.w,
+                                0u32,
+                                hd.xq8.ptr,
+                                hd.xq8.ptr + n as u64,
+                                hd.out.ptr,
+                                nv as u32,
+                                1u32,
+                                nv as u32,
+                                n as u32
+                            ],
                         )?;
                         (xf, hd.out.ptr)
                     } else {
                         let (dw, k5, xb, ob) = res.head.as_ref().context("resident: no LM head")?;
                         let xf = xb.ptr;
-                        launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![hi, nw, xf, ni, eps])?;
+                        launch(
+                            nf,
+                            (1, 1, 1),
+                            (1024, 1, 1),
+                            0,
+                            s,
+                            args![hi, nw, xf, ni, eps],
+                        )?;
                         launch(
                             k5.gemv,
                             (nv.div_ceil(128) as u32, 1, 1),
@@ -1166,7 +1518,16 @@ fn wexec(
                 };
                 d2d(wb.hn.ptr + (i * rb) as u64, xf, rb, s).map_err(ge)?;
                 let (nvi, tp, inc) = (nv as i32, wb.ids.ptr + 4 * i as u64, 0i32);
-                unsafe { launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![logits, nvi, tp, inc])? };
+                unsafe {
+                    launch(
+                        af,
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        s,
+                        args![logits, nvi, tp, inc],
+                    )?
+                };
             }
         }
     }
@@ -1189,7 +1550,11 @@ fn plan(hp: &super::super::Hparams) -> Vec<Item> {
     let mut v = Vec::new();
     for l in 0..hp.n_layer {
         v.push(Item::PreAttn(l));
-        v.push(if hp.is_kda[l] { Item::Kda(l) } else { Item::Dsa(l) });
+        v.push(if hp.is_kda[l] {
+            Item::Kda(l)
+        } else {
+            Item::Dsa(l)
+        });
         v.push(Item::PreFfn(l));
         v.push(Item::Ffn(l));
     }
@@ -1269,7 +1634,8 @@ fn exec(
             if let Pass::Whole(sparse) = pass {
                 let _tr = span("dsa");
                 cu.set_seq(0);
-                let y = p.window_dev_pos(cu, mla_w[l].as_ref().unwrap(), res.tok.ptr + 4, sparse, s)?;
+                let y =
+                    p.window_dev_pos(cu, mla_w[l].as_ref().unwrap(), res.tok.ptr + 4, sparse, s)?;
                 debug_assert_eq!(y, p.y_ptr(1)?);
                 return f.post_dev(y);
             }
@@ -1286,8 +1652,15 @@ fn exec(
                     // the append regrows the device caches and re-uploads [0, pos0) from the
                     // host mirrors: bring the stale rows over first (rare: capacity doubles)
                     if let Some(from) = c.stale_from.take().filter(|&f| f < pos0) {
-                        cu.refresh_mirrors(from, pos0 - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
-                            .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
+                        cu.refresh_mirrors(
+                            from,
+                            pos0 - from,
+                            &mut c.lat16,
+                            &mut c.idx_k,
+                            &mut c.idx_g,
+                            &mut c.valid,
+                        )
+                        .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
                     }
                 }
                 c.lat16.resize(kv_len * dl, 0);
@@ -1327,15 +1700,31 @@ fn exec(
                 if let Some(hd) = g.head_dev.as_ref() {
                     let xf = hd.xf.ptr;
                     launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![h, nw, xf, ni, eps])?;
-                    launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32])?;
+                    launch(
+                        hd.k5.q8,
+                        ((n / 32) as u32, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        s,
+                        args![hd.xf.ptr, hd.xq8.ptr, n as u32, 1u32],
+                    )?;
                     launch(
                         hd.k5.gemv8,
                         (nv.div_ceil(K5_WARPS) as u32, 1, 1),
                         (128, 1, 1),
                         (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                         s,
-                        args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
-                            nv as u32, 1u32, nv as u32, n as u32],
+                        args![
+                            hd.dw.w,
+                            0u32,
+                            hd.xq8.ptr,
+                            hd.xq8.ptr + n as u64,
+                            hd.out.ptr,
+                            nv as u32,
+                            1u32,
+                            nv as u32,
+                            n as u32
+                        ],
                     )?;
                     hd.out.ptr
                 } else {
@@ -1353,13 +1742,25 @@ fn exec(
                     ob.ptr
                 }
             };
-            let (nvi, tp, inc) = (nv as i32, res.tok.ptr, i32::from(matches!(pass, Pass::Whole(_))));
-            unsafe { launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![logits, nvi, tp, inc])? };
+            let (nvi, tp, inc) = (
+                nv as i32,
+                res.tok.ptr,
+                i32::from(matches!(pass, Pass::Whole(_))),
+            );
+            unsafe {
+                launch(
+                    af,
+                    (1, 1, 1),
+                    (1024, 1, 1),
+                    0,
+                    s,
+                    args![logits, nvi, tp, inc],
+                )?
+            };
         }
     }
     Ok(())
 }
-
 
 /// Bumped whenever shared scratch a captured graph may point at can be reallocated (a host
 /// window, a new resident window length): the MTP draft-cell graphs recapture after it.
@@ -1422,20 +1823,34 @@ impl DraftCell {
     /// `norms` = enorm, hnorm, attn_norm, ffn_norm, shared_head_norm (host f32). `None` when
     /// a piece is not supported (no device head, an embed / eh_proj type the kernels don't
     /// read): the caller keeps the host cell.
-    pub(crate) fn new(e: &Glm5Engine, layer: usize, norms: [&[f32]; 5], eps: f32) -> Result<Option<Self>> {
-        let Some(g) = e.gpu.as_ref() else { return Ok(None) };
+    pub(crate) fn new(
+        e: &Glm5Engine,
+        layer: usize,
+        norms: [&[f32]; 5],
+        eps: f32,
+    ) -> Result<Option<Self>> {
+        let Some(g) = e.gpu.as_ref() else {
+            return Ok(None);
+        };
         let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
         let gpu = &g.devs[0].0;
         gpu.bind().map_err(ge)?;
         let (n, nv) = (e.m.hp.n_embd, e.m.hp.n_vocab);
         let gg = &e.m.g;
         let embd = gg.info("token_embd.weight")?;
-        let Some(ty) = embed_ty(embd.ty) else { return Ok(None) };
+        let Some(ty) = embed_ty(embd.ty) else {
+            return Ok(None);
+        };
         let info = gg.info(&super::super::t(layer, "nextn.eh_proj.weight"))?;
-        let eh = super::super::moe::gpu::upload(&super::super::moe::W::Gguf(gg, info), 1, n, 2 * n)?;
+        let eh =
+            super::super::moe::gpu::upload(&super::super::moe::W::Gguf(gg, info), 1, n, 2 * n)?;
         eprintln!(
             "glm5: MTP draft cell on the device (eh_proj {} {}x{} row_bytes {}, embed {})",
-            info.ty.name(), n, 2 * n, eh.w.row_bytes, embd.ty.name()
+            info.ty.name(),
+            n,
+            2 * n,
+            eh.w.row_bytes,
+            embd.ty.name()
         );
         let f4 = |k: usize| DevBuf::zeroed_elems::<f32>(k).map_err(ge);
         let b = |k: usize| DevBuf::zeroed(k).map_err(ge);
@@ -1446,7 +1861,12 @@ impl DraftCell {
                 Some(t) => t,
                 None => gg.info("token_embd.weight")?,
             };
-            Some(super::super::moe::gpu::upload(&super::super::moe::W::Gguf(gg, info), 1, nv, n)?)
+            Some(super::super::moe::gpu::upload(
+                &super::super::moe::W::Gguf(gg, info),
+                1,
+                nv,
+                n,
+            )?)
         } else {
             None
         };
@@ -1461,8 +1881,18 @@ impl DraftCell {
             s: tang_moe::gpu::Stream::blocking().map_err(ge)?,
             k5: super::super::moe::gpu::Kernels5::new(gpu)?,
             eh,
-            embd: (DevBuf::from_slice(gg.bytes(embd)).map_err(ge)?, embd.row_bytes()? as u64, ty),
-            norms: [up(norms[0])?, up(norms[1])?, up(norms[2])?, up(norms[3])?, up(norms[4])?],
+            embd: (
+                DevBuf::from_slice(gg.bytes(embd)).map_err(ge)?,
+                embd.row_bytes()? as u64,
+                ty,
+            ),
+            norms: [
+                up(norms[0])?,
+                up(norms[1])?,
+                up(norms[2])?,
+                up(norms[3])?,
+                up(norms[4])?,
+            ],
             eps,
             tp: DevBuf::zeroed_elems::<u32>(2).map_err(ge)?,
             ids: DevBuf::zeroed_elems::<u32>(16).map_err(ge)?,
@@ -1496,7 +1926,10 @@ impl DraftCell {
     pub(crate) fn stage_next(&mut self, n: usize) -> (u64, u64) {
         let i = self.stage_i % STAGE;
         self.stage_i += 1;
-        (self.stage_t.ptr + 4 * i as u64, self.stage_h.ptr + (i * n * 4) as u64)
+        (
+            self.stage_t.ptr + 4 * i as u64,
+            self.stage_h.ptr + (i * n * 4) as u64,
+        )
     }
 
     /// The cell's launches on `s` (capturable).
@@ -1520,21 +1953,48 @@ impl DraftCell {
         let addg = (n.div_ceil(256) as u32, 1, 1);
         let ni2 = ni;
         let (tab, rb, ty) = (self.embd.0.ptr, self.embd.1, self.embd.2);
-        let (tpp, cat, cat_h, hin) = (self.tp.ptr, self.cat.ptr, self.cat.ptr + (n * 4) as u64, self.hin.ptr);
+        let (tpp, cat, cat_h, hin) = (
+            self.tp.ptr,
+            self.cat.ptr,
+            self.cat.ptr + (n * 4) as u64,
+            self.hin.ptr,
+        );
         let one = 1i32;
         let nw = |i: usize| self.norms[i].ptr;
         let dbg = std::env::var("TANG_GLM5_MTP_CELL_EAGER").is_ok_and(|v| v == "1");
         let chk = |what: &str| -> Result<()> {
             if dbg {
-                s.sync().map_err(|er| anyhow::anyhow!("draft cell stage {what}: {er}"))?;
+                s.sync()
+                    .map_err(|er| anyhow::anyhow!("draft cell stage {what}: {er}"))?;
             }
             Ok(())
         };
         unsafe {
-            launch(ef, addg, (256, 1, 1), 0, s, args![tab, rb, ty, tpp, cat, ni, one])?;
+            launch(
+                ef,
+                addg,
+                (256, 1, 1),
+                0,
+                s,
+                args![tab, rb, ty, tpp, cat, ni, one],
+            )?;
             let (w0, w1) = (nw(0), nw(1));
-            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![cat, w0, cat, ni, eps])?;
-            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![hin, w1, cat_h, ni, eps])?;
+            launch(
+                nf,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                s,
+                args![cat, w0, cat, ni, eps],
+            )?;
+            launch(
+                nf,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                s,
+                args![hin, w1, cat_h, ni, eps],
+            )?;
         }
         chk("embed+norms")?;
         // eh_proj: Q8_0 on the k5 q8 + gemv8 pair (the trunk's KDA / head projection
@@ -1543,20 +2003,39 @@ impl DraftCell {
             let (cq, xp) = (self.cq.ptr, self.x.ptr);
             let n2 = (2 * n) as u32;
             unsafe {
-                launch(self.k5.q8, ((2 * n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![cat, cq, n2, 1u32])?;
+                launch(
+                    self.k5.q8,
+                    ((2 * n / 32) as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    s,
+                    args![cat, cq, n2, 1u32],
+                )?;
                 launch(
                     self.k5.gemv8,
                     (n.div_ceil(K5_WARPS) as u32, 1, 1),
                     (128, 1, 1),
                     (K5_WARPS * ((self.eh.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                     s,
-                    args![self.eh.w, 0u32, cq, cq + 2 * n as u64, xp, n as u32, 1u32, n as u32, n2],
+                    args![
+                        self.eh.w,
+                        0u32,
+                        cq,
+                        cq + 2 * n as u64,
+                        xp,
+                        n as u32,
+                        1u32,
+                        n as u32,
+                        n2
+                    ],
                 )?;
             }
         } else {
             let quant = self.eh.w.ty > 1;
             if quant {
-                self.k5.fast.q8(s, cat, self.cq.ptr, self.cq2.ptr, self.cd.ptr, 2 * n, 1)?;
+                self.k5
+                    .fast
+                    .q8(s, cat, self.cq.ptr, self.cq2.ptr, self.cd.ptr, 2 * n, 1)?;
             }
             let a = super::super::moe::gpu::Act {
                 xf: cat,
@@ -1565,18 +2044,36 @@ impl DraftCell {
                 xd: if quant { self.cd.ptr } else { 0 },
                 xs: 2 * n,
             };
-            self.k5.fast.gemv(s, self.eh.w, 0, a, self.x.ptr, n, 1, n, 2 * n)?;
+            self.k5
+                .fast
+                .gemv(s, self.eh.w, 0, a, self.x.ptr, n, 1, n, 2 * n)?;
         }
         chk("eh_proj")?;
         let (xp, xa, w2) = (self.x.ptr, p.x_ptr(1)?, nw(2));
-        unsafe { launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w2, xa, ni, eps])? };
+        unsafe {
+            launch(
+                nf,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                s,
+                args![xp, w2, xa, ni, eps],
+            )?
+        };
         cu.set_seq(0);
         let y = p.window_dev_pos(cu, w, tpp + 4, sparse, s)?;
         chk("dsa")?;
         let (fx, fy, w3, w4, ho) = (self.fx.ptr, self.fy.ptr, nw(3), nw(4), self.hout.ptr);
         unsafe {
             launch(ad, addg, (256, 1, 1), 0, s, args![xp, y, ni2])?;
-            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w3, fx, ni, eps])?;
+            launch(
+                nf,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                s,
+                args![xp, w3, fx, ni, eps],
+            )?;
         }
         super::super::moe::gpu::ffn_async(&self.mk, s, moe, fx, fy, 1)?;
         chk("ffn")?;
@@ -1584,17 +2081,41 @@ impl DraftCell {
         let lg = self.logits.ptr;
         unsafe {
             launch(ad, addg, (256, 1, 1), 0, s, args![xp, fy, ni2])?;
-            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w4, ho, ni, eps])?;
+            launch(
+                nf,
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                s,
+                args![xp, w4, ho, ni, eps],
+            )?;
             match (g.head_dev.as_ref(), self.own_head.as_ref()) {
                 (Some(hd), _) => {
-                    launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![ho, hq, n as u32, 1u32])?;
+                    launch(
+                        hd.k5.q8,
+                        ((n / 32) as u32, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        s,
+                        args![ho, hq, n as u32, 1u32],
+                    )?;
                     launch(
                         hd.k5.gemv8,
                         (nv.div_ceil(K5_WARPS) as u32, 1, 1),
                         (128, 1, 1),
                         (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                         s,
-                        args![hd.dw.w, 0u32, hq, hq + n as u64, lg, nv as u32, 1u32, nv as u32, n as u32],
+                        args![
+                            hd.dw.w,
+                            0u32,
+                            hq,
+                            hq + n as u64,
+                            lg,
+                            nv as u32,
+                            1u32,
+                            nv as u32,
+                            n as u32
+                        ],
                     )?;
                 }
                 (None, Some(oh)) => {
@@ -1662,7 +2183,8 @@ impl DraftCell {
         if self.graphs[sp].is_none() && !eager {
             let me: &Self = self;
             let gr = tang_moe::gpu::Graph::capture(&me.s, |cs| {
-                me.enqueue(g, cu, p, w, moe, n, nv, sparse, cs).map_err(|er| tang_moe::gpu::Error(format!("{er:#}")))
+                me.enqueue(g, cu, p, w, moe, n, nv, sparse, cs)
+                    .map_err(|er| tang_moe::gpu::Error(format!("{er:#}")))
             })
             .map_err(|er| anyhow::anyhow!("draft cell capture: {er}"))?;
             self.graphs[sp] = Some(gr);
@@ -1697,12 +2219,15 @@ impl DraftCell {
         if sparse {
             let np = pos / w.kpool;
             if cu.pool_upto() < np {
-                cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, pos, 0, np, &mut [], s).map_err(ge)?;
+                cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, pos, 0, np, &mut [], s)
+                    .map_err(ge)?;
             }
         }
         if eager {
             self.enqueue(g, cu, p, w, moe, n, nv, sparse, s)?;
-            s.sync().map_err(|er| anyhow::anyhow!("draft cell (eager, pos {pos}, sparse {sparse}): {er}"))?;
+            s.sync().map_err(|er| {
+                anyhow::anyhow!("draft cell (eager, pos {pos}, sparse {sparse}): {er}")
+            })?;
         } else {
             self.graphs[sp].as_ref().unwrap().launch(s).map_err(ge)?;
         }
@@ -1724,13 +2249,25 @@ impl DraftCell {
 
 /// Before a host-staged drafter cell: pull the rows the device cells left only on the
 /// device into the drafter cache's mirrors.
-pub(crate) fn refresh_cell_mirrors(cu: &super::super::mla::cuda::MlaCuda, c: &mut DsaCache) -> Result<()> {
-    let Some(from) = c.stale_from else { return Ok(()) };
+pub(crate) fn refresh_cell_mirrors(
+    cu: &super::super::mla::cuda::MlaCuda,
+    c: &mut DsaCache,
+) -> Result<()> {
+    let Some(from) = c.stale_from else {
+        return Ok(());
+    };
     let rows = c.valid.len();
     cu.set_seq(0);
     if rows > from {
-        cu.refresh_mirrors(from, rows - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
-            .map_err(|er| anyhow::anyhow!("mtp mirror refresh: {er}"))?;
+        cu.refresh_mirrors(
+            from,
+            rows - from,
+            &mut c.lat16,
+            &mut c.idx_k,
+            &mut c.idx_g,
+            &mut c.valid,
+        )
+        .map_err(|er| anyhow::anyhow!("mtp mirror refresh: {er}"))?;
     }
     c.stale_from = None;
     Ok(())
@@ -1763,17 +2300,38 @@ mod draft_cell_tests {
                 *q = (rnd() % 31) as u8;
             }
         }
-        let x: Vec<f32> = (0..cols).map(|_| (rnd() % 1000) as f32 / 1000.0 - 0.5).collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|_| (rnd() % 1000) as f32 / 1000.0 - 0.5)
+            .collect();
         let k5 = Kernels5::new(&gpu).unwrap();
         let wd = DevBuf::from_slice(&w).unwrap();
-        let g5 = G5W { base: wd.ptr, estride: (rows * rb) as u64, row_bytes: rb as u32, ty: 8 };
+        let g5 = G5W {
+            base: wd.ptr,
+            estride: (rows * rb) as u64,
+            row_bytes: rb as u32,
+            ty: 8,
+        };
         let xb = DevBuf::from_slice(&x).unwrap();
-        let (xq, xq2, xd) = (DevBuf::zeroed(8 * cols).unwrap(), DevBuf::zeroed(8 * cols).unwrap(), DevBuf::zeroed(8 * cols / 8).unwrap());
+        let (xq, xq2, xd) = (
+            DevBuf::zeroed(8 * cols).unwrap(),
+            DevBuf::zeroed(8 * cols).unwrap(),
+            DevBuf::zeroed(8 * cols / 8).unwrap(),
+        );
         let y = DevBuf::zeroed(rows * 4).unwrap();
         let s = Stream::blocking().unwrap();
-        k5.fast.q8(&s, xb.ptr, xq.ptr, xq2.ptr, xd.ptr, cols, 1).unwrap();
-        let a = Act { xf: xb.ptr, xq: xq.ptr, xq2: xq2.ptr, xd: xd.ptr, xs: cols };
-        k5.fast.gemv(&s, g5, 0, a, y.ptr, rows, 1, rows, cols).unwrap();
+        k5.fast
+            .q8(&s, xb.ptr, xq.ptr, xq2.ptr, xd.ptr, cols, 1)
+            .unwrap();
+        let a = Act {
+            xf: xb.ptr,
+            xq: xq.ptr,
+            xq2: xq2.ptr,
+            xd: xd.ptr,
+            xs: cols,
+        };
+        k5.fast
+            .gemv(&s, g5, 0, a, y.ptr, rows, 1, rows, cols)
+            .unwrap();
         s.sync().expect("g5f_gemv 4096x8192 Q8_0");
         let got = y.read::<f32>(0, rows).unwrap();
         // host reference in f32 over the dequantised weights

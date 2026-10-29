@@ -94,7 +94,10 @@ impl Verifier {
     /// Whether unit `u`'s next window is checked (the `LAYERS` / `WINDOWS` filters).
     pub fn wants(&self, u: usize) -> bool {
         self.cfg.units.as_ref().is_none_or(|v| v.contains(&u))
-            && self.cfg.windows.is_none_or(|n| self.windows.get(u).copied().unwrap_or(0) < n)
+            && self
+                .cfg
+                .windows
+                .is_none_or(|n| self.windows.get(u).copied().unwrap_or(0) < n)
     }
 
     /// The index the next window of unit `u` will get.
@@ -118,11 +121,20 @@ impl Verifier {
             .filter_map(|t| {
                 let (g, c) = (t.resolve(gpu)?, t.resolve(cpu)?);
                 let s = stat(&g, &c, tol);
-                Some(Row { name: t.name, bad: s.bad(tol), stat: s, layout: t.layout.clone() })
+                Some(Row {
+                    name: t.name,
+                    bad: s.bad(tol),
+                    stat: s,
+                    layout: t.layout.clone(),
+                })
             })
             .collect();
         let any_bad = rows.iter().any(|r| r.bad);
-        let ctx = if ctx.is_empty() { String::new() } else { format!(" {ctx}") };
+        let ctx = if ctx.is_empty() {
+            String::new()
+        } else {
+            format!(" {ctx}")
+        };
         let head = format!("w{win} {}{u}{ctx}", self.unit);
         if self.verbose || any_bad {
             for r in &rows {
@@ -131,7 +143,8 @@ impl Verifier {
         }
         for r in &rows {
             if r.stat.rel_l2.is_finite() {
-                self.worst.push((r.stat.rel_l2, format!("w{win} {}{u} {}", self.unit, r.name)));
+                self.worst
+                    .push((r.stat.rel_l2, format!("w{win} {}{u} {}", self.unit, r.name)));
             }
         }
         let verdict = any_bad.then(|| attribute(spec, &rows, gpu, cpu, tol, self.cfg.poison));
@@ -156,12 +169,19 @@ impl Verifier {
             }
             for (side, taps) in [("gpu", gpu), ("cpu", cpu)] {
                 for (name, v) in taps.iter() {
-                    write_f32(&dir.join(format!("w{win}_{}{u}_{name}.{side}.f32", self.unit)), v);
+                    write_f32(
+                        &dir.join(format!("w{win}_{}{u}_{name}.{side}.f32", self.unit)),
+                        v,
+                    );
                 }
             }
             self.log(format_args!("{head}: tensors written to {}", dir.display()));
         }
-        Report { window: win, rows, verdict }
+        Report {
+            window: win,
+            rows,
+            verdict,
+        }
     }
 
     pub fn summary(&self) -> Vec<String> {
@@ -173,7 +193,11 @@ impl Verifier {
             self.failed,
             self.first.as_deref().unwrap_or("none (all within tol)")
         )];
-        out.extend(w.iter().take(10).map(|(r, what)| format!("SUMMARY worst rel {r:.3e} {what}")));
+        out.extend(
+            w.iter()
+                .take(10)
+                .map(|(r, what)| format!("SUMMARY worst rel {r:.3e} {what}")),
+        );
         out
     }
 }

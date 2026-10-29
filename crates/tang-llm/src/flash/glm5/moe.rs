@@ -365,8 +365,11 @@ pub fn experts(
     // then the weighted sums into `y` in the serial loop's exact order (expert id, then
     // pair) — so the floats round identically and the oracle stays bit-exact
     use rayon::prelude::*;
-    let active: Vec<(usize, &Vec<(usize, usize)>)> =
-        by_expert.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
+    let active: Vec<(usize, &Vec<(usize, usize)>)> = by_expert
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
     let outs: Vec<Vec<Vec<f32>>> = active
         .par_iter()
         .map(|&(e, pairs)| -> Result<Vec<Vec<f32>>> {
@@ -462,7 +465,11 @@ pub const SRC: &str = include_str!("moe_cuda.cuh");
 
 /// The KDA projection kernels ([`kda_dev::K5_SRC`]), appended to [`SRC`] at compile so
 /// `g5_dot`/`g5_deq` are in scope for them.
-pub const K5_SRC: &str = concat!(include_str!("moe_cuda.cuh"), "\n", include_str!("kda_k5.cuh"));
+pub const K5_SRC: &str = concat!(
+    include_str!("moe_cuda.cuh"),
+    "\n",
+    include_str!("kda_k5.cuh")
+);
 
 #[cfg(feature = "cuda")]
 #[path = "moe_gpu.rs"]

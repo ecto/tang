@@ -378,6 +378,16 @@ fn main() -> Result<()> {
     if cmd == "glm5-ref" {
         return tang_llm::flash::glm5::forward::cli(&args[1..]);
     }
+    // DeepSeek-V4.1-Flash: deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N]
+    #[cfg(feature = "cuda")]
+    if cmd == "deepseek-serve" {
+        return deepseek_serve(&args[1..]);
+    }
+    // deepseek-profile <dir> [--devices ..] [--steps N] [--prompt-tokens N] [--direct]
+    #[cfg(feature = "cuda")]
+    if cmd == "deepseek-profile" {
+        return deepseek_profile(&args[1..]);
+    }
     // GLM-5.3-Flash (`glm5-next`) runs on its own engine, on any build.
     if matches!(cmd, "flash-generate" | "flash-bench")
         && tang_llm::flash::glm5::engine::is_glm5(&dir)
@@ -621,6 +631,96 @@ fn serve_flash(args: &[String]) -> Result<()> {
         hardware: probe(Backend::Cuda),
     };
     tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
+}
+
+/// Where a DeepSeek step's time goes: prefill + N decode/verify forwards with the step
+/// timeline on (docs/observability.md, "DeepSeek").
+#[cfg(feature = "cuda")]
+fn deepseek_profile(args: &[String]) -> Result<()> {
+    let usage = "deepseek-profile <checkpoint dir> [--devices 0,1,..] [--steps N] [--prompt-tokens N] [--direct] [--graph-debug] [--no-spec] [--ctx N]";
+    let dir = PathBuf::from(args.first().context(usage)?);
+    let mut devices: Vec<usize> = Vec::new();
+    let mut o = tang_llm::flash::deepseek::serve::ProfileOpts {
+        steps: 20,
+        prompt_tokens: 64,
+        direct: false,
+        graph_debug: false,
+        spec: std::env::var("DS_SPEC").map_or(true, |v| v != "0"),
+    };
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--steps" => o.steps = val()?.parse()?,
+            "--prompt-tokens" => o.prompt_tokens = val()?.parse()?,
+            "--direct" => o.direct = true,
+            "--graph-debug" => o.graph_debug = true,
+            "--no-spec" => o.spec = false,
+            "--ctx" => std::env::set_var("DS41_CTX", val()?),
+            "--devices" => {
+                devices = val()?
+                    .split(',')
+                    .map(|d| d.trim().parse::<usize>())
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            other => bail!("unknown option {other} ({usage})"),
+        }
+    }
+    let _otel = tang_llm::telemetry::init();
+    let table = tang_llm::flash::deepseek::serve::profile(&dir, &devices, &o)?;
+    print!("{table}");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn deepseek_serve(args: &[String]) -> Result<()> {
+    let usage =
+        "deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N] [--expert-slots N] [--devices 0,1,..]";
+    let dir = PathBuf::from(args.first().context(usage)?);
+    let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    let mut devices: Vec<usize> = Vec::new();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--host" => host = val()?.clone(),
+            "--port" => port = val()?.parse()?,
+            "--ctx" => std::env::set_var("DS41_CTX", val()?),
+            "--expert-slots" => std::env::set_var("DS_EXPERT_SLOTS", val()?),
+            // GPU ordinals for expert parallelism (needs --features ep), e.g. 0,1,2,3
+            "--devices" => {
+                devices = val()?
+                    .split(',')
+                    .map(|d| d.trim().parse::<usize>())
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            "--api-key-file" => {
+                let path = val()?;
+                key =
+                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+            }
+            other => bail!("unknown option {other} ({usage})"),
+        }
+    }
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
+        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+    }
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let opts = tang_llm::server::Options {
+        addr: format!("{host}:{port}"),
+        model: Some(name),
+        key,
+        dtype: Dtype::Q4,
+        hardware: probe(Backend::Cuda),
+    };
+    tang_llm::server::serve(opts, move |_name: &str| {
+        tang_llm::flash::deepseek::serve::DsServe::load_on(&dir, &devices)
+    })
 }
 
 fn serve(backend: Backend, args: &[String]) -> Result<()> {

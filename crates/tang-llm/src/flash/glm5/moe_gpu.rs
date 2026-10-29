@@ -158,19 +158,33 @@ impl Kernels {
         };
         // TANG_GLM5_MOE_MINB: __launch_bounds__ min blocks for g5f_gu / g5f_down. 6 (<= 80 regs)
         // measured best on the H200 l4 T1: 1 -> 126 us (86 / 139 regs), 4 -> 115, 6 -> 110
-        let minb = std::env::var("TANG_GLM5_MOE_MINB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8);
+        let minb = std::env::var("TANG_GLM5_MOE_MINB")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8);
         // TANG_GLM5_MOE_DOT32=0: the 8-weight Q4_K / Q5_K row decode instead of the 32-chunk one
         let dot32 = i32::from(env_on("TANG_GLM5_MOE_DOT32", true));
         // TANG_GLM5_MOE_UNROLL: unroll of the 32-chunk dot loops (more loads in flight per lane)
-        let unroll = std::env::var("TANG_GLM5_MOE_UNROLL").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+        let unroll = std::env::var("TANG_GLM5_MOE_UNROLL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
         // TANG_GLM5_MOE_FUSE2=0: gate / up (and the down row pair) as two separate row loops
         let fuse2 = i32::from(env_on("TANG_GLM5_MOE_FUSE2", true));
         // TANG_GLM5_MOE_GUR / _DNR: rows a warp in the routed gate|up / split down (0 = the
         // one-row g5f_gu / two-row g5f_down_split); same sums, so the same h / y bit for bit
         // TANG_GLM5_MOE_PF (mask, default 2): L2 prefetch of a warp's whole rows before its dot,
         // 1 = gate|up, 2 = down (no-op on the math; B300 l11 Q6_K down 52 -> 44 us, gate|up no gain)
-        let pf = std::env::var("TANG_GLM5_MOE_PF").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(2);
-        let rows = |key: &str, d: usize| std::env::var(key).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d);
+        let pf = std::env::var("TANG_GLM5_MOE_PF")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(2);
+        let rows = |key: &str, d: usize| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(d)
+        };
         let gur = rows("TANG_GLM5_MOE_GUR", 1).min(8);
         let dnr = match rows("TANG_GLM5_MOE_DNR", 2).min(16) {
             1 => 2,
@@ -180,7 +194,10 @@ impl Kernels {
         let gux = rows("TANG_GLM5_MOE_GUX", 4).min(16);
         // TANG_GLM5_MOE_SEL2=0: the previous top-k select (smem scan, per-round global stores)
         // (2, default: the select rounds as warp reductions — same choices, same float ops)
-        let sel2 = std::env::var("TANG_GLM5_MOE_SEL2").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(2);
+        let sel2 = std::env::var("TANG_GLM5_MOE_SEL2")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(2);
         // TANG_GLM5_MOE_LDU: unroll of the 8-weight row loop (Q8_0 shared / dense rows; same order)
         let ldu = rows("TANG_GLM5_MOE_LDU", 4).min(16);
         // TANG_GLM5_MOE_K4R / _K4NR / _K4DR / _K4DNR / _K4MINB: g5f_gu4 / g5f_down4 rows a block,
@@ -202,7 +219,9 @@ impl Kernels {
         let m = g.module(&src)?;
         let debug = std::env::var("TANG_GLM5_MOE_DEBUG").is_ok_and(|v| v == "1");
         let smem_optin = g
-            .attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+            .attribute(
+                cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )
             .unwrap_or(48 * 1024) as u32;
         Ok(Kernels {
             logits: m.func("g5_router_logits")?,
@@ -254,7 +273,11 @@ impl Kernels {
         let r = |f: Func| {
             let mut v = 0i32;
             unsafe {
-                cu::cuFuncGetAttribute(&mut v, cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+                cu::cuFuncGetAttribute(
+                    &mut v,
+                    cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS,
+                    f,
+                );
             }
             v
         };
@@ -392,7 +415,9 @@ fn repack_on() -> bool {
 /// [`upload`] for the MoE / dense FFN weights: Q8_0 (k % 32 == 0) and Q6_K (k % 256 == 0) are
 /// repacked to [`G5_Q8R`] / [`G5_Q6R`] (when [`repack_on`]); everything else as `upload`.
 pub fn upload_ffn(w: &W, n_mat: usize, rows: usize, cols: usize) -> Result<DevW> {
-    let W::Gguf(g, t) = *w else { return upload(w, n_mat, rows, cols) };
+    let W::Gguf(g, t) = *w else {
+        return upload(w, n_mat, rows, cols);
+    };
     let ty = ggml_id(t)?;
     let ok = match ty {
         8 => cols % 32 == 0,
@@ -410,7 +435,12 @@ pub fn upload_ffn(w: &W, n_mat: usize, rows: usize, cols: usize) -> Result<DevW>
     );
     let rb = t.row_bytes()?;
     let src = g.bytes(t);
-    ensure!(src.len() == n_mat * rows * rb, "{}: {} bytes, want {n_mat}x{rows}x{rb}", t.name, src.len());
+    ensure!(
+        src.len() == n_mat * rows * rb,
+        "{}: {} bytes, want {n_mat}x{rows}x{rb}",
+        t.name,
+        src.len()
+    );
     let nrb = repacked_row_bytes(ty, cols);
     let mut out = Vec::with_capacity(n_mat * rows * nrb);
     for row in src.chunks_exact(rb) {
@@ -493,12 +523,16 @@ impl DevMoe {
     pub fn active_bytes(&self) -> usize {
         let p = &self.p;
         let mlp = |m: &Mlp, ff: usize| {
-            ff * (m.0.w.row_bytes as usize + m.1.w.row_bytes as usize) + p.hidden * m.2.w.row_bytes as usize
+            ff * (m.0.w.row_bytes as usize + m.1.w.row_bytes as usize)
+                + p.hidden * m.2.w.row_bytes as usize
         };
         if let Some(d) = &self.dense {
             return mlp(d, p.ff_dense);
         }
-        let r = self.router.as_ref().map_or(0, |w| p.n_expert * w.w.row_bytes as usize);
+        let r = self
+            .router
+            .as_ref()
+            .map_or(0, |w| p.n_expert * w.w.row_bytes as usize);
         let e = self.exps.as_ref().map_or(0, |m| p.top_k * mlp(m, p.ff_exp));
         let s = self.sh.as_ref().map_or(0, |m| mlp(m, p.ff_shexp));
         r + e + s
@@ -572,7 +606,9 @@ pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) ->
 /// scratch; the caller syncs its stream first). `None` before any routed call.
 pub fn last_route_ids(k: &Kernels, n: usize) -> Result<Option<Vec<u32>>> {
     let pool = k.pool.borrow();
-    let Some(Some(b)) = pool.bufs.get(P_IDS) else { return Ok(None) };
+    let Some(Some(b)) = pool.bufs.get(P_IDS) else {
+        return Ok(None);
+    };
     if b.len < n * 4 {
         return Ok(None);
     }
@@ -709,7 +745,14 @@ fn row16(ws: &[G5W]) -> usize {
 
 /// Dynamic smem for a 4-warp block staging two rows a warp, or `(0, 0)` (no staging) when it
 /// exceeds the device's opt-in; sets the function's opt-in once when it passes 48 KB.
-fn smem_for(k: &Kernels, pool: &mut Pool, which: usize, f: Func, r16: usize, pairs: usize) -> Result<(i32, u32)> {
+fn smem_for(
+    k: &Kernels,
+    pool: &mut Pool,
+    which: usize,
+    f: Func,
+    r16: usize,
+    pairs: usize,
+) -> Result<(i32, u32)> {
     if !k.stage || r16 == 0 {
         return Ok((0, 0));
     }
@@ -735,7 +778,15 @@ fn smem_for(k: &Kernels, pool: &mut Pool, which: usize, f: Func, r16: usize, pai
 
 /// Dynamic shared memory of g5f_gu4 / g5f_down4 (moe_cuda.cuh `g5f_k4_smem`): the cp.async ring
 /// of the largest K4-eligible view (`(view, k)`), opted in past 48 KB. `m` matrices a batch.
-fn k4_smem(k: &Kernels, pool: &mut Pool, which: usize, f: Func, views: &[(G5W, usize)], m: usize, nr: usize) -> Result<u32> {
+fn k4_smem(
+    k: &Kernels,
+    pool: &mut Pool,
+    which: usize,
+    f: Func,
+    views: &[(G5W, usize)],
+    m: usize,
+    nr: usize,
+) -> Result<u32> {
     // gate|up (m == 2) keeps Q8_0r rows on the g5f_gux row code (moe_cuda.cuh g5f_k4_ok)
     let ok = |w: &G5W, kk: usize| {
         let nb = kk / 256;
@@ -752,11 +803,19 @@ fn k4_smem(k: &Kernels, pool: &mut Pool, which: usize, f: Func, views: &[(G5W, u
         .map(|(w, kk)| (k.k4ns * m * (4096 / kk) * nr * w.row_bytes as usize) as u32)
         .max()
         .unwrap_or(0);
-    ensure!(bytes <= k.smem_optin, "g5f K4: {bytes} B of shared memory > opt-in {}", k.smem_optin);
+    ensure!(
+        bytes <= k.smem_optin,
+        "g5f K4: {bytes} B of shared memory > opt-in {}",
+        k.smem_optin
+    );
     if bytes > 48 * 1024 && pool.smem_set[which] < bytes {
         gpu::check(
             unsafe {
-                cu::cuFuncSetAttribute(f, cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32)
+                cu::cuFuncSetAttribute(
+                    f,
+                    cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
             },
             "cuFuncSetAttribute(g5f K4 smem)",
         )?;
@@ -787,7 +846,15 @@ fn ffn_fast(
     let p = &m.p;
     let hid = p.hidden;
     let (gate, up, down, ff, lim, nr, routed) = match (&m.dense, &m.exps) {
-        (Some(d), _) => (d.0.w, d.1.w, d.2.w, p.ff_dense, p.limit_shexp, 1usize, false),
+        (Some(d), _) => (
+            d.0.w,
+            d.1.w,
+            d.2.w,
+            p.ff_dense,
+            p.limit_shexp,
+            1usize,
+            false,
+        ),
         (None, Some(e)) => (e.0.w, e.1.w, e.2.w, p.ff_exp, p.limit_exp, p.top_k, true),
         (None, None) => bail!("no dense FFN and no routed experts"),
     };
@@ -807,7 +874,11 @@ fn ffn_fast(
     // x -> int8 codes + per-32 scales
     let xq = pool.get(P_XQ, t * hid)?;
     let xd = pool.get(P_XD, t * hid / 32 * 4)?;
-    let xq2 = if k.act2 { pool.get(P_XQ2, t * hid)? } else { 0u64 };
+    let xq2 = if k.act2 {
+        pool.get(P_XQ2, t * hid)?
+    } else {
+        0u64
+    };
     let fused = routed
         && k.route1
         && m.router.as_ref().is_some_and(|r| r.w.ty == 0)
@@ -818,13 +889,13 @@ fn ffn_fast(
     if !fused {
         unsafe {
             gpu::launch(
-            k.f_q8,
-            (hid.div_ceil(128) as u32, t as u32, 1),
-            blk,
-            0,
-            s,
-            tang_moe::args![x, xq, xq2, xd, hidi],
-        )?;
+                k.f_q8,
+                (hid.div_ceil(128) as u32, t as u32, 1),
+                blk,
+                0,
+                s,
+                tang_moe::args![x, xq, xq2, xd, hidi],
+            )?;
         }
     }
 
@@ -841,7 +912,10 @@ fn ffn_fast(
         if fused {
             if pool.cnt_zero < t {
                 let c = pool.get(P_CNT, t * 4)?;
-                gpu::check(unsafe { cu::cuMemsetD32Async(c, 0, t, s.0) }, "cuMemsetD32Async(cnt)")?;
+                gpu::check(
+                    unsafe { cu::cuMemsetD32Async(c, 0, t, s.0) },
+                    "cuMemsetD32Async(cnt)",
+                )?;
                 pool.cnt_zero = t;
             }
             let cnt = pool.get(P_CNT, t * 4)?;
@@ -852,51 +926,53 @@ fn ffn_fast(
                     blk,
                     0,
                     s,
-                    tang_moe::args![rw, x, sc, nei, hidi, xq, xq2, xd, bias, idp, wtp, kki, norm, scale, cnt],
+                    tang_moe::args![
+                        rw, x, sc, nei, hidi, xq, xq2, xd, bias, idp, wtp, kki, norm, scale, cnt
+                    ],
                 )?;
             }
         } else {
-        unsafe {
-            if rw.ty == 0 && hid % 8 == 0 {
-                gpu::launch(
-                    k.f_router,
-                    (ne as u32, t as u32, 1),
-                    blk,
-                    0,
-                    s,
-                    tang_moe::args![rw, x, sc, nei, hidi],
-                )?;
-            } else {
-                gpu::launch(
-                    k.logits,
-                    grid(t * ne),
-                    BLOCK,
-                    0,
-                    s,
-                    tang_moe::args![rw, x, sc, ti, nei, hidi],
-                )?;
+            unsafe {
+                if rw.ty == 0 && hid % 8 == 0 {
+                    gpu::launch(
+                        k.f_router,
+                        (ne as u32, t as u32, 1),
+                        blk,
+                        0,
+                        s,
+                        tang_moe::args![rw, x, sc, nei, hidi],
+                    )?;
+                } else {
+                    gpu::launch(
+                        k.logits,
+                        grid(t * ne),
+                        BLOCK,
+                        0,
+                        s,
+                        tang_moe::args![rw, x, sc, ti, nei, hidi],
+                    )?;
+                }
+                if p.n_group <= 1 && ne <= 1024 {
+                    gpu::launch(
+                        k.f_select,
+                        (t as u32, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![sc, bias, idp, wtp, nei, kki, norm, scale],
+                    )?;
+                } else {
+                    let (ng, tg) = (p.n_group as i32, p.topk_group as i32);
+                    gpu::launch(
+                        k.select,
+                        grid(t),
+                        BLOCK,
+                        0,
+                        s,
+                        tang_moe::args![sc, bias, idp, wtp, ti, nei, kki, ng, tg, norm, scale],
+                    )?;
+                }
             }
-            if p.n_group <= 1 && ne <= 1024 {
-                gpu::launch(
-                    k.f_select,
-                    (t as u32, 1, 1),
-                    (32, 1, 1),
-                    0,
-                    s,
-                    tang_moe::args![sc, bias, idp, wtp, nei, kki, norm, scale],
-                )?;
-            } else {
-                let (ng, tg) = (p.n_group as i32, p.topk_group as i32);
-                gpu::launch(
-                    k.select,
-                    grid(t),
-                    BLOCK,
-                    0,
-                    s,
-                    tang_moe::args![sc, bias, idp, wtp, ti, nei, kki, ng, tg, norm, scale],
-                )?;
-            }
-        }
         }
         (idp, wtp, nr as i32, ne as i32)
     } else {
@@ -934,14 +1010,25 @@ fn ffn_fast(
     unsafe {
         gpu::trace::bytes(gu_b);
         if k.k4 && smg == 0 {
-            let sm4 = k4_smem(k, pool, 3, k.f_gu4, &[(gate, hid), (up, hid), (sg, hid), (su, hid)], 2, k.k4nr)?;
+            let sm4 = k4_smem(
+                k,
+                pool,
+                3,
+                k.f_gu4,
+                &[(gate, hid), (up, hid), (sg, hid), (su, hid)],
+                2,
+                k.k4nr,
+            )?;
             gpu::launch(
                 k.f_gu4,
                 (hs.div_ceil(k.k4r) as u32, slots as u32, t as u32),
                 blk,
                 sm4,
                 s,
-                tang_moe::args![gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims],
+                tang_moe::args![
+                    gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim,
+                    lims
+                ],
             )?;
         } else if k.gux > 0 && smg == 0 {
             gpu::launch(
@@ -950,7 +1037,10 @@ fn ffn_fast(
                 blk,
                 0,
                 s,
-                tang_moe::args![gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims],
+                tang_moe::args![
+                    gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim,
+                    lims
+                ],
             )?;
         } else if k.gur > 0 && smg == 0 {
             gpu::launch(
@@ -959,19 +1049,23 @@ fn ffn_fast(
                 blk,
                 0,
                 s,
-                tang_moe::args![gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims],
+                tang_moe::args![
+                    gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim,
+                    lims
+                ],
             )?;
         } else {
-        gpu::launch(
-            k.f_gu,
-            (hs.div_ceil(4) as u32, slots as u32, t as u32),
-            blk,
-            smg,
-            s,
-            tang_moe::args![
-                gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim, lims, r16g
-            ],
-        )?;
+            gpu::launch(
+                k.f_gu,
+                (hs.div_ceil(4) as u32, slots as u32, t as u32),
+                blk,
+                smg,
+                s,
+                tang_moe::args![
+                    gate, up, sg, su, idp, kk, ne, x, xq, xq2, xd, h, hsi, ffi, ffsi, hidi, lim,
+                    lims, r16g
+                ],
+            )?;
         }
         gpu::launch(
             k.f_q8,
@@ -992,7 +1086,9 @@ fn ffn_fast(
                     blk,
                     sm4,
                     s,
-                    tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi],
+                    tang_moe::args![
+                        down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi
+                    ],
                 )?;
             } else if k.dnr > 0 && smd == 0 {
                 gpu::launch(
@@ -1001,17 +1097,21 @@ fn ffn_fast(
                     blk,
                     0,
                     s,
-                    tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi],
+                    tang_moe::args![
+                        down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi
+                    ],
                 )?;
             } else {
-            gpu::launch(
-                k.f_down_split,
-                (hid.div_ceil(8) as u32, slots as u32, t as u32),
-                blk,
-                smd,
-                s,
-                tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi, r16d],
-            )?;
+                gpu::launch(
+                    k.f_down_split,
+                    (hid.div_ceil(8) as u32, slots as u32, t as u32),
+                    blk,
+                    smd,
+                    s,
+                    tang_moe::args![
+                        down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi, r16d
+                    ],
+                )?;
             }
             let si = slots as i32;
             gpu::launch(
@@ -1029,7 +1129,9 @@ fn ffn_fast(
                 blk,
                 smd,
                 s,
-                tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d, swi],
+                tang_moe::args![
+                    down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d, swi
+                ],
             )?;
         }
     }
@@ -1143,14 +1245,25 @@ impl FastGemv {
             q8: m.func("g5f_q8")?,
             stage: !std::env::var("TANG_GLM5_MOE_STAGE").is_ok_and(|v| v == "0"),
             smem_optin: g
-                .attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+                .attribute(
+                    cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                )
                 .unwrap_or(48 * 1024) as u32,
         })
     }
 
     /// `x [t][xs]` f32 → `xq [t][xs]` codes, `xd [t][xs/32]` scales, `xq2` residual codes
     /// (0 = skip). Quantises the first `k` of each token (`k % 32 == 0`, `k <= xs`).
-    pub fn q8(&self, s: &Stream, x: u64, xq: u64, xq2: u64, xd: u64, k: usize, t: usize) -> Result<()> {
+    pub fn q8(
+        &self,
+        s: &Stream,
+        x: u64,
+        xq: u64,
+        xq2: u64,
+        xd: u64,
+        k: usize,
+        t: usize,
+    ) -> Result<()> {
         ensure!(k % 32 == 0, "g5f_q8: k {k} not a multiple of 32");
         let ki = k as i32;
         unsafe {
@@ -1187,7 +1300,11 @@ impl FastGemv {
             a.xs
         );
         ensure!(
-            if w.ty <= 1 { a.xf != 0 } else { a.xq != 0 && a.xd != 0 },
+            if w.ty <= 1 {
+                a.xf != 0
+            } else {
+                a.xq != 0 && a.xd != 0
+            },
             "g5f_gemv: ggml type {} needs {} activations",
             w.ty,
             if w.ty <= 1 { "f32" } else { "int8" }
@@ -1198,10 +1315,20 @@ impl FastGemv {
         let r16 = if self.stage { row16(&[w]) } else { 0 };
         let bytes = (8 * r16 * 16) as u32;
         let cap = self.smem_optin.min(48 * 1024);
-        let (r16, bytes) = if r16 == 0 || bytes > cap { (0, 0) } else { (r16, bytes) };
+        let (r16, bytes) = if r16 == 0 || bytes > cap {
+            (0, 0)
+        } else {
+            (r16, bytes)
+        };
         let (xf, xq, xq2, xd) = (a.xf, a.xq, a.xq2, a.xd);
-        let (xs, ys, ti, ri, ci, r16i) =
-            (a.xs as i32, ystride as i32, t_len as i32, rows as i32, cols as i32, r16 as i32);
+        let (xs, ys, ti, ri, ci, r16i) = (
+            a.xs as i32,
+            ystride as i32,
+            t_len as i32,
+            rows as i32,
+            cols as i32,
+            r16 as i32,
+        );
         unsafe {
             gpu::launch(
                 self.gemv,

@@ -184,9 +184,7 @@ impl ConvState {
     pub fn zeros(cfg: &KdaConfig, slots: usize) -> Self {
         Self(vec![
             0f32;
-            slots
-                * cfg.conv_dim()
-                * cfg.d_conv.saturating_sub(1)
+            slots * cfg.conv_dim() * cfg.d_conv.saturating_sub(1)
         ])
     }
 
@@ -345,7 +343,13 @@ pub fn conv1d_prefill(
 }
 
 /// The one-token conv of decode. `x` = `[b][3*nh*hd]` → `[b][3*nh*hd]`, `conv` updated.
-pub fn conv1d_decode(x: &[f32], w: &[f32], conv: &mut ConvState, cfg: &KdaConfig, b: usize) -> Result<Vec<f32>> {
+pub fn conv1d_decode(
+    x: &[f32],
+    w: &[f32],
+    conv: &mut ConvState,
+    cfg: &KdaConfig,
+    b: usize,
+) -> Result<Vec<f32>> {
     let ch = cfg.conv_dim();
     let kc = cfg.d_conv;
     ensure!(x.len() == b * ch && w.len() == ch * kc, "conv shapes");
@@ -362,7 +366,11 @@ pub fn conv1d_decode(x: &[f32], w: &[f32], conv: &mut ConvState, cfg: &KdaConfig
             y[bi * ch + c] = silu(acc as f32);
             // shift: the oldest drops, the new input becomes the newest
             for s in 0..kc - 1 {
-                conv.chan(cfg, bi, c)[s] = if s + 1 < kc - 1 { hist[s + 1] } else { x[bi * ch + c] };
+                conv.chan(cfg, bi, c)[s] = if s + 1 < kc - 1 {
+                    hist[s + 1]
+                } else {
+                    x[bi * ch + c]
+                };
             }
         }
     }
@@ -423,10 +431,20 @@ fn head_step(
 /// The token-serial decode step: `qkv` `[b][3*nh*hd]` (conv output, **not** l2-normed),
 /// `g` `[b][nh*hd]` pre-exp, `beta` `[b][nh]` post-sigmoid. Updates `state` in place,
 /// returns `o` = `[b][nh*hd]` (pre-gated-norm).
-pub fn kda_decode(qkv: &[f32], g: &[f32], beta: &[f32], state: &mut KdaState, cfg: &KdaConfig, b: usize) -> Result<Vec<f32>> {
+pub fn kda_decode(
+    qkv: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut KdaState,
+    cfg: &KdaConfig,
+    b: usize,
+) -> Result<Vec<f32>> {
     let (nh, hd) = (cfg.heads, cfg.head_dim);
     let ch = 3 * nh * hd;
-    ensure!(qkv.len() == b * ch && g.len() == b * nh * hd && beta.len() == b * nh, "decode shapes");
+    ensure!(
+        qkv.len() == b * ch && g.len() == b * nh * hd && beta.len() == b * nh,
+        "decode shapes"
+    );
     let mut out = vec![0f32; b * nh * hd];
     for bi in 0..b {
         let row = &qkv[bi * ch..(bi + 1) * ch];
@@ -489,8 +507,10 @@ pub fn kda_chunk(
             for ti in 0..t {
                 let row = &qkv[(bi * t + ti) * ch..(bi * t + ti + 1) * ch];
                 q[ti * hd..(ti + 1) * hd].copy_from_slice(&row[h * hd..(h + 1) * hd]);
-                k[ti * hd..(ti + 1) * hd].copy_from_slice(&row[nh * hd + h * hd..nh * hd + (h + 1) * hd]);
-                v[ti * hd..(ti + 1) * hd].copy_from_slice(&row[2 * nh * hd + h * hd..2 * nh * hd + (h + 1) * hd]);
+                k[ti * hd..(ti + 1) * hd]
+                    .copy_from_slice(&row[nh * hd + h * hd..nh * hd + (h + 1) * hd]);
+                v[ti * hd..(ti + 1) * hd]
+                    .copy_from_slice(&row[2 * nh * hd + h * hd..2 * nh * hd + (h + 1) * hd]);
                 l2_norm(&mut q[ti * hd..(ti + 1) * hd], 1e-6);
                 l2_norm(&mut k[ti * hd..(ti + 1) * hd], 1e-6);
                 for x in &mut q[ti * hd..(ti + 1) * hd] {
@@ -508,9 +528,17 @@ pub fn kda_chunk(
                 let o0 = ci * c;
                 for ti in 0..c {
                     let r = o0 + ti;
-                    bet[r] = if r < t { beta[(bi * t + r) * nh + h] } else { 0.0 };
+                    bet[r] = if r < t {
+                        beta[(bi * t + r) * nh + h]
+                    } else {
+                        0.0
+                    };
                     for j in 0..hd {
-                        let gv = if r < t { g[(bi * t + r) * nh * hd + h * hd + j] } else { 0.0 };
+                        let gv = if r < t {
+                            g[(bi * t + r) * nh * hd + h * hd + j]
+                        } else {
+                            0.0
+                        };
                         gc[r * hd + j] = gv + if ti > 0 { gc[(r - 1) * hd + j] } else { 0.0 };
                     }
                 }
@@ -561,7 +589,9 @@ pub fn kda_chunk(
                         }
                         for x in 0..hd {
                             vp[i * hd + x] += w * v[(o0 + j) * hd + x] * bet[o0 + j];
-                            kp[i * hd + x] += w * k[(o0 + j) * hd + x] * bet[o0 + j]
+                            kp[i * hd + x] += w
+                                * k[(o0 + j) * hd + x]
+                                * bet[o0 + j]
                                 * gc[(o0 + j) * hd + x].exp();
                         }
                     }
@@ -592,7 +622,8 @@ pub fn kda_chunk(
                     for j in 0..=i {
                         let mut s = 0f64;
                         for x in 0..hd {
-                            s += (q[(o0 + i) * hd + x] as f64) * (k[(o0 + j) * hd + x] as f64)
+                            s += (q[(o0 + i) * hd + x] as f64)
+                                * (k[(o0 + j) * hd + x] as f64)
                                 * ((gc[(o0 + i) * hd + x] - gc[(o0 + j) * hd + x]).exp() as f64);
                         }
                         for (o, vn) in oir.iter_mut().zip(&vnew[j * hd..(j + 1) * hd]) {
@@ -606,7 +637,9 @@ pub fn kda_chunk(
                     let dl = gc[last + x].exp();
                     let mut upd = vec![0f64; d];
                     for j in 0..c {
-                        let w = (k[(o0 + j) * hd + x] * (gc[last + x] - gc[(o0 + j) * hd + x]).exp()) as f64;
+                        let w = (k[(o0 + j) * hd + x]
+                            * (gc[last + x] - gc[(o0 + j) * hd + x]).exp())
+                            as f64;
                         if w == 0.0 {
                             continue;
                         }
@@ -682,8 +715,10 @@ pub fn kda_layer_taps(
     let mut qkv = vec![0f32; b * t * ch];
     for i in 0..b * t {
         qkv[i * ch..i * ch + nh * hd].copy_from_slice(&qp[i * nh * hd..(i + 1) * nh * hd]);
-        qkv[i * ch + nh * hd..i * ch + 2 * nh * hd].copy_from_slice(&kp[i * nh * hd..(i + 1) * nh * hd]);
-        qkv[i * ch + 2 * nh * hd..(i + 1) * ch].copy_from_slice(&vp[i * nh * hd..(i + 1) * nh * hd]);
+        qkv[i * ch + nh * hd..i * ch + 2 * nh * hd]
+            .copy_from_slice(&kp[i * nh * hd..(i + 1) * nh * hd]);
+        qkv[i * ch + 2 * nh * hd..(i + 1) * ch]
+            .copy_from_slice(&vp[i * nh * hd..(i + 1) * nh * hd]);
     }
     // pre-conv, like kda_dev's `kda gpu qkv` (read from qkvb before the core's conv)
     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
@@ -734,7 +769,10 @@ pub fn kda_layer_taps(
             let dst = &mut y[i * nh * hd + h * hd..i * nh * hd + (h + 1) * hd];
             dst.copy_from_slice(&o[i * nh * hd + h * hd..i * nh * hd + (h + 1) * hd]);
             rms_norm_mul(dst, &w.o_norm, cfg.eps);
-            for (yj, gj) in dst.iter_mut().zip(&g2[i * nh * hd + h * hd..i * nh * hd + (h + 1) * hd]) {
+            for (yj, gj) in dst
+                .iter_mut()
+                .zip(&g2[i * nh * hd + h * hd..i * nh * hd + (h + 1) * hd])
+            {
                 *yj *= sigmoid(*gj);
             }
         }
@@ -773,7 +811,10 @@ mod tests {
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "length");
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
     }
 
     // geometry of the fixtures (meta.json): B=1, T=100, H=4, D=16, conv taps 4, lb −5,
@@ -908,7 +949,10 @@ mod tests {
             f_a: load("w_forget_gate_f_a_proj_weight"),
             f_b: load("w_forget_gate_f_b_proj_weight"),
             dt_bias: load("w_forget_gate_dt_bias"),
-            decay_rate: load("w_forget_gate_A_log").iter().map(|a| a.exp()).collect(),
+            decay_rate: load("w_forget_gate_A_log")
+                .iter()
+                .map(|a| a.exp())
+                .collect(),
             b_proj: load("w_b_proj_weight"),
             g_a: load("w_g_a_proj_weight"),
             g_b: load("w_g_b_proj_weight"),

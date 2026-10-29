@@ -478,10 +478,10 @@ fn tiny_quantised_gguf_layers_close_to_hf() {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use tang_verify::stat;
     use crate::flash::glm5::moe::gpu::{ffn as gpu_ffn, ffn_host, DevMoe, Kernels};
     use std::time::Instant;
     use tang_moe::gpu::{self, DevBuf, Gpu, Stream};
+    use tang_verify::stat;
 
     /// Every GPU path vs the CPU reference: naive and fast with two-level int8 activations
     /// (q8x2, the default) within `tol`, fast with one-level int8 (q8) within `tol_fast` (all
@@ -509,7 +509,11 @@ mod cuda {
                 "gpu {mode} {name}: max abs err vs cpu {err:e}, rel l2 {:.3e}, nonfinite {}",
                 s.rel_l2, s.nonfinite_gpu
             );
-            assert!(s.nonfinite_gpu == 0, "gpu {mode} {name}: {} non-finite", s.nonfinite_gpu);
+            assert!(
+                s.nonfinite_gpu == 0,
+                "gpu {mode} {name}: {} non-finite",
+                s.nonfinite_gpu
+            );
             assert!(
                 err <= tl * max_abs(&want).max(1.0),
                 "gpu {mode} {name}: max abs err {err}"
@@ -583,7 +587,13 @@ mod cuda {
             let Some(g) = tiny(file) else { continue };
             for l in [0, 2] {
                 let p = MoeParams::from_gguf(g, l).unwrap();
-                check2(&format!("{file} layer {l}"), &p, f("tiny_x"), 2e-4, tol_fast);
+                check2(
+                    &format!("{file} layer {l}"),
+                    &p,
+                    f("tiny_x"),
+                    2e-4,
+                    tol_fast,
+                );
             }
         }
     }
@@ -600,7 +610,11 @@ mod cuda {
         (0..n)
             .map(|i| {
                 let v = (u() + u() + u() + u() - 2.0) * 1.7;
-                if i % 997 == 0 { v * 8.0 } else { v }
+                if i % 997 == 0 {
+                    v * 8.0
+                } else {
+                    v
+                }
             })
             .collect()
     }
@@ -637,7 +651,10 @@ mod cuda {
             e.0 += l.gpu_ms.unwrap_or(0.0) as f64 * 1e3;
             e.1 += l.bytes;
         }
-        let rb = m.router.as_ref().map_or(0, |w| m.p.n_expert * w.w.row_bytes as usize) as u64;
+        let rb = m
+            .router
+            .as_ref()
+            .map_or(0, |w| m.p.n_expert * w.w.row_bytes as usize) as u64;
         let mut tot = 0f64;
         for ((_, name), (us, b)) in &agg {
             let (us, mut b) = (us / n as f64, b / n as u64);
@@ -646,9 +663,16 @@ mod cuda {
             }
             tot += us;
             let tbs = if b > 0 { b as f64 / us / 1e6 } else { 0.0 };
-            eprintln!("moesplit {tag} {name:<16} {us:7.1} us {:8.2} MB {tbs:5.2} TB/s", b as f64 / 1e6);
+            eprintln!(
+                "moesplit {tag} {name:<16} {us:7.1} us {:8.2} MB {tbs:5.2} TB/s",
+                b as f64 / 1e6
+            );
         }
-        eprintln!("moesplit {tag} total {tot:.1} us kernel-only, active {:.2} MB, {:.2} TB/s", m.active_bytes() as f64 / 1e6, m.active_bytes() as f64 / tot / 1e6);
+        eprintln!(
+            "moesplit {tag} total {tot:.1} us kernel-only, active {:.2} MB, {:.2} TB/s",
+            m.active_bytes() as f64 / 1e6,
+            m.active_bytes() as f64 / tot / 1e6
+        );
     }
 
     /// REAL GLM-5.3 layers, one layer's FFN resident at a time (a 24 GB card can't hold all
@@ -713,9 +737,11 @@ mod cuda {
                 let yd = DevBuf::zeroed(x.len() * 4).unwrap();
                 let s = Stream::blocking().unwrap();
                 let mut outs = Vec::new();
-                for (mode, fast, act2) in
-                    [("naive", false, true), ("fast-q8x2", true, true), ("fast-q8", true, false)]
-                {
+                for (mode, fast, act2) in [
+                    ("naive", false, true),
+                    ("fast-q8x2", true, true),
+                    ("fast-q8", true, false),
+                ] {
                     k.fast = fast;
                     k.act2 = act2;
                     k.poison = fast;
@@ -737,8 +763,18 @@ mod cuda {
                         st.rel_l2, st.cos, st.max_abs, st.nonfinite_gpu, us, m.active_bytes() as f64 / us / 1e6, us_host, cpu_ms
                     );
                     assert_eq!(st.nonfinite_gpu, 0, "l{l} {mode}: non-finite output");
-                    let bar = if !fast { 1e-4 } else if act2 { 1e-3 } else { 1e-1 };
-                    assert!(st.rel_l2 <= bar, "l{l} T{t_len} {mode}: rel l2 {} > {bar}", st.rel_l2);
+                    let bar = if !fast {
+                        1e-4
+                    } else if act2 {
+                        1e-3
+                    } else {
+                        1e-1
+                    };
+                    assert!(
+                        st.rel_l2 <= bar,
+                        "l{l} T{t_len} {mode}: rel l2 {} > {bar}",
+                        st.rel_l2
+                    );
                     if fast && act2 {
                         worst_fast = worst_fast.max(st.rel_l2);
                         if !p.is_dense() {
@@ -760,7 +796,10 @@ mod cuda {
                 }
                 for (i, name) in [(1, "fast-q8x2"), (2, "fast-q8")] {
                     let ab = stat(&outs[i], &outs[0], 2e-2);
-                    eprintln!("moebench l{l} T{t_len} {name}-vs-naive rel {:.3e}", ab.rel_l2);
+                    eprintln!(
+                        "moebench l{l} T{t_len} {name}-vs-naive rel {:.3e}",
+                        ab.rel_l2
+                    );
                 }
             }
         }
@@ -779,7 +818,11 @@ mod cuda {
             let xt = &x[t * cols..(t + 1) * cols];
             for r in 0..rows {
                 let wr = &wf[r * cols..(r + 1) * cols];
-                y[t * rows + r] = wr.iter().zip(xt).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32;
+                y[t * rows + r] = wr
+                    .iter()
+                    .zip(xt)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum::<f64>() as f32;
             }
         }
         y
@@ -803,7 +846,9 @@ mod cuda {
                 xd: DevBuf::zeroed(t_len * cols / 32 * 4).unwrap(),
                 cols,
             };
-            k.fast.q8(s, a.xf.ptr, a.xq.ptr, a.xq2.ptr, a.xd.ptr, cols, t_len).unwrap();
+            k.fast
+                .q8(s, a.xf.ptr, a.xq.ptr, a.xq2.ptr, a.xd.ptr, cols, t_len)
+                .unwrap();
             s.sync().unwrap();
             a
         }
@@ -833,7 +878,11 @@ mod cuda {
         let mut k = Kernels5::new(&g).unwrap();
         let s = Stream::blocking().unwrap();
         let mut checked = 0;
-        for file in ["glm5-tiny-f32.gguf", "glm5-tiny-q8_0.gguf", "glm5-tiny-q4_k_m.gguf"] {
+        for file in [
+            "glm5-tiny-f32.gguf",
+            "glm5-tiny-q8_0.gguf",
+            "glm5-tiny-q4_k_m.gguf",
+        ] {
             let Some(gg) = tiny(file) else { continue };
             let mut seen = std::collections::HashSet::new();
             let ts: Vec<&TensorInfo> = gg
@@ -841,7 +890,14 @@ mod cuda {
                 .iter()
                 .filter(|t| t.dims.len() == 2 && t.row_len() % 32 == 0)
                 .filter(|t| {
-                    matches!(t.ty, GgmlType::F32 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+                    matches!(
+                        t.ty,
+                        GgmlType::F32
+                            | GgmlType::Q8_0
+                            | GgmlType::Q4K
+                            | GgmlType::Q5K
+                            | GgmlType::Q6K
+                    )
                 })
                 .filter(|t| seen.insert((t.ty.name().to_string(), t.row_len())))
                 .collect();
@@ -862,7 +918,13 @@ mod cuda {
                         s.sync().unwrap();
                         let got = y.read::<f32>(0, t_len * rows).unwrap();
                         let st = stat(&got, &want, 1e-3);
-                        let bar = if ti.ty == GgmlType::F32 { 1e-5 } else if act2 { 1e-4 } else { 2e-2 };
+                        let bar = if ti.ty == GgmlType::F32 {
+                            1e-5
+                        } else if act2 {
+                            1e-4
+                        } else {
+                            2e-2
+                        };
                         eprintln!(
                             "gemv-fast {file} {} {} {rows}x{cols} T{t_len} stage {stage} act2 {act2}: rel {:.3e} nonfinite {}",
                             ti.name,
@@ -870,8 +932,17 @@ mod cuda {
                             st.rel_l2,
                             st.nonfinite_gpu
                         );
-                        assert_eq!(st.nonfinite_gpu, 0, "{}: non-finite / unwritten outputs", ti.name);
-                        assert!(st.rel_l2 <= bar, "{} T{t_len}: rel l2 {} > {bar}", ti.name, st.rel_l2);
+                        assert_eq!(
+                            st.nonfinite_gpu, 0,
+                            "{}: non-finite / unwritten outputs",
+                            ti.name
+                        );
+                        assert!(
+                            st.rel_l2 <= bar,
+                            "{} T{t_len}: rel l2 {} > {bar}",
+                            ti.name,
+                            st.rel_l2
+                        );
                         checked += 1;
                     }
                 }
@@ -915,7 +986,10 @@ mod cuda {
         let ev_us = |n: usize, f: &mut dyn FnMut()| -> f64 {
             f();
             s.sync().unwrap();
-            let (e0, e1) = (gpu::Event::new(true).unwrap(), gpu::Event::new(true).unwrap());
+            let (e0, e1) = (
+                gpu::Event::new(true).unwrap(),
+                gpu::Event::new(true).unwrap(),
+            );
             e0.record(&s).unwrap();
             for _ in 0..n {
                 f();
@@ -994,8 +1068,15 @@ mod cuda {
                     );
                     assert_eq!(st.nonfinite_gpu, 0, "{name} {mode}: non-finite");
                     let bar = if act2 { 1e-4 } else { 2e-2 };
-                    assert!(st.rel_l2 <= bar, "{name} T{t_len} {mode}: rel l2 {} > {bar}", st.rel_l2);
-                    match layer_sum.iter_mut().find(|(t, m, _)| *t == t_len && *m == mode) {
+                    assert!(
+                        st.rel_l2 <= bar,
+                        "{name} T{t_len} {mode}: rel l2 {} > {bar}",
+                        st.rel_l2
+                    );
+                    match layer_sum
+                        .iter_mut()
+                        .find(|(t, m, _)| *t == t_len && *m == mode)
+                    {
                         Some(e) => e.2 += us_ev,
                         None => layer_sum.push((t_len, mode, us_ev)),
                     }

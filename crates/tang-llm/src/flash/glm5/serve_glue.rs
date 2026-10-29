@@ -177,7 +177,10 @@ impl ServeEngine for Glm5Serve {
             tok = self.e.slot_tokens(slot).len(),
             pos = s.pos
         );
-        self.e.restore_kda_parts(slot, &s.parts().iter().map(|p| p.to_vec()).collect::<Vec<_>>())?;
+        self.e.restore_kda_parts(
+            slot,
+            &s.parts().iter().map(|p| p.to_vec()).collect::<Vec<_>>(),
+        )?;
         self.e.slot_tokens_mut(slot).clear();
         self.e.slot_tokens_mut(slot).extend_from_slice(prefix);
         // the DSA caches are per-position and not saved: drop them; the caller prefills
@@ -206,7 +209,10 @@ impl ServeEngine for Glm5Serve {
     }
 
     fn prefill(&mut self, ids: &[u32], chunk: usize) -> Result<u32> {
-        { let _ = chunk; self.prefill_slot(0, ids) }
+        {
+            let _ = chunk;
+            self.prefill_slot(0, ids)
+        }
     }
 
     fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
@@ -232,18 +238,18 @@ impl ServeEngine for Glm5Serve {
         let lg = self.run_window(0, &ids);
         self.e.tokens.extend_from_slice(&tail);
         let lg = lg?;
-        Ok((0..t).map(|i| argmax(&lg[i * self.e.m.hp.n_vocab..(i + 1) * self.e.m.hp.n_vocab])).collect())
+        Ok((0..t)
+            .map(|i| argmax(&lg[i * self.e.m.hp.n_vocab..(i + 1) * self.e.m.hp.n_vocab]))
+            .collect())
     }
 
     fn verify(&mut self, cur: u32, drafts: &[u32]) -> Result<Vec<u32>> {
         self.verify_slot(0, cur, drafts)
     }
 
-
     fn logits(&self, t: usize) -> Vec<f32> {
         self.logits_at(0, t)
     }
-
 
     fn set_sampling(&mut self, _temperature: f32, _seed: u32) {
         // Greedy only (see the module docs).
@@ -309,7 +315,11 @@ impl ServeEngine for Glm5Serve {
         let t0 = Instant::now();
         let lg = self.e.window_batch(rows)?;
         let secs = t0.elapsed().as_secs_f64();
-        self.last_window = WinStats { t: rows.len(), wall_ms: secs * 1e3, ..WinStats::default() };
+        self.last_window = WinStats {
+            t: rows.len(),
+            wall_ms: secs * 1e3,
+            ..WinStats::default()
+        };
         crate::telemetry::glm5_window(rows.len(), secs);
         let mut out = Vec::with_capacity(rows.len());
         for (i, &(slot, _)) in rows.iter().enumerate() {

@@ -20,9 +20,9 @@
 //! - `TANG_GLM5_MOE_DEBUG_POISON=0`     don't NaN-fill (read by moe::gpu::Kernels)
 //!
 //! Output lines start with `moedbg`.
-use tang_verify::{stat, Stat};
 use super::moe::{self, MoeParams};
 use anyhow::Result;
+use tang_verify::{stat, Stat};
 
 pub struct Config {
     pub layers: Option<Vec<usize>>,
@@ -46,11 +46,9 @@ impl Shadow {
             return None;
         }
         let cfg = Config {
-            layers: std::env::var("TANG_GLM5_MOE_DEBUG_LAYERS").ok().map(|s| {
-                s.split(',')
-                    .filter_map(|p| p.trim().parse().ok())
-                    .collect()
-            }),
+            layers: std::env::var("TANG_GLM5_MOE_DEBUG_LAYERS")
+                .ok()
+                .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect()),
             windows: std::env::var("TANG_GLM5_MOE_DEBUG_WINDOWS")
                 .ok()
                 .and_then(|s| s.parse().ok()),

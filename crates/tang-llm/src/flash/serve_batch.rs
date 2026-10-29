@@ -371,10 +371,13 @@ impl FlashServe {
 
     pub(super) fn batch_step(&mut self, lanes: &mut [DynLane<'_>]) -> Result<()> {
         let t_step = Instant::now();
-        let prefill_tokens0: usize = lanes.iter().map(|l| {
-            let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
-            s.done_prompt
-        }).sum();
+        let prefill_tokens0: usize = lanes
+            .iter()
+            .map(|l| {
+                let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                s.done_prompt
+            })
+            .sum();
         // Cancellations first.
         for l in lanes.iter_mut() {
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -531,18 +534,27 @@ impl FlashServe {
         }
         // One step's shape, for the otel gauges/histograms (zero-sized without the feature).
         crate::telemetry::step(&crate::engine::StepStats {
-            decode_rows: lanes.iter().filter(|l| {
-                let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
-                s.windows > 0
-            }).count(),
-            decode_streams: lanes.iter().filter(|l| {
-                let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
-                s.finish.is_none() && s.pending.is_some()
-            }).count(),
-            prefill_tokens: lanes.iter().map(|l| {
-                let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
-                s.done_prompt
-            }).sum::<usize>()
+            decode_rows: lanes
+                .iter()
+                .filter(|l| {
+                    let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                    s.windows > 0
+                })
+                .count(),
+            decode_streams: lanes
+                .iter()
+                .filter(|l| {
+                    let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                    s.finish.is_none() && s.pending.is_some()
+                })
+                .count(),
+            prefill_tokens: lanes
+                .iter()
+                .map(|l| {
+                    let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                    s.done_prompt
+                })
+                .sum::<usize>()
                 .saturating_sub(prefill_tokens0),
             prefill_chunks: n_chunks,
             secs: t_step.elapsed().as_secs_f64(),

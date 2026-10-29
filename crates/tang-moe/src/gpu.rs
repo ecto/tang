@@ -113,8 +113,9 @@ impl Gpu {
         // arch the wheel doesn't know). Per-layer owners (GLM-5's 34 resident KDA layers
         // each build three modules) compile identical sources, so memoise the PTX text by
         // (arch, source): the bytes handed to cuModuleLoadData are unchanged.
-        static PTX: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String), String>>> =
-            std::sync::OnceLock::new();
+        static PTX: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
+        > = std::sync::OnceLock::new();
         let cache = PTX.get_or_init(Default::default);
         let key = (arch.to_string(), src.to_string());
         if let Some(p) = cache.lock().unwrap().get(&key).cloned() {
@@ -122,8 +123,14 @@ impl Gpu {
         }
         let ptx = match cudarc::nvrtc::compile_ptx_with_opts(src, opts.clone()) {
             Ok(p) => p,
-            Err(e) if format!("{e:?}").contains("INVALID_OPTION") || format!("{e:?}").contains("invalid value") => {
-                let opts = cudarc::nvrtc::CompileOptions { arch: Some("sm_90"), ..Default::default() };
+            Err(e)
+                if format!("{e:?}").contains("INVALID_OPTION")
+                    || format!("{e:?}").contains("invalid value") =>
+            {
+                let opts = cudarc::nvrtc::CompileOptions {
+                    arch: Some("sm_90"),
+                    ..Default::default()
+                };
                 cudarc::nvrtc::compile_ptx_with_opts(src, opts)
                     .map_err(|e| Error(format!("nvrtc: {e:?}")))?
             }
@@ -172,8 +179,8 @@ impl Module {
 /// The process drives the GPU from one thread at a time, so a global tag is enough.
 pub mod trace {
     use super::sys;
-    use std::collections::HashMap;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
     use std::sync::Mutex;
 
@@ -288,7 +295,11 @@ pub mod trace {
     /// Bracket a graph capture: launches inside get no timing events (counted only).
     /// [`super::Graph::capture`] calls this around its body; nesting is fine.
     pub fn capture(on: bool) {
-        CAPTURE.set(if on { CAPTURE.get() + 1 } else { CAPTURE.get() - 1 });
+        CAPTURE.set(if on {
+            CAPTURE.get() + 1
+        } else {
+            CAPTURE.get() - 1
+        });
     }
 
     #[inline(always)]
@@ -391,7 +402,8 @@ pub mod trace {
         C[LAUNCHES].fetch_add(1, Relaxed);
         let bytes = HINT.swap(0, Relaxed);
         let mut st = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        let capturing = unsafe { sys::cuStreamIsCapturing(s, &mut st) } != sys::CUresult::CUDA_SUCCESS
+        let capturing = unsafe { sys::cuStreamIsCapturing(s, &mut st) }
+            != sys::CUresult::CUDA_SUCCESS
             || st != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
         // a stream's first traced launch since tracing started has no base event: record
         // one (the next launch measures from it); graph capture gets nothing recorded
@@ -450,8 +462,9 @@ pub mod trace {
             let gpu_ms = p.ev.and_then(|(stream, e0, e1)| {
                 unsafe {
                     let mut ms = 0f32;
-                    let ok = sys::cuEventElapsedTime(&mut ms, e0 as sys::CUevent, e1 as sys::CUevent)
-                        == sys::CUresult::CUDA_SUCCESS;
+                    let ok =
+                        sys::cuEventElapsedTime(&mut ms, e0 as sys::CUevent, e1 as sys::CUevent)
+                            == sys::CUresult::CUDA_SUCCESS;
                     back.push(e1); // the start event stays as the stream's base
                     if exact() {
                         back.push(e0); // exact mode: each launch's own start event
@@ -459,7 +472,12 @@ pub mod trace {
                     ok.then_some(ms)
                 }
             });
-            out.push(Launch { tag: p.tag, func: p.func, bytes: p.bytes, gpu_ms });
+            out.push(Launch {
+                tag: p.tag,
+                func: p.func,
+                bytes: p.bytes,
+                gpu_ms,
+            });
         }
         POOL.with_borrow_mut(|p| p.extend(back));
         out

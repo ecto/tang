@@ -142,20 +142,37 @@ fn mtp_device_draft_matches_host() {
     let mut h = e.last_h.clone();
     let (mut clear, mut same, mut worst) = (0, 0, 0f64);
     for i in 0..64 {
-        let (a, b) = (dm.cells(&e, &h, &nexts).unwrap(), hm.cells(&e, &h, &nexts).unwrap());
+        let (a, b) = (
+            dm.cells(&e, &h, &nexts).unwrap(),
+            hm.cells(&e, &h, &nexts).unwrap(),
+        );
         assert_eq!(dm.len(), hm.len());
-        let num: f64 = a.h.iter().zip(&b.h).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+        let num: f64 =
+            a.h.iter()
+                .zip(&b.h)
+                .map(|(x, y)| ((x - y) as f64).powi(2))
+                .sum();
         let den: f64 = b.h.iter().map(|y| (*y as f64).powi(2)).sum();
         let rel = (num / den.max(1e-30)).sqrt();
         worst = worst.max(rel);
         let n = b.h.len() / nexts.len();
         let lgh = hm.host_logits(&b.h[b.h.len() - n..]);
         let top = super::engine::argmax(&lgh) as usize;
-        let second = lgh.iter().enumerate().filter(|(j, _)| *j != top).map(|(_, v)| *v).fold(f32::MIN, f32::max);
+        let second = lgh
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != top)
+            .map(|(_, v)| *v)
+            .fold(f32::MIN, f32::max);
         let (da, db) = (*a.top.last().unwrap(), *b.top.last().unwrap());
         if lgh[top] - second > 0.05 {
             clear += 1;
-            assert_eq!(da, db, "token {i}: clear margin {} but device {da} != host {db}", lgh[top] - second);
+            assert_eq!(
+                da,
+                db,
+                "token {i}: clear margin {} but device {da} != host {db}",
+                lgh[top] - second
+            );
         }
         same += usize::from(da == db);
         let lg = e.window(&[cur]).unwrap();
@@ -199,11 +216,21 @@ fn mtp_device_cell_matches_host() {
         let n = b.h.len() / nexts.len();
         let lgh = hm.host_logits(&b.h[b.h.len() - n..]);
         let top = super::engine::argmax(&lgh) as usize;
-        let second = lgh.iter().enumerate().filter(|(j, _)| *j != top).map(|(_, v)| *v).fold(f32::MIN, f32::max);
+        let second = lgh
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != top)
+            .map(|(_, v)| *v)
+            .fold(f32::MIN, f32::max);
         let db = *b.top.last().unwrap();
         if lgh[top] - second > 0.05 {
             clear += 1;
-            assert_eq!(da, db, "step {i}: clear margin {} but device cell {da} != host {db}", lgh[top] - second);
+            assert_eq!(
+                da,
+                db,
+                "step {i}: clear margin {} but device cell {da} != host {db}",
+                lgh[top] - second
+            );
         }
         same += usize::from(da == db);
         let lg = e.window(&[cur]).unwrap();
@@ -214,5 +241,8 @@ fn mtp_device_cell_matches_host() {
     let replays = dd.mtp.cell_replays();
     std::env::remove_var("TANG_GLM5_MOE");
     eprintln!("mtp device cell vs host: {same}/48 identical, {clear} clear-margin (all equal), {replays} cell replays");
-    assert!(replays > 0, "the device cell never ran (host fallback only)");
+    assert!(
+        replays > 0,
+        "the device cell never ran (host fallback only)"
+    );
 }

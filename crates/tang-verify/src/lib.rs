@@ -104,7 +104,15 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { units: None, windows: None, tol: 1e-3, resync: true, poison: true, dir: None, dumps: 3 }
+        Self {
+            units: None,
+            windows: None,
+            tol: 1e-3,
+            resync: true,
+            poison: true,
+            dir: None,
+            dumps: 3,
+        }
     }
 }
 
@@ -121,7 +129,11 @@ impl Config {
         }
         let dir = legacy
             .and_then(|p| std::env::var(format!("{p}_DIR")).ok().map(PathBuf::from))
-            .or_else(|| std::env::var(format!("{ENV}_DIR")).ok().map(|s| PathBuf::from(s).join(kernel)));
+            .or_else(|| {
+                std::env::var(format!("{ENV}_DIR"))
+                    .ok()
+                    .map(|s| PathBuf::from(s).join(kernel))
+            });
         Some(Self {
             units: knob(legacy, "LAYERS")
                 .or_else(|| knob(legacy, "UNITS"))
@@ -148,7 +160,10 @@ pub struct Probe {
 
 impl Probe {
     pub fn new(poison: bool) -> Self {
-        Self { poison, taps: Taps::new() }
+        Self {
+            poison,
+            taps: Taps::new(),
+        }
     }
 
     /// Record a host-side value (a tap the device path computed on the host).

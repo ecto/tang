@@ -112,6 +112,115 @@ cargo build --release --example bench_batch --no-default-features --features cud
 TANG_OTEL_LIVE=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 target/release/examples/bench_batch <model> --batches 1,4,8
 ```
 
+## DeepSeek-V4.1-Flash: the step timeline (`flash/deepseek/obs.rs`)
+
+The DeepSeek engine has its own per-forward timeline that needs no OpenTelemetry: every
+forward (`step`) is timed with CUDA events on the model's stream and with host wall-clock,
+and on the direct path its interior is spans nested by name. Off by default.
+
+| Variable | Meaning |
+|---|---|
+| `DS_OBS=1` | One line per forward on stderr (rank 0): `step decode t=1 sp=812 path=graph 38.2ms gpu=35.1ms host=3.1ms launches=0 syncs=1 d2h=.. h2d=.. allocs=0`, and per speculative step `spec drafted=5 accepted=3 draft=..ms verify=..ms rewind=..ms`. |
+| `DS_OBS=2` | Also the interior spans, on every `DS_OBS_EVERY`-th forward, and a per-op breakdown (name, ms, % of the step's device time, count) printed for it. |
+| `DS_OBS_EVERY=N` | Sampling period for interior spans and OTel forward spans (default 50). |
+| `DS_OBS_DIRECT=1` | Decode / verify steps skip CUDA graphs, so their interior can be timed (a profiled run, slower). |
+| `DS_OBS_FILE=path` | Every observed forward (every rank) as a JSON line (`StepRec`: kind, t, sp, path, captured, rank, step, parent, wall_ms, gpu_ms, host_ms, reduce_wait_ms, arena_bytes, counts, spans), plus `{"spec": ...}` lines. |
+
+The span tree of a direct step:
+
+```
+step{kind: prefill|decode|verify|draft, t, sp, path: graph|direct, captured}
+├─ embed
+├─ layer{i}                        (one per backbone layer; `layer` field = i)
+│  ├─ engram                       (Engram layers)
+│  ├─ hc                           (mHC mixes / pre / post and the norms, several per layer)
+│  ├─ attn
+│  │  ├─ q  window_kv
+│  │  ├─ compress ─ indexer        (compressed layers; the indexer on index sources)
+│  │  ├─ sparse_attn               (window/top-k index rows and the attention kernel)
+│  │  └─ wo                        (un-RoPE, quant, wo_a, wo_b)
+│  └─ moe
+│     ├─ router  route
+│     ├─ grouped_gu  grouped_down  (or `experts`, the per-expert loop)
+│     ├─ reduce                    (the EP all-reduce: enqueue to completion)
+│     └─ shared  finish
+└─ head
+```
+
+- **Device time** comes from events recorded at span boundaries and read only once they have
+  completed: after the step's own read-back sync, or, on an EP rank that skips the read-back,
+  at its next step's start (which syncs anyway). The timeline adds no host sync.
+- **Graph steps are opaque.** A replayed graph is one launch; its step is timed around the
+  launch and has no interior. No event is recorded inside a capture (the capturing step is
+  marked `captured`), so capture works with the timeline on. To see a decode step's
+  interior, run with `DS_OBS_DIRECT=1`.
+- `host_ms` = `wall_ms - gpu_ms`: host time the device did not overlap (Engram hashing and row
+  gather, staging, launch gaps, the read-back). On the direct path a large `host_ms` with a
+  high launch count is launch-bound.
+- **Counters** are per thread (each EP rank has its own) and always counted (a thread-local
+  increment): kernel launches (every `ds_*`/`dg_*` launch goes through `obs::launch`), host
+  syncs, D2H and H2D bytes (graph replays count their staged inputs), device / pinned
+  allocations (arena and staging growth), graph captures and replays, expert tensors uploaded.
+  A step reports its deltas.
+- **EP**: each rank records its own steps with `rank`; `parent` is the group's command
+  sequence number, equal on every rank, so the records of one forward line up.
+  `reduce_wait_ms` is the summed `reduce` spans (direct path only).
+
+Overhead (RTX 3090, tiny fixture, decode µs/step, best of 10 rounds): see the table in
+[deepseek-v41-plan.md](deepseek-v41-plan.md#how-to-profile-a-step). Off it is a few relaxed
+atomic loads and thread-local increments per step.
+
+### `tang-llm deepseek-profile`
+
+```bash
+tang-llm deepseek-profile <checkpoint dir> [--devices 0,1,2,3] [--steps N] [--prompt-tokens N] \
+    [--direct] [--graph-debug] [--no-spec] [--ctx N]
+```
+
+Loads the model (one GPU, or expert parallel with `--devices`), prefills a synthetic prompt
+(`--prompt-tokens`, default 64) and runs `--steps` (default 20) decode / verify forwards,
+greedy, with DSpark unless `--no-spec` / `DS_SPEC=0`, at `DS_OBS=2` on every step, then prints:
+one row per forward (wall / gpu / host ms, launches, syncs, D2H / H2D bytes, allocs, expert
+uploads), per kind the means over its steps after the first (the first uploads weights and
+sizes the arena), and for steps with an interior a per-op table (ms per step, % of the step's
+device time, count per step, ms each), the share covered by `embed` + layers + `head`, and
+other ranks' gpu / reduce-wait means. `--direct` forces the direct path so decode and verify
+steps have interiors; `--graph-debug` prints each change of a step shape's path (direct ->
+graph+capture -> graph). It also honours `DS_OBS_FILE`, and with `otel` emits its spans under
+a `deepseek.profile` root.
+
+### OpenTelemetry (feature `otel`)
+
+`deepseek-serve` requests get the same `chat.completions` > `queued` / `prefill` / `decode` /
+`finish` spans as the dense server (the attributes come from the run's `Usage`). Under them:
+
+```
+prefill
+└─ forward{kind=prefill|draft(seed), ...}
+decode
+├─ forward{kind, t, sp, path, captured, rank, step, gpu_ms, host_ms, launches, syncs,
+│          d2h_bytes, h2d_bytes, allocs, expert_uploads, reduce_wait_ms}
+│  ├─ embed / layer / ... / head   (the timeline's spans, when the direct path ran;
+│  │                                attributes op = dotted path, layer, gpu_ms, host_ms)
+│  └─ forward{rank=1..}            (other EP ranks' forward for the same command)
+└─ spec_step{drafted, accepted, draft_ms, verify_ms, rewind_ms}
+```
+
+`forward` spans are sampled: every `DS_OBS_EVERY`-th forward (default 50), every forward at
+`DS_OBS=2`. With telemetry installed the sampled forwards are timed even at `DS_OBS=0`. Spans are
+buffered (at most 20k) and built when the request finishes, like the request's own spans.
+EP ranks run on their own threads; their forwards are linked to rank 0's by the command
+sequence number each `Cmd` carries (spans are built after the fact, so there is no live span
+context to pass).
+
+| Instrument | Kind | Attributes | What |
+|---|---|---|---|
+| `deepseek.forward.ms` | histogram | `kind`, `path` | An observed forward's device time (rank 0). |
+| `deepseek.spec.accepted` | histogram | | Drafts accepted per speculative step. |
+| `deepseek.launches` | counter | `kind`, `path` | Kernel launches in observed forwards. |
+| `deepseek.syncs` | counter | `kind`, `path` | Host syncs in observed forwards. |
+| `deepseek.arena.bytes` | gauge | | The step arena's capacity. |
+
 ## GLM-5 engine traces (`TANG_GLM5_TRACE=1`)
 
 The GLM-5.3 engine's twin of `TANG_CODER_PROF` plus the spans above

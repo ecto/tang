@@ -50,7 +50,11 @@ impl FlashTokenizer {
             pre.starts_with("qwen") || pre == "glm4",
             "pre-tokenizer {pre} isn't supported"
         );
-        let split = if pre == "glm4" { GLM4_SPLIT } else { QWEN35_SPLIT };
+        let split = if pre == "glm4" {
+            GLM4_SPLIT
+        } else {
+            QWEN35_SPLIT
+        };
         let mut vocab = serde_json::Map::new();
         let mut added = Vec::new();
         for (i, t) in tokens.iter().enumerate() {

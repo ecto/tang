@@ -24,10 +24,7 @@ use anyhow::{ensure, Context, Result};
 /// `hd` = `kda.head_dim`, `d_inner` = `hd * n_head`; `hc` = hyper-connection streams,
 /// `mix` = `(2 + hc) * hc`.
 #[allow(clippy::type_complexity)]
-pub fn layer_tensors(
-    hp: &Hparams,
-    l: usize,
-) -> Result<Vec<(&'static str, Vec<u64>)>> {
+pub fn layer_tensors(hp: &Hparams, l: usize) -> Result<Vec<(&'static str, Vec<u64>)>> {
     let n = hp.n_embd as u64;
     let hc = hp.hc as u64;
     let mix = hp.hc_mix_dim() as u64;

@@ -34,12 +34,12 @@
 //! skips the shift (it would cost a qkv read-back) EXCEPT in a debug window, where the
 //! shadow check compares it (`conv_host`).
 #![allow(clippy::too_many_arguments)]
-use super::DevLayer;
 use super::super::kda::ConvState;
+use super::DevLayer;
 use anyhow::{ensure, Context, Result};
 use cudarc::driver::sys;
-use tang_moe::gpu::{launch, Event, Graph, Gpu, Module, Stream};
 use tang_moe::args;
+use tang_moe::gpu::{launch, Event, Gpu, Graph, Module, Stream};
 
 /// Which decode path a call takes (env-selected by [`Mode::from_env`]; tests pass it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,26 +122,64 @@ impl Fast {
             super::super::moe::K5_SRC,
             include_str!("kda_decode.cuh")
         );
-        let m = g.module(&src).map_err(|e| anyhow::anyhow!("kda_decode nvrtc: {e}"))?;
-        let f = |n: &str| m.func(n).map_err(|e| anyhow::anyhow!("kda_decode {n}: {e}"));
+        let m = g
+            .module(&src)
+            .map_err(|e| anyhow::anyhow!("kda_decode nvrtc: {e}"))?;
+        let f = |n: &str| {
+            m.func(n)
+                .map_err(|e| anyhow::anyhow!("kda_decode {n}: {e}"))
+        };
         let tail = f("k5d_tail")?;
         // k5d_tail stages x (HID * 4 + 16 B, HID <= K5D_HIDMAX = 4096) in dynamic shared
         // memory on top of ~43 KB static: past the 48 KB default
         let r = unsafe {
-            sys::cuFuncSetAttribute(tail, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
+            sys::cuFuncSetAttribute(
+                tail,
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                4096 * 4 + 16,
+            )
         };
-        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tail smem attribute: {r:?}");
+        anyhow::ensure!(
+            r == sys::CUresult::CUDA_SUCCESS,
+            "k5d_tail smem attribute: {r:?}"
+        );
         let tailt = f("k5d_tailt")?;
         let r = unsafe {
-            sys::cuFuncSetAttribute(tailt, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
+            sys::cuFuncSetAttribute(
+                tailt,
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                4096 * 4 + 16,
+            )
         };
-        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tailt smem attribute: {r:?}");
+        anyhow::ensure!(
+            r == sys::CUresult::CUDA_SUCCESS,
+            "k5d_tailt smem attribute: {r:?}"
+        );
         let pret = f("k5d_pret")?;
         let r = unsafe {
-            sys::cuFuncSetAttribute(pret, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
+            sys::cuFuncSetAttribute(
+                pret,
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                4096 * 4 + 16,
+            )
         };
-        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_pret smem attribute: {r:?}");
-        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, qgt9: f("k5_qgemvt9")?, tailt, pret, stept: f("k5d_stept")?, qgt17: f("k5_qgemvt17")?, graph: None, _m: m })
+        anyhow::ensure!(
+            r == sys::CUresult::CUDA_SUCCESS,
+            "k5d_pret smem attribute: {r:?}"
+        );
+        Ok(Fast {
+            proj: f("k5d_proj")?,
+            gate2: f("k5d_gate2")?,
+            step: f("k5d_step")?,
+            tail,
+            qgt9: f("k5_qgemvt9")?,
+            tailt,
+            pret,
+            stept: f("k5d_stept")?,
+            qgt17: f("k5_qgemvt17")?,
+            graph: None,
+            _m: m,
+        })
     }
 }
 
@@ -167,14 +205,23 @@ impl DevLayer {
 
     /// [`Self::enqueue_decode`] for sequence `slot`: only the step kernel's state pointers
     /// (h0 / st) move — everything else is per-window scratch.
-    fn enqueue_decode_at(&self, s: &Stream, slot: usize, gemv8: bool, ev: Option<&[Event]>) -> Result<()> {
+    fn enqueue_decode_at(
+        &self,
+        s: &Stream,
+        slot: usize,
+        gemv8: bool,
+        ev: Option<&[Event]>,
+    ) -> Result<()> {
         let mark = |i: usize| -> Result<()> {
             if let Some(e) = ev {
                 e[i].record(s).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             Ok(())
         };
-        let fast = self.fast.as_ref().context("kda fused decode: kernels not built")?;
+        let fast = self
+            .fast
+            .as_ref()
+            .context("kda fused decode: kernels not built")?;
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
         let f = std::mem::size_of::<f32>() as u64;
@@ -205,8 +252,17 @@ impl DevLayer {
                         // k5d_tail wrote yb's k5_q8 codes: o_proj straight on k5_qgemv
                         Some(tab) => {
                             let codes = self.xq8.ptr;
-                            self.qgemv_launch(s, tab, 1, self.wo.w.row_bytes, hidden, self.wo.w.estride, codes,
-                                codes + (self.max_t * di) as u64, di)?;
+                            self.qgemv_launch(
+                                s,
+                                tab,
+                                1,
+                                self.wo.w.row_bytes,
+                                hidden,
+                                self.wo.w.estride,
+                                codes,
+                                codes + (self.max_t * di) as u64,
+                                di,
+                            )?;
                         }
                         None => {
                             self.g5f_o(s, 1)?;
@@ -221,58 +277,96 @@ impl DevLayer {
                     (128, 1, 1),
                     0,
                     s,
-                    args![self.bproj.w, self.xb.ptr, self.bb.ptr, 1u32, hidden as u32, nh as u32],
+                    args![
+                        self.bproj.w,
+                        self.xb.ptr,
+                        self.bb.ptr,
+                        1u32,
+                        hidden as u32,
+                        nh as u32
+                    ],
                 )?;
             } else {
-            let r0 = if gemv8 {
-                // the dequant-reuse GEMV for q/k/v (kda_dev's TANG_GLM5_GEMV8 path, T = 1)
+                let r0 = if gemv8 {
+                    // the dequant-reuse GEMV for q/k/v (kda_dev's TANG_GLM5_GEMV8 path, T = 1)
+                    launch(
+                        self.gv.q8,
+                        ((hidden / 32) as u32, 1, 1),
+                        (32, 1, 1),
+                        0,
+                        s,
+                        args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],
+                    )?;
+                    let codes = self.xq8.ptr;
+                    let scales = codes + (self.max_t * hidden) as u64;
+                    for (w, off) in [
+                        (&self.wq, 0u64),
+                        (&self.wk, di as u64 * f),
+                        (&self.wv, 2 * di as u64 * f),
+                    ] {
+                        // the same dynamic smem as kda_dev's gemv8 launch (keep the two in step)
+                        let smem = (super::K5_WARPS
+                            * ((w.w.row_bytes as usize).div_ceil(16) + 1)
+                            * 16) as u32;
+                        launch(
+                            self.gv.gemv8,
+                            (di.div_ceil(super::K5_WARPS) as u32, 1, 1),
+                            (128, 1, 1),
+                            smem,
+                            s,
+                            args![
+                                w.w,
+                                0u32,
+                                codes,
+                                scales,
+                                qkv + off,
+                                (3 * di) as u32,
+                                1u32,
+                                di as u32,
+                                hidden as u32
+                            ],
+                        )?;
+                    }
+                    // f_a / g_a read the SAME x codes — strictly AFTER k5_q8 above: before it,
+                    // xq8 still holds the previous step's o_proj codes (yb, d_inner wide), a
+                    // stale read that diverged every output on the first real-weights rerun
+                    if g8f {
+                        self.gemv8_launch_on(s, &self.fa, codes, hidden, self.g1b.ptr, hd, hd, 1)?;
+                    }
+                    if g8ga {
+                        self.gemv8_launch_on(s, &self.ga, codes, hidden, self.g2a.ptr, hd, hd, 1)?;
+                    }
+                    3 * di
+                } else {
+                    0
+                };
+                mark(2)?;
                 launch(
-                    self.gv.q8,
-                    ((hidden / 32) as u32, 1, 1),
-                    (32, 1, 1),
+                    fast.proj,
+                    grid(rows - r0),
+                    (128, 1, 1),
                     0,
                     s,
-                    args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],
+                    args![
+                        self.wq.w,
+                        self.wk.w,
+                        self.wv.w,
+                        self.fa.w,
+                        self.bproj.w,
+                        self.ga.w,
+                        self.xb.ptr,
+                        qkv,
+                        self.g1b.ptr,
+                        self.bb.ptr,
+                        self.g2a.ptr,
+                        di as u32,
+                        hd as u32,
+                        nh as u32,
+                        hidden as u32,
+                        r0 as u32,
+                        skip
+                    ],
                 )?;
-                let codes = self.xq8.ptr;
-                let scales = codes + (self.max_t * hidden) as u64;
-                for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
-                    // the same dynamic smem as kda_dev's gemv8 launch (keep the two in step)
-                    let smem = (super::K5_WARPS * ((w.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
-                    launch(
-                        self.gv.gemv8,
-                        (di.div_ceil(super::K5_WARPS) as u32, 1, 1),
-                        (128, 1, 1),
-                        smem,
-                        s,
-                        args![w.w, 0u32, codes, scales, qkv + off, (3 * di) as u32, 1u32,
-                            di as u32, hidden as u32],
-                    )?;
-                }
-                // f_a / g_a read the SAME x codes — strictly AFTER k5_q8 above: before it,
-                // xq8 still holds the previous step's o_proj codes (yb, d_inner wide), a
-                // stale read that diverged every output on the first real-weights rerun
-                if g8f {
-                    self.gemv8_launch_on(s, &self.fa, codes, hidden, self.g1b.ptr, hd, hd, 1)?;
-                }
-                if g8ga {
-                    self.gemv8_launch_on(s, &self.ga, codes, hidden, self.g2a.ptr, hd, hd, 1)?;
-                }
-                3 * di
-            } else {
-                0
-            };
-            mark(2)?;
-            launch(
-                fast.proj,
-                grid(rows - r0),
-                (128, 1, 1),
-                0,
-                s,
-                args![self.wq.w, self.wk.w, self.wv.w, self.fa.w, self.bproj.w, self.ga.w,
-                    self.xb.ptr, qkv, self.g1b.ptr, self.bb.ptr, self.g2a.ptr, di as u32,
-                    hd as u32, nh as u32, hidden as u32, r0 as u32, skip],
-            )?;
             }
             mark(1)?;
             launch(
@@ -281,8 +375,19 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 s,
-                args![self.fb.w, self.gb.w, self.g1b.ptr, self.g2a.ptr, self.dt.ptr,
-                    self.rate.ptr, self.gb_out.ptr, self.g2b.ptr, nh as u32, hd as u32, lb],
+                args![
+                    self.fb.w,
+                    self.gb.w,
+                    self.g1b.ptr,
+                    self.g2a.ptr,
+                    self.dt.ptr,
+                    self.rate.ptr,
+                    self.gb_out.ptr,
+                    self.g2b.ptr,
+                    nh as u32,
+                    hd as u32,
+                    lb
+                ],
             )?;
             launch(
                 fast.step,
@@ -290,9 +395,19 @@ impl DevLayer {
                 (hd as u32, 1, 1),
                 0,
                 s,
-                args![qkv, h0, self.core.wconv.ptr, self.gb_out.ptr,
-                    self.bb.ptr, st, self.ob.ptr, self.on.ptr, self.g2b.ptr,
-                    self.yb.ptr, self.cfg.eps],
+                args![
+                    qkv,
+                    h0,
+                    self.core.wconv.ptr,
+                    self.gb_out.ptr,
+                    self.bb.ptr,
+                    st,
+                    self.ob.ptr,
+                    self.on.ptr,
+                    self.g2b.ptr,
+                    self.yb.ptr,
+                    self.cfg.eps
+                ],
             )?;
             mark(3)?;
             // o_proj: gemv8 quantises yb (d_inner wide) first — the SAME xq8 the q/k/v
@@ -311,15 +426,26 @@ impl DevLayer {
                 )?;
                 let codes = self.xq8.ptr;
                 let scales = codes + (self.max_t * di) as u64;
-                let smem = (super::K5_WARPS * ((self.wo.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32;
+                let smem = (super::K5_WARPS
+                    * ((self.wo.w.row_bytes as usize).div_ceil(16) + 1)
+                    * 16) as u32;
                 launch(
                     self.gv.gemv8,
                     (hidden.div_ceil(super::K5_WARPS) as u32, 1, 1),
                     (128, 1, 1),
                     smem,
                     s,
-                    args![self.wo.w, 0u32, codes, scales, self.outb.ptr, hidden as u32, 1u32,
-                        hidden as u32, di as u32],
+                    args![
+                        self.wo.w,
+                        0u32,
+                        codes,
+                        scales,
+                        self.outb.ptr,
+                        hidden as u32,
+                        1u32,
+                        hidden as u32,
+                        di as u32
+                    ],
                 )?;
             } else {
                 launch(
@@ -328,8 +454,16 @@ impl DevLayer {
                     (128, 1, 1),
                     0,
                     s,
-                    args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, 1u32,
-                        hidden as u32, di as u32],
+                    args![
+                        self.wo.w,
+                        0u32,
+                        self.yb.ptr,
+                        self.outb.ptr,
+                        hidden as u32,
+                        1u32,
+                        hidden as u32,
+                        di as u32
+                    ],
                 )?;
             }
             mark(4)?;
@@ -351,7 +485,10 @@ impl DevLayer {
     /// [`Self::decode_dev`]'s kernels enqueued directly on `s` (no graph launch): the
     /// whole-step graph capture records them as its own nodes.
     pub fn decode_enqueue(&self, s: &Stream) -> Result<()> {
-        ensure!(self.resident_ok(), "kda decode_enqueue: fused kernels off, naive mode, or a probe");
+        ensure!(
+            self.resident_ok(),
+            "kda decode_enqueue: fused kernels off, naive mode, or a probe"
+        );
         let g8 = |w: &super::super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
         self.enqueue_decode(s, g8(&self.wq) && g8(&self.wk) && g8(&self.wv), None)
     }
@@ -366,13 +503,22 @@ impl DevLayer {
     /// once `s` reaches it. No host copy, no sync. Graph mode captures on the layer's own
     /// stream after the first eager enqueue (capture only records).
     pub fn decode_dev(&mut self, s: &Stream) -> Result<()> {
-        ensure!(self.resident_ok(), "kda decode_dev: fused kernels off, naive mode, or a probe");
+        ensure!(
+            self.resident_ok(),
+            "kda decode_dev: fused kernels off, naive mode, or a probe"
+        );
         let g8 = |w: &super::super::moe::gpu::DevW| self.gemv8 && w.w.ty == 8;
         let gemv8 = g8(&self.wq) && g8(&self.wk) && g8(&self.wv);
         let mode = Mode::from_env();
         if mode == Mode::Graph {
-            if let Some((g, _)) = self.fast.as_ref().and_then(|f| f.graph.as_ref()).filter(|g| g.1 == gemv8) {
-                g.launch(s).map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
+            if let Some((g, _)) = self
+                .fast
+                .as_ref()
+                .and_then(|f| f.graph.as_ref())
+                .filter(|g| g.1 == gemv8)
+            {
+                g.launch(s)
+                    .map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
                 return Ok(());
             }
             self.enqueue_decode(s, gemv8, None)?;
@@ -381,11 +527,14 @@ impl DevLayer {
             }
             let me = &*self;
             let gr = Graph::capture(&me.s, |cs| {
-                me.enqueue_decode(cs, gemv8, None).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
+                me.enqueue_decode(cs, gemv8, None)
+                    .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
             })
             .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
             self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
-            log_once(&LOG_CAPTURE, || format!("glm5 kda: decode mode graph captured (resident, gemv8={gemv8})"));
+            log_once(&LOG_CAPTURE, || {
+                format!("glm5 kda: decode mode graph captured (resident, gemv8={gemv8})")
+            });
             return Ok(());
         }
         self.enqueue_decode(s, gemv8, None)
@@ -394,7 +543,12 @@ impl DevLayer {
     /// One decode token through the fused step (`mode` Fused or Graph). Same contract as
     /// [`DevLayer::window`] at `t = 1`, including the shadow-check probe (the poisoned
     /// buffers get their taps read out of the device, `out`/`conv_host` put on the host).
-    pub(super) fn decode_fast(&mut self, x: &[f32], conv: &mut ConvState, mode: Mode) -> Result<Vec<f32>> {
+    pub(super) fn decode_fast(
+        &mut self,
+        x: &[f32],
+        conv: &mut ConvState,
+        mode: Mode,
+    ) -> Result<Vec<f32>> {
         self.decode_fast_at(0, x, conv, mode)
     }
 
@@ -402,7 +556,13 @@ impl DevLayer {
     /// pointers directly (`enqueue_decode`'s `self.core.h0.ptr` etc. are slot-0 bases), so
     /// a slot adds its offsets to the step kernel's arguments — and only the EAGER path can
     /// do that: a captured graph freezes the pointers, so Graph mode runs slot 0 only.
-    pub(super) fn decode_fast_at(&mut self, slot: usize, x: &[f32], conv: &mut ConvState, mode: Mode) -> Result<Vec<f32>> {
+    pub(super) fn decode_fast_at(
+        &mut self,
+        slot: usize,
+        x: &[f32],
+        conv: &mut ConvState,
+        mode: Mode,
+    ) -> Result<Vec<f32>> {
         ensure!(x.len() == self.hidden, "k5 decode input");
         ensure!(mode != Mode::Naive, "decode_fast: naive mode");
         let (nh, di, hidden) = (self.nh, self.d_inner, self.hidden);
@@ -422,16 +582,36 @@ impl DevLayer {
             // no kernel touches then reads NaN in the shadow check, not a plausible 0.0.
             // (The PF2 workspace `core.ws` is prefill-only, not touched at t = 1.)
             p.poison(&[
-                &self.qkvb, &self.g1b, &self.gb_out, &self.bb, &self.g2a, &self.g2b, &self.yb,
-                &self.outb, &self.ob,
+                &self.qkvb,
+                &self.g1b,
+                &self.gb_out,
+                &self.bb,
+                &self.g2a,
+                &self.g2b,
+                &self.yb,
+                &self.outb,
+                &self.ob,
             ])?;
         }
         if slot == 0 {
             match mode {
-                Mode::Graph if self.fast.as_ref().and_then(|f| f.graph.as_ref()).is_some_and(|g| g.1 == gemv8) => {
+                Mode::Graph
+                    if self
+                        .fast
+                        .as_ref()
+                        .and_then(|f| f.graph.as_ref())
+                        .is_some_and(|g| g.1 == gemv8) =>
+                {
                     let f = self.fast.as_ref().unwrap();
-                    f.graph.as_ref().unwrap().0.launch(&self.s).map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
-                    log_once(&LOG_REPLAY, || format!("glm5 kda: decode mode graph engaged (first replay, gemv8={gemv8})"));
+                    f.graph
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .launch(&self.s)
+                        .map_err(|e| anyhow::anyhow!("kda graph launch: {e}"))?;
+                    log_once(&LOG_REPLAY, || {
+                        format!("glm5 kda: decode mode graph engaged (first replay, gemv8={gemv8})")
+                    });
                 }
                 Mode::Graph => {
                     // first token (or GEMV8 toggled): run eagerly, then capture for the next
@@ -443,15 +623,22 @@ impl DevLayer {
                     }
                     let me = &*self;
                     let gr = Graph::capture(&me.s, |s| {
-                        me.enqueue_decode(s, gemv8, None).map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
+                        me.enqueue_decode(s, gemv8, None)
+                            .map_err(|e| tang_moe::gpu::Error(format!("{e:#}")))
                     })
                     .map_err(|e| anyhow::anyhow!("kda decode capture: {e}"))?;
                     self.fast.as_mut().unwrap().graph = Some((gr, gemv8));
-                    log_once(&LOG_CAPTURE, || format!("glm5 kda: decode mode graph captured (first decode ran eager, gemv8={gemv8})"));
+                    log_once(&LOG_CAPTURE, || {
+                        format!("glm5 kda: decode mode graph captured (first decode ran eager, gemv8={gemv8})")
+                    });
                 }
                 _ => {
                     self.enqueue_decode(&self.s, gemv8, None)?;
-                    log_once(&LOG_EAGER, || format!("glm5 kda: decode mode fused engaged (first eager step, gemv8={gemv8})"));
+                    log_once(&LOG_EAGER, || {
+                        format!(
+                            "glm5 kda: decode mode fused engaged (first eager step, gemv8={gemv8})"
+                        )
+                    });
                 }
             }
         } else {
@@ -475,7 +662,11 @@ impl DevLayer {
         let mut next = conv.0.clone();
         for c in 0..ch {
             for s2 in 0..m {
-                next[c * m + s2] = if s2 + 1 < m { conv.0[c * m + s2 + 1] } else { qkv_h[c] };
+                next[c * m + s2] = if s2 + 1 < m {
+                    conv.0[c * m + s2 + 1]
+                } else {
+                    qkv_h[c]
+                };
             }
         }
         *conv = ConvState(next);
@@ -493,8 +684,8 @@ impl DevLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::kda::{ConvState, KdaConfig, KdaState};
+    use super::*;
     use std::path::Path;
 
     const TINY: &str = "/private/tmp/glm5-tiny/glm5-tiny-f32.gguf";
@@ -502,7 +693,17 @@ mod tests {
     fn poison(d: &DevLayer) {
         let (di, hd, nh) = (d.d_inner, d.hd, d.nh);
         let nan = |n: usize| vec![f32::NAN; n];
-        for (b, n) in [(&d.qkvb, 3 * di), (&d.g1b, hd), (&d.gb_out, di), (&d.bb, nh), (&d.g2a, hd), (&d.g2b, di), (&d.ob, di), (&d.yb, di), (&d.outb, d.hidden)] {
+        for (b, n) in [
+            (&d.qkvb, 3 * di),
+            (&d.g1b, hd),
+            (&d.gb_out, di),
+            (&d.bb, nh),
+            (&d.g2a, hd),
+            (&d.g2b, di),
+            (&d.ob, di),
+            (&d.yb, di),
+            (&d.outb, d.hidden),
+        ] {
             b.write(0, &nan(n)).unwrap();
         }
     }
@@ -516,7 +717,10 @@ mod tests {
         let _env = crate::flash::glm5::env_read();
         let required = std::env::var("TANG_REQUIRE_CUDA").is_ok_and(|v| v == "1");
         if !Path::new(TINY).exists() {
-            assert!(!required, "TANG_REQUIRE_CUDA=1 but the tiny fixture is absent");
+            assert!(
+                !required,
+                "TANG_REQUIRE_CUDA=1 but the tiny fixture is absent"
+            );
             eprintln!("SKIP kda_fused_decode_matches_naive: no fixture");
             return;
         }
@@ -535,17 +739,34 @@ mod tests {
         let n = hp.n_embd;
         // `a` has no fused kernels, so its window() is the naive path whatever the env says
         let mk = |fast: bool| {
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 8, 1).unwrap();
+            let mut d = DevLayer::new_gguf(
+                &g,
+                &gguf,
+                l,
+                &cfg,
+                n,
+                &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1),
+                8,
+                1,
+            )
+            .unwrap();
             d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
             d
         };
         let (mut a, mut b, mut c) = (mk(false), mk(true), mk(true));
         let mut seed = 7u64;
         let mut rnd = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
-        let (mut ca, mut cb, mut cc) = (ConvState::zeros(&cfg, 1), ConvState::zeros(&cfg, 1), ConvState::zeros(&cfg, 1));
+        let (mut ca, mut cb, mut cc) = (
+            ConvState::zeros(&cfg, 1),
+            ConvState::zeros(&cfg, 1),
+            ConvState::zeros(&cfg, 1),
+        );
         let rel = |p: &[f32], q: &[f32]| {
             let num: f64 = p.iter().zip(q).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
             let den: f64 = q.iter().map(|y| (*y as f64).powi(2)).sum();
@@ -561,7 +782,11 @@ mod tests {
             }
             let yb = b.decode_fast(&x, &mut cb, Mode::Fused).unwrap();
             let yc = c.decode_fast(&x, &mut cc, Mode::Graph).unwrap();
-            let (mut sa, mut sb, mut sc) = (KdaState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1));
+            let (mut sa, mut sb, mut sc) = (
+                KdaState::zeros(&cfg, 1),
+                KdaState::zeros(&cfg, 1),
+                KdaState::zeros(&cfg, 1),
+            );
             let (mut ha, mut hb, mut hc) = (ca.clone(), cb.clone(), cc.clone());
             a.read_back(&mut ha, &mut sa).unwrap();
             b.read_back(&mut hb, &mut sb).unwrap();
@@ -573,12 +798,21 @@ mod tests {
             eprintln!(
                 "step {step}: out rel fused {r_fb:.2e} graph {r_gr:.2e}; state {s_fb:.2e} {s_gr:.2e}; conv {h_fb:.2e} {h_gr:.2e}; bit-equal {bits}"
             );
-            assert!(ya.iter().all(|v| v.is_finite()) && ya.iter().any(|&v| v != 0.0), "naive output degenerate");
+            assert!(
+                ya.iter().all(|v| v.is_finite()) && ya.iter().any(|&v| v != 0.0),
+                "naive output degenerate"
+            );
             for r in [r_fb, r_gr, s_fb, s_gr, h_fb, h_gr] {
-                assert!(r <= 1e-5, "fused decode diverges from naive: {r:.3e} at step {step}");
+                assert!(
+                    r <= 1e-5,
+                    "fused decode diverges from naive: {r:.3e} at step {step}"
+                );
             }
         }
-        assert!(c.fast.as_ref().unwrap().graph.is_some(), "graph never captured");
+        assert!(
+            c.fast.as_ref().unwrap().graph.is_some(),
+            "graph never captured"
+        );
     }
 
     /// REAL WEIGHTS, one KDA layer (TANG_GLM5_REAL_GGUF = shard 1; TANG_GLM5_BENCH_LAYER,
@@ -611,17 +845,32 @@ mod tests {
         };
         let n = hp.n_embd;
         let mk = |fast: bool| {
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
+            let mut d = DevLayer::new_gguf(
+                &g,
+                &gguf,
+                l,
+                &cfg,
+                n,
+                &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1),
+                64,
+                1,
+            )
+            .unwrap();
             d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
             d
         };
         let mut seed = 11u64;
         let mut rnd = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
         let steps = 64usize;
-        let xs: Vec<Vec<f32>> = (0..steps).map(|_| (0..n).map(|_| rnd()).collect()).collect();
+        let xs: Vec<Vec<f32>> = (0..steps)
+            .map(|_| (0..n).map(|_| rnd()).collect())
+            .collect();
         let mut outs: Vec<Vec<Vec<f32>>> = Vec::new();
         let mut states = Vec::new();
         for mode in [Mode::Naive, Mode::Fused, Mode::Graph] {
@@ -640,7 +889,10 @@ mod tests {
                 });
             }
             let us = t0.elapsed().as_secs_f64() * 1e6 / (steps - 8) as f64;
-            eprintln!("kda decode layer {l} {mode:?}: {us:.0} us/step (real weights, {} steps timed)", steps - 8);
+            eprintln!(
+                "kda decode layer {l} {mode:?}: {us:.0} us/step (real weights, {} steps timed)",
+                steps - 8
+            );
             let mut st = KdaState::zeros(&cfg, 1);
             let mut hc = conv.clone();
             d.read_back(&mut hc, &mut st).unwrap();
@@ -674,10 +926,28 @@ mod tests {
                 .flat_map(|(a, b)| a.iter().zip(b))
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            let sdiff = states[mi].1 .0.iter().zip(&states[0].1 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            let cdiff = states[mi].0 .0.iter().zip(&states[0].0 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            eprintln!("{name} vs naive: {diff} output values differ (bits), state {sdiff}, conv {cdiff}");
-            assert_eq!((diff, sdiff, cdiff), (0, 0, 0), "{name} decode is not bit-equal to naive on real weights");
+            let sdiff = states[mi]
+                .1
+                 .0
+                .iter()
+                .zip(&states[0].1 .0)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let cdiff = states[mi]
+                .0
+                 .0
+                .iter()
+                .zip(&states[0].0 .0)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            eprintln!(
+                "{name} vs naive: {diff} output values differ (bits), state {sdiff}, conv {cdiff}"
+            );
+            assert_eq!(
+                (diff, sdiff, cdiff),
+                (0, 0, 0),
+                "{name} decode is not bit-equal to naive on real weights"
+            );
         }
     }
     /// REAL WEIGHTS (TANG_GLM5_REAL_GGUF = shard 1), TANG_GLM5_KDA_G5F: (a) per-matrix
@@ -713,23 +983,48 @@ mod tests {
         let mk = |g5f: u8, fast: bool| {
             std::env::set_var("TANG_GLM5_KDA_G5F", g5f.to_string());
             std::env::set_var("TANG_GLM5_GEMV8", "1");
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
+            let mut d = DevLayer::new_gguf(
+                &g,
+                &gguf,
+                l,
+                &cfg,
+                n,
+                &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1),
+                64,
+                1,
+            )
+            .unwrap();
             std::env::remove_var("TANG_GLM5_KDA_G5F");
             d.fast = fast.then(|| Fast::new(&g, &cfg).unwrap());
             d
         };
         let mut seed = 11u64;
         let mut rnd = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
         let xs: Vec<Vec<f32>> = (0..32).map(|_| (0..n).map(|_| rnd()).collect()).collect();
 
         // (a) per-matrix kernel time
         let d = mk(2, false);
-        assert!(d.segx.is_some() && d.sego.is_some(), "k5_qgemv tables not built (non-Q8_0 or unaligned weights)");
+        assert!(
+            d.segx.is_some() && d.sego.is_some(),
+            "k5_qgemv tables not built (non-Q8_0 or unaligned weights)"
+        );
         d.xb.write(0, &xs[0]).unwrap();
-        d.yb.write(0, &xs[0].iter().cycle().take(d.d_inner).copied().collect::<Vec<f32>>()).unwrap();
+        d.yb.write(
+            0,
+            &xs[0]
+                .iter()
+                .cycle()
+                .take(d.d_inner)
+                .copied()
+                .collect::<Vec<f32>>(),
+        )
+        .unwrap();
         let (e0, e1) = (Event::new(true).unwrap(), Event::new(true).unwrap());
         let time = |f: &dyn Fn()| -> f32 {
             for _ in 0..5 {
@@ -748,7 +1043,14 @@ mod tests {
             v[25]
         };
         let (di, hd, hid) = (d.d_inner, d.hd, d.hidden);
-        let mats: [(&str, &crate::flash::glm5::moe::gpu::DevW, usize, usize, u64, u64); 6] = [
+        let mats: [(
+            &str,
+            &crate::flash::glm5::moe::gpu::DevW,
+            usize,
+            usize,
+            u64,
+            u64,
+        ); 6] = [
             ("q", &d.wq, di, hid, d.xb.ptr, d.qkvb.ptr),
             ("k", &d.wk, di, hid, d.xb.ptr, d.qkvb.ptr),
             ("v", &d.wv, di, hid, d.xb.ptr, d.qkvb.ptr),
@@ -762,14 +1064,40 @@ mod tests {
         let mut tabs = Vec::new();
         for (name, w, rows, cols, x, y) in mats {
             unsafe {
-                launch(d.gv.q8, ((cols / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![x, codes, cols as u32, d.max_t as u32]).unwrap();
+                launch(
+                    d.gv.q8,
+                    ((cols / 32) as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &d.s,
+                    args![x, codes, cols as u32, d.max_t as u32],
+                )
+                .unwrap();
             }
             let scales = codes + (d.max_t * cols) as u64;
             let t8 = time(&|| unsafe { d.gemv8_launch(w, codes, cols, y, rows, rows, 1).unwrap() });
-            let a = crate::flash::glm5::moe::gpu::Act { xf: x, xq: codes, xq2: 0, xd: scales, xs: cols };
-            let tf = time(&|| d.gv.fast.gemv(&d.s, w.w, 0, a, y, rows, 1, rows, cols).unwrap());
-            let tab = tang_moe::gpu::DevBuf::from_slice(&[w.w.base, y, w.w.row_bytes as u64 | ((rows as u64) << 32)]).unwrap();
-            let tq = time(&|| unsafe { d.qgemv_launch(&d.s, &tab, 1, w.w.row_bytes, rows, 0, codes, scales, cols).unwrap() });
+            let a = crate::flash::glm5::moe::gpu::Act {
+                xf: x,
+                xq: codes,
+                xq2: 0,
+                xd: scales,
+                xs: cols,
+            };
+            let tf = time(&|| {
+                d.gv.fast
+                    .gemv(&d.s, w.w, 0, a, y, rows, 1, rows, cols)
+                    .unwrap()
+            });
+            let tab = tang_moe::gpu::DevBuf::from_slice(&[
+                w.w.base,
+                y,
+                w.w.row_bytes as u64 | ((rows as u64) << 32),
+            ])
+            .unwrap();
+            let tq = time(&|| unsafe {
+                d.qgemv_launch(&d.s, &tab, 1, w.w.row_bytes, rows, 0, codes, scales, cols)
+                    .unwrap()
+            });
             tabs.push(tab);
             let mb = w.w.estride as f64 / 1e6;
             eprintln!(
@@ -784,13 +1112,39 @@ mod tests {
             }
         }
         unsafe {
-            launch(d.gv.q8, ((hid / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![d.xb.ptr, codes, hid as u32, d.max_t as u32]).unwrap();
+            launch(
+                d.gv.q8,
+                ((hid / 32) as u32, 1, 1),
+                (32, 1, 1),
+                0,
+                &d.s,
+                args![d.xb.ptr, codes, hid as u32, d.max_t as u32],
+            )
+            .unwrap();
         }
-        let mb5: f64 = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga].iter().map(|w| w.w.estride as f64).sum::<f64>() / 1e6;
+        let mb5: f64 = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga]
+            .iter()
+            .map(|w| w.w.estride as f64)
+            .sum::<f64>()
+            / 1e6;
         let tm = time(&|| unsafe {
-            d.qgemv_launch(&d.s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * di + 2 * hd, 0, codes, codes + (d.max_t * hid) as u64, hid).unwrap()
+            d.qgemv_launch(
+                &d.s,
+                d.segx.as_ref().unwrap(),
+                5,
+                d.wq.w.row_bytes,
+                3 * di + 2 * hd,
+                0,
+                codes,
+                codes + (d.max_t * hid) as u64,
+                hid,
+            )
+            .unwrap()
         });
-        eprintln!("g5f bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)", mb5 / tm as f64);
+        eprintln!(
+            "g5f bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)",
+            mb5 / tm as f64
+        );
         eprintln!(
             "g5f bench per layer (6 matrices, separate launches): k5_gemv8 {:.1} us, g5f_gemv {:.1} us, k5_qgemv {:.1} us; merged x-launch + o: {:.1} us",
             tot[0], tot[1], tot[2], tm + to
@@ -821,7 +1175,10 @@ mod tests {
             let nv = run(g5f, Mode::Naive);
             let (eo, es) = (rel64(&nv.0, &base.0), rel64(&nv.1 .0, &base.1 .0));
             eprintln!("g5f parity G5F={g5f} naive vs gemv8 naive: out rel {eo:.3e}, state rel {es:.3e} ({:.0} vs {:.0} us/step host)", nv.2, base.2);
-            assert!(eo < 1e-2 && es < 1e-2, "G5F={g5f} diverges from the gemv8 path");
+            assert!(
+                eo < 1e-2 && es < 1e-2,
+                "G5F={g5f} diverges from the gemv8 path"
+            );
             // G5F=1 is EXPECTED bit-identical: g5f_gemv's Q8_0 lane dot on k5_q8's codes walks
             // the same e0 = lane*8 + 256i steps with the same fmaf and xor reduce as k5_gemv8
             // (measured: rel 0 on real layer 0). k5_qgemv sums 32 per dp4a chain: must differ.
@@ -830,10 +1187,23 @@ mod tests {
             }
             for m in [Mode::Fused, Mode::Graph] {
                 let fv = run(g5f, m);
-                let diff = fv.0.iter().zip(&nv.0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                let sdiff = fv.1 .0.iter().zip(&nv.1 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                let diff =
+                    fv.0.iter()
+                        .zip(&nv.0)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                let sdiff =
+                    fv.1 .0
+                        .iter()
+                        .zip(&nv.1 .0)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
                 eprintln!("g5f parity G5F={g5f} {m:?} vs naive: {diff} outputs, {sdiff} state values differ (bits); {:.0} us/step host", fv.2);
-                assert_eq!((diff, sdiff), (0, 0), "G5F={g5f} {m:?} not bit-equal to naive");
+                assert_eq!(
+                    (diff, sdiff),
+                    (0, 0),
+                    "G5F={g5f} {m:?} not bit-equal to naive"
+                );
             }
         }
         // (d) fused per-stage GPU time per mode
@@ -886,13 +1256,26 @@ mod tests {
         let n = hp.n_embd;
         let mk = |g5f: u8| {
             std::env::set_var("TANG_GLM5_KDA_G5F", g5f.to_string());
-            let d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
+            let d = DevLayer::new_gguf(
+                &g,
+                &gguf,
+                l,
+                &cfg,
+                n,
+                &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1),
+                64,
+                1,
+            )
+            .unwrap();
             std::env::remove_var("TANG_GLM5_KDA_G5F");
             d
         };
         let mut seed = 11u64;
         let mut rnd = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
         let xs: Vec<Vec<f32>> = (0..32).map(|_| (0..n).map(|_| rnd()).collect()).collect();
@@ -935,14 +1318,38 @@ mod tests {
             let info = gguf.info(&t(tn)).unwrap();
             let wf = gguf.dequantize(info).unwrap();
             let want: Vec<f32> = (0..rows)
-                .map(|r| wf[r * cols..(r + 1) * cols].iter().zip(xh.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>() as f32)
+                .map(|r| {
+                    wf[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(xh.iter())
+                        .map(|(a, b)| (*a as f64) * (*b as f64))
+                        .sum::<f64>() as f32
+                })
                 .collect();
             unsafe {
-                launch(d.gv.q8, ((cols / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![x, codes, cols as u32, d.max_t as u32]).unwrap();
+                launch(
+                    d.gv.q8,
+                    ((cols / 32) as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &d.s,
+                    args![x, codes, cols as u32, d.max_t as u32],
+                )
+                .unwrap();
             }
             let scales = codes + (d.max_t * cols) as u64;
-            let a = crate::flash::glm5::moe::gpu::Act { xf: x, xq: codes, xq2: 0, xd: scales, xs: cols };
-            let tf = time(&|| d.gv.fast.gemv(&d.s, w.w, 0, a, ybuf.ptr, rows, 1, rows, cols).unwrap());
+            let a = crate::flash::glm5::moe::gpu::Act {
+                xf: x,
+                xq: codes,
+                xq2: 0,
+                xd: scales,
+                xs: cols,
+            };
+            let tf = time(&|| {
+                d.gv.fast
+                    .gemv(&d.s, w.w, 0, a, ybuf.ptr, rows, 1, rows, cols)
+                    .unwrap()
+            });
             d.s.sync().unwrap();
             let ef = rel64(&ybuf.read::<f32>(0, rows).unwrap(), &want);
             let mb = w.w.estride as f64 / 1e6;
@@ -953,11 +1360,22 @@ mod tests {
             assert!(ef < 2e-2, "{name}: g5f_gemv rel {ef} vs the f32 dequant");
             tf_sum += tf;
             if qg {
-                let tab = tang_moe::gpu::DevBuf::from_slice(&[w.w.base, ybuf.ptr, w.w.row_bytes as u64 | ((rows as u64) << 32)]).unwrap();
-                let tq = time(&|| unsafe { d.qgemv_launch(&d.s, &tab, 1, w.w.row_bytes, rows, 0, codes, scales, cols).unwrap() });
+                let tab = tang_moe::gpu::DevBuf::from_slice(&[
+                    w.w.base,
+                    ybuf.ptr,
+                    w.w.row_bytes as u64 | ((rows as u64) << 32),
+                ])
+                .unwrap();
+                let tq = time(&|| unsafe {
+                    d.qgemv_launch(&d.s, &tab, 1, w.w.row_bytes, rows, 0, codes, scales, cols)
+                        .unwrap()
+                });
                 d.s.sync().unwrap();
                 let eq = rel64(&ybuf.read::<f32>(0, rows).unwrap(), &want);
-                line += &format!(", k5_qgemv {tq:.1} us ({:.2} TB/s, rel {eq:.2e})", mb / tq as f64);
+                line += &format!(
+                    ", k5_qgemv {tq:.1} us ({:.2} TB/s, rel {eq:.2e})",
+                    mb / tq as f64
+                );
                 assert!(eq < 2e-2, "{name}: k5_qgemv rel {eq} vs the f32 dequant");
                 tq_sum += tq;
                 if name == "o" {
@@ -968,22 +1386,53 @@ mod tests {
         }
         if qg {
             unsafe {
-                launch(d.gv.q8, ((hid / 32) as u32, 1, 1), (32, 1, 1), 0, &d.s, args![d.xb.ptr, codes, hid as u32, d.max_t as u32]).unwrap();
+                launch(
+                    d.gv.q8,
+                    ((hid / 32) as u32, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &d.s,
+                    args![d.xb.ptr, codes, hid as u32, d.max_t as u32],
+                )
+                .unwrap();
             }
-            let mb5: f64 = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga].iter().map(|w| w.w.estride as f64).sum::<f64>() / 1e6;
+            let mb5: f64 = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga]
+                .iter()
+                .map(|w| w.w.estride as f64)
+                .sum::<f64>()
+                / 1e6;
             let tm = time(&|| unsafe {
-                d.qgemv_launch(&d.s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * di + 2 * hd, 0, codes, codes + (d.max_t * hid) as u64, hid).unwrap()
+                d.qgemv_launch(
+                    &d.s,
+                    d.segx.as_ref().unwrap(),
+                    5,
+                    d.wq.w.row_bytes,
+                    3 * di + 2 * hd,
+                    0,
+                    codes,
+                    codes + (d.max_t * hid) as u64,
+                    hid,
+                )
+                .unwrap()
             });
-            eprintln!("quant bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)", mb5 / tm as f64);
+            eprintln!(
+                "quant bench merged q|k|v|f_a|g_a ({mb5:.1} MB): k5_qgemv {tm:.1} us ({:.2} TB/s)",
+                mb5 / tm as f64
+            );
             eprintln!("quant bench per layer: g5f_gemv {tf_sum:.1} us, k5_qgemv {tq_sum:.1} us; merged + o {:.1} us", tm + to);
         } else {
-            eprintln!("quant bench per layer: g5f_gemv {tf_sum:.1} us (no k5_qgemv tables for this type)");
+            eprintln!(
+                "quant bench per layer: g5f_gemv {tf_sum:.1} us (no k5_qgemv tables for this type)"
+            );
         }
         drop(d);
         let run = |g5f: u8| {
             let mut d = mk(g5f);
             let mut conv = ConvState::zeros(&cfg, 1);
-            let ys: Vec<Vec<f32>> = xs.iter().map(|x| d.window(x, 1, &mut conv).unwrap()).collect();
+            let ys: Vec<Vec<f32>> = xs
+                .iter()
+                .map(|x| d.window(x, 1, &mut conv).unwrap())
+                .collect();
             let mut st = KdaState::zeros(&cfg, 1);
             let mut hc = conv.clone();
             d.read_back(&mut hc, &mut st).unwrap();
@@ -991,7 +1440,9 @@ mod tests {
         };
         let (a, b) = (run(1), run(2));
         let (eo, es) = (rel64(&b.0, &a.0), rel64(&b.1 .0, &a.1 .0));
-        eprintln!("quant parity G5F=2 vs G5F=1 naive, 32 steps: out rel {eo:.3e}, state rel {es:.3e}");
+        eprintln!(
+            "quant parity G5F=2 vs G5F=1 naive, 32 steps: out rel {eo:.3e}, state rel {es:.3e}"
+        );
         assert!(eo < 1e-2 && es < 1e-2, "G5F=2 diverges from G5F=1");
     }
 
@@ -1042,7 +1493,11 @@ impl DevLayer {
     /// The t-row fast path applies (resident.rs window_resident routes a t>1 KDA item
     /// through [`Self::rows_enqueue`] when this holds).
     pub fn rows_fast_ok(&self, t: usize) -> bool {
-        (2..=4).contains(&t) && rows_fast() && self.tail_ok() && self.segx.is_some() && self.sego.is_some()
+        (2..=4).contains(&t)
+            && rows_fast()
+            && self.tail_ok()
+            && self.segx.is_some()
+            && self.sego.is_some()
     }
 
     unsafe fn rows_fast(&self, s: &Stream, t: usize, ck: Option<(u64, usize)>) -> Result<()> {
@@ -1062,13 +1517,25 @@ impl DevLayer {
             )?;
             let rows = 3 * di + 2 * hd;
             launch(
-                if self.wq.w.row_bytes as usize <= 9 * 32 * 16 { fast.qgt9 } else { fast.qgt17 },
+                if self.wq.w.row_bytes as usize <= 9 * 32 * 16 {
+                    fast.qgt9
+                } else {
+                    fast.qgt17
+                },
                 (rows.div_ceil(4) as u32, 1, 1),
                 (128, 1, 1),
                 0,
                 s,
-                args![self.segx.as_ref().unwrap().ptr, 5u32, codes, codes + (self.max_t * hidden) as u64,
-                    hidden as u32, 3u32, (3 * di) as u32, t as u32],
+                args![
+                    self.segx.as_ref().unwrap().ptr,
+                    5u32,
+                    codes,
+                    codes + (self.max_t * hidden) as u64,
+                    hidden as u32,
+                    3u32,
+                    (3 * di) as u32,
+                    t as u32
+                ],
             )?;
             if split_flag() {
                 // heads x rows pre-pass (state independent), then the serial state rows
@@ -1079,10 +1546,31 @@ impl DevLayer {
                     (self.hd as u32, 1, 1),
                     (self.hidden * 4 + 16) as u32,
                     s,
-                    args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
-                        self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, regs[0].0, self.core.wconv.ptr, regs[1].0,
-                        self.on.ptr, self.cfg.eps, self.bb.ptr, self.gb_out.ptr, self.g2b.ptr,
-                        self.rsc.ptr, self.hidden as u32, t as u32, ckp, ckf],
+                    args![
+                        self.fb.w,
+                        self.gb.w,
+                        self.bproj.w,
+                        self.xb.ptr,
+                        self.g1b.ptr,
+                        self.g2a.ptr,
+                        self.dt.ptr,
+                        self.rate.ptr,
+                        lb,
+                        self.qkvb.ptr,
+                        regs[0].0,
+                        self.core.wconv.ptr,
+                        regs[1].0,
+                        self.on.ptr,
+                        self.cfg.eps,
+                        self.bb.ptr,
+                        self.gb_out.ptr,
+                        self.g2b.ptr,
+                        self.rsc.ptr,
+                        self.hidden as u32,
+                        t as u32,
+                        ckp,
+                        ckf
+                    ],
                 )?;
                 launch(
                     fast.stept,
@@ -1090,9 +1578,24 @@ impl DevLayer {
                     (self.hd as u32, 1, 1),
                     0,
                     s,
-                    args![self.qkvb.ptr, regs[0].0, regs[1].0, self.on.ptr, self.cfg.eps, self.bb.ptr,
-                        self.g2b.ptr, self.rsc.ptr, self.ob.ptr, self.yb.ptr, self.xq8.ptr, self.max_t as u32,
-                        t as u32, ckp, ckf, (regs[0].1 / 4) as u64],
+                    args![
+                        self.qkvb.ptr,
+                        regs[0].0,
+                        regs[1].0,
+                        self.on.ptr,
+                        self.cfg.eps,
+                        self.bb.ptr,
+                        self.g2b.ptr,
+                        self.rsc.ptr,
+                        self.ob.ptr,
+                        self.yb.ptr,
+                        self.xq8.ptr,
+                        self.max_t as u32,
+                        t as u32,
+                        ckp,
+                        ckf,
+                        (regs[0].1 / 4) as u64
+                    ],
                 )?;
             } else if tailt_flag() {
                 // one launch for the t rows; the checkpoints are written from registers
@@ -1103,30 +1606,67 @@ impl DevLayer {
                     (self.hd as u32, 1, 1),
                     (self.hidden * 4 + 16) as u32,
                     s,
-                    args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
-                        self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, regs[0].0, self.core.wconv.ptr, regs[1].0,
-                        self.on.ptr, self.cfg.eps, self.bb.ptr, self.gb_out.ptr, self.g2b.ptr,
-                        self.ob.ptr, self.yb.ptr, self.xq8.ptr, self.max_t as u32, self.hidden as u32, t as u32,
-                        ckp, ckf, (regs[0].1 / 4) as u64],
+                    args![
+                        self.fb.w,
+                        self.gb.w,
+                        self.bproj.w,
+                        self.xb.ptr,
+                        self.g1b.ptr,
+                        self.g2a.ptr,
+                        self.dt.ptr,
+                        self.rate.ptr,
+                        lb,
+                        self.qkvb.ptr,
+                        regs[0].0,
+                        self.core.wconv.ptr,
+                        regs[1].0,
+                        self.on.ptr,
+                        self.cfg.eps,
+                        self.bb.ptr,
+                        self.gb_out.ptr,
+                        self.g2b.ptr,
+                        self.ob.ptr,
+                        self.yb.ptr,
+                        self.xq8.ptr,
+                        self.max_t as u32,
+                        self.hidden as u32,
+                        t as u32,
+                        ckp,
+                        ckf,
+                        (regs[0].1 / 4) as u64
+                    ],
                 )?;
             }
             for i in 0..if tailt_flag() || split_flag() { 0 } else { t } {
                 self.tail_launch(s, fast, self.core.h0.ptr, self.core.st.ptr, lb, i)?;
                 if let (Some((base, stride)), true) = (ck, i + 1 < t) {
                     let b = base + (i * stride) as u64;
-                    tang_moe::gpu::copy_d2d_async(b, regs[0].0, regs[0].1, s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    tang_moe::gpu::copy_d2d_async(b, regs[0].0, regs[0].1, s)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     tang_moe::gpu::copy_d2d_async(b + regs[0].1 as u64, regs[1].0, regs[1].1, s)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
             }
             launch(
-                if self.wo.w.row_bytes as usize <= 9 * 32 * 16 { fast.qgt9 } else { fast.qgt17 },
+                if self.wo.w.row_bytes as usize <= 9 * 32 * 16 {
+                    fast.qgt9
+                } else {
+                    fast.qgt17
+                },
                 (hidden.div_ceil(4) as u32, 1, 1),
                 (128, 1, 1),
                 0,
                 s,
-                args![self.sego.as_ref().unwrap().ptr, 1u32, codes, codes + (self.max_t * di) as u64,
-                    di as u32, 0u32, 0u32, t as u32],
+                args![
+                    self.sego.as_ref().unwrap().ptr,
+                    1u32,
+                    codes,
+                    codes + (self.max_t * di) as u64,
+                    di as u32,
+                    0u32,
+                    0u32,
+                    t as u32
+                ],
             )?;
         }
         Ok(())
@@ -1152,9 +1692,22 @@ impl DevLayer {
     /// state bases. Writes bb, gb_out, g2b, ob, yb and yb's k5_q8 codes into xq8.
     /// `i` = the row of a t-row window (0 for a decode step): every per-row input / output
     /// pointer moves by row i, the state (h0 / st) does not (rows run serially).
-    unsafe fn tail_launch(&self, s: &Stream, fast: &Fast, h0: u64, st: u64, lb: f32, i: usize) -> Result<()> {
+    unsafe fn tail_launch(
+        &self,
+        s: &Stream,
+        fast: &Fast,
+        h0: u64,
+        st: u64,
+        lb: f32,
+        i: usize,
+    ) -> Result<()> {
         let f = 4u64;
-        let (i, di, hd, nh) = (i as u64, self.d_inner as u64, self.hd as u64, self.nh as u64);
+        let (i, di, hd, nh) = (
+            i as u64,
+            self.d_inner as u64,
+            self.hd as u64,
+            self.nh as u64,
+        );
         unsafe {
             launch(
                 fast.tail,
@@ -1162,12 +1715,32 @@ impl DevLayer {
                 (self.hd as u32, 1, 1),
                 (self.hidden * 4 + 16) as u32,
                 s,
-                args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr + i * self.hidden as u64 * f,
-                    self.g1b.ptr + i * hd * f, self.g2a.ptr + i * hd * f,
-                    self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr + i * 3 * di * f, h0, self.core.wconv.ptr, st,
-                    self.on.ptr, self.cfg.eps, self.bb.ptr + i * nh * f, self.gb_out.ptr + i * di * f,
-                    self.g2b.ptr + i * di * f, self.ob.ptr + i * di * f, self.yb.ptr + i * di * f,
-                    self.xq8.ptr, self.max_t as u32, self.hidden as u32, i as u32],
+                args![
+                    self.fb.w,
+                    self.gb.w,
+                    self.bproj.w,
+                    self.xb.ptr + i * self.hidden as u64 * f,
+                    self.g1b.ptr + i * hd * f,
+                    self.g2a.ptr + i * hd * f,
+                    self.dt.ptr,
+                    self.rate.ptr,
+                    lb,
+                    self.qkvb.ptr + i * 3 * di * f,
+                    h0,
+                    self.core.wconv.ptr,
+                    st,
+                    self.on.ptr,
+                    self.cfg.eps,
+                    self.bb.ptr + i * nh * f,
+                    self.gb_out.ptr + i * di * f,
+                    self.g2b.ptr + i * di * f,
+                    self.ob.ptr + i * di * f,
+                    self.yb.ptr + i * di * f,
+                    self.xq8.ptr,
+                    self.max_t as u32,
+                    self.hidden as u32,
+                    i as u32
+                ],
             )?;
         }
         Ok(())
@@ -1176,8 +1749,8 @@ impl DevLayer {
 
 #[cfg(test)]
 mod tail_tests {
-    use super::*;
     use super::super::super::kda::{ConvState, KdaConfig, KdaState};
+    use super::*;
     use std::path::Path;
 
     /// REAL WEIGHTS (TANG_GLM5_REAL_GGUF, run with TANG_GLM5_KDA_G5F=2): (a) the G5F fused
@@ -1207,61 +1780,196 @@ mod tail_tests {
         };
         let n = hp.n_embd;
         let mk = || {
-            let mut d = DevLayer::new_gguf(&g, &gguf, l, &cfg, n, &ConvState::zeros(&cfg, 1), &KdaState::zeros(&cfg, 1), 64, 1).unwrap();
+            let mut d = DevLayer::new_gguf(
+                &g,
+                &gguf,
+                l,
+                &cfg,
+                n,
+                &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1),
+                64,
+                1,
+            )
+            .unwrap();
             d.fast = Some(Fast::new(&g, &cfg).unwrap());
             d
         };
         let mut seed = 11u64;
         let mut rnd = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
         let steps = 64usize;
-        let xs: Vec<Vec<f32>> = (0..steps).map(|_| (0..n).map(|_| rnd()).collect()).collect();
+        let xs: Vec<Vec<f32>> = (0..steps)
+            .map(|_| (0..n).map(|_| rnd()).collect())
+            .collect();
         let d0 = mk();
-        assert!(d0.g5f == 2 && d0.segx.is_some() && d0.sego.is_some(), "run with TANG_GLM5_KDA_G5F=2 (Q8_0 weights)");
-        assert!(d0.tail_ok(), "k5d_tail preconditions fail on the real layer");
+        assert!(
+            d0.g5f == 2 && d0.segx.is_some() && d0.sego.is_some(),
+            "run with TANG_GLM5_KDA_G5F=2 (Q8_0 weights)"
+        );
+        assert!(
+            d0.tail_ok(),
+            "k5d_tail preconditions fail on the real layer"
+        );
         let (nh, hd, di, hidden) = (d0.nh, d0.hd, d0.d_inner, d0.hidden);
-        eprintln!("layer {l}: nh {nh} hd {hd} d_inner {di} hidden {hidden}; state {:.2} MiB/layer", (nh * hd * hd * 4) as f64 / 1048576.0);
+        eprintln!(
+            "layer {l}: nh {nh} hd {hd} d_inner {di} hidden {hidden}; state {:.2} MiB/layer",
+            (nh * hd * hd * 4) as f64 / 1048576.0
+        );
         let lb = d0.cfg.gate_lower_bound.unwrap_or(f32::NAN);
         drop(d0);
         // the launches, one closure per kernel (index into the timing table)
         type K<'a> = Box<dyn Fn(&DevLayer, &Stream) + 'a>;
         let q8x: K = Box::new(|d, s| unsafe {
-            launch(d.gv.q8, ((d.hidden / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![d.xb.ptr, d.xq8.ptr, d.hidden as u32, d.max_t as u32]).unwrap();
+            launch(
+                d.gv.q8,
+                ((d.hidden / 32) as u32, 1, 1),
+                (32, 1, 1),
+                0,
+                s,
+                args![d.xb.ptr, d.xq8.ptr, d.hidden as u32, d.max_t as u32],
+            )
+            .unwrap();
         });
         let qx: K = Box::new(|d, s| unsafe {
             let c = d.xq8.ptr;
-            let bytes = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga].iter().map(|w| w.w.estride).sum();
-            d.qgemv_launch(s, d.segx.as_ref().unwrap(), 5, d.wq.w.row_bytes, 3 * d.d_inner + 2 * d.hd, bytes, c, c + (d.max_t * d.hidden) as u64, d.hidden).unwrap();
+            let bytes = [&d.wq, &d.wk, &d.wv, &d.fa, &d.ga]
+                .iter()
+                .map(|w| w.w.estride)
+                .sum();
+            d.qgemv_launch(
+                s,
+                d.segx.as_ref().unwrap(),
+                5,
+                d.wq.w.row_bytes,
+                3 * d.d_inner + 2 * d.hd,
+                bytes,
+                c,
+                c + (d.max_t * d.hidden) as u64,
+                d.hidden,
+            )
+            .unwrap();
         });
         let beta: K = Box::new(|d, s| unsafe {
-            launch(d.gv.beta, (d.nh.div_ceil(super::super::K5_WARPS) as u32, 1, 1), (128, 1, 1), 0, s,
-                args![d.bproj.w, d.xb.ptr, d.bb.ptr, 1u32, d.hidden as u32, d.nh as u32]).unwrap();
+            launch(
+                d.gv.beta,
+                (d.nh.div_ceil(super::super::K5_WARPS) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                s,
+                args![
+                    d.bproj.w,
+                    d.xb.ptr,
+                    d.bb.ptr,
+                    1u32,
+                    d.hidden as u32,
+                    d.nh as u32
+                ],
+            )
+            .unwrap();
         });
         let gate2: K = Box::new(move |d, s| unsafe {
-            launch(d.fast.as_ref().unwrap().gate2, grid(2 * d.d_inner), (128, 1, 1), 0, s,
-                args![d.fb.w, d.gb.w, d.g1b.ptr, d.g2a.ptr, d.dt.ptr, d.rate.ptr, d.gb_out.ptr, d.g2b.ptr,
-                    d.nh as u32, d.hd as u32, lb]).unwrap();
+            launch(
+                d.fast.as_ref().unwrap().gate2,
+                grid(2 * d.d_inner),
+                (128, 1, 1),
+                0,
+                s,
+                args![
+                    d.fb.w,
+                    d.gb.w,
+                    d.g1b.ptr,
+                    d.g2a.ptr,
+                    d.dt.ptr,
+                    d.rate.ptr,
+                    d.gb_out.ptr,
+                    d.g2b.ptr,
+                    d.nh as u32,
+                    d.hd as u32,
+                    lb
+                ],
+            )
+            .unwrap();
         });
         let step: K = Box::new(|d, s| unsafe {
-            launch(d.fast.as_ref().unwrap().step, (d.nh as u32, 1, 1), (d.hd as u32, 1, 1), 0, s,
-                args![d.qkvb.ptr, d.core.h0.ptr, d.core.wconv.ptr, d.gb_out.ptr, d.bb.ptr, d.core.st.ptr,
-                    d.ob.ptr, d.on.ptr, d.g2b.ptr, d.yb.ptr, d.cfg.eps]).unwrap();
+            launch(
+                d.fast.as_ref().unwrap().step,
+                (d.nh as u32, 1, 1),
+                (d.hd as u32, 1, 1),
+                0,
+                s,
+                args![
+                    d.qkvb.ptr,
+                    d.core.h0.ptr,
+                    d.core.wconv.ptr,
+                    d.gb_out.ptr,
+                    d.bb.ptr,
+                    d.core.st.ptr,
+                    d.ob.ptr,
+                    d.on.ptr,
+                    d.g2b.ptr,
+                    d.yb.ptr,
+                    d.cfg.eps
+                ],
+            )
+            .unwrap();
         });
         let q8y: K = Box::new(|d, s| unsafe {
-            launch(d.gv.q8, ((d.d_inner / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![d.yb.ptr, d.xq8.ptr, d.d_inner as u32, d.max_t as u32]).unwrap();
+            launch(
+                d.gv.q8,
+                ((d.d_inner / 32) as u32, 1, 1),
+                (32, 1, 1),
+                0,
+                s,
+                args![d.yb.ptr, d.xq8.ptr, d.d_inner as u32, d.max_t as u32],
+            )
+            .unwrap();
         });
         let qo: K = Box::new(|d, s| unsafe {
             let c = d.xq8.ptr;
-            d.qgemv_launch(s, d.sego.as_ref().unwrap(), 1, d.wo.w.row_bytes, d.hidden, d.wo.w.estride, c, c + (d.max_t * d.d_inner) as u64, d.d_inner).unwrap();
+            d.qgemv_launch(
+                s,
+                d.sego.as_ref().unwrap(),
+                1,
+                d.wo.w.row_bytes,
+                d.hidden,
+                d.wo.w.estride,
+                c,
+                c + (d.max_t * d.d_inner) as u64,
+                d.d_inner,
+            )
+            .unwrap();
         });
         let tail: K = Box::new(move |d, s| unsafe {
-            d.tail_launch(s, d.fast.as_ref().unwrap(), d.core.h0.ptr, d.core.st.ptr, lb, 0).unwrap();
+            d.tail_launch(
+                s,
+                d.fast.as_ref().unwrap(),
+                d.core.h0.ptr,
+                d.core.st.ptr,
+                lb,
+                0,
+            )
+            .unwrap();
         });
-        let old: Vec<(&str, &K)> = vec![("k5_q8 x", &q8x), ("k5_qgemv q|k|v|f_a|g_a", &qx), ("k5_beta", &beta),
-            ("k5d_gate2", &gate2), ("k5d_step", &step), ("k5_q8 yb", &q8y), ("k5_qgemv o", &qo)];
-        let new: Vec<(&str, &K)> = vec![("k5_q8 x", &q8x), ("k5_qgemv q|k|v|f_a|g_a", &qx), ("k5d_tail", &tail), ("k5_qgemv o", &qo)];
+        let old: Vec<(&str, &K)> = vec![
+            ("k5_q8 x", &q8x),
+            ("k5_qgemv q|k|v|f_a|g_a", &qx),
+            ("k5_beta", &beta),
+            ("k5d_gate2", &gate2),
+            ("k5d_step", &step),
+            ("k5_q8 yb", &q8y),
+            ("k5_qgemv o", &qo),
+        ];
+        let new: Vec<(&str, &K)> = vec![
+            ("k5_q8 x", &q8x),
+            ("k5_qgemv q|k|v|f_a|g_a", &qx),
+            ("k5d_tail", &tail),
+            ("k5_qgemv o", &qo),
+        ];
         let mut outs = Vec::new();
         let mut states = Vec::new();
         let mut taps: Vec<[Vec<f32>; 5]> = Vec::new();
@@ -1280,8 +1988,13 @@ mod tail_tests {
                 d.s.sync().unwrap();
                 ys.push(d.outb.read::<f32>(0, hidden).unwrap());
                 if i == 0 {
-                    taps.push([d.bb.read::<f32>(0, nh).unwrap(), d.gb_out.read::<f32>(0, di).unwrap(),
-                        d.g2b.read::<f32>(0, di).unwrap(), d.ob.read::<f32>(0, di).unwrap(), d.yb.read::<f32>(0, di).unwrap()]);
+                    taps.push([
+                        d.bb.read::<f32>(0, nh).unwrap(),
+                        d.gb_out.read::<f32>(0, di).unwrap(),
+                        d.g2b.read::<f32>(0, di).unwrap(),
+                        d.ob.read::<f32>(0, di).unwrap(),
+                        d.yb.read::<f32>(0, di).unwrap(),
+                    ]);
                 }
                 if i >= 8 {
                     for j in 0..seq.len() {
@@ -1297,7 +2010,11 @@ mod tail_tests {
             for (j, (name, _)) in seq.iter().enumerate() {
                 eprintln!("tail bench {form}: {name:<24} {:7.1} us", med(&mut per[j]));
             }
-            eprintln!("tail bench {form}: {:<24} {:7.1} us (events, back to back, one stream)", "TOTAL step", med(&mut per[seq.len()]));
+            eprintln!(
+                "tail bench {form}: {:<24} {:7.1} us (events, back to back, one stream)",
+                "TOTAL step",
+                med(&mut per[seq.len()])
+            );
             let mut conv = ConvState::zeros(&cfg, 1);
             let mut st = KdaState::zeros(&cfg, 1);
             d.read_back(&mut conv, &mut st).unwrap();
@@ -1307,9 +2024,20 @@ mod tail_tests {
         for (ti, name) in ["beta", "g", "g2", "o", "y"].iter().enumerate() {
             let a = &taps[0][ti];
             let b = &taps[1][ti];
-            let n = a.iter().zip(b).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            let m = a.iter().zip(b).map(|(a, b)| ((a - b).abs() / a.abs().max(1e-30)) as f64).fold(0.0, f64::max);
-            eprintln!("tail tap step 0 {name}: {n}/{} differ, max rel {m:.2e}", a.len());
+            let n = a
+                .iter()
+                .zip(b)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let m = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| ((a - b).abs() / a.abs().max(1e-30)) as f64)
+                .fold(0.0, f64::max);
+            eprintln!(
+                "tail tap step 0 {name}: {n}/{} differ, max rel {m:.2e}",
+                a.len()
+            );
         }
         // the production entry: decode_fast eager and graph (tail on unless TANG_GLM5_KDA_TAIL=0)
         for mode in [Mode::Fused, Mode::Graph] {
@@ -1327,12 +2055,37 @@ mod tail_tests {
             outs.push(ys);
             states.push((hc, st));
         }
-        for (mi, name) in [(1, "tail eager"), (2, "decode_fast fused"), (3, "decode_fast graph")] {
-            let diff = outs[mi].iter().zip(&outs[0]).flat_map(|(a, b)| a.iter().zip(b)).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            let sdiff = states[mi].1 .0.iter().zip(&states[0].1 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-            let cdiff = states[mi].0 .0.iter().zip(&states[0].0 .0).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        for (mi, name) in [
+            (1, "tail eager"),
+            (2, "decode_fast fused"),
+            (3, "decode_fast graph"),
+        ] {
+            let diff = outs[mi]
+                .iter()
+                .zip(&outs[0])
+                .flat_map(|(a, b)| a.iter().zip(b))
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let sdiff = states[mi]
+                .1
+                 .0
+                .iter()
+                .zip(&states[0].1 .0)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let cdiff = states[mi]
+                .0
+                 .0
+                .iter()
+                .zip(&states[0].0 .0)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
             eprintln!("{name} vs old launches: {diff} output values differ (bits), state {sdiff}, conv {cdiff}");
-            assert_eq!((diff, sdiff, cdiff), (0, 0, 0), "{name} is not bit-equal to the old launches");
+            assert_eq!(
+                (diff, sdiff, cdiff),
+                (0, 0, 0),
+                "{name} is not bit-equal to the old launches"
+            );
         }
     }
 }
@@ -1347,7 +2100,11 @@ impl DevLayer {
     /// pointers only (capturable); `outb` holds y `[t][hidden]`. Not bit-identical to the
     /// t=1 decode step (batched GEMVs; the windiff note in NOTES.md).
     pub fn rows_enqueue(&self, s: &Stream, t: usize, ck: Option<(u64, usize)>) -> Result<()> {
-        ensure!(self.pf2 && t >= 1 && t <= self.max_t, "kda rows_enqueue: pf2 {} t {t}", self.pf2);
+        ensure!(
+            self.pf2 && t >= 1 && t <= self.max_t,
+            "kda rows_enqueue: pf2 {} t {t}",
+            self.pf2
+        );
         if self.rows_fast_ok(t) {
             return unsafe { self.rows_fast(s, t, ck) };
         }
@@ -1369,23 +2126,49 @@ impl DevLayer {
                         s,
                         args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],
                     )?;
-                    for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    for (w, off) in [
+                        (&self.wq, 0u64),
+                        (&self.wk, di as u64 * f),
+                        (&self.wv, 2 * di as u64 * f),
+                    ] {
                         self.gemv8_launch_on(s, w, self.xq8.ptr, hidden, qkv + off, 3 * di, di, t)?;
                     }
                 } else {
-                    for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                    for (w, off) in [
+                        (&self.wq, 0u64),
+                        (&self.wk, di as u64 * f),
+                        (&self.wv, 2 * di as u64 * f),
+                    ] {
                         launch(
                             self.gv.gemv,
                             grid(t * di),
                             (128, 1, 1),
                             0,
                             s,
-                            args![w.w, 0u32, self.xb.ptr, qkv + off, (3 * di) as u32, t as u32, di as u32, hidden as u32],
+                            args![
+                                w.w,
+                                0u32,
+                                self.xb.ptr,
+                                qkv + off,
+                                (3 * di) as u32,
+                                t as u32,
+                                di as u32,
+                                hidden as u32
+                            ],
                         )?;
                     }
                 }
                 if gemv8 && g8(&self.fa) {
-                    self.gemv8_launch_on(s, &self.fa, self.xq8.ptr, hidden, self.g1b.ptr, hd, hd, t)?;
+                    self.gemv8_launch_on(
+                        s,
+                        &self.fa,
+                        self.xq8.ptr,
+                        hidden,
+                        self.g1b.ptr,
+                        hd,
+                        hd,
+                        t,
+                    )?;
                 } else {
                     launch(
                         self.gv.gemv,
@@ -1393,7 +2176,16 @@ impl DevLayer {
                         (128, 1, 1),
                         0,
                         s,
-                        args![self.fa.w, 0u32, self.xb.ptr, self.g1b.ptr, hd as u32, t as u32, hd as u32, hidden as u32],
+                        args![
+                            self.fa.w,
+                            0u32,
+                            self.xb.ptr,
+                            self.g1b.ptr,
+                            hd as u32,
+                            t as u32,
+                            hd as u32,
+                            hidden as u32
+                        ],
                     )?;
                 }
             }
@@ -1403,7 +2195,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 s,
-                args![self.fb.w, 0u32, self.g1b.ptr, self.gb_out.ptr, di as u32, t as u32, di as u32, hd as u32],
+                args![
+                    self.fb.w,
+                    0u32,
+                    self.g1b.ptr,
+                    self.gb_out.ptr,
+                    di as u32,
+                    t as u32,
+                    di as u32,
+                    hd as u32
+                ],
             )?;
             launch(
                 self.gv.gate,
@@ -1411,7 +2212,15 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 s,
-                args![self.gb_out.ptr, self.dt.ptr, self.rate.ptr, nh as u32, hd as u32, lb, t as u32],
+                args![
+                    self.gb_out.ptr,
+                    self.dt.ptr,
+                    self.rate.ptr,
+                    nh as u32,
+                    hd as u32,
+                    lb,
+                    t as u32
+                ],
             )?;
             launch(
                 self.gv.beta,
@@ -1419,12 +2228,28 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 s,
-                args![self.bproj.w, self.xb.ptr, self.bb.ptr, t as u32, hidden as u32, nh as u32],
+                args![
+                    self.bproj.w,
+                    self.xb.ptr,
+                    self.bb.ptr,
+                    t as u32,
+                    hidden as u32,
+                    nh as u32
+                ],
             )?;
             // g_a (unless g5f_x wrote it): before o_proj re-quantises xq8
             if !g5 {
                 if gemv8 && g8(&self.ga) {
-                    self.gemv8_launch_on(s, &self.ga, self.xq8.ptr, hidden, self.g2a.ptr, hd, hd, t)?;
+                    self.gemv8_launch_on(
+                        s,
+                        &self.ga,
+                        self.xq8.ptr,
+                        hidden,
+                        self.g2a.ptr,
+                        hd,
+                        hd,
+                        t,
+                    )?;
                 } else {
                     launch(
                         self.gv.gemv,
@@ -1432,7 +2257,16 @@ impl DevLayer {
                         (128, 1, 1),
                         0,
                         s,
-                        args![self.ga.w, 0u32, self.xb.ptr, self.g2a.ptr, hd as u32, t as u32, hd as u32, hidden as u32],
+                        args![
+                            self.ga.w,
+                            0u32,
+                            self.xb.ptr,
+                            self.g2a.ptr,
+                            hd as u32,
+                            t as u32,
+                            hd as u32,
+                            hidden as u32
+                        ],
                     )?;
                 }
             }
@@ -1451,7 +2285,8 @@ impl DevLayer {
             )?;
             if let (Some((base, stride)), true) = (ck, (i as usize) + 1 < t) {
                 let b = base + i * stride as u64;
-                tang_moe::gpu::copy_d2d_async(b, regs[0].0, regs[0].1, s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                tang_moe::gpu::copy_d2d_async(b, regs[0].0, regs[0].1, s)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 tang_moe::gpu::copy_d2d_async(b + regs[0].1 as u64, regs[1].0, regs[1].1, s)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
@@ -1463,7 +2298,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 s,
-                args![self.gb.w, 0u32, self.g2a.ptr, self.g2b.ptr, di as u32, t as u32, di as u32, hd as u32],
+                args![
+                    self.gb.w,
+                    0u32,
+                    self.g2a.ptr,
+                    self.g2b.ptr,
+                    di as u32,
+                    t as u32,
+                    di as u32,
+                    hd as u32
+                ],
             )?;
             launch(
                 self.gv.norm,
@@ -1471,7 +2315,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 s,
-                args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32, hd as u32, self.cfg.eps, t as u32],
+                args![
+                    self.ob.ptr,
+                    self.on.ptr,
+                    self.g2b.ptr,
+                    self.yb.ptr,
+                    nh as u32,
+                    hd as u32,
+                    self.cfg.eps,
+                    t as u32
+                ],
             )?;
             if self.g5f_o(s, t)? {
             } else if g8(&self.wo) {
@@ -1483,7 +2336,16 @@ impl DevLayer {
                     s,
                     args![self.yb.ptr, self.xq8.ptr, di as u32, self.max_t as u32],
                 )?;
-                self.gemv8_launch_on(s, &self.wo, self.xq8.ptr, di, self.outb.ptr, hidden, hidden, t)?;
+                self.gemv8_launch_on(
+                    s,
+                    &self.wo,
+                    self.xq8.ptr,
+                    di,
+                    self.outb.ptr,
+                    hidden,
+                    hidden,
+                    t,
+                )?;
             } else {
                 launch(
                     self.gv.gemv,
@@ -1491,7 +2353,16 @@ impl DevLayer {
                     (128, 1, 1),
                     0,
                     s,
-                    args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32, t as u32, hidden as u32, di as u32],
+                    args![
+                        self.wo.w,
+                        0u32,
+                        self.yb.ptr,
+                        self.outb.ptr,
+                        hidden as u32,
+                        t as u32,
+                        hidden as u32,
+                        di as u32
+                    ],
                 )?;
             }
         }

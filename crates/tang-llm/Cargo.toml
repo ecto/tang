@@ -16,6 +16,9 @@ default = []
 metal = ["tang-compute/metal"]
 # NVIDIA GPUs. On Linux, build with `--no-default-features --features cuda` (Metal is macOS-only).
 cuda = ["tang-compute/cuda", "dep:tang-moe", "tang-moe/cuda", "dep:cudarc", "tang-verify/cuda"]
+# Expert parallelism over NCCL (flash/deepseek/ep.rs, docs/deepseek-ep.md). Not part of `cuda`:
+# the in-process host reduction works without it; NCCL needs libnccl.so.2 at run time.
+ep = ["cuda", "tang-moe/nccl"]
 
 # OpenTelemetry traces and metrics (see docs/observability.md). Off by default. On: OTLP/JSON
 # lines to a file (crates/tang-otel); OTLP/HTTP only with TANG_OTEL_LIVE=1 / `serve --otel-live`.

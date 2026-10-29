@@ -26,11 +26,11 @@ pub mod mla_debug;
 #[cfg(feature = "cuda")]
 pub mod mla_dev;
 pub mod moe;
+#[cfg(feature = "cuda")]
+pub mod moe_debug;
 pub mod mtp;
 #[cfg(test)]
 mod mtp_tests;
-#[cfg(feature = "cuda")]
-pub mod moe_debug;
 #[cfg(feature = "cuda")]
 pub mod serve_glue;
 pub mod trace;
@@ -183,7 +183,6 @@ impl Hparams {
             }
         };
 
-
         Ok(Self {
             n_vocab: g.info("token_embd.weight")?.dims[1] as usize,
             n_embd: u("embedding_length")?,
@@ -314,7 +313,11 @@ pub fn inventory(g: &Gguf) -> Result<String> {
             r.count,
             r.dims
                 .iter()
-                .map(|(d, n)| if *n > 1 { format!("{d}×{n}") } else { d.clone() })
+                .map(|(d, n)| if *n > 1 {
+                    format!("{d}×{n}")
+                } else {
+                    d.clone()
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
             r.types
@@ -325,7 +328,11 @@ pub fn inventory(g: &Gguf) -> Result<String> {
             r.bytes
         )?;
     }
-    writeln!(s, "total: {total} ({:.3} GiB)", total as f64 / (1u64 << 30) as f64)?;
+    writeln!(
+        s,
+        "total: {total} ({:.3} GiB)",
+        total as f64 / (1u64 << 30) as f64
+    )?;
     Ok(s)
 }
 
@@ -493,6 +500,7 @@ pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// Exclusive: this test mutates process env (poison-tolerant: a failed test must not fail
 /// every later one).
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn env_write() -> std::sync::RwLockWriteGuard<'static, ()> {
     ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
 }

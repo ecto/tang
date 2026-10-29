@@ -469,7 +469,8 @@ fn render(s: &State) -> Option<String> {
     let run_ms = ms(first, s.t_last);
     let (sol, sol_src) = s.sol.clone().unwrap_or((0.0, "unknown".into()));
     let all_gpu: f64 = s.phases.iter().map(|p| p.gpu_ms).sum();
-    let _ = writeln!(
+    let _ =
+        writeln!(
         o,
         "\n== glm5 trace (TANG_GLM5_TRACE) — {:.2} s traced, GPU busy {:.2} s ({:.0}%); SOL {} ==",
         run_ms / 1e3,
@@ -510,7 +511,14 @@ fn render(s: &State) -> Option<String> {
             ph.windows,
             ph.tokens,
             ph.wall_ms / div,
-            if pi == 0 { format!(" ({:.2} tok/s)", 1e3 * ph.windows as f64 / ph.wall_ms.max(1e-9)) } else { String::new() },
+            if pi == 0 {
+                format!(
+                    " ({:.2} tok/s)",
+                    1e3 * ph.windows as f64 / ph.wall_ms.max(1e-9)
+                )
+            } else {
+                String::new()
+            },
             ph.gpu_ms / div,
             100.0 * ph.gpu_ms / ph.wall_ms.max(1e-9),
             (ph.io.launches as f64 / div).round(),
@@ -572,9 +580,14 @@ fn render(s: &State) -> Option<String> {
                 "kernel", "stage", "launch", "gpu ms", "avg µs", "%gpu", "GB/s", "%SOL"
             );
             let mut ks: Vec<_> = kernels.iter().collect();
-            ks.sort_by(|a, b| b.1.gpu_ms.partial_cmp(&a.1.gpu_ms).unwrap_or(std::cmp::Ordering::Equal));
+            ks.sort_by(|a, b| {
+                b.1.gpu_ms
+                    .partial_cmp(&a.1.gpu_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for ((k, st), a) in ks.iter().take(24) {
-                let gbs = (a.bytes > 0 && a.bytes_ms > 0.0).then(|| a.bytes as f64 / a.bytes_ms / 1e6);
+                let gbs =
+                    (a.bytes > 0 && a.bytes_ms > 0.0).then(|| a.bytes as f64 / a.bytes_ms / 1e6);
                 let _ = writeln!(
                     o,
                     "{:<24} {:<26} {:>7.0} {:>9.2} {:>8.1} {:>5.1}% {:>8} {:>6}",
@@ -593,10 +606,17 @@ fn render(s: &State) -> Option<String> {
             }
         }
         // the ranking: top-level stages by wall, how much of it the GPU covers
-        let _ = writeln!(o, "\nbottlenecks ({label}; top-level stages by wall, host = wall − GPU):");
+        let _ = writeln!(
+            o,
+            "\nbottlenecks ({label}; top-level stages by wall, host = wall − GPU):"
+        );
         let mut top: Vec<(&String, &Agg)> =
             stages.iter().filter(|(p, _)| !p.contains('/')).collect();
-        top.sort_by(|a, b| b.1.wall_ms.partial_cmp(&a.1.wall_ms).unwrap_or(std::cmp::Ordering::Equal));
+        top.sort_by(|a, b| {
+            b.1.wall_ms
+                .partial_cmp(&a.1.wall_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for (i, (p, a)) in top.iter().take(8).enumerate() {
             let host = (a.wall_ms - a.gpu_ms).max(0.0);
             let _ = writeln!(

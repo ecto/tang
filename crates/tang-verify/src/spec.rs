@@ -38,7 +38,10 @@ impl Taps {
     }
 
     pub fn get(&self, name: &str) -> Option<&[f32]> {
-        self.items.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice())
+        self.items
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_slice())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[f32])> {
@@ -86,7 +89,13 @@ pub struct Tap {
 
 impl Tap {
     pub fn new(name: &'static str, layout: Layout) -> Self {
-        Self { name, layout, inputs: Vec::new(), what: "", region: None }
+        Self {
+            name,
+            layout,
+            inputs: Vec::new(),
+            what: "",
+            region: None,
+        }
     }
 
     /// The taps it reads.
@@ -103,7 +112,12 @@ impl Tap {
 
     /// A section of shared buffer `buffer`: row r at `r·stride + base`, `len` elements.
     pub fn within(mut self, buffer: &'static str, base: usize, len: usize, stride: usize) -> Self {
-        self.region = Some(Region { buffer, base, len, stride });
+        self.region = Some(Region {
+            buffer,
+            base,
+            len,
+            stride,
+        });
         self
     }
 
@@ -134,7 +148,10 @@ pub struct Spec {
 
 impl Spec {
     pub fn new(kernel: impl Into<String>) -> Self {
-        Self { kernel: kernel.into(), taps: Vec::new() }
+        Self {
+            kernel: kernel.into(),
+            taps: Vec::new(),
+        }
     }
 
     pub fn tap(mut self, t: Tap) -> Self {
@@ -189,7 +206,10 @@ mod tests {
             Layout::flat(),
             &[],
         );
-        assert_eq!(&*s.get("k").unwrap().resolve(&t).unwrap(), &[2.0, 3.0, 8.0, 9.0]);
+        assert_eq!(
+            &*s.get("k").unwrap().resolve(&t).unwrap(),
+            &[2.0, 3.0, 8.0, 9.0]
+        );
         assert!(s.get("k").unwrap().resolve(&Taps::new()).is_none());
     }
 

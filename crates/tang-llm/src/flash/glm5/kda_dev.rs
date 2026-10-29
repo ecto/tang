@@ -68,7 +68,6 @@ pub mod decode;
 ///   ordinary `k5_gemv` launches into the `g2` scratch (`g_a`: `[t][hd]`, then `g_b`
 ///   in place on a separate buffer, so no read/write race).
 
-
 /// Everything of one KDA layer on one GPU, built once at engine load.
 pub struct DevLayer {
     /// The conv + delta-rule core (W4's `DevKda`): state lives on device between windows.
@@ -203,7 +202,11 @@ impl DevLayer {
             // the converter splits HF's fused qkv conv per q|k|v; the CPU loader stacks
             // them in q,k,v order — the core kernel indexes the same stack
             let mut c = Vec::with_capacity(3 * d_inner * cfg.d_conv);
-            for n in ["ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"] {
+            for n in [
+                "ssm_conv1d_q.weight",
+                "ssm_conv1d_k.weight",
+                "ssm_conv1d_v.weight",
+            ] {
                 c.extend_from_slice(&gguf.tensor_f32(&t(n))?);
             }
             c
@@ -272,7 +275,10 @@ impl DevLayer {
                 }
             },
             gemv8: std::env::var("TANG_GLM5_GEMV8").is_ok_and(|v| v == "1"),
-            g5f: std::env::var("TANG_GLM5_KDA_G5F").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            g5f: std::env::var("TANG_GLM5_KDA_G5F")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             segx: None,
             sego: None,
         }
@@ -290,8 +296,19 @@ impl DevLayer {
         let ok = |ws: &[&super::moe::gpu::DevW]| {
             let rb = ws[0].w.row_bytes;
             // Q8_0 (k5_qgemv9/17) or Q4_K (k5_qgemv_q4k5/9), one type per table
-            let cap = match ws[0].w.ty { 8 => 17, 12 => 9, _ => 0 } * 32 * 16;
-            ws.iter().all(|w| w.w.ty == ws[0].w.ty && w.w.base % 16 == 0 && w.w.row_bytes == rb && rb % 16 == 0 && rb <= cap)
+            let cap = match ws[0].w.ty {
+                8 => 17,
+                12 => 9,
+                _ => 0,
+            } * 32
+                * 16;
+            ws.iter().all(|w| {
+                w.w.ty == ws[0].w.ty
+                    && w.w.base % 16 == 0
+                    && w.w.row_bytes == rb
+                    && rb % 16 == 0
+                    && rb <= cap
+            })
         };
         let tab = |e: &[(&super::moe::gpu::DevW, u64, usize)]| -> Result<DevBuf> {
             let mut v: Vec<u64> = Vec::new();
@@ -319,8 +336,18 @@ impl DevLayer {
     /// k5_qgemv over a segment table (T = 1): `nseg` matrices of `rows_total` rows of
     /// `rb` bytes, all reading x's k5_q8 codes. Warps a block: as many staged rows as fit
     /// 48 KB, at most 8.
-    unsafe fn qgemv_launch(&self, s: &Stream, tab: &DevBuf, nseg: usize, rb: u32, rows_total: usize,
-        bytes: u64, codes: u64, scales: u64, cols: usize) -> Result<()> {
+    unsafe fn qgemv_launch(
+        &self,
+        s: &Stream,
+        tab: &DevBuf,
+        nseg: usize,
+        rb: u32,
+        rows_total: usize,
+        bytes: u64,
+        codes: u64,
+        scales: u64,
+        cols: usize,
+    ) -> Result<()> {
         let nw = (49152 / rb as usize).clamp(1, 8);
         // a Q4_K row is cols/256 super-blocks of 144 B (a Q8_0 row: cols/32 blocks of 34 B)
         let f = match (rb as usize == cols / 256 * 144, rb as usize <= 9 * 32 * 16) {
@@ -330,7 +357,11 @@ impl DevLayer {
             (false, false) => self.gv.qgemv17,
         };
         // the Q8_0 kernels stage nothing (kda_k5.cuh): 4 warps a block, no shared memory
-        let (nw, smem) = if rb as usize == cols / 256 * 144 { (nw, nw as u32 * rb) } else { (4, 0) };
+        let (nw, smem) = if rb as usize == cols / 256 * 144 {
+            (nw, nw as u32 * rb)
+        } else {
+            (4, 0)
+        };
         // two rows a warp on k5_qgemv9 (bit 31 of nseg; every segment's rows are even here:
         // di, hd), same per-row chains: B300 23.4 -> 22.1 us. Not on k5_qgemv17 (o_proj:
         // 11.8 -> 12.7 us, 2 x 81 words a lane). TANG_GLM5_KDA_QR2=0: one row a warp.
@@ -338,7 +369,11 @@ impl DevLayer {
         let qr2 = smem == 0
             && rb as usize <= 9 * 32 * 16
             && *QR2.get_or_init(|| !std::env::var("TANG_GLM5_KDA_QR2").is_ok_and(|v| v == "0"));
-        let (rows_total, nseg) = if qr2 { (rows_total.div_ceil(2), nseg as u32 | 0x8000_0000) } else { (rows_total, nseg as u32) };
+        let (rows_total, nseg) = if qr2 {
+            (rows_total.div_ceil(2), nseg as u32 | 0x8000_0000)
+        } else {
+            (rows_total, nseg as u32)
+        };
         tang_moe::gpu::trace::bytes(bytes);
         unsafe {
             launch(
@@ -373,12 +408,31 @@ impl DevLayer {
                 args![self.xb.ptr, codes, hidden as u32, self.max_t as u32],
             )?;
             if let (1, Some(tab)) = (t, self.segx.as_ref()) {
-                let bytes = [&self.wq, &self.wk, &self.wv, &self.fa, &self.ga].iter().map(|w| w.w.estride).sum();
+                let bytes = [&self.wq, &self.wk, &self.wv, &self.fa, &self.ga]
+                    .iter()
+                    .map(|w| w.w.estride)
+                    .sum();
                 return self
-                    .qgemv_launch(s, tab, 5, self.wq.w.row_bytes, 3 * di + 2 * hd, bytes, codes, scales, hidden)
+                    .qgemv_launch(
+                        s,
+                        tab,
+                        5,
+                        self.wq.w.row_bytes,
+                        3 * di + 2 * hd,
+                        bytes,
+                        codes,
+                        scales,
+                        hidden,
+                    )
                     .map(|_| true);
             }
-            let a = super::moe::gpu::Act { xf: self.xb.ptr, xq: codes, xq2: 0, xd: scales, xs: hidden };
+            let a = super::moe::gpu::Act {
+                xf: self.xb.ptr,
+                xq: codes,
+                xq2: 0,
+                xd: scales,
+                xs: hidden,
+            };
             let q = self.qkvb.ptr;
             for (w, y, ys, rows) in [
                 (&self.wq, q, 3 * di, di),
@@ -414,12 +468,30 @@ impl DevLayer {
             )?;
             if let (1, Some(tab)) = (t, self.sego.as_ref()) {
                 return self
-                    .qgemv_launch(s, tab, 1, self.wo.w.row_bytes, hidden, self.wo.w.estride, codes, scales, di)
+                    .qgemv_launch(
+                        s,
+                        tab,
+                        1,
+                        self.wo.w.row_bytes,
+                        hidden,
+                        self.wo.w.estride,
+                        codes,
+                        scales,
+                        di,
+                    )
                     .map(|_| true);
             }
-            let a = super::moe::gpu::Act { xf: self.yb.ptr, xq: codes, xq2: 0, xd: scales, xs: di };
+            let a = super::moe::gpu::Act {
+                xf: self.yb.ptr,
+                xq: codes,
+                xq2: 0,
+                xd: scales,
+                xs: di,
+            };
             tang_moe::gpu::trace::bytes(self.wo.w.estride);
-            self.gv.fast.gemv(s, self.wo.w, 0, a, self.outb.ptr, hidden, t, hidden, di)?;
+            self.gv
+                .fast
+                .gemv(s, self.wo.w, 0, a, self.outb.ptr, hidden, t, hidden, di)?;
         }
         Ok(true)
     }
@@ -438,7 +510,12 @@ impl DevLayer {
     }
 
     /// [`Self::read_back`] of sequence `slot`'s state.
-    pub fn read_back_at(&self, slot: usize, conv: &mut ConvState, state: &mut KdaState) -> Result<()> {
+    pub fn read_back_at(
+        &self,
+        slot: usize,
+        conv: &mut ConvState,
+        state: &mut KdaState,
+    ) -> Result<()> {
         self.s.sync()?;
         self.core.read_conv_at(slot, conv)?;
         self.core.read_state_at(slot, state)?;
@@ -503,7 +580,17 @@ impl DevLayer {
                 (128, 1, 1),
                 smem,
                 s,
-                args![w.w, 0u32, xq8, scales, y, ystride as u32, t as u32, rows as u32, cols as u32],
+                args![
+                    w.w,
+                    0u32,
+                    xq8,
+                    scales,
+                    y,
+                    ystride as u32,
+                    t as u32,
+                    rows as u32,
+                    cols as u32
+                ],
             )?;
         }
         Ok(())
@@ -516,7 +603,13 @@ impl DevLayer {
     /// [`Self::window`] for sequence `slot` (its device conv + recurrent state, one slice
     /// of the layer's `[slots][...]` state buffers). The projection scratch is shared: one
     /// window at a time runs per layer, so no slot partitioning is needed there.
-    pub fn window_at(&mut self, slot: usize, x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
+    pub fn window_at(
+        &mut self,
+        slot: usize,
+        x: &[f32],
+        t: usize,
+        conv: &mut ConvState,
+    ) -> Result<Vec<f32>> {
         self.window_impl(&[slot], x, t, conv)
     }
 
@@ -532,7 +625,10 @@ impl DevLayer {
     /// conv + delta-rule step — runs per row, on that row's slot state. Needs the
     /// device-resident core (`TANG_GLM5_KDA_PF2=1`); the slots must be distinct.
     pub fn window_rows(&mut self, slots: &[usize], x: &[f32]) -> Result<Vec<f32>> {
-        ensure!(self.pf2, "batched KDA rows need the device-resident core (TANG_GLM5_KDA_PF2=1)");
+        ensure!(
+            self.pf2,
+            "batched KDA rows need the device-resident core (TANG_GLM5_KDA_PF2=1)"
+        );
         ensure!(!slots.is_empty(), "empty batch");
         let mut dummy = ConvState(Vec::new());
         self.window_impl(slots, x, slots.len(), &mut dummy)
@@ -540,13 +636,26 @@ impl DevLayer {
 
     /// `slots.len() == 1`: a window of `t` consecutive tokens of `slots[0]`;
     /// `slots.len() == t > 1`: one decode row per slot ([`Self::window_rows`]).
-    fn window_impl(&mut self, slots: &[usize], x: &[f32], t: usize, conv: &mut ConvState) -> Result<Vec<f32>> {
-        ensure!(slots.len() == 1 || slots.len() == t, "k5 rows: {} slots for {t} rows", slots.len());
+    fn window_impl(
+        &mut self,
+        slots: &[usize],
+        x: &[f32],
+        t: usize,
+        conv: &mut ConvState,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            slots.len() == 1 || slots.len() == t,
+            "k5 rows: {} slots for {t} rows",
+            slots.len()
+        );
         let rows = slots.len() > 1;
         let slot = slots[0];
         ensure!(x.len() == t * self.hidden, "k5 layer input");
         ensure!(t <= self.max_t, "k5 window {t} > {max}", max = self.max_t);
-        ensure!(!rows || self.probe.is_none(), "k5 rows: no shadow check on batched rows");
+        ensure!(
+            !rows || self.probe.is_none(),
+            "k5 rows: no shadow check on batched rows"
+        );
         if t == 1 && self.fast.is_some() {
             let mode = decode::Mode::from_env();
             if mode != decode::Mode::Naive {
@@ -574,8 +683,18 @@ impl DevLayer {
             // Includes the core's own scratch (conv output, core output) and PF2's
             // workspace (the pf_state temporaries).
             p.poison(&[
-                &self.qkvb, &self.g1b, &self.gb_out, &self.bb, &self.g2a, &self.g2b, &self.yb,
-                &self.outb, &self.ob, &self.core.yb, &self.core.ob, &self.core.ws,
+                &self.qkvb,
+                &self.g1b,
+                &self.gb_out,
+                &self.bb,
+                &self.g2a,
+                &self.g2b,
+                &self.yb,
+                &self.outb,
+                &self.ob,
+                &self.core.yb,
+                &self.core.ob,
+                &self.core.ws,
             ])?;
         }
         let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
@@ -611,13 +730,21 @@ impl DevLayer {
                     (32, 1, 1),
                     0,
                     &self.s,
-                    args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32],  // MAXT: the codes array's row cap (scales follow it), NOT t
+                    args![self.xb.ptr, self.xq8.ptr, hidden as u32, self.max_t as u32], // MAXT: the codes array's row cap (scales follow it), NOT t
                 )?;
-                for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                for (w, off) in [
+                    (&self.wq, 0u64),
+                    (&self.wk, di as u64 * f),
+                    (&self.wv, 2 * di as u64 * f),
+                ] {
                     self.gemv8_launch(w, self.xq8.ptr, hidden, qkv + off, 3 * di, di, t)?;
                 }
             } else {
-                for (w, off) in [(&self.wq, 0u64), (&self.wk, di as u64 * f), (&self.wv, 2 * di as u64 * f)] {
+                for (w, off) in [
+                    (&self.wq, 0u64),
+                    (&self.wk, di as u64 * f),
+                    (&self.wv, 2 * di as u64 * f),
+                ] {
                     tr_bytes(w.w.estride);
                     launch(
                         self.gv.gemv,
@@ -626,8 +753,14 @@ impl DevLayer {
                         0,
                         &self.s,
                         args![
-                            w.w, 0u32, self.xb.ptr, qkv + off, (3 * di) as u32, t as u32,
-                            di as u32, hidden as u32
+                            w.w,
+                            0u32,
+                            self.xb.ptr,
+                            qkv + off,
+                            (3 * di) as u32,
+                            t as u32,
+                            di as u32,
+                            hidden as u32
                         ],
                     )?;
                 }
@@ -648,8 +781,16 @@ impl DevLayer {
                     (128, 1, 1),
                     0,
                     &self.s,
-                    args![self.fa.w, 0u32, self.xb.ptr, self.g1b.ptr, hd as u32, t as u32,
-                        hd as u32, hidden as u32],
+                    args![
+                        self.fa.w,
+                        0u32,
+                        self.xb.ptr,
+                        self.g1b.ptr,
+                        hd as u32,
+                        t as u32,
+                        hd as u32,
+                        hidden as u32
+                    ],
                 )?;
             }
             tr_bytes(self.fb.w.estride);
@@ -659,8 +800,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.fb.w, 0u32, self.g1b.ptr, self.gb_out.ptr, di as u32, t as u32,
-                    di as u32, hd as u32],
+                args![
+                    self.fb.w,
+                    0u32,
+                    self.g1b.ptr,
+                    self.gb_out.ptr,
+                    di as u32,
+                    t as u32,
+                    di as u32,
+                    hd as u32
+                ],
             )?;
             launch(
                 self.gv.gate,
@@ -668,8 +817,15 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.gb_out.ptr, self.dt.ptr, self.rate.ptr, nh as u32, hd as u32,
-                    lb, t as u32],
+                args![
+                    self.gb_out.ptr,
+                    self.dt.ptr,
+                    self.rate.ptr,
+                    nh as u32,
+                    hd as u32,
+                    lb,
+                    t as u32
+                ],
             )?;
             // beta gate
             tr_bytes(self.bproj.w.estride);
@@ -683,8 +839,14 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.bproj.w, self.xb.ptr, self.bb.ptr, t as u32, hidden as u32,
-                    nh as u32],
+                args![
+                    self.bproj.w,
+                    self.xb.ptr,
+                    self.bb.ptr,
+                    t as u32,
+                    hidden as u32,
+                    nh as u32
+                ],
             )?;
             drop(tr);
         }
@@ -692,7 +854,10 @@ impl DevLayer {
         if self.pf2 {
             if prof {
                 self.s.sync()?;
-                eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
+                eprintln!(
+                    "glm5: prof kda proj: {:.2} ms",
+                    t_win.elapsed().as_secs_f32() * 1e3
+                );
             }
             let t_core = std::time::Instant::now();
             if rows {
@@ -702,17 +867,26 @@ impl DevLayer {
             }
             if prof {
                 self.s.sync()?;
-                eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
+                eprintln!(
+                    "glm5: prof kda core: {:.2} ms",
+                    t_core.elapsed().as_secs_f32() * 1e3
+                );
             }
             drop(tr);
             return self.finish(t, None, tp);
         }
         self.s.sync()?;
         if prof {
-            eprintln!("glm5: prof kda proj: {:.2} ms", t_win.elapsed().as_secs_f32() * 1e3);
+            eprintln!(
+                "glm5: prof kda proj: {:.2} ms",
+                t_win.elapsed().as_secs_f32() * 1e3
+            );
         }
         let t_core = std::time::Instant::now();
-        ensure!(!rows, "k5 rows: the host-staged core runs one sequence (TANG_GLM5_KDA_PF2=1)");
+        ensure!(
+            !rows,
+            "k5 rows: the host-staged core runs one sequence (TANG_GLM5_KDA_PF2=1)"
+        );
         // the core (W4's launchers stage their inputs from host): qkv, g, beta
         let qkv_h = self.qkvb.read::<f32>(0, t * 3 * di)?;
         let g_h = self.gb_out.read::<f32>(0, t * di)?;
@@ -749,11 +923,21 @@ impl DevLayer {
         // W4's core decode/prefill index state.head(cfg, slot, h) on the host even when the
         // device owns the state — hand it a correctly-sized zero buffer so the indexing is
         // in-bounds (the values are ignored: the device-side state is authoritative).
-        let mut dummy_state = KdaState(vec![0f32; self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim]);
+        let mut dummy_state = KdaState(vec![
+            0f32;
+            self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim
+        ]);
         let mut o = vec![0f32; t * di];
         if t == 1 {
             o.copy_from_slice(&self.core.decode(
-                &self.kers, &self.cfg, &qkv_h, &g_h, &beta_h, conv, &mut dummy_state, 1,
+                &self.kers,
+                &self.cfg,
+                &qkv_h,
+                &g_h,
+                &beta_h,
+                conv,
+                &mut dummy_state,
+                1,
             )?);
         } else {
             let mut off = 0usize;
@@ -771,7 +955,12 @@ impl DevLayer {
                 )?;
                 o[off * di..(off + 64) * di].copy_from_slice(&o64);
                 if let Some(p) = tp.as_mut() {
-                    p.read_at(super::kda_debug::tap::CONV, off * 3 * di, &self.core.yb, 64 * 3 * di)?;
+                    p.read_at(
+                        super::kda_debug::tap::CONV,
+                        off * 3 * di,
+                        &self.core.yb,
+                        64 * 3 * di,
+                    )?;
                 }
                 off += 64;
             }
@@ -783,11 +972,9 @@ impl DevLayer {
                     conv.clone(),
                     KdaState(vec![
                         0f32;
-                        self.cfg.heads
-                            * self.cfg.head_dim
-                            * self.cfg.head_dim
-                    ],
-                ));
+                        self.cfg.heads * self.cfg.head_dim * self.cfg.head_dim
+                    ]),
+                );
                 self.read_back_at(slot, &mut hconv, &mut hstate)?;
                 let yc = super::kda::conv1d_prefill(
                     &qkv_h[off * 3 * di..t * 3 * di],
@@ -809,7 +996,8 @@ impl DevLayer {
                 )?;
                 o[off * di..t * di].copy_from_slice(&oc);
                 if let Some(p) = tp.as_mut() {
-                    p.taps.put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
+                    p.taps
+                        .put_at(super::kda_debug::tap::CONV, off * 3 * di, &yc);
                 }
                 self.seed_at(slot, &hconv, &hstate)?;
                 *conv = hconv;
@@ -817,7 +1005,10 @@ impl DevLayer {
         }
         self.ob.write(0, &o)?;
         if prof {
-            eprintln!("glm5: prof kda core: {:.2} ms", t_core.elapsed().as_secs_f32() * 1e3);
+            eprintln!(
+                "glm5: prof kda core: {:.2} ms",
+                t_core.elapsed().as_secs_f32() * 1e3
+            );
         }
         drop(tr);
         self.finish(t, Some(o), tp)
@@ -865,7 +1056,13 @@ impl DevLayer {
     /// the conv output (in place in `qkvb`) are read back as taps, and the host conv copy
     /// is mirrored from the device (this path doesn't maintain it: the device is
     /// authoritative and `read_back` syncs it before any CPU use).
-    fn core_pf2(&mut self, slot: usize, t: usize, conv: &mut ConvState, tp: &mut Option<tang_verify::Probe>) -> Result<()> {
+    fn core_pf2(
+        &mut self,
+        slot: usize,
+        t: usize,
+        conv: &mut ConvState,
+        tp: &mut Option<tang_verify::Probe>,
+    ) -> Result<()> {
         let (nh, di) = (self.nh, self.d_inner);
         if let Some(p) = tp.as_mut() {
             use super::kda_debug::tap;
@@ -921,7 +1118,12 @@ impl DevLayer {
 
     /// The gated output norm + o_proj from the core output in `ob` (`o`: the host copy
     /// when the host-staged path produced it), then the taps.
-    fn finish(&mut self, t: usize, o: Option<Vec<f32>>, tp: Option<tang_verify::Probe>) -> Result<Vec<f32>> {
+    fn finish(
+        &mut self,
+        t: usize,
+        o: Option<Vec<f32>>,
+        tp: Option<tang_verify::Probe>,
+    ) -> Result<Vec<f32>> {
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         // same per-matrix rule as window(): g_a reuses x's codes from the q/k/v pre-pass,
         // which ran only if q/k/v all took gemv8; o_proj quantises its own input
@@ -958,8 +1160,16 @@ impl DevLayer {
                     (128, 1, 1),
                     0,
                     &self.s,
-                    args![self.ga.w, 0u32, self.xb.ptr, self.g2a.ptr, hd as u32, t as u32,
-                        hd as u32, hidden as u32],
+                    args![
+                        self.ga.w,
+                        0u32,
+                        self.xb.ptr,
+                        self.g2a.ptr,
+                        hd as u32,
+                        t as u32,
+                        hd as u32,
+                        hidden as u32
+                    ],
                 )?;
             }
             tr_bytes(self.gb.w.estride);
@@ -969,8 +1179,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.gb.w, 0u32, self.g2a.ptr, self.g2b.ptr, di as u32, t as u32,
-                    di as u32, hd as u32],
+                args![
+                    self.gb.w,
+                    0u32,
+                    self.g2a.ptr,
+                    self.g2b.ptr,
+                    di as u32,
+                    t as u32,
+                    di as u32,
+                    hd as u32
+                ],
             )?;
             launch(
                 self.gv.norm,
@@ -978,8 +1196,16 @@ impl DevLayer {
                 (128, 1, 1),
                 0,
                 &self.s,
-                args![self.ob.ptr, self.on.ptr, self.g2b.ptr, self.yb.ptr, nh as u32,
-                    hd as u32, self.cfg.eps, t as u32],
+                args![
+                    self.ob.ptr,
+                    self.on.ptr,
+                    self.g2b.ptr,
+                    self.yb.ptr,
+                    nh as u32,
+                    hd as u32,
+                    self.cfg.eps,
+                    t as u32
+                ],
             )?;
             drop(tr);
             let _tr = span("o_proj");
@@ -1003,8 +1229,16 @@ impl DevLayer {
                     (128, 1, 1),
                     0,
                     &self.s,
-                    args![self.wo.w, 0u32, self.yb.ptr, self.outb.ptr, hidden as u32,
-                        t as u32, hidden as u32, di as u32],
+                    args![
+                        self.wo.w,
+                        0u32,
+                        self.yb.ptr,
+                        self.outb.ptr,
+                        hidden as u32,
+                        t as u32,
+                        hidden as u32,
+                        di as u32
+                    ],
                 )?;
             }
         }
@@ -1013,7 +1247,10 @@ impl DevLayer {
         let tr = span("sync+read");
         self.s.sync()?;
         if prof {
-            eprintln!("glm5: prof kda out: {:.2} ms", t_out.elapsed().as_secs_f32() * 1e3);
+            eprintln!(
+                "glm5: prof kda out: {:.2} ms",
+                t_out.elapsed().as_secs_f32() * 1e3
+            );
         }
         let out = self.outb.read::<f32>(0, t * hidden)?;
         drop(tr);
@@ -1082,8 +1319,18 @@ mod tests {
         let mk = |pf2: bool| {
             // DevLayer reads the flag at load
             std::env::set_var("TANG_GLM5_KDA_PF2", if pf2 { "1" } else { "0" });
-            let d = DevLayer::new_gguf(&g, &r.g, l, &cfg, hidden, &ConvState::zeros(&cfg, 1),
-                &KdaState::zeros(&cfg, 1), max_t, 1).unwrap();
+            let d = DevLayer::new_gguf(
+                &g,
+                &r.g,
+                l,
+                &cfg,
+                hidden,
+                &ConvState::zeros(&cfg, 1),
+                &KdaState::zeros(&cfg, 1),
+                max_t,
+                1,
+            )
+            .unwrap();
             std::env::remove_var("TANG_GLM5_KDA_PF2");
             d
         };
@@ -1098,7 +1345,9 @@ mod tests {
                     seed ^= seed >> 12;
                     seed ^= seed << 25;
                     seed ^= seed >> 27;
-                    ((seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 3.46
+                    ((seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32
+                        - 0.5)
+                        * 3.46
                 })
                 .collect();
             let t0 = std::time::Instant::now();
@@ -1130,9 +1379,14 @@ mod tests {
                 ms_old * 34.0,
                 best * 34.0
             );
-            assert!(e < 1e-3 && es < 1e-3 && ec < 1e-6, "pf2 diverges from the original path at T={t}");
+            assert!(
+                e < 1e-3 && es < 1e-3 && ec < 1e-6,
+                "pf2 diverges from the original path at T={t}"
+            );
             if t == 20 {
-                let y_cpu = super::super::kda::kda_layer(&x, &w, &cfg, &mut c_cpu, &mut s_cpu, 1, t).unwrap();
+                let y_cpu =
+                    super::super::kda::kda_layer(&x, &w, &cfg, &mut c_cpu, &mut s_cpu, 1, t)
+                        .unwrap();
                 let (ecpu, escpu) = (rel(&y_new, &y_cpu), rel(&sn.0, &s_cpu.0));
                 println!("kda layer {l} T={t}: pf2 vs CPU kda_layer: out rel {ecpu:.2e} state {escpu:.2e}");
                 assert!(ecpu < 1e-3 && escpu < 1e-3, "pf2 vs CPU at T={t}");
@@ -1154,7 +1408,9 @@ mod gemv8_tests {
     /// section `sec` (0=q,1=k,2=v) of a stacked [t][3·di] tap (the old kda_debug helper,
     /// which the tang-verify port replaced with the Spec's stacked sections)
     fn section(v: &[f32], t: usize, di: usize, sec: usize) -> Vec<f32> {
-        if v.len() < t * 3 * di { return Vec::new(); }
+        if v.len() < t * 3 * di {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(t * di);
         for ti in 0..t {
             let b = ti * 3 * di + sec * di;
@@ -1170,7 +1426,10 @@ mod gemv8_tests {
         }
         let (mut d2, mut c2, mut nf) = (0f64, 0f64, 0usize);
         for (&g, &c) in gpu.iter().zip(cpu) {
-            if !g.is_finite() { nf += 1; continue; }
+            if !g.is_finite() {
+                nf += 1;
+                continue;
+            }
             d2 += ((g as f64) - (c as f64)).powi(2);
             c2 += (c as f64).powi(2);
         }
@@ -1211,12 +1470,15 @@ mod gemv8_tests {
         let conv = ConvState::zeros(&cfg, 1);
         let state = KdaState::zeros(&cfg, 1);
         g.bind().unwrap();
-        let mut layer = DevLayer::new_gguf(&g, &r.g, l, &cfg, hp.n_embd, &conv, &state, 64, 1).unwrap();
+        let mut layer =
+            DevLayer::new_gguf(&g, &r.g, l, &cfg, hp.n_embd, &conv, &state, 64, 1).unwrap();
         let t = 20usize;
         let mut seed = 7u64;
         let x: Vec<f32> = (0..t * hp.n_embd)
             .map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
             })
             .collect();
@@ -1230,7 +1492,9 @@ mod gemv8_tests {
         };
         let tap = |t: &tang_verify::Taps, n: &str| t.get(n).unwrap_or(&[]).to_vec();
         assert!(
-            [&layer.wq, &layer.wk, &layer.wv].iter().all(|w| w.w.ty == 8),
+            [&layer.wq, &layer.wk, &layer.wv]
+                .iter()
+                .all(|w| w.w.ty == 8),
             "fixture q/k/v must be Q8_0 for this test to exercise k5_gemv8"
         );
         let (y0, t0) = run(&mut layer, false);
@@ -1240,15 +1504,37 @@ mod gemv8_tests {
             let a = section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, sec);
             let b = section(&tap(&t1, super::super::kda_debug::tap::QKV), t, di, sec);
             let s = stat(&b, &a, 1e-2);
-            eprintln!("qkv.{name}: rel {:.3e} l2 {:.3e} nonfinite {}", s.0, s.1, s.2);
+            eprintln!(
+                "qkv.{name}: rel {:.3e} l2 {:.3e} nonfinite {}",
+                s.0, s.1, s.2
+            );
             // int8 activations vs f32: the fe_gemv8 band, not bitwise
-            assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 qkv.{name} diverges: rel {:.3e}", s.0);
+            assert!(
+                s.2 == 0 && s.0 < 1e-2,
+                "gemv8 qkv.{name} diverges: rel {:.3e}",
+                s.0
+            );
         }
         // f_a (gate) and g_a (g2) now on gemv8 too; o_proj covers the layer output
-        for (name, a, b) in [("g", tap(&t0, super::super::kda_debug::tap::G), tap(&t1, super::super::kda_debug::tap::G)), ("g2", tap(&t0, super::super::kda_debug::tap::G2), tap(&t1, super::super::kda_debug::tap::G2))] {
+        for (name, a, b) in [
+            (
+                "g",
+                tap(&t0, super::super::kda_debug::tap::G),
+                tap(&t1, super::super::kda_debug::tap::G),
+            ),
+            (
+                "g2",
+                tap(&t0, super::super::kda_debug::tap::G2),
+                tap(&t1, super::super::kda_debug::tap::G2),
+            ),
+        ] {
             let s = stat(&b, &a, 1e-2);
             eprintln!("{name}: rel {:.3e} l2 {:.3e} nonfinite {}", s.0, s.1, s.2);
-            assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 {name} diverges: rel {:.3e}", s.0);
+            assert!(
+                s.2 == 0 && s.0 < 1e-2,
+                "gemv8 {name} diverges: rel {:.3e}",
+                s.0
+            );
         }
         let s = stat(&y1, &y0, 1e-2);
         eprintln!("layer out: rel {:.3e} max {:.3e}", s.0, s.1);
@@ -1259,9 +1545,16 @@ mod gemv8_tests {
             &section(&tap(&t0, super::super::kda_debug::tap::QKV), t, di, 0),
             1e-2,
         );
-        assert!(sq.0 > 0.0, "A/B is hollow: gemv8 produced bit-identical q (did it run?)");
+        assert!(
+            sq.0 > 0.0,
+            "A/B is hollow: gemv8 produced bit-identical q (did it run?)"
+        );
         // relative, like the taps above. s.1 is an ABSOLUTE l2: it grew 1.1e-2 -> 1.5e-1 when
         // k5_beta began computing every (t, h) (output scale, not error; rel stayed 9.2e-3)
-        assert!(s.2 == 0 && s.0 < 1e-2, "gemv8 layer output diverges: rel {:.3e}", s.0);
+        assert!(
+            s.2 == 0 && s.0 < 1e-2,
+            "gemv8 layer output diverges: rel {:.3e}",
+            s.0
+        );
     }
 }

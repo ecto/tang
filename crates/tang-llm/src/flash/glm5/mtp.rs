@@ -24,9 +24,9 @@
 use super::engine::{argmax, Glm5Engine};
 use super::mla::MlaWeights;
 use crate::flash::reference::{rms_norm_mul, Mat};
-use anyhow::{ensure, Result};
 #[cfg(feature = "cuda")]
 use anyhow::Context;
+use anyhow::{ensure, Result};
 use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
@@ -67,7 +67,12 @@ struct MtpDev {
     /// eh_proj on the device (`k5_gemv`, GGUF storage type), its input `[t][2n]` / output
     /// `[t][n]` scratch (MAX_EH rows). Opt-in `TANG_GLM5_MTP_EH_DEV=1`: on the generic
     /// thread-per-row `k5_gemv` it measured 2.9 ms a cell vs 0.9 on the host (B300).
-    eh: Option<(super::moe::gpu::DevW, super::moe::gpu::Kernels5, tang_moe::gpu::DevBuf, tang_moe::gpu::DevBuf)>,
+    eh: Option<(
+        super::moe::gpu::DevW,
+        super::moe::gpu::Kernels5,
+        tang_moe::gpu::DevBuf,
+        tang_moe::gpu::DevBuf,
+    )>,
     /// The whole cell as one device graph (`resident::DraftCell`; `None`: host-staged cells).
     cell: Option<super::engine::resident::DraftCell>,
 }
@@ -116,11 +121,6 @@ impl Mtp {
             #[cfg(feature = "cuda")]
             dev: None,
         })
-        .and_then(|mut me| {
-            #[cfg(feature = "cuda")]
-            me.load_dev(e)?;
-            Ok(me)
-        })
     }
 
     /// Put the block on the engine's GPU 0 (no-op without one, or `TANG_GLM5_MTP_DEV=0`).
@@ -129,9 +129,12 @@ impl Mtp {
         if std::env::var("TANG_GLM5_MTP_DEV").is_ok_and(|v| v == "0") {
             return Ok(());
         }
-        let Some(gf) = e.gpu.as_ref() else { return Ok(()) };
+        let Some(gf) = e.gpu.as_ref() else {
+            return Ok(());
+        };
         let (gpu, _) = gf.dev0();
-        gpu.bind().map_err(|er| anyhow::anyhow!("bind GPU 0 (mtp): {er}"))?;
+        gpu.bind()
+            .map_err(|er| anyhow::anyhow!("bind GPU 0 (mtp): {er}"))?;
         let g = &e.m.g;
         let cu = super::mla::cuda::MlaCuda::new_at(&self.mla, 0)
             .map_err(|er| anyhow::anyhow!("mtp MlaCuda: {er}"))?;
@@ -157,19 +160,35 @@ impl Mtp {
             super::engine::resident::DraftCell::new(
                 e,
                 self.layer,
-                [&self.enorm, &self.hnorm, &self.attn_norm, &self.ffn_norm, &self.shnorm],
+                [
+                    &self.enorm,
+                    &self.hnorm,
+                    &self.attn_norm,
+                    &self.ffn_norm,
+                    &self.shnorm,
+                ],
                 self.eps,
             )?
         } else {
             None
         };
-        self.dev = Some(MtpDev { cu, p, c: Default::default(), moe, eh, cell });
-        eprintln!("glm5: MTP layer blk.{} resident on GPU 0 (DSA + FFN + head)", self.layer);
+        self.dev = Some(MtpDev {
+            cu,
+            p,
+            c: Default::default(),
+            moe,
+            eh,
+            cell,
+        });
+        eprintln!(
+            "glm5: MTP layer blk.{} resident on GPU 0 (DSA + FFN + head)",
+            self.layer
+        );
         Ok(())
     }
 
     /// Drop the device home: the host reference path (tests compare the two).
-    pub fn host_only(mut self) -> Self {
+    pub fn host_only(self) -> Self {
         #[cfg(feature = "cuda")]
         {
             self.dev = None;
@@ -200,6 +219,7 @@ impl Mtp {
     }
 
     /// Cells in the cache (= the next cell's position).
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         #[cfg(feature = "cuda")]
         if let Some(d) = &self.dev {
@@ -238,7 +258,9 @@ impl Mtp {
         #[cfg(feature = "cuda")]
         if let Some(d) = self.dev.as_mut() {
             if let Some(c) = d.cell.as_ref() {
-                c.stream().sync().map_err(|er| anyhow::anyhow!("mtp: {er}"))?;
+                c.stream()
+                    .sync()
+                    .map_err(|er| anyhow::anyhow!("mtp: {er}"))?;
             }
             super::engine::resident::refresh_cell_mirrors(&d.cu, &mut d.c)?;
         }
@@ -262,10 +284,16 @@ impl Mtp {
         };
         let t0 = Instant::now();
         #[cfg(feature = "cuda")]
-        let dev_x = match self.dev.as_ref().and_then(|d| d.eh.as_ref()).filter(|_| t <= MAX_EH) {
+        let dev_x = match self
+            .dev
+            .as_ref()
+            .and_then(|d| d.eh.as_ref())
+            .filter(|_| t <= MAX_EH)
+        {
             Some((dw, k5, xin, xout)) => {
                 let (gpu, _) = e.gpu.as_ref().context("mtp: no GPU")?.dev0();
-                gpu.bind().map_err(|er| anyhow::anyhow!("bind (mtp): {er}"))?;
+                gpu.bind()
+                    .map_err(|er| anyhow::anyhow!("bind (mtp): {er}"))?;
                 let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp eh_proj: {er}");
                 xin.write(0, &cat).map_err(ge)?;
                 let s = tang_moe::gpu::Stream::blocking().map_err(ge)?;
@@ -276,7 +304,16 @@ impl Mtp {
                         (128, 1, 1),
                         0,
                         &s,
-                        tang_moe::args![dw.w, 0u32, xin.ptr, xout.ptr, n as u32, t as u32, n as u32, (2 * n) as u32],
+                        tang_moe::args![
+                            dw.w,
+                            0u32,
+                            xin.ptr,
+                            xout.ptr,
+                            n as u32,
+                            t as u32,
+                            n as u32,
+                            (2 * n) as u32
+                        ],
                     )
                     .map_err(ge)?;
                 }
@@ -300,10 +337,17 @@ impl Mtp {
         #[cfg(feature = "cuda")]
         let y = match self.dev.as_mut() {
             Some(d) => {
-                let (gpu, _) = e.gpu.as_ref().context("mtp: device block without a GPU")?.dev0();
-                gpu.bind().map_err(|er| anyhow::anyhow!("bind (mtp): {er}"))?;
+                let (gpu, _) = e
+                    .gpu
+                    .as_ref()
+                    .context("mtp: device block without a GPU")?
+                    .dev0();
+                gpu.bind()
+                    .map_err(|er| anyhow::anyhow!("bind (mtp): {er}"))?;
                 d.cu.set_seq(0);
-                super::engine::dsa_gpu_resident(self.layer, &self.mla, &d.cu, &d.p, &xa, t, pos0, &mut d.c, None)?
+                super::engine::dsa_gpu_resident(
+                    self.layer, &self.mla, &d.cu, &d.p, &xa, t, pos0, &mut d.c, None,
+                )?
             }
             None => self.dsa_host(&xa, t, pos0),
         };
@@ -334,7 +378,7 @@ impl Mtp {
         };
         x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
         pr("draft.moe", t0);
-        let t0 = Instant::now();
+        let _t0 = Instant::now();
         // ---- shared head
         x.par_chunks_mut(n)
             .for_each(|r| rms_norm_mul(r, &self.shnorm, eps));
@@ -423,7 +467,11 @@ pub trait Drafter {
     /// The drafts enqueued on the device without waiting: (ids ptr, count, event fired when
     /// they are written). `None`: use [`Self::draft`].
     #[cfg(feature = "cuda")]
-    fn draft_async(&mut self, _e: &Glm5Engine, _k: usize) -> Result<Option<(u64, usize, tang_moe::gpu::Event)>> {
+    fn draft_async(
+        &mut self,
+        _e: &Glm5Engine,
+        _k: usize,
+    ) -> Result<Option<(u64, usize, tang_moe::gpu::Event)>> {
         Ok(None)
     }
     /// [`Self::observe`] of the last resident window's first `rows` rows, read from the device
@@ -436,7 +484,12 @@ pub trait Drafter {
     /// resident step): async; returns the event the next trunk launch must wait on, or
     /// `None` when the drafter can't (the caller has no host row to fall back to).
     #[cfg(feature = "cuda")]
-    fn observe_ptrs(&mut self, _e: &Glm5Engine, _tok: u64, _h: u64) -> Result<Option<tang_moe::gpu::Event>> {
+    fn observe_ptrs(
+        &mut self,
+        _e: &Glm5Engine,
+        _tok: u64,
+        _h: u64,
+    ) -> Result<Option<tang_moe::gpu::Event>> {
         Ok(None)
     }
     /// After [`Self::draft_async`]: wait for and read its `n` ids (the host-window fallback).
@@ -457,7 +510,11 @@ pub struct MtpDrafter {
 
 impl MtpDrafter {
     pub fn new(mtp: Mtp) -> Self {
-        Self { mtp, last: None, dev_last: false }
+        Self {
+            mtp,
+            last: None,
+            dev_last: false,
+        }
     }
 
     /// Teacher-forced device cells for every row (async). `Ok(i)`: rows `[0, i)` ran
@@ -465,11 +522,31 @@ impl MtpDrafter {
     #[cfg(feature = "cuda")]
     fn observe_dev(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<usize> {
         let n = self.mtp.n;
-        let Some(d) = self.mtp.dev.as_mut() else { return Ok(0) };
-        let Some(cell) = d.cell.as_mut() else { return Ok(0) };
-        e.gpu.as_ref().context("mtp: no GPU")?.dev0().0.bind().map_err(|er| anyhow::anyhow!("bind: {er}"))?;
+        let Some(d) = self.mtp.dev.as_mut() else {
+            return Ok(0);
+        };
+        let Some(cell) = d.cell.as_mut() else {
+            return Ok(0);
+        };
+        e.gpu
+            .as_ref()
+            .context("mtp: no GPU")?
+            .dev0()
+            .0
+            .bind()
+            .map_err(|er| anyhow::anyhow!("bind: {er}"))?;
         for (i, &tk) in toks.iter().enumerate() {
-            if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, Some((tk, &h[i * n..(i + 1) * n])), None, None)? {
+            if !cell.run(
+                e,
+                &d.cu,
+                &d.p,
+                &self.mtp.mla,
+                &d.moe,
+                &mut d.c,
+                Some((tk, &h[i * n..(i + 1) * n])),
+                None,
+                None,
+            )? {
                 return Ok(i);
             }
         }
@@ -487,10 +564,28 @@ impl MtpDrafter {
         let mut got = 0usize;
         let tr = ProfT::new("draft.chain_enqueue");
         while got < k {
-            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None, None)? {
+            if got > 0
+                && !cell.run(
+                    e,
+                    &d.cu,
+                    &d.p,
+                    &self.mtp.mla,
+                    &d.moe,
+                    &mut d.c,
+                    None,
+                    None,
+                    None,
+                )?
+            {
                 break;
             }
-            tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
+            tang_moe::gpu::copy_d2d_async(
+                cell.ids.ptr + 4 * got as u64,
+                cell.tp.ptr,
+                4,
+                cell.stream(),
+            )
+            .map_err(ge)?;
             got += 1;
         }
         drop(tr);
@@ -527,7 +622,11 @@ impl Drafter for MtpDrafter {
     }
 
     #[cfg(feature = "cuda")]
-    fn draft_async(&mut self, e: &Glm5Engine, k: usize) -> Result<Option<(u64, usize, tang_moe::gpu::Event)>> {
+    fn draft_async(
+        &mut self,
+        e: &Glm5Engine,
+        k: usize,
+    ) -> Result<Option<(u64, usize, tang_moe::gpu::Event)>> {
         if !self.dev_last || !std::env::var("TANG_GLM5_MTP_CHAIN").is_ok_and(|v| v == "1") {
             return Ok(None);
         }
@@ -538,10 +637,28 @@ impl Drafter for MtpDrafter {
         let k = k.min(15);
         let mut got = 0usize;
         while got < k {
-            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None, None)? {
+            if got > 0
+                && !cell.run(
+                    e,
+                    &d.cu,
+                    &d.p,
+                    &self.mtp.mla,
+                    &d.moe,
+                    &mut d.c,
+                    None,
+                    None,
+                    None,
+                )?
+            {
                 break;
             }
-            tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
+            tang_moe::gpu::copy_d2d_async(
+                cell.ids.ptr + 4 * got as u64,
+                cell.tp.ptr,
+                4,
+                cell.stream(),
+            )
+            .map_err(ge)?;
             got += 1;
         }
         let ev = tang_moe::gpu::Event::new(false).map_err(ge)?;
@@ -552,18 +669,39 @@ impl Drafter for MtpDrafter {
     }
 
     #[cfg(feature = "cuda")]
-    fn observe_ptrs(&mut self, e: &Glm5Engine, _tok: u64, _h: u64) -> Result<Option<tang_moe::gpu::Event>> {
+    fn observe_ptrs(
+        &mut self,
+        e: &Glm5Engine,
+        _tok: u64,
+        _h: u64,
+    ) -> Result<Option<tang_moe::gpu::Event>> {
         if !self.dev_last {
             return Ok(None);
         }
         let n = self.mtp.n;
-        let Some(d) = self.mtp.dev.as_mut() else { return Ok(None) };
-        let Some(cell) = d.cell.as_mut() else { return Ok(None) };
+        let Some(d) = self.mtp.dev.as_mut() else {
+            return Ok(None);
+        };
+        let Some(cell) = d.cell.as_mut() else {
+            return Ok(None);
+        };
         // the step's outputs staged on the trunk stream; the cell runs concurrently with the
         // next trunk launch (own MoE pool, own MLA caches): the trunk never waits for it
         let (st, sh) = cell.stage_next(n);
-        let Some(ev) = e.step_out_stage(st, sh)? else { return Ok(None) };
-        if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, Some((st, sh)), Some(&ev))? {
+        let Some(ev) = e.step_out_stage(st, sh)? else {
+            return Ok(None);
+        };
+        if !cell.run(
+            e,
+            &d.cu,
+            &d.p,
+            &self.mtp.mla,
+            &d.moe,
+            &mut d.c,
+            None,
+            Some((st, sh)),
+            Some(&ev),
+        )? {
             return Ok(None);
         }
         Ok(Some(ev))
@@ -579,7 +717,17 @@ impl Drafter for MtpDrafter {
                 let _t = ProfT::new("draft.observe_window");
                 for i in 0..toks.len() {
                     let src = (ip + 4 * i as u64, hp + (i * n * 4) as u64);
-                    if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, Some(src), None)? {
+                    if !cell.run(
+                        e,
+                        &d.cu,
+                        &d.p,
+                        &self.mtp.mla,
+                        &d.moe,
+                        &mut d.c,
+                        None,
+                        Some(src),
+                        None,
+                    )? {
                         self.dev_last = false;
                         return self.observe(e, &h[i * n..], &toks[i..]);
                     }
@@ -623,8 +771,10 @@ impl Drafter for MtpDrafter {
 }
 
 /// `TANG_GLM5_WIN_PROF=1`: time a scope into the resident profile.
+#[allow(dead_code)]
 struct ProfT(&'static str, Instant);
 
+#[allow(dead_code)]
 impl ProfT {
     fn new(k: &'static str) -> Self {
         Self(k, Instant::now())
@@ -693,7 +843,10 @@ impl Stats {
             self.trunk_s
         );
         if !self.auto_picks.is_empty() {
-            s += &format!("mtp: auto K picks (K=0..): {:?}; {} plain steps\n", self.auto_picks, self.plain_steps);
+            s += &format!(
+                "mtp: auto K picks (K=0..): {:?}; {} plain steps\n",
+                self.auto_picks, self.plain_steps
+            );
         }
         if self.res_windows > 0 {
             s += &format!(
@@ -733,9 +886,11 @@ struct AutoK {
     probe_at: usize,
     probing: Option<usize>,
     picks: Vec<usize>,
+    #[allow(dead_code)]
     log: bool,
 }
 
+#[allow(dead_code)]
 const WIN: usize = 16;
 const MARGIN: f64 = 1.05;
 const STREAK: usize = 8;
@@ -792,15 +947,26 @@ impl AutoK {
         // a probe of the stalest K, at most once per PROBE passes
         if self.pass >= self.probe_at + PROBE {
             self.probe_at = self.pass;
-            let k = (0..=self.cap).filter(|&k| k != self.cur).min_by_key(|&k| self.last[k]).unwrap();
+            let k = (0..=self.cap)
+                .filter(|&k| k != self.cur)
+                .min_by_key(|&k| self.last[k])
+                .unwrap();
             self.probing = Some(k);
             return self.take(k);
         }
         self.probing = None;
         let best = (0..=self.cap)
-            .max_by(|&a, &b| self.rate(a).unwrap_or(0.0).partial_cmp(&self.rate(b).unwrap_or(0.0)).unwrap())
+            .max_by(|&a, &b| {
+                self.rate(a)
+                    .unwrap_or(0.0)
+                    .partial_cmp(&self.rate(b).unwrap_or(0.0))
+                    .unwrap()
+            })
             .unwrap();
-        let (rb, rc) = (self.rate(best).unwrap_or(0.0), self.rate(self.cur).unwrap_or(0.0));
+        let (rb, rc) = (
+            self.rate(best).unwrap_or(0.0),
+            self.rate(self.cur).unwrap_or(0.0),
+        );
         if best != self.cur && rb >= MARGIN * rc {
             if best == self.cand {
                 self.streak += 1;
@@ -826,6 +992,7 @@ impl AutoK {
     }
 
     /// A pass of `k` drafts took `ms`; `a` drafts were accepted.
+    #[allow(dead_code)]
     fn update(&mut self, k: usize, a: usize, ms: f64) {
         self.seen[k] += 1;
         if self.seen[k] > 1 {
@@ -839,13 +1006,21 @@ impl AutoK {
             let v = if d < a { 1.0 } else { 0.0 };
             self.p[d] += 0.1 * (v - self.p[d]);
         }
-        if self.log && self.pass % 32 == 0 {
+        if self.log && self.pass.is_multiple_of(32) {
             eprintln!("{}", self.report());
         }
     }
 
     fn report(&self) -> String {
-        let mut s = format!("mtp auto @pass {} (cur K={}): p {:?}", self.pass, self.cur, self.p.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+        let mut s = format!(
+            "mtp auto @pass {} (cur K={}): p {:?}",
+            self.pass,
+            self.cur,
+            self.p
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>()
+        );
         for k in 0..=self.cap {
             s += &format!(
                 "; K={k} cost {} ms E {:.3} rate {} tok/ms",
@@ -902,7 +1077,7 @@ pub fn generate(
         let td = Instant::now();
         // never draft past n: the window is cur + drafts
         let kk = if auto { ak.pick() } else { k }.min(n - gen.len());
-        let tp0 = td;
+        let _tp0 = td;
         #[cfg(feature = "cuda")]
         if let Some(ev) = pending.take() {
             e.trunk_wait(&ev)?;
@@ -921,7 +1096,9 @@ pub fn generate(
                 Some(_) => {}
                 None => {
                     // the device cell can't take it (cache capacity): the host row
-                    let h = e.step_h_read()?.context("mtp auto: K=0 without a device head")?;
+                    let h = e
+                        .step_h_read()?
+                        .context("mtp auto: K=0 without a device head")?;
                     dr.observe(e, &h, &[next])?;
                 }
             }
@@ -1078,7 +1255,8 @@ pub fn generate(
 /// Default for `TANG_GLM5_KDA_WIN_STEP` when the env is unset: [`cli_run`] sets it to
 /// the draft depth + 1 (the verify window length), so MTP's KDA windows run as serial
 /// t=1 steps and the verify is exact against plain decode. Plain decode leaves it 0.
-pub static WIN_STEP_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static WIN_STEP_DEFAULT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// The effective KDA window-step threshold: `TANG_GLM5_KDA_WIN_STEP` if set and parses,
 /// else [`WIN_STEP_DEFAULT`].
@@ -1099,7 +1277,10 @@ pub fn cli_run(
     quiet: bool,
 ) -> Result<()> {
     WIN_STEP_DEFAULT.store(k + 1, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("glm5: KDA win_step={} (TANG_GLM5_KDA_WIN_STEP overrides)", win_step());
+    eprintln!(
+        "glm5: KDA win_step={} (TANG_GLM5_KDA_WIN_STEP overrides)",
+        win_step()
+    );
     let t0 = Instant::now();
     let mut dr = MtpDrafter::new(Mtp::load(e)?);
     eprintln!(
