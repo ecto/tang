@@ -106,6 +106,8 @@ pub struct DevLayer {
     g2b: DevBuf,
     yb: DevBuf,
     outb: DevBuf,
+    /// k5d_pret's per-row scratch [max_t][4][d_inner] (q, k, v, expf(gate)).
+    rsc: DevBuf,
     /// int8 activations for `k5_gemv8` (codes + scales; see the xq8 field).
     xq8: DevBuf,
     /// The layer's persistent stream (reads host-staged buffers, hence blocking).
@@ -242,6 +244,7 @@ impl DevLayer {
             g2b: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
             yb: DevBuf::zeroed_elems::<f32>(max_t * d_inner).map_err(gerr)?,
             outb: DevBuf::zeroed_elems::<f32>(max_t * hidden).map_err(gerr)?,
+            rsc: DevBuf::zeroed_elems::<f32>(max_t * 4 * d_inner).map_err(gerr)?,
             // TANG_GLM5_GEMV8: int8 codes [t][hidden] + f32 per-32 scales [t][hidden/32]
             // (k5_q8's layout; the codes+scales in one buffer, scales after T*hidden codes)
             xq8: {
