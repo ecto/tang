@@ -2056,7 +2056,13 @@ impl Coder {
             Stage {
                 dev: &self.dev,
                 stream: &self.stream,
-                k: &self.k,
+                // The wide set's kernels during a wide window: the narrow ones are compiled
+                // for `MAX_T` rows and overrun the wide scratch.
+                k: if in_wide {
+                    self.wide.as_ref().map(|w| &w.k).unwrap_or(&self.k)
+                } else {
+                    &self.k
+                },
                 s: if in_wide {
                     self.wide.as_ref().map(|w| &w.s).unwrap_or(&self.s)
                 } else {
