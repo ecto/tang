@@ -268,7 +268,12 @@ pub struct GpuModel {
     /// never reads them: 3 MB of the per-step read)
     draft_logits: bool,
     /// `copy_many`'s entry tables (snapshot, rewind)
-    cm: [Option<DevBuf>; 2],
+    cm: [Option<DevBuf>; 3],
+    /// `DS_PIPE=1`: the accepted rows' DSpark target hiddens stay on the device ([`Self::keep`],
+    /// laid out as the host `main`) and a spec step returns an empty `main`
+    pipe: bool,
+    /// ([max rows][n][D] f32, rows) of the last spec step's accepted hiddens (`pipe`)
+    keep: Option<(DevBuf, usize)>,
     /// Capture decode steps as CUDA graphs (`DS_GRAPH=0` turns it off; see the module doc).
     pub graph: bool,
     pub graph_stats: GraphStats,
@@ -473,7 +478,9 @@ impl GpuModel {
             },
             fast: std::env::var_os("DS_SLOW").is_none(),
             draft_logits: true,
-            cm: [None, None],
+            cm: [None, None, None],
+            pipe: std::env::var("DS_PIPE").is_ok_and(|v| v == "1"),
+            keep: None,
             graph: std::env::var("DS_GRAPH").map_or(true, |v| v != "0"),
             graph_stats: GraphStats::default(),
             tabs,
@@ -3284,6 +3291,33 @@ impl GpuModel {
         Self::read_mains(out, rows, d)
     }
 
+    /// The first `rows` positions' DSpark target hiddens of the last verify window into
+    /// [`Self::keep`] on the device, in the host `main` layout ([row][n][D]).
+    fn keep_mains(&mut self, rows: usize) -> Result<()> {
+        let d = self.cpu.cfg.dim;
+        let out = self.last.as_ref().context("keep_mains: no verify window")?;
+        let n = out.mains.len();
+        let cap = self.cpu.cfg.dspark_block_size.max(8) + 1;
+        if self
+            .keep
+            .as_ref()
+            .map_or(true, |k| k.0.len < cap * n * d * 4)
+        {
+            self.keep = Some((DevBuf::alloc(cap * n * d * 4)?, 0));
+        }
+        let dst = self.keep.as_ref().unwrap().0.ptr;
+        let mut l = Vec::with_capacity(rows * n);
+        for ti in 0..rows {
+            for (j, m) in out.mains.iter().enumerate() {
+                let o = ((ti * n + j) * d * 4) as u64;
+                l.push((dst + o, m.ptr + (ti * d * 4) as u64, d));
+            }
+        }
+        self.copy_many(2, &[&l])?;
+        self.keep.as_mut().unwrap().1 = rows;
+        Ok(())
+    }
+
     /// The generation the next step will start at (one more when this one overflowed).
     fn gen_after(&self) -> (u64, u64) {
         let (a, s) = (self.arena.borrow(), self.stage.borrow());
@@ -3522,7 +3556,16 @@ impl GpuModel {
         let (d, blk, v) = (c.dim, c.dspark_block_size, c.vocab_size);
         self.begin_step()?;
         self.obs.begin(&self.s, "draft", blk, sp);
-        let t = main_hidden.len() / (d * c.dspark_target_layer_ids.len());
+        // an empty `main` (pipe): the hiddens are the device-kept rows of the last spec step
+        let dev_main = main_hidden.is_empty() && sp > 0;
+        let t = if dev_main {
+            self.keep
+                .as_ref()
+                .context("spark: no device-kept hiddens")?
+                .1
+        } else {
+            main_hidden.len() / (d * c.dspark_target_layer_ids.len())
+        };
         let last = format!("mtp.{}", c.n_mtp_layers - 1);
         let rank = c.dspark_markov_rank;
         let memb_w = self.cpu.w(&format!("{last}.markov_head.embed.weight"))?;
@@ -3534,8 +3577,13 @@ impl GpuModel {
         let (p, u) = self.stage(&[sp as i32, 0, 0, 0])?;
         copies.push(u);
         self.p = p;
-        let (mh, u) = self.stage(main_hidden)?;
-        copies.push(u);
+        let mh = if dev_main {
+            b(&self.keep.as_ref().unwrap().0)
+        } else {
+            let (mh, u) = self.stage(main_hidden)?;
+            copies.push(u);
+            mh
+        };
         let mut ids = vec![c.dspark_noise_token_id as i32; blk];
         ids[0] = token as i32;
         let (idb, u) = self.stage(&ids)?;
@@ -3625,7 +3673,11 @@ impl GpuModel {
             Draw::Sample(sm) => Some((sm.temp, sm.top_p)),
             _ => None,
         };
-        let key = (t, samp.map(|(a, b)| (a.to_bits(), b.to_bits())));
+        // device-kept hiddens: its own graphs (no upload node for them)
+        let key = (
+            t + if dev_main { 1 << 20 } else { 0 },
+            samp.map(|(a, b)| (a.to_bits(), b.to_bits())),
+        );
         if samp.is_some() && self.spec_dev.is_none() {
             self.spec_dev = Some(SpecDev::new(blk, v)?);
         }
@@ -3958,7 +4010,13 @@ impl GpuModel {
     ) -> Result<SpecStep> {
         let c = self.cpu.cfg.clone();
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
-        let pos0 = sp + main.len() / w;
+        // `main`'s rows, or (pipe, empty `main`) the device-kept ones
+        let rows = if main.is_empty() {
+            self.keep.as_ref().map_or(0, |k| k.1)
+        } else {
+            main.len() / w
+        };
+        let pos0 = sp + rows;
         let (start, t0) = (std::time::SystemTime::now(), std::time::Instant::now());
         // the drafter's block for this mode (the spark reads it from the config)
         let greedy = pick.greedy();
@@ -4014,7 +4072,12 @@ impl GpuModel {
             }
             r
         };
-        let main = self.window_mains(k + 1)?;
+        let main = if self.pipe {
+            self.keep_mains(k + 1)?;
+            Vec::new()
+        } else {
+            self.window_mains(k + 1)?
+        };
         let t2 = std::time::Instant::now();
         self.rewind(&snap, pos0 + k + 1, pos0 + n)?;
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
@@ -4806,6 +4869,42 @@ mod tests {
             "8 sampled steps: {rows} logits rows; walks device/host {:?}",
             a.spec_walks
         );
+    }
+
+    /// `DS_PIPE` (accepted hiddens kept on the device, an empty `main` between steps) gives
+    /// the host-`main` path's steps exactly: tokens, accepted counts, positions and (sampled)
+    /// the RNG, greedy and sampled, graph replays included.
+    #[test]
+    fn gpu_tiny_pipe_matches() {
+        use super::super::forward::{Greedy, SpecPick, SpecSampler};
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let n = ids.len();
+        let dir = Path::new(&tiny()).join("hf");
+        for sampled in [false, true] {
+            let mut ms: Vec<GpuModel> = (0..2).map(|_| GpuModel::open(&dir).unwrap()).collect();
+            ms[0].pipe = true;
+            ms[1].pipe = false;
+            let mut runs = Vec::new();
+            for m in ms.iter_mut() {
+                let (l, main) = m.forward(&ids, 0, None).unwrap();
+                let t0 = argmax(&l);
+                m.forward_spec(t0, &main, 0).unwrap();
+                let (_, mut main) = m.forward(&[t0], n, None).unwrap();
+                let (mut tok, mut sp) = (t0, n);
+                let mut samp = SpecSampler::new(0.9, 0.95, 7);
+                let mut log = Vec::new();
+                for _ in 0..12 {
+                    let pick: &mut dyn SpecPick = if sampled { &mut samp } else { &mut Greedy };
+                    let st = m.decode_spec(tok, &main, sp, &mut |_, _| {}, pick).unwrap();
+                    log.push((st.tokens.clone(), st.accepted, st.sp, samp.rng));
+                    tok = *st.tokens.last().unwrap();
+                    (main, sp) = (st.main, st.sp);
+                }
+                runs.push(log);
+            }
+            assert_eq!(runs[0], runs[1], "sampled {sampled}");
+        }
     }
 
     #[test]
