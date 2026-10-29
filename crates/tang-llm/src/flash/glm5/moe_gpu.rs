@@ -103,7 +103,8 @@ pub struct Kernels {
     f_gux: Func,
     f_gu4: Func,
     f_down4: Func,
-    /// Round-4 gate|up / down (`g5f_gu4` / `g5f_down4`, `TANG_GLM5_MOE_K4`, default on):
+    /// Round-4 gate|up / down (`g5f_gu4` / `g5f_down4`, `TANG_GLM5_MOE_K4=1`, default OFF: no
+    /// end-to-end gain on the B300 and logit KL 2.2e-3 > the 1e-3 bar, see NOTES):
     /// activation-resident lane-contiguous rows, NOT bit-identical to `g5f_gux` /
     /// `g5f_down_splitn` (summation order); `TANG_GLM5_MOE_K4=0` restores those.
     pub k4: bool,
@@ -222,7 +223,7 @@ impl Kernels {
             f_gux: m.func("g5f_gux")?,
             f_gu4: m.func("g5f_gu4")?,
             f_down4: m.func("g5f_down4")?,
-            k4: env_on("TANG_GLM5_MOE_K4", true),
+            k4: env_on("TANG_GLM5_MOE_K4", false),
             k4r,
             k4dr,
             k4nr,
@@ -377,14 +378,14 @@ fn repacked_row_bytes(ty: u32, k: usize) -> usize {
 }
 
 /// `TANG_GLM5_MOE_REPACK`: repack the FFN's Q8_0 / Q6_K weights at upload. Default: on with the
-/// round-4 kernels (`TANG_GLM5_MOE_K4`, default on; g5f_gu4 / g5f_down4 take Q8_0 / Q6_K only
-/// repacked), off with `TANG_GLM5_MOE_K4=0` (the B300 A/B with the round-2 kernels was 35.02 off
+/// round-4 kernels (`TANG_GLM5_MOE_K4=1`; g5f_gu4 / g5f_down4 take Q8_0 / Q6_K only
+/// repacked), off otherwise (the B300 A/B with the round-2 kernels was 35.02 off
 /// vs 33.51 on).
 fn repack_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("TANG_GLM5_MOE_REPACK") {
         Ok(v) => v == "1",
-        Err(_) => !std::env::var("TANG_GLM5_MOE_K4").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => std::env::var("TANG_GLM5_MOE_K4").is_ok_and(|v| v == "1"),
     })
 }
 

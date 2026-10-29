@@ -4,6 +4,46 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MoE round 4 on B300: K4 kernels (summation order CHANGED) built, opt-in only; route select -2 us bit-identical (branch claude/glm5-moe4)
+
+This round was allowed to change summation order. The new path (`TANG_GLM5_MOE_K4=1`: `g5f_gu4` /
+`g5f_down4`, plus Q8_0/Q6_K repack at upload) DOES change it; it is NOT the default because it failed
+the acceptance bar below. Default = the round-3 kernels, ids bit-identical to f0d94cc2.
+
+K4 design: 8 threads per 256-weight superblock, each owning 16 positions of two 32-chunks (Q4_K/Q5_K
+low/high nibbles of the same 16 qs bytes; Q6_Kr ql halves; Q8_0r two chunks), activations
+(codes, residual codes, scales, min sums) held in registers for every row, rows streamed through a
+3-stage cp.async shared ring (whole block copies contiguous row batches), integer dot + integer scale
+products (254 x.n + y.n), branch-free Q4_K scale/min extraction, row sums by a transpose-shuffle +
+smem tree. Shared Q8_0 gate|up stays on the g5f_gux row code.
+
+Microbench (bench/glm5-moe-roofline, L2-cold, one layer, us): routed gate|up gux 25.5 -> gu4 22.1-24.3
+(no-math floor of the same structure 16-17; register variant 25-27); down Q5_K splitn 19.7 -> down4
+21.5 (worse); down Q6_K raw splitn 50.5, repacked splitn 26.2, down4 (repacked) 21.6.
+Real layers (real_layers_fast_matches_cpu, T1 us/call, K4=0 -> K4=1): l4 80 -> 83, l11 114 -> 87,
+l12 107 -> 84, l20 79 -> 83; rel l2 vs CPU unchanged (4.66e-5 -> 4.66e-5 etc.). The Q6_K win is the
+repack, not the kernel shape. Targets (gate|up <= 16, down <= 20 us) NOT reached: the per-weight
+decode (~60 instr per thread per 32 weights) does not overlap the stream well enough.
+
+Logit comparison (scripts/glm5-logits-compare.py, TANG_GLM5_LOGITS_DUMP, bench prompt -n 128 --temp 0,
+ref = f0d94cc2-equivalent K4=0): K4=1 first id divergence at position 29, top-1 96.55% over the 29
+rows, max |dlogit| 2.10, mean KL 3.4e-3 -> FAIL (bar 1e-3). K4=1 with repack off: no id divergence
+(128/128), max |dlogit| 5.4, mean KL 2.2e-3 -> FAIL. Per-layer error vs CPU is unchanged, so the logit
+drift is routing near-ties flipping under re-association and compounding over 45 layers, not a bug.
+Haiku oracle passes in every mode. K4=0: KL 0, bit-identical.
+
+Bench (scripts/glm5-bench.sh, B flags, 65e1a847, same binary): -n 128 K4=0 83.48 / K4=1 82.86 tok/s;
+GLM5_N=512 K4=0 83.02 / K4=1 84.24 (noise level). md5 K4=0 04e96df4 (128) / 2ddf0aab (512) — the
+values for this branch's default; K4=1 c551818e / b223c067. (f0d94cc2 itself: 79.30 tok/s with the
+logits dump on.)
+
+Kept on by default (bit-identical, ids/logits KL 0 vs f0d94cc2):
+- g5f_route select rounds as `__reduce_max_sync` / `__reduce_min_sync` on order-preserving keys
+  (TANG_GLM5_MOE_SEL2=2; 1 = round 3). %globaltimer phases (G5F_ROUTE_TS microbench, cold):
+  dots done 1.7 us, hand-off 1.2 -> 0.9 us, select 6.1 -> 4.4 us; 15.1 -> 13.1 us/call by events.
+- last-block hand-off as one `atom.add.acq_rel.gpu` (TANG_GLM5_MOE_ROUTE_REL=0: fence+atomic+fence).
+Route target (<= 5 us) NOT reached: the select is still a serial 8-round loop on one warp.
+
 ## 2026-10-28 — MoE round 3 on B300: roofline microbench; shared-expert tail fix; +1.0 tok/s, ids unchanged (branch claude/glm5-moe3)
 
 Roofline (new `bench/glm5-moe-roofline/roofline.cu`, nvcc sm_100, one routed layer's gate|up at T=1:

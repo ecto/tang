@@ -1423,8 +1423,8 @@ extern "C" __global__ void __launch_bounds__(128, G5F_MINB) g5f_down_splitn(
 }
 
 
-// ---- round 4 (TANG_GLM5_MOE_K4, default 1): activation-resident, lane-contiguous rows ------------
-// NOT bit-identical to g5f_gux / g5f_down_splitn (TANG_GLM5_MOE_K4=0 restores those): a thread
+// ---- round 4 (TANG_GLM5_MOE_K4=1, default off): activation-resident, lane-contiguous rows ------------
+// NOT bit-identical to g5f_gux / g5f_down_splitn (the default): a thread
 // sums 2 x 16 weights of one superblock per row and the row sum is a fixed shuffle + smem tree,
 // so the float summation order differs (same ints, same per-chunk scale math up to association).
 // Rows of Q4_K / Q5_K / Q6_Kr with k % 256 == 0, k <= 4096, 16-byte aligned views. TPR = 8 k/256
