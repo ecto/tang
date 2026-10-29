@@ -4,6 +4,28 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 (paused) — where the GLM-5.3 decode push stopped (branch frog/glm5-forward)
+
+State at a5447e57 (B300, B flags, bench prompt): plain decode 98–101 tok/s at -n 128, ~114 at -n 512;
+MTP K=1 129.6 tok/s at -n 128 (1.29× plain), K=1 105–112 at -n 512; ids identical to the oracle set
+(7174cdd6 / 1453cf0e) on every merge. Ladder: 22.9 → 56.7 → 71.9 → 82.4 → 111.7 (plain, -n 512) and
+129.6 (MTP, -n 128). The B300 pod was terminated externally; GPU work is paused by Cam.
+
+Open, not merged:
+- claude/glm5-mtp-win 75a52439: sticky `--mtp auto` (median costs, 5% margin over 8 passes, probe
+  ≤ 1/64) with per-K logging. Unmeasured. Its bench plan (auto/plain/K=1/K=2 ×2 at 128 and 512, the
+  g5f eh_proj A/B now that the mla use-after-free is fixed, and a context-rule default if auto loses)
+  needs a B300 and a rebuild.
+- claude/glm5-kda4 (latest commit): g5f_rd64 out-of-bounds read fix from the memcheck sweep, value-
+  identical, not yet run through the full mew suite. Sweep status: memcheck done for mhc, mla (fixed),
+  moe (this fix); kda/mtp/engine/resident memcheck and the kda/mhc racecheck were not finished.
+
+Next steps toward 1000: the verify row still costs ~5 ms (MoE ~2 ms/row, inherent at ~80% distinct
+experts), the MoE kernels sit at ~3 TB/s (issue-bound; reorder-allowed rewrites failed the KL bar),
+and acceptance falls with context. Realistic next rungs are ~140–160 tok/s (cheaper rows + auto K);
+1000 needs a different draft/verify regime (tree drafts, a bigger draft model, or batching), not
+more kernel polish.
+
 ## 2026-10-29 (integration round 9) — forward a5447e57: use-after-free fixed; MTP K=1 129.6 / K=2 129.1 tok/s at -n 128 (branch frog/glm5-forward)
 
 = f92a4f07 + claude/glm5-kda4 c815b990. Correctness: the mew suite's sticky CUDA_ERROR_ILLEGAL_ADDRESS
