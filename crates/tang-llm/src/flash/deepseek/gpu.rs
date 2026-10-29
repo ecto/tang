@@ -352,7 +352,12 @@ pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
 
 impl Kernels {
     pub fn new(g: &Gpu) -> Result<Self> {
-        let m = g.module(SRC)?;
+        // ds_ks's L2 prefetch prologue only pays off under PDL (kernels.cu ks_pf)
+        let m = if super::pdl::on() {
+            g.module(&format!("#define DS_PDL_PF 1\n{SRC}"))?
+        } else {
+            g.module(SRC)?
+        };
         Ok(Kernels {
             linear: m.func("ds_linear")?,
             fp8_qdq: m.func("ds_fp8_qdq")?,
