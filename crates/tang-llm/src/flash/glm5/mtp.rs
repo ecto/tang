@@ -188,7 +188,8 @@ impl Mtp {
     }
 
     /// Drop the device home: the host reference path (tests compare the two).
-    pub fn host_only(self) -> Self {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    pub fn host_only(mut self) -> Self {
         #[cfg(feature = "cuda")]
         {
             self.dev = None;
@@ -1077,7 +1078,8 @@ pub fn generate(
         let td = Instant::now();
         // never draft past n: the window is cur + drafts
         let kk = if auto { ak.pick() } else { k }.min(n - gen.len());
-        let _tp0 = td;
+        #[cfg(feature = "cuda")]
+        let tp0 = td;
         #[cfg(feature = "cuda")]
         if let Some(ev) = pending.take() {
             e.trunk_wait(&ev)?;
