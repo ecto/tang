@@ -3800,16 +3800,20 @@ impl GpuModel {
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
         let (start, t0) = (std::time::SystemTime::now(), std::time::Instant::now());
+        // the drafter's block for this mode (the spark reads it from the config)
+        let greedy = pick.greedy();
+        self.cpu.cfg.dspark_block_size = c.draft_block(greedy);
         let draft = if pick.greedy_draft() {
-            self.spark(token, main, sp, Draw::Greedy)?
+            self.spark(token, main, sp, Draw::Greedy)
         } else if let Some(sm) = pick.as_sampler() {
-            self.spark(token, main, sp, Draw::Sample(sm))?
+            self.spark(token, main, sp, Draw::Sample(sm))
         } else {
-            self.spark(token, main, sp, Draw::Host(&mut |q: &[f32]| pick.draft(q)))?
-        }
-        .context("decode_spec needs sp > 0")?;
+            self.spark(token, main, sp, Draw::Host(&mut |q: &[f32]| pick.draft(q)))
+        };
+        self.cpu.cfg.dspark_block_size = c.dspark_block_size;
+        let draft = draft?.context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
-        ids.truncate(1 + c.draft_keep(&draft.conf));
+        ids.truncate(1 + c.draft_keep(&draft.conf, greedy));
         edit(pos0 + 1, &mut ids[1..]);
         let t1 = std::time::Instant::now();
         let snap = self.snapshot()?;
@@ -4550,12 +4554,13 @@ mod tests {
                 .decode_spec(tok, &ma, sp, &mut |_, _| {}, &mut pa)
                 .unwrap();
             let pos0 = sp + mb.len() / w;
+            b.cpu.cfg.dspark_block_size = c.draft_block(false);
             let mut d = b
                 .forward_spec_with(tok, &mb, sp, &mut |q: &[f32]| pb.draft(q))
                 .unwrap()
                 .unwrap();
-            // the window decode_spec verifies (DS_DRAFT_N / DS_DRAFT_CONF)
-            d.ids.truncate(1 + c.draft_keep(&d.conf));
+            // the window decode_spec verifies (DS_DRAFT_N* / DS_DRAFT_CONF)
+            d.ids.truncate(1 + c.draft_keep(&d.conf, false));
             let snap = b.snapshot().unwrap();
             let (logits, mains) = b.forward_all(&d.ids, pos0).unwrap();
             let (k, tokens) =
@@ -4654,7 +4659,7 @@ mod tests {
         }
     }
 
-    /// `DS_DRAFT_N` below (3) and above (7, the drafter's block grown past the trained 5) the
+    /// `DS_DRAFT_N_GREEDY` below (3) and above (7, the drafter's block grown past the trained 5) the
     /// trained block, and the confidence early stop: greedy spec equals plain greedy, with
     /// windows of at most n + 1 rows.
     #[test]
@@ -4672,9 +4677,18 @@ mod tests {
                 .0;
         }
         drop(m);
-        let keep = ["DS_DRAFT_N", "DS_DRAFT_CONF"].map(|k| (k, std::env::var_os(k)));
+        let keep = [
+            "DS_DRAFT_N",
+            "DS_DRAFT_N_GREEDY",
+            "DS_DRAFT_N_SAMPLED",
+            "DS_DRAFT_CONF",
+        ]
+        .map(|k| (k, std::env::var_os(k)));
         for (dn, conf) in [("3", "0"), ("7", "0"), ("7", "0.3")] {
-            std::env::set_var("DS_DRAFT_N", dn);
+            // the greedy length alone; sampled steps keep their own (3 here)
+            std::env::remove_var("DS_DRAFT_N");
+            std::env::set_var("DS_DRAFT_N_GREEDY", dn);
+            std::env::set_var("DS_DRAFT_N_SAMPLED", "3");
             std::env::set_var("DS_DRAFT_CONF", conf);
             let m = GpuModel::open(&Path::new(&tiny()).join("hf"));
             for (k, v) in &keep {
@@ -4685,7 +4699,7 @@ mod tests {
             }
             let mut m = m.unwrap();
             let dn: usize = dn.parse().unwrap();
-            assert_eq!(m.cpu.cfg.draft_n, dn);
+            assert_eq!((m.cpu.cfg.draft_n, m.cpu.cfg.draft_n_sampled), (dn, 3));
             assert_eq!(m.cpu.cfg.dspark_block_size, dn.max(5));
             let (l, main) = m.forward(&ids, 0, None).unwrap();
             let t0 = argmax(&l);
