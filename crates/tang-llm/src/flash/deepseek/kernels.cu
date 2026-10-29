@@ -482,6 +482,23 @@ extern "C" __global__ void ds_copy(float* dst, const float* src, long long n) { 
     if (i < n) dst[i] = src[i];
 }
 
+// Engram's row gather on the device: out[i][c] = lut[w[r][c]] * e8m0(s[r][c / 32]) for r =
+// rows[i], with `w` / `s` the host tables mapped into the device's address space (UVA) and
+// `lut` the host's e4m3 table, so the values are the host gather's bit for bit (NaN codes too).
+// Block per row, one thread per column.
+extern "C" __global__ void ds_engram_gather(const float* __restrict__ lut, const unsigned char* w,
+                                            const unsigned char* s, const long long* __restrict__ rows,
+                                            int n, int ehd, float* __restrict__ out) { DS_PDL_ENTRY
+    int i = blockIdx.x;
+    if (i >= n) return;
+    long long r = rows[i];
+    for (int c = threadIdx.x; c < ehd; c += blockDim.x) {
+        unsigned char sv = s[r * (ehd / 32) + c / 32];
+        float sc = sv == 0xff ? __int_as_float(0x7fc00000) : e8m0(sv);
+        out[(long long)i * ehd + c] = lut[w[r * ehd + c]] * sc;
+    }
+}
+
 // Many f32 copies in one launch: entry j = blockIdx.y of d [n][3] (dst, src, floats);
 // entries must not overlap one another (a later launch orders dependent ones).
 extern "C" __global__ void ds_copy_many(const long long* __restrict__ d, int n) { DS_PDL_ENTRY

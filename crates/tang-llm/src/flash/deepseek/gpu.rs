@@ -170,6 +170,7 @@ const MORE: &[&str] = &[
     "ds_attn_fd_comb",
     "ds_copy",
     "ds_copy_many",
+    "ds_engram_gather",
     "ds_hc_scale",
     "ds_hc_sinkhorn",
     "ds_hc_pre",
@@ -4212,6 +4213,105 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Engram's row gather: today's host decode + upload against `ds_engram_gather` reading
+    /// a host-registered table over UVA (bit for bit), timed; `DS_EG_GB` sizes the table
+    /// (default 8). `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn engram_gather_uva() {
+        use cudarc::driver::sys;
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let gb: usize = std::env::var("DS_EG_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let ehd = 256usize;
+        let nrow = (gb << 30) / ehd;
+        let mut w = vec![0u8; nrow * ehd];
+        for (i, x) in w.iter_mut().enumerate() {
+            *x = ((i as u64).wrapping_mul(2654435761) >> 7) as u8;
+        }
+        let sc: Vec<u8> = (0..nrow * ehd / 32).map(|i| 110 + (i % 30) as u8).collect();
+        let reg = |p: *const u8, n: usize| -> u64 {
+            let mut d = 0u64;
+            unsafe {
+                gpu::check(
+                    sys::cuMemHostRegister_v2(
+                        p as *mut _,
+                        n,
+                        sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY,
+                    ),
+                    "cuMemHostRegister",
+                )
+                .unwrap();
+                gpu::check(
+                    sys::cuMemHostGetDevicePointer_v2(&mut d, p as *mut _, 0),
+                    "cuMemHostGetDevicePointer",
+                )
+                .unwrap();
+            }
+            d
+        };
+        let (dw, ds) = (reg(w.as_ptr(), w.len()), reg(sc.as_ptr(), sc.len()));
+        let lut = DevBuf::from_slice(&super::super::quant::e4m3_lut()[..]).unwrap();
+        let lut_h = super::super::quant::e4m3_lut();
+        let n = 336usize;
+        let mut seed = 99u64;
+        for rep in 0..5 {
+            let rows: Vec<i64> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 17) as usize % nrow) as i64
+                })
+                .collect();
+            // today's path: host decode (table-driven), then the upload
+            let t0 = std::time::Instant::now();
+            let mut host = Vec::with_capacity(n * ehd);
+            for &r in &rows {
+                let r = r as usize;
+                let (wr, sr) = (&w[r * ehd..(r + 1) * ehd], &sc[r * (ehd / 32)..]);
+                for (g, ch) in wr.chunks(32).enumerate() {
+                    let f = super::super::quant::e8m0_to_f32(sr[g]);
+                    host.extend(ch.iter().map(|&b| lut_h[b as usize] * f));
+                }
+            }
+            let hb = DevBuf::from_slice(&host).unwrap();
+            s.sync().unwrap();
+            let t_host = t0.elapsed().as_secs_f64() * 1e6;
+            // the device gather: the row indices up, one kernel
+            let out = DevBuf::alloc(n * ehd * 4).unwrap();
+            let t1 = std::time::Instant::now();
+            let rb = DevBuf::from_slice(&rows).unwrap();
+            let (ni, ei) = (n as i32, ehd as i32);
+            unsafe {
+                k.go(
+                    "ds_engram_gather",
+                    (n as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &s,
+                    tang_moe::args![lut.ptr, dw, ds, rb.ptr, ni, ei, out.ptr],
+                )
+                .unwrap();
+            }
+            s.sync().unwrap();
+            let t_dev = t1.elapsed().as_secs_f64() * 1e6;
+            let (a, b) = (
+                hb.read::<f32>(0, n * ehd).unwrap(),
+                out.read::<f32>(0, n * ehd).unwrap(),
+            );
+            assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+            eprintln!("rep {rep}: {n} rows of {gb} GB: host gather + upload {t_host:.0} us, device gather (UVA) {t_dev:.0} us");
+        }
+        unsafe {
+            sys::cuMemHostUnregister(w.as_ptr() as *mut _);
+            sys::cuMemHostUnregister(sc.as_ptr() as *mut _);
         }
     }
 
