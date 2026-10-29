@@ -9,6 +9,21 @@
 //   2 fp8 e4m3 [rows][cols] + e8m0 scales [ceil(rows/32)][ceil(cols/32)]
 //   3 fp4 e2m1 packed two to a byte along cols, low nibble first, + e8m0 scales [rows][cols/32]
 
+// Programmatic dependent launch (DS_PDL=1, pdl.rs): every kernel lets its stream successor
+// launch at its entry and waits for its predecessor (and its memory) before its first read;
+// both are no-ops for a plain launch and below sm_90.
+#ifndef DS_PDL_ENTRY
+#if __CUDA_ARCH__ >= 900
+#define DS_PDL_TRIGGER asm volatile("griddepcontrol.launch_dependents;");
+#define DS_PDL_WAIT asm volatile("griddepcontrol.wait;" ::: "memory");
+#else
+#define DS_PDL_TRIGGER
+#define DS_PDL_WAIT
+#endif
+#define DS_PDL_ENTRY DS_PDL_TRIGGER DS_PDL_WAIT
+#endif
+
+
 // NVRTC has no <math.h> macros
 #define DS_INF __int_as_float(0x7f800000)
 
@@ -108,7 +123,7 @@ __device__ __forceinline__ void row_prefetch(const DsW& w, int r, int lane) {
         asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
 }
 
-extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int round) {
+extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int round) { DS_PDL_ENTRY
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (warp >= t * w.rows) return;
     int ti = warp / w.rows, n = warp % w.rows;
@@ -121,7 +136,7 @@ extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int
 
 // ds_linear for t <= 8 rows, one warp per output column n across all t rows: the weight row
 // is read once, not t times. Bit-identical to ds_linear (same per-lane order and shuffle tree).
-extern "C" __global__ void ds_linear_t8(DsW w, const float* x, float* y, int t, int round) {
+extern "C" __global__ void ds_linear_t8(DsW w, const float* x, float* y, int t, int round) { DS_PDL_ENTRY
     int n = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (n >= w.rows) return;
     row_prefetch(w, n, lane);
@@ -169,7 +184,7 @@ extern "C" __global__ void ds_linear_t8(DsW w, const float* x, float* y, int t, 
 // independent of t (a 1-token decode and a verify window agree bit for bit), but not of
 // `ds_linear`'s order. Needs cols % 8 == 0 and 16-byte-aligned rows of x.
 extern "C" __global__ void ds_head_bf16(const unsigned short* w, int rows, int cols,
-                                        const float* x, float* y, int t) {
+                                        const float* x, float* y, int t) { DS_PDL_ENTRY
     int n0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 4, lane = threadIdx.x & 31;
     if (n0 >= rows) return;
     float s[4][8];
@@ -232,7 +247,7 @@ extern "C" __global__ void ds_head_bf16(const unsigned short* w, int rows, int c
 
 // Per-row argmax of x [rows][n], one 1024-thread block per row, as the host `argmax`: the
 // first index of the maximum, NaN never greater (a NaN at index 0 wins, as the host fold).
-extern "C" __global__ void ds_argmax_rows(const float* x, int n, int* out) {
+extern "C" __global__ void ds_argmax_rows(const float* x, int n, int* out) { DS_PDL_ENTRY
     const float* r = x + (long long)blockIdx.x * n;
     float bv = -DS_INF;
     int bi = 0x7fffffff;
@@ -276,7 +291,7 @@ extern "C" __global__ void ds_argmax_rows(const float* x, int n, int* out) {
 }
 
 // In place: fp8 quant-dequant per 32 with power-of-two scales (warp per group, lane per value).
-extern "C" __global__ void ds_fp8_qdq(float* v, int n_groups) {
+extern "C" __global__ void ds_fp8_qdq(float* v, int n_groups) { DS_PDL_ENTRY
     int g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (g >= n_groups) return;
     float* p = v + (long long)g * 32 + lane;
@@ -288,7 +303,7 @@ extern "C" __global__ void ds_fp8_qdq(float* v, int n_groups) {
 }
 
 // In place: fp4 quant-dequant per `block`, e4m3 scales when `e4m3_scale`, else power of two.
-extern "C" __global__ void ds_fp4_qdq(float* v, int n_groups, int block, int e4m3_scale) {
+extern "C" __global__ void ds_fp4_qdq(float* v, int n_groups, int block, int e4m3_scale) { DS_PDL_ENTRY
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= n_groups) return;
     float* p = v + (long long)g * block;
@@ -300,7 +315,7 @@ extern "C" __global__ void ds_fp4_qdq(float* v, int n_groups, int block, int e4m
 }
 
 // In place: RMSNorm of rows of n with weight w (any format, one row), bf16 out. Block per row.
-extern "C" __global__ void ds_rms(float* x, DsW w, int n, float eps) {
+extern "C" __global__ void ds_rms(float* x, DsW w, int n, float eps) { DS_PDL_ENTRY
     __shared__ float red[32];
     float* r = x + (long long)blockIdx.x * n;
     float s = 0.f;
@@ -321,7 +336,7 @@ extern "C" __global__ void ds_rms(float* x, DsW w, int n, float eps) {
 // In place: rotate the last rd of each d-wide vector; row r (of per_row vectors) at position
 // pos0 + r * pstride, or pos_fixed when >= 0. tab is [S][rd/2] of (cos, sin). One thread per pair.
 extern "C" __global__ void ds_rope(float* v, const float2* tab, int rows, int per_row, int d, int rd,
-                                   int pos0, int pstride, int pos_fixed, int inverse) {
+                                   int pos0, int pstride, int pos_fixed, int inverse) { DS_PDL_ENTRY
     int half = rd / 2;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)rows * per_row * half) return;
@@ -346,7 +361,7 @@ extern "C" __global__ void ds_rope(float* v, const float2* tab, int rows, int pe
 
 extern "C" __global__ void ds_sparse_attn(const float* q, const float* kv0, int split, const float* kv1,
                                           const float* sink, const int* idxs, float* o, int h, int d, int k,
-                                          float scale) {
+                                          float scale) { DS_PDL_ENTRY
     extern __shared__ float sc[];
     __shared__ float red[32];
     __shared__ float den_s;
@@ -426,7 +441,7 @@ __device__ __forceinline__ void sinkhorn_row(const float* m, const float* scale,
 }
 
 extern "C" __global__ void ds_sinkhorn(const float* mixes, const float* scale, const float* base,
-                                       float* pre, float* post, float* comb, int t, int hc, int iters, float eps) {
+                                       float* pre, float* post, float* comb, int t, int hc, int iters, float eps) { DS_PDL_ENTRY
     int ti = blockIdx.x * blockDim.x + threadIdx.x;
     if (ti >= t) return;
     int mix = (2 + hc) * hc;
@@ -439,7 +454,7 @@ extern "C" __global__ void ds_sinkhorn(const float* mixes, const float* scale, c
 // thread 0 runs the token's Sinkhorn. `mixes` is left unscaled.
 extern "C" __global__ void ds_hc_sinkhorn(const float* x, const float* mixes, int n, float neps, const float* scale,
                                           const float* base, float* pre, float* post, float* comb, int hc, int iters,
-                                          float eps) {
+                                          float eps) { DS_PDL_ENTRY
     __shared__ float red[32];
     __shared__ float sm[80];
     int mix = (2 + hc) * hc;
@@ -462,13 +477,13 @@ extern "C" __global__ void ds_hc_sinkhorn(const float* x, const float* mixes, in
 
 // ---- the rest of the forward -------------------------------------------------------------
 
-extern "C" __global__ void ds_copy(float* dst, const float* src, long long n) {
+extern "C" __global__ void ds_copy(float* dst, const float* src, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
 
 // mixes[t][m] *= rsqrt(mean(x[t]^2) + eps), x rows of n. Block per row.
-extern "C" __global__ void ds_hc_scale(const float* x, float* mixes, int n, int mix, float eps) {
+extern "C" __global__ void ds_hc_scale(const float* x, float* mixes, int n, int mix, float eps) { DS_PDL_ENTRY
     __shared__ float red[32];
     const float* r = x + (long long)blockIdx.x * n;
     float s = 0.f;
@@ -486,7 +501,7 @@ extern "C" __global__ void ds_hc_scale(const float* x, float* mixes, int n, int 
 }
 
 // out[t][i] = bf(Σ_c pre[t][c] x[t][c][i]). Thread per (t, i).
-extern "C" __global__ void ds_hc_pre(const float* x, const float* pre, float* out, int t, int hc, int d) {
+extern "C" __global__ void ds_hc_pre(const float* x, const float* pre, float* out, int t, int hc, int d) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * d) return;
     int ti = i / d, k = i % d;
@@ -508,7 +523,7 @@ __device__ __forceinline__ float hc_post_at(const float* h, const float* h2, con
 
 // out[t][k][i] = hc_post_at(..). Thread per element. h2 may be null.
 extern "C" __global__ void ds_hc_post(const float* h, const float* h2, const float* res, const float* post,
-                                      const float* comb, float* out, int t, int hc, int d) {
+                                      const float* comb, float* out, int t, int hc, int d) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)t * hc * d) return;
     int i = e % d;
@@ -528,7 +543,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_post_mix(const float* __
                                                                  const float* __restrict__ res,
                                                                  const float* __restrict__ post,
                                                                  const float* __restrict__ comb, float* __restrict__ out,
-                                                                 DsW w, float* __restrict__ y, int t, int hc, int d) {
+                                                                 DsW w, float* __restrict__ y, int t, int hc, int d) { DS_PDL_ENTRY
     const int U = 8;
     int ti = blockIdx.y * 8 + threadIdx.x / 32, n = blockIdx.x, lane = threadIdx.x & 31;
     if (ti >= t) return;
@@ -603,7 +618,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_mix_ks(const float* __re
                                                                const float* __restrict__ res,
                                                                const float* __restrict__ post,
                                                                const float* __restrict__ comb, float* __restrict__ out,
-                                                               DsW w, float* __restrict__ part, int t, int hc, int d) {
+                                                               DsW w, float* __restrict__ part, int t, int hc, int d) { DS_PDL_ENTRY
     __shared__ float xs[8][256];
     int K = hc * d, k0 = blockIdx.x * 256, t0 = blockIdx.y * 8, tid = threadIdx.x;
     int nt = min(8, t - t0), k = k0 + tid;
@@ -703,7 +718,7 @@ __device__ __forceinline__ void sinkhorn_warp(const float* m, const float* scale
 extern "C" __global__ void ds_hc_stage(const float* x, const float* mixes, float neps, const float* scale,
                                        const float* base, float* pre_o, float* post, float* comb, int hc, int iters,
                                        float eps, const float* pre_i, float* out, DsW w, int d, float reps,
-                                       int np) {
+                                       int np) { DS_PDL_ENTRY
     __shared__ float ra[32], rb[32], sm[80];
     int mix = (2 + hc) * hc, n = hc * d, tid = threadIdx.x;
     const float* r = x + (long long)blockIdx.x * n;
@@ -767,7 +782,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_fused_ks(
     const float* __restrict__ post, const float* __restrict__ comb, float* __restrict__ xo, DsW w,
     float* part, const float* __restrict__ pre_i, float* hin, DsW nw, const float* __restrict__ scale,
     const float* __restrict__ base, float* __restrict__ pre_o, float* __restrict__ post_o,
-    float* __restrict__ comb_o, int* cnt, int t, int hc, int d, int iters, float eps, float neps, float reps) {
+    float* __restrict__ comb_o, int* cnt, int t, int hc, int d, int iters, float eps, float neps, float reps) { DS_PDL_ENTRY
     __shared__ float xs[8][256];
     __shared__ float rx[8][8], ro[8][8], sm[8][80], rs[8];
     int ci = 256 / hc, tid = threadIdx.x, lane = tid & 31, wp = tid / 32;
@@ -906,7 +921,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_hc_fused_ks(
 }
 
 // out[t][c][i] = table[ids[t]][i] for every copy c (bf16 table). Thread per element.
-extern "C" __global__ void ds_embed(const unsigned short* table, const int* ids, float* out, int t, int copies, int d) {
+extern "C" __global__ void ds_embed(const unsigned short* table, const int* ids, float* out, int t, int copies, int d) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)t * copies * d) return;
     int i = e % d;
@@ -915,7 +930,7 @@ extern "C" __global__ void ds_embed(const unsigned short* table, const int* ids,
 }
 
 // out[t][i] = bf(mean_c x[t][c][i]).
-extern "C" __global__ void ds_mean_hc(const float* x, float* out, int t, int hc, int d) {
+extern "C" __global__ void ds_mean_hc(const float* x, float* out, int t, int hc, int d) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * d) return;
     int ti = i / d, k = i % d;
@@ -934,7 +949,7 @@ __device__ __forceinline__ float swiglu1(float gv, float uv, const float* w, flo
 }
 
 // h[r][j] = bf(w[r] * silu(min(g, lim)) * clamp(u, ±lim)); w null for the shared expert.
-extern "C" __global__ void ds_swiglu(const float* g, const float* u, const float* w, float* h, long long n, int inter, float lim) {
+extern "C" __global__ void ds_swiglu(const float* g, const float* u, const float* w, float* h, long long n, int inter, float lim) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     h[i] = swiglu1(g[i], u[i], w ? w + i / inter : 0, lim);
@@ -949,7 +964,7 @@ __device__ __forceinline__ bool router_better(float v, int e, float bv, int be) 
 }
 
 extern "C" __global__ void ds_router(const float* raw, const float* bias, int* ids, float* wts, int t, int ne, int k,
-                                     int norm, float route_scale) {
+                                     int norm, float route_scale) { DS_PDL_ENTRY
     extern __shared__ float sh[];
     float* sv = sh;
     unsigned char* used = (unsigned char*)(sh + ne);
@@ -1001,45 +1016,45 @@ extern "C" __global__ void ds_router(const float* raw, const float* bias, int* i
 }
 
 // out[j][i] = x[rows[j]][i].
-extern "C" __global__ void ds_gather_rows(const float* x, const int* rows, float* out, int n, int d) {
+extern "C" __global__ void ds_gather_rows(const float* x, const int* rows, float* out, int n, int d) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)n * d) return;
     out[e] = x[(long long)rows[e / d] * d + e % d];
 }
 
 // y[rows[j]][i] += v[j][i] (rows unique within one launch).
-extern "C" __global__ void ds_scatter_add(float* y, const float* v, const int* rows, int n, int d) {
+extern "C" __global__ void ds_scatter_add(float* y, const float* v, const int* rows, int n, int d) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)n * d) return;
     y[(long long)rows[e / d] * d + e % d] += v[e];
 }
 
 // y[i] += v[i].
-extern "C" __global__ void ds_add(float* y, const float* v, long long n) {
+extern "C" __global__ void ds_add(float* y, const float* v, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += v[i];
 }
 
 // y[i] = bf(y[i] + v[i]).
-extern "C" __global__ void ds_add_round(float* y, const float* v, long long n) {
+extern "C" __global__ void ds_add_round(float* y, const float* v, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = bf(y[i] + v[i]);
 }
 
 // v[i] = bf(v[i] * s).
-extern "C" __global__ void ds_scale_round(float* v, float s, long long n) {
+extern "C" __global__ void ds_scale_round(float* v, float s, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) v[i] = bf(v[i] * s);
 }
 
 // v[i] = bf(v[i]).
-extern "C" __global__ void ds_round(float* v, long long n) {
+extern "C" __global__ void ds_round(float* v, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) v[i] = bf(v[i]);
 }
 
 // The ratio-r compressor's pooling: out[g][c] = Σ_j kv[g*r+j][c] softmax_j(sc[g*r+j][c]).
-extern "C" __global__ void ds_pool(const float* kv, const float* sc, float* out, int groups, int r, int hd) {
+extern "C" __global__ void ds_pool(const float* kv, const float* sc, float* out, int groups, int r, int hd) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)groups * hd) return;
     int g = e / hd, c = e % hd;
@@ -1061,7 +1076,7 @@ extern "C" __global__ void ds_pool(const float* kv, const float* sc, float* out,
 // then ds_rms(nw), into lat[e]. Bit for bit the per-position ring_write + pool + round + rms.
 extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst, const float* sst, const float* kv,
                                                                  const float* sc, float* lat, DsW nw, const int* P,
-                                                                 int r, int hd, float eps) {
+                                                                 int r, int hd, float eps) { DS_PDL_ENTRY
     __shared__ float red[32];
     int e = blockIdx.x, p0 = P[0], pe = p0 + e;
     float* out = lat + (long long)e * hd;
@@ -1107,7 +1122,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst
 // The rows a batch of t leaves in two rings of r slots (slot (P[0] + e) % r): only each slot's
 // last write, so the batch's rows never race.
 extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, const float* b, int t, int hd, int r,
-                                         const int* P) {
+                                         const int* P) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * hd) return;
     int e = i / hd, c = i % hd;
@@ -1123,7 +1138,7 @@ extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, c
 // ds_fp4_qdq, into cache row (P[0] + e) / r, by the batch's last row for that cache row.
 extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int hd, float* ckv, float* ik, int ihd,
                                                                  DsW kn, float* idxk, const float2* tab, int rd,
-                                                                 const int* P, int r, int t, float eps) {
+                                                                 const int* P, int r, int t, float eps) { DS_PDL_ENTRY
     __shared__ float red[32];
     int e = blockIdx.x, job = blockIdx.y, p0 = P[0];
     int n = job ? ihd : hd, blk = job ? 32 : 16;
@@ -1169,7 +1184,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int 
 
 // The indexer's scores, warp per (t, j): score = bf(Σ_h bf(relu(bf(q_h·k_j)) * w[t][h])).
 extern "C" __global__ void ds_index_score(const float* q, const float* ik, const float* w, float* score,
-                                          int t, int width, int nh, int ihd) {
+                                          int t, int width, int nh, int ihd) { DS_PDL_ENTRY
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (warp >= t * width) return;
     int ti = warp / width, j = warp % width;
@@ -1204,7 +1219,7 @@ __device__ __forceinline__ float ds_fp8w(const unsigned char* wr, const unsigned
 // the tokens' activations staged in shared memory 256 columns at a time, read by every warp.
 #define DS_WO_ROWS 16
 #define DS_WO_TC 256
-extern "C" __global__ void __launch_bounds__(256) ds_wo_a(const float* o, DsW w, float* mid, int t, int g, int ol) {
+extern "C" __global__ void __launch_bounds__(256) ds_wo_a(const float* o, DsW w, float* mid, int t, int g, int ol) { DS_PDL_ENTRY
     __shared__ float xs[DS_WO_T][DS_WO_TC];
     int lane = threadIdx.x & 31, wi = threadIdx.x >> 5;
     int base = blockIdx.x * DS_WO_ROWS, gi = base / ol;
@@ -1264,7 +1279,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_wo_a(const float* o, DsW w,
 
 // out[b][a][c] = in[a][b][c] for in [na][nb][nc]: the wo_a groups' rows to and from
 // per-group contiguous blocks for the K-split GEMV.
-extern "C" __global__ void ds_perm3(const float* in, float* out, int na, int nb, int nc) {
+extern "C" __global__ void ds_perm3(const float* in, float* out, int na, int nb, int nc) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)na * nb * nc) return;
     int c = e % nc, b = (e / nc) % nb, a = e / ((long long)nb * nc);
@@ -1274,7 +1289,7 @@ extern "C" __global__ void ds_perm3(const float* in, float* out, int na, int nb,
 // Engram's gate, block per (t, c): out = bf(h + sigmoid(signed sqrt(normalized h·qk·key)) val).
 // kv [t][(hc + 1) d] (keys, then the shared value), qk [hc][d] = q_weight * k_weight.
 extern "C" __global__ void ds_engram_gate(const float* x, const float* kv, const float* qk, float* out,
-                                          int hc, int d, float eps) {
+                                          int hc, int d, float eps) { DS_PDL_ENTRY
     __shared__ float red[3][32];
     int ti = blockIdx.x / hc, c = blockIdx.x % hc;
     const float* h = x + ((long long)ti * hc + c) * d;
@@ -1449,7 +1464,7 @@ __device__ __forceinline__ void lin_fast(DsW w, DsW w3, const float* __restrict_
 
 #define DS_LIN(F, T, G)                                                                                       \
     extern "C" __global__ void __launch_bounds__(128) ds_lin_f##F##_t##T##_g##G(                             \
-        DsW w, DsW w3, const float* x, float* y, int t, int round, int qdq, const float* rw, float lim) {     \
+        DsW w, DsW w3, const float* x, float* y, int t, int round, int qdq, const float* rw, float lim) { DS_PDL_ENTRY     \
         lin_fast<F, T, G>(w, w3, x, y, t, round, qdq, rw, lim, 0);                                            \
     }
 #define DS_LIN_T(F, G) DS_LIN(F, 1, G) DS_LIN(F, 2, G) DS_LIN(F, 4, G) DS_LIN(F, 8, G)
@@ -1469,7 +1484,7 @@ DS_LIN_T(3, 1)
 #define DS_MOE(F, T)                                                                                          \
     extern "C" __global__ void __launch_bounds__(128) ds_moe_gu_f##F##_t##T(                                 \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,  \
-        const float* xq, float* h, float lim) {                                                               \
+        const float* xq, float* h, float lim) { DS_PDL_ENTRY                                                               \
         int e = elist[blockIdx.y];                                                                            \
         if (e < 0) return;                                                                                    \
         int o = off[e], n = off[e + 1] - o;                                                                   \
@@ -1477,7 +1492,7 @@ DS_LIN_T(3, 1)
         lin_fast<F, T, 1>(w, w3s[e], xq, h + (long long)o * w.rows, n, 1, 0, rw + o, lim, rows + o);          \
     }                                                                                                         \
     extern "C" __global__ void __launch_bounds__(128) ds_moe_down_f##F##_t##T(                               \
-        const DsW* w2s, const int* elist, const int* off, const float* hq, float* part) {                    \
+        const DsW* w2s, const int* elist, const int* off, const float* hq, float* part) { DS_PDL_ENTRY                    \
         int e = elist[blockIdx.y];                                                                            \
         if (e < 0) return;                                                                                    \
         int o = off[e], n = off[e + 1] - o;                                                                   \
@@ -1527,7 +1542,7 @@ __device__ __forceinline__ void mma16816(float* c, unsigned int a0, unsigned int
 }
 
 // __CUDA_ARCH__ of the module, so the host can fall back to the exact kernels below sm_80.
-extern "C" __global__ void ds_arch(int* out) { *out = __CUDA_ARCH__; }
+extern "C" __global__ void ds_arch(int* out) { DS_PDL_ENTRY *out = __CUDA_ARCH__; }
 
 // e4m3-valued float -> its e4m3 byte (|v| <= 448, on the grid)
 __device__ __forceinline__ unsigned int e4m3_byte(float v) {
@@ -1540,7 +1555,7 @@ __device__ __forceinline__ unsigned int e4m3_byte(float v) {
 
 // The activation, quantized once: codes [t][K] (e4m3 bytes) and scales [t][K/32] (pow2), bit
 // for bit ds_fp8_qdq's. Warp per 32-group.
-extern "C" __global__ void ds_ks_quant(const float* x, unsigned char* codes, float* sx, int n_groups) {
+extern "C" __global__ void ds_ks_quant(const float* x, unsigned char* codes, float* sx, int n_groups) { DS_PDL_ENTRY
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (gw >= n_groups) return;
     float xv = x[(long long)gw * 32 + lane];
@@ -1705,10 +1720,31 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
     }
 }
 
+// PDL prologue of ds_ks: L2 prefetches of this block's first work item's weight slice (its
+// rows of w, and w3's for GU), issued before DS_PDL_WAIT so they stream under the predecessor.
+template <int FMT, int GU>
+__device__ __forceinline__ void ks_pf(const DsW& w, const DsW& w3, int S, int SB) {
+#if __CUDA_ARCH__ >= 900
+    int nch = w.cols / 32, gpb = (nch + SB - 1) / SB;
+    int br = blockIdx.x / SB, sb = blockIdx.x % SB;
+    int nr = (8 / S) * (GU ? 8 : 16), n0 = br * nr;
+    long long rbytes = FMT == 3 ? w.cols / 2 : w.cols, gb = FMT == 3 ? 16 : 32;
+    long long lo = sb * gpb * gb, hi = min(nch, (sb + 1) * gpb) * gb;
+    int lines = (int)((hi - lo + 127) / 128);
+    for (int e = threadIdx.x; e < nr * (1 + GU) * lines; e += blockDim.x) {
+        int r = e / lines % nr, m = e / lines / nr, l = e % lines;
+        if (n0 + r >= w.rows) continue;
+        const char* base = (const char*)(m ? w3.w : w.w) + (long long)(n0 + r) * rbytes + lo + 128LL * l;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(base));
+    }
+#endif
+}
+
 #define DS_KS(F, G)                                                                                             \
     extern "C" __global__ void __launch_bounds__(256) ds_ks_f##F##_g##G(                                        \
         DsW w, DsW w3, const unsigned char* xc, const float* xsc, float* y, int t, int round, const float* rw,  \
-        float lim, int S, int SB, int nbr, float* part, int* cnt) {                                             \
+        float lim, int S, int SB, int nbr, float* part, int* cnt) { DS_PDL_TRIGGER                                             \
+        ks_pf<F, G>(w, w3, S, SB); DS_PDL_WAIT                                                                  \
         lin_mma<F, G>(w, w3, xc, xsc, y, t, round, rw, lim, S, SB, nbr, part, cnt, 0);                           \
     }
 // The K-split GEMV over t > 8 rows in one launch (prefill): block b is row group b / nc of
@@ -1718,7 +1754,7 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
 #define DS_KST(F, G)                                                                                            \
     extern "C" __global__ void __launch_bounds__(256) ds_kst_f##F##_g##G(                                       \
         DsW w, DsW w3, const unsigned char* xc, const float* xsc, float* y, int t, int round, const float* rw,  \
-        float lim, int S, int nbr) {                                                                            \
+        float lim, int S, int nbr) { DS_PDL_ENTRY                                                                            \
         int nc = (t + 7) / 8, c = blockIdx.x % nc, br = blockIdx.x / nc, r0 = c * 8;                          \
         lin_mma<F, G>(w, w3, xc + (long long)r0 * w.cols, xsc + (long long)r0 * (w.cols / 32),                 \
                       y + (long long)r0 * w.rows, min(8, t - r0), round, rw ? rw + r0 : 0, lim, S, 1, nbr, 0, 0, \
@@ -1741,7 +1777,7 @@ DS_KS(3, 1)
 #define DS_MOE_KS(F)                                                                                           \
     extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_gu_f##F(                                       \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
-        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) {                      \
+        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) { DS_PDL_ENTRY                      \
         int e = elist[blockIdx.y];                                                                              \
         if (e < 0) return;                                                                                      \
         int o = off[e], n = off[e + 1] - o;                                                                     \
@@ -1752,7 +1788,7 @@ DS_KS(3, 1)
     }                                                                                                           \
     extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_down_f##F(                                     \
         const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
-        float* part, int S, int nbr) {                                                                          \
+        float* part, int S, int nbr) { DS_PDL_ENTRY                                                                          \
         int e = elist[blockIdx.y];                                                                              \
         if (e < 0) return;                                                                                      \
         int o = off[e], n = off[e + 1] - o;                                                                     \
@@ -1773,7 +1809,7 @@ DS_MOE_KS(3)
     extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_gu_f##F##_s##SF(                              \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
         const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr, DsW s1, DsW s3, int t, \
-        int n) {                                                                                                \
+        int n) { DS_PDL_ENTRY                                                                                                \
         if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
             lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * s1.rows, t, 1, 0, lim, S, 1, nbr, 0, 0, 0);     \
             return;                                                                                             \
@@ -1788,7 +1824,7 @@ DS_MOE_KS(3)
     }                                                                                                           \
     extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_down_f##F##_s##SF(                            \
         const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
-        float* part, int S, int nbr, DsW s2, int t, int n) {                                                    \
+        float* part, int S, int nbr, DsW s2, int t, int n) { DS_PDL_ENTRY                                                    \
         if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
             lin_mma<SF, 0>(s2, s2, hc + (long long)n * s2.cols, hsc + (long long)n * (s2.cols / 32),           \
                            part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                    \
@@ -1814,7 +1850,7 @@ DS_MOE_KS_SH(2, 3)
 #define DS_WO_KS(F)                                                                                            \
     extern "C" __global__ void __launch_bounds__(256) ds_wo_ks_f##F(DsW w, const unsigned char* xc,            \
                                                                      const float* xsc, float* y, int t, int ol, \
-                                                                     int S, int nbr) {                          \
+                                                                     int S, int nbr) { DS_PDL_ENTRY                            \
         long long gi = blockIdx.y, gd = w.cols, g = gridDim.y;                                                  \
         DsW v = w;                                                                                              \
         v.rows = ol;                                                                                            \
@@ -1838,7 +1874,7 @@ DS_WO_KS(3)
 extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn, unsigned char* qc, float* qsc,
                                                                 float* kv, DsW kn, const float2* tab, int rd,
                                                                 const int* P, float* ring, int win, float* all,
-                                                                float eps) {
+                                                                float eps) { DS_PDL_ENTRY
     __shared__ float red[32];
     int ti = blockIdx.x, isq = blockIdx.y == 0;
     DsW w = isq ? qn : kn;
@@ -1909,25 +1945,25 @@ extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn
 #define DS_MOE_TILES(F)                                                                                        \
     extern "C" __global__ void __launch_bounds__(128) ds_moe_tgu_f##F(                                         \
         const DsW* w1s, const DsW* w3s, const int* tiles, const int* off, const int* rows, const float* rw,   \
-        const float* xq, float* h, float lim) {                                                                \
+        const float* xq, float* h, float lim) { DS_PDL_ENTRY                                                                \
         MOE_TILE DsW w = w1s[e];                                                                               \
         lin_fast<F, 8, 1>(w, w3s[e], xq, h + (long long)o * w.rows, n, 1, 0, rw + o, lim, rows + o);           \
     }                                                                                                          \
     extern "C" __global__ void __launch_bounds__(128) ds_moe_tdown_f##F(                                       \
-        const DsW* w2s, const int* tiles, const int* off, const float* hq, float* part) {                     \
+        const DsW* w2s, const int* tiles, const int* off, const float* hq, float* part) { DS_PDL_ENTRY                     \
         MOE_TILE DsW w = w2s[e];                                                                               \
         lin_fast<F, 8, 0>(w, w, hq + (long long)o * w.cols, part + (long long)o * w.rows, n, 1, 0, 0, 0.f, 0); \
     }                                                                                                          \
     extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_tgu_f##F(                                      \
         const DsW* w1s, const DsW* w3s, const int* tiles, const int* off, const int* rows, const float* rw,   \
-        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) {                      \
+        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) { DS_PDL_ENTRY                      \
         MOE_TILE DsW w = w1s[e];                                                                               \
         lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, n, 1, rw + o, lim, S, 1, nbr, 0, 0,       \
                       rows + o);                                                                               \
     }                                                                                                          \
     extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_tdown_f##F(                                    \
         const DsW* w2s, const int* tiles, const int* off, const unsigned char* hc, const float* hsc,          \
-        float* part, int S, int nbr) {                                                                         \
+        float* part, int S, int nbr) { DS_PDL_ENTRY                                                                         \
         MOE_TILE DsW w = w2s[e];                                                                               \
         lin_mma<F, 0>(w, w, hc + (long long)o * w.cols, hsc + (long long)o * (w.cols / 32),                    \
                       part + (long long)o * w.rows, n, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                         \
@@ -1959,7 +1995,7 @@ __device__ __forceinline__ float ds_rope_at(float a, float b, int col, int d, in
 extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, const float* kv0, int split,
                                                              const float* kv1, const int* idxs, float* part,
                                                              int h, int d, int k, const float2* tab, const int* Pp,
-                                                             int rd, int add, int ps) {
+                                                             int rd, int add, int ps) { DS_PDL_ENTRY
     __shared__ float Qs[64][65];
     __shared__ float Ks[32][65];
     int nkt = (k + 31) / 32, nds = d / 64, nhc = h / 64;
@@ -2010,7 +2046,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_qk(const float* q, con
 }
 
 extern "C" __global__ void ds_attn_soft(const float* part, const float* sink, const int* idxs, float* pr,
-                                        float* den, int t, int h, int d, int k, float scale) {
+                                        float* den, int t, int h, int d, int k, float scale) { DS_PDL_ENTRY
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (warp >= t * h) return;
     int ti = warp / h, hi = warp % h, nds = d / 64;
@@ -2045,7 +2081,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_spv(const float* part,
                                                               const float* kv0, int split, const float* kv1,
                                                               const int* idxs, float* o, int h, int d, int k,
                                                               float scale, int dsb, const float2* tab, const int* Pp,
-                                                              int rd, int add, int ps) {
+                                                              int rd, int add, int ps) { DS_PDL_ENTRY
     extern __shared__ float P[];  // [8][k], then the k indices
     __shared__ float red[4][8][64];
     __shared__ float dens[8];
@@ -2126,7 +2162,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_spv(const float* part,
 extern "C" __global__ void __launch_bounds__(256) ds_attn_pv(const float* pr, const float* den, const float* kv0,
                                                              int split, const float* kv1, const int* idxs,
                                                              float* o, int h, int d, int k, const float2* tab,
-                                                             const int* Pp, int rd, int add, int ps) {
+                                                             const int* Pp, int rd, int add, int ps) { DS_PDL_ENTRY
     extern __shared__ float P[];  // [8][k], then the k indices
     __shared__ float red[4][8][64];
     int* Is = (int*)(P + 8 * k);
@@ -2195,7 +2231,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, con
                                                              const float* kv1, const int* idxs, float* part,
                                                              float* ml, int h, int d, int k, float scale, int S,
                                                              const float2* tab, const int* Pp, int rd, int add,
-                                                             int ps, int, int, const int*, int, int) {
+                                                             int ps, int, int, const int*, int, int) { DS_PDL_ENTRY
     extern __shared__ float fsm[];
     unsigned int* Qs = (unsigned int*)fsm;  // [64][FD_QP]
     unsigned int* Ks = Qs + 64 * FD_QP;     // [FD_KT][FD_QP]
@@ -2322,7 +2358,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, con
 extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* part, const float* ml,
                                                                   const float* sink, float* o, int h, int d,
                                                                   int S, const float2* tab, const int* Pp, int rd,
-                                                                  int add, int ps) {
+                                                                  int add, int ps) { DS_PDL_ENTRY
     int b = blockIdx.x, hi = b % h, ti = b / h, tid = threadIdx.x;
     float M = -DS_INF;
     for (int s = 0; s < S; s++) M = fmaxf(M, ml[(((long long)ti * S + s) * h + hi) * 2]);
@@ -2370,7 +2406,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
                                                               float* ml, int h, int d, int k, float scale, int S,
                                                               const float2* tab, const int* Pp, int rd, int add,
                                                               int ps, int wmode, int win, const int* wsrc, int kc,
-                                                              int r0) {
+                                                              int r0) { DS_PDL_ENTRY
     extern __shared__ float fsm[];
     unsigned int* Qs = (unsigned int*)fsm;       // [64][FD_QP]
     unsigned int* Ks = Qs + 64 * FD_QP;          // [FD_KT][FD_QP]

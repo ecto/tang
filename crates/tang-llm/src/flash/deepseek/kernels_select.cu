@@ -97,7 +97,7 @@ __device__ void ds_select_row(const float* v, int n, int k, int* sel) {
 // In place on score [t][width]: -inf past each row's causal prefix (when `causal`), and
 // where the candidate mask cand [t][width] (u8; null for none) is 0.
 extern "C" __global__ void ds_mask_scores(float* score, const unsigned char* cand, int t, int width, int causal,
-                                          int r) {
+                                          int r) { DS_PDL_ENTRY
     long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= (long long)t * width) return;
     int ti = (int)(e / width), j = (int)(e % width);
@@ -108,7 +108,7 @@ extern "C" __global__ void ds_mask_scores(float* score, const unsigned char* can
 // holding the row's newest position pinned to +inf, the top `kb` blocks kept (-inf blocks
 // never), expanded to a mask cand [t][width].
 extern "C" __global__ void ds_candidates(const float* score, float* sc, int* scratch, unsigned char* cand, int t,
-                                         int width, int causal, int r, int bs, int kb) {
+                                         int width, int causal, int r, int bs, int kb) { DS_PDL_ENTRY
     int ti = blockIdx.x;
     if (ti >= t) return;
     int nb = (width + bs - 1) / bs;
@@ -141,7 +141,7 @@ extern "C" __global__ void ds_candidates(const float* score, float* sc, int* scr
 // order, as out[ti * stride + q] = idx + offset, or -1 when idx is past the row's prefix.
 // `scratch` holds [t][k] ints.
 extern "C" __global__ void ds_topk(const float* score, int* scratch, int* out, int t, int width, int k, int stride,
-                                   int offset, int causal, int r) {
+                                   int offset, int causal, int r) { DS_PDL_ENTRY
     int ti = blockIdx.x;
     if (ti >= t) return;
     int* sel = scratch + (long long)ti * k;
@@ -160,7 +160,7 @@ extern "C" __global__ void ds_topk(const float* score, int* scratch, int* out, i
 //   mode 3, verify window at sp (kv = the pre-chunk ring then the chunk's t rows): row e sees
 //     positions max(sp + e - win + 1, 0) .. sp + e ascending, -1 past them;
 //   mode 2, DSpark at sp: ring slots 0 .. min(win, sp + 1), then win .. win + b (the block).
-extern "C" __global__ void ds_win_idx(int* out, int t, int stride, int n, int mode, int sp, int win, int b) {
+extern "C" __global__ void ds_win_idx(int* out, int t, int stride, int n, int mode, int sp, int win, int b) { DS_PDL_ENTRY
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= t * n) return;
     int row = e / n, j = e % n, v;
@@ -181,7 +181,7 @@ extern "C" __global__ void ds_win_idx(int* out, int t, int stride, int n, int mo
 }
 
 // dst[row * dstride + col + j] = src[row * k + j], j < k.
-extern "C" __global__ void ds_idx_cat(int* dst, const int* src, int t, int k, int dstride, int col) {
+extern "C" __global__ void ds_idx_cat(int* dst, const int* src, int t, int k, int dstride, int col) { DS_PDL_ENTRY
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= t * k) return;
     dst[(long long)(e / k) * dstride + col + e % k] = src[e];
@@ -219,7 +219,7 @@ __device__ __forceinline__ void route_body(const int* ids, const float* wts, int
 }
 
 extern "C" __global__ void ds_route(const int* ids, const float* wts, int* counts, int* off, int* rows, float* rw,
-                                    int t, int k, int ne) {
+                                    int t, int k, int ne) { DS_PDL_ENTRY
     route_body(ids, wts, counts, off, rows, rw, t, k, ne);
 }
 
@@ -227,7 +227,7 @@ extern "C" __global__ void ds_route(const int* ids, const float* wts, int* count
 // grouped K-split GU's activation, independent of the routing): three launches in one.
 extern "C" __global__ void ds_route_plan_q(const int* ids, const float* wts, int* counts, int* off, int* rows,
                                            float* rw, int t, int k, int ne, const int* mask, int* elist, int cap,
-                                           const float* x, unsigned char* codes, float* sx, int ng) {
+                                           const float* x, unsigned char* codes, float* sx, int ng) { DS_PDL_ENTRY
     if (blockIdx.x == 0) {
         route_body(ids, wts, counts, off, rows, rw, t, k, ne);
         __syncthreads();
@@ -253,7 +253,7 @@ extern "C" __global__ void ds_route_plan_q(const int* ids, const float* wts, int
 // Expert e's rows of x [.][d] into xs [cap][d] and its route weights into w [cap]; rows past
 // the expert's count are zero (cap is the host's bound, t).
 extern "C" __global__ void ds_gather_csr(const float* x, const int* off, const int* rows, const float* rw, float* xs,
-                                         float* w, int e, int cap, int d) {
+                                         float* w, int e, int cap, int d) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)cap * d) return;
     int j = (int)(i / d), n = off[e + 1] - off[e];
@@ -264,7 +264,7 @@ extern "C" __global__ void ds_gather_csr(const float* x, const int* off, const i
 
 // y[rows[j]] += v[j] for expert e's rows only.
 extern "C" __global__ void ds_scatter_csr(float* y, const float* v, const int* off, const int* rows, int e, int cap,
-                                          int d) {
+                                          int d) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int n = off[e + 1] - off[e];
     if (i >= (long long)n * d) return;
@@ -272,7 +272,7 @@ extern "C" __global__ void ds_scatter_csr(float* y, const float* v, const int* o
 }
 
 // ds_linear limited to expert e's row count (rows past it are left unwritten).
-extern "C" __global__ void ds_linear_csr(DsW w, const float* x, float* y, int t, int round, const int* off, int e) {
+extern "C" __global__ void ds_linear_csr(DsW w, const float* x, float* y, int t, int round, const int* off, int e) { DS_PDL_ENTRY
     int n_rows = min(t, off[e + 1] - off[e]);
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (warp >= n_rows * w.rows) return;
@@ -286,7 +286,7 @@ extern "C" __global__ void ds_linear_csr(DsW w, const float* x, float* y, int t,
 
 // Grouped MoE plan, one thread: elist[0..cap) = the experts with rows that this rank owns
 // (mask[e] != 0), ascending, then -1.
-extern "C" __global__ void ds_moe_plan(const int* counts, const int* mask, int* elist, int ne, int cap) {
+extern "C" __global__ void ds_moe_plan(const int* counts, const int* mask, int* elist, int ne, int cap) { DS_PDL_ENTRY
     if (threadIdx.x || blockIdx.x) return;
     int j = 0;
     for (int e = 0; e < ne && j < cap; e++)
@@ -296,7 +296,7 @@ extern "C" __global__ void ds_moe_plan(const int* counts, const int* mask, int* 
 
 // The 8-row tiles of the elist experts' CSR segments, one thread: tiles[0..cap) = e | c << 16
 // for each slot's expert e and chunk c < ceil(rows / 8), then -1 (cap >= slots + rows / 8).
-extern "C" __global__ void ds_moe_plan_tiles(const int* elist, const int* off, int* tiles, int slots, int cap) {
+extern "C" __global__ void ds_moe_plan_tiles(const int* elist, const int* off, int* tiles, int slots, int cap) { DS_PDL_ENTRY
     if (threadIdx.x || blockIdx.x) return;
     int j = 0;
     for (int s = 0; s < slots; s++) {
@@ -338,22 +338,22 @@ __device__ __forceinline__ void moe_reduce_at(float* y, const float* part, const
     y[i] = s;
 }
 extern "C" __global__ void ds_moe_reduce(float* y, const float* part, const int* ids, const int* off, const int* rows,
-                                         const int* mask, int t, int k, int d) {
+                                         const int* mask, int t, int k, int d) { DS_PDL_ENTRY
     moe_reduce_at(y, part, ids, off, rows, mask, t, k, d, 0);
 }
 extern "C" __global__ void ds_moe_reduce_sh(float* y, const float* part, const int* ids, const int* off,
-                                            const int* rows, const int* mask, int t, int k, int d, int sh) {
+                                            const int* rows, const int* mask, int t, int k, int d, int sh) { DS_PDL_ENTRY
     moe_reduce_at(y, part, ids, off, rows, mask, t, k, d, sh);
 }
 
 // n ints set to v (a verify window's [t][k] selection, -1 = no entry).
-extern "C" __global__ void ds_fill_i32(int* p, int v, long long n) {
+extern "C" __global__ void ds_fill_i32(int* p, int v, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) p[i] = v;
 }
 
 // n bytes (candidate mask rows).
-extern "C" __global__ void ds_copy_u8(unsigned char* dst, const unsigned char* src, long long n) {
+extern "C" __global__ void ds_copy_u8(unsigned char* dst, const unsigned char* src, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
@@ -363,7 +363,7 @@ extern "C" __global__ void ds_copy_u8(unsigned char* dst, const unsigned char* s
 // row == nullptr keep ids[slot] (first set to set[0] when given); then, when memb != nullptr, the
 // Markov embedding row of that id: memb[0..rank] = tab[id * rank ..]. One block of 1024.
 extern "C" __global__ void ds_spark_pick(float* row, int v, int* ids, int slot, const float* tab, int rank,
-                                         float* memb, const float* bias, const int* set) {
+                                         float* memb, const float* bias, const int* set) { DS_PDL_ENTRY
     __shared__ float sv[1024];
     __shared__ int si[1024];
     __shared__ int pick;
@@ -439,7 +439,7 @@ extern "C" __global__ void __launch_bounds__(128) ds_moe_gate(DsW w, const float
                                                              const float* __restrict__ bias, int* ids, float* wts,
                                                              int* counts, int* off, int* rows, float* rw,
                                                              const int* __restrict__ mask, int* elist, int cap, int t,
-                                                             int ne, int k, int norm, float route_scale, int* cnt) {
+                                                             int ne, int k, int norm, float route_scale, int* cnt) { DS_PDL_ENTRY
     __shared__ int sid[GATE_N];
     __shared__ float swt[GATE_N];
     __shared__ int soff[GATE_NE + 1];
@@ -889,7 +889,7 @@ __device__ double ds_ss_uniform(unsigned long long* st) {
 extern "C" __global__ void __launch_bounds__(1024) ds_spark_sample(float* row, int v, int* ids, int slot,
                                            const float* tab, int rank, float* memb, float temp,
                                            float top_p, unsigned long long* rng, double* w,
-                                           const float* bias, int* qi, double* qp, int* qn) {
+                                           const float* bias, int* qi, double* qp, int* qn) { DS_PDL_ENTRY
     __shared__ DsSs S;
     __shared__ double red[32][15];
     __shared__ double out[15];
@@ -959,7 +959,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_spark_sample(float* row, i
 // the fast path does not apply. `w` is [rows][v] f64 scratch.
 extern "C" __global__ void __launch_bounds__(1024) ds_spec_dist(float* logits, int v, float temp,
                                                                 float top_p, double* w, int* pi,
-                                                                double* pp, int* pn) {
+                                                                double* pp, int* pn) { DS_PDL_ENTRY
     __shared__ DsSs S;
     int r = blockIdx.x, tid = threadIdx.x;
     int keep = ds_ss_dist(logits + (long long)r * v, v, nullptr, temp, top_p, w + (long long)r * v, S);
@@ -984,7 +984,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_spec_walk(const int* ids, 
                                                                 const double* pp, const int* pn,
                                                                 const int* qi, const double* qp,
                                                                 const int* qn, unsigned long long rng0,
-                                                                int* out) {
+                                                                int* out) { DS_PDL_ENTRY
     __shared__ double res[DS_SS_CAP];
     __shared__ unsigned long long st;
     __shared__ int sk, acc;

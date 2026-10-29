@@ -9,6 +9,21 @@
 // `add` is a row's offset from the step's start (a verify window runs its positions one by
 // one); `r` the layer's compress ratio.
 
+// Programmatic dependent launch (DS_PDL=1, pdl.rs): every kernel lets its stream successor
+// launch at its entry and waits for its predecessor (and its memory) before its first read;
+// both are no-ops for a plain launch and below sm_90.
+#ifndef DS_PDL_ENTRY
+#if __CUDA_ARCH__ >= 900
+#define DS_PDL_TRIGGER asm volatile("griddepcontrol.launch_dependents;");
+#define DS_PDL_WAIT asm volatile("griddepcontrol.wait;" ::: "memory");
+#else
+#define DS_PDL_TRIGGER
+#define DS_PDL_WAIT
+#endif
+#define DS_PDL_ENTRY DS_PDL_TRIGGER DS_PDL_WAIT
+#endif
+
+
 #define DG_INF __int_as_float(0x7f800000)
 #define DG_SEL_THREADS 512
 
@@ -22,7 +37,7 @@ __device__ __forceinline__ float dg_bf(float x) {
 // As ds_rope: row r at P[0] + add + r * pstride, or (fixed_r > 0) every row at the
 // compressed group's position P[0] + add + 1 - fixed_r.
 extern "C" __global__ void dg_rope(float* v, const float2* tab, int rows, int per_row, int d, int rd, const int* P,
-                                   int add, int pstride, int fixed_r, int inverse) {
+                                   int add, int pstride, int fixed_r, int inverse) { DS_PDL_ENTRY
     int half = rd / 2;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)rows * per_row * half) return;
@@ -41,7 +56,7 @@ extern "C" __global__ void dg_rope(float* v, const float2* tab, int rows, int pe
 // As ds_win_idx modes 1 (decode) and 3 (verify window) at sp = P[0]; with src, also its [t][k]
 // rows into columns n.. (as ds_idx_cat), so the whole index row in one launch.
 extern "C" __global__ void dg_win_idx(int* out, int t, int stride, int n, int mode, const int* P, int win,
-                                      const int* src, int k) {
+                                      const int* src, int k) { DS_PDL_ENTRY
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (src && e >= t * n && e < t * (n + k)) {
         int f = e - t * n;
@@ -63,7 +78,7 @@ extern "C" __global__ void dg_win_idx(int* out, int t, int stride, int n, int mo
 
 // t rows of hd into a ring of `win` slots at positions P[0] + add + e.
 extern "C" __global__ void dg_ring_write(float* ring, const float* src, int t, int hd, int win, const int* P,
-                                         int add) {
+                                         int add) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * hd) return;
     int e = i / hd, c = i % hd;
@@ -71,7 +86,7 @@ extern "C" __global__ void dg_ring_write(float* ring, const float* src, int t, i
 }
 
 // One row of n into dst's row (P[0] + add) / r (a compressed cache).
-extern "C" __global__ void dg_row_write(float* dst, const float* src, int n, const int* P, int add, int r) {
+extern "C" __global__ void dg_row_write(float* dst, const float* src, int n, const int* P, int add, int r) { DS_PDL_ENTRY
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n) return;
     dst[(long long)((P[0] + add) / r) * n + c] = src[c];
@@ -83,7 +98,7 @@ __device__ __forceinline__ int dg_width(const int* P, int add, int r) { return (
 // launch's).
 // Row blockIdx.y of a batch: q [y][nh][ihd], w [y][nh], score [y][sst], position add + y.
 extern "C" __global__ void dg_index_score(const float* q, const float* ik, const float* w, float* score, const int* P,
-                                          int add, int r, int nh, int ihd, int sst) {
+                                          int add, int r, int nh, int ihd, int sst) { DS_PDL_ENTRY
     int y = blockIdx.y;
     q += (long long)y * nh * ihd;
     w += y * nh;
@@ -105,7 +120,7 @@ extern "C" __global__ void dg_index_score(const float* q, const float* ik, const
 
 // As ds_mask_scores (no causal part), row blockIdx.y of a batch.
 extern "C" __global__ void dg_mask_scores(float* score, const unsigned char* cand, const int* P, int add, int r,
-                                          int sst, int cst) {
+                                          int sst, int cst) { DS_PDL_ENTRY
     int y = blockIdx.y;
     score += (long long)y * sst;
     cand += (long long)y * cst;
@@ -194,7 +209,7 @@ __device__ void dg_select_row(const float* v, int n, int k, int* sel) {
 
 // As ds_candidates (decode: no causal prefix), block per row of a batch (position add + row).
 extern "C" __global__ void dg_candidates(const float* score, float* s, int* sel, unsigned char* out, const int* P,
-                                         int add, int r, int bs, int kb, int sst, int nbs, int ost) {
+                                         int add, int r, int bs, int kb, int sst, int nbs, int ost) { DS_PDL_ENTRY
     int y = blockIdx.x;
     score += (long long)y * sst;
     s += (long long)y * nbs;
@@ -227,7 +242,7 @@ extern "C" __global__ void dg_candidates(const float* score, float* s, int* sel,
 // As ds_topk, block per row of a batch (position add + row; no causal prefix): the min(kmax, width) largest, ascending, as
 // idx + offset, then -1 up to kmax (holes ds_sparse_attn skips exactly).
 extern "C" __global__ void dg_topk(const float* score, int* sel, int* out, const int* P, int add, int r, int kmax,
-                                   int offset, int sst) {
+                                   int offset, int sst) { DS_PDL_ENTRY
     int y = blockIdx.x;
     score += (long long)y * sst;
     sel += (long long)y * kmax;
@@ -243,7 +258,7 @@ extern "C" __global__ void dg_topk(const float* score, int* sel, int* out, const
 // kv1 (the window, then a source layer's compressed cache), so neither is copied.
 extern "C" __global__ void dg_sparse_attn(const float* q, const float* kv0, int split, const float* kv1,
                                           const float* sink, const int* idxs, float* o, int h, int d, int k,
-                                          float scale) {
+                                          float scale) { DS_PDL_ENTRY
     extern __shared__ float sc[];
     __shared__ float red[32];
     __shared__ float den_s;
@@ -295,7 +310,7 @@ extern "C" __global__ void dg_sparse_attn(const float* q, const float* kv0, int 
 
 // As ds_win_idx mode 2 (a DSpark block of t rows: the ring's min(win, sp + 1) rows, then the
 // block's t) at sp = P[0] + add, for n = win + t columns: the rest -1.
-extern "C" __global__ void dg_spark_idx(int* out, int t, int n, const int* P, int add, int win) {
+extern "C" __global__ void dg_spark_idx(int* out, int t, int n, const int* P, int add, int win) { DS_PDL_ENTRY
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= t * n) return;
     int j = e % n, n1 = min(win, P[0] + add + 1), v;

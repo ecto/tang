@@ -214,7 +214,8 @@ pub unsafe fn launch(
     args: &mut [*mut c_void],
 ) -> gpu::Result<()> {
     bump(|c| c.launches += 1);
-    gpu::launch(f, grid, block, smem, s, args)
+    // every kernel of these modules opens with DS_PDL_ENTRY (or ds_ks's prefetch + wait)
+    super::pdl::launch(f, grid, block, smem, s, args, super::pdl::on())
 }
 
 // records

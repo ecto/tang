@@ -1,7 +1,7 @@
 // DS_MEGA lane: launch-floor probes and the persistent dense-glue kernel.
 
 // One dependent step: every block bumps its own counter (the stream orders the launches).
-extern "C" __global__ void mg_tick(int* p) {
+extern "C" __global__ void mg_tick(int* p) { DS_PDL_ENTRY
     if (threadIdx.x == 0) p[blockIdx.x] += 1;
 }
 
@@ -26,7 +26,7 @@ __device__ __forceinline__ void mg_grid_sync(int* cnt, int nb) {
 }
 
 // `rounds` grid barriers back to back, a counter bump between them.
-extern "C" __global__ void mg_barrier_loop(int* p, int* cnt, int rounds) {
+extern "C" __global__ void mg_barrier_loop(int* p, int* cnt, int rounds) { DS_PDL_ENTRY
     int nb = gridDim.x;
     for (int r = 0; r < rounds; r++) {
         if (threadIdx.x == 0) p[blockIdx.x] += 1;
@@ -333,8 +333,8 @@ __device__ void mg_glue_body(const MgArgs& a) {
     lin_mma<F, 0>(a.wqb, a.wqb, a.qc, a.qsc, a.q, a.t, 1, 0, 0.f, a.S3, a.SB3, a.NB3, a.part3, a.cnt3, 0);
 }
 
-extern "C" __global__ void __launch_bounds__(256) mg_glue_f2(MgArgs a) { mg_glue_body<2>(a); }
-extern "C" __global__ void __launch_bounds__(256) mg_glue_f3(MgArgs a) { mg_glue_body<3>(a); }
+extern "C" __global__ void __launch_bounds__(256) mg_glue_f2(MgArgs a) { DS_PDL_ENTRY mg_glue_body<2>(a); }
+extern "C" __global__ void __launch_bounds__(256) mg_glue_f3(MgArgs a) { DS_PDL_ENTRY mg_glue_body<3>(a); }
 
 // ---- programmatic dependent launch probes (DS_PDL) ----
 __device__ __forceinline__ void mg_pdl_wait() {
