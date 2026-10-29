@@ -264,6 +264,8 @@ pub struct GpuModel {
     /// The fast GEMV path (`ds_lin_*`: fused activation quant and SwiGLU), bit-identical to
     /// the naive `ds_linear` path kept for A/B (`DS_SLOW=1` turns it off).
     pub fast: bool,
+    /// `DS_KS_REPACK=1`: wq_b / wo_b get a fragment-native copy for the K-split GEMV
+    ks_repack: bool,
     /// Capture decode steps as CUDA graphs (`DS_GRAPH=0` turns it off; see the module doc).
     pub graph: bool,
     pub graph_stats: GraphStats,
@@ -464,6 +466,7 @@ impl GpuModel {
                 Some(n) => n.max(3),
             },
             fast: std::env::var_os("DS_SLOW").is_none(),
+            ks_repack: std::env::var("DS_KS_REPACK").is_ok_and(|v| v == "1"),
             graph: std::env::var("DS_GRAPH").map_or(true, |v| v != "0"),
             graph_stats: GraphStats::default(),
             tabs,
@@ -629,6 +632,16 @@ impl GpuModel {
         }
         let w = Rc::new(DevW::upload(&self.cpu.st, name)?);
         self.w.borrow_mut().insert(name.to_string(), w.clone());
+        if self.ks_repack
+            && self.fast
+            && (name.ends_with(".attn.wq_b.weight") || name.ends_with(".attn.wo_b.weight"))
+            && self.k.ks_ok(&w.v)
+        {
+            let n = self.k.ks_repack(&self.s, &w.v)?;
+            if name.starts_with("layers.0.") && n > 0 {
+                eprintln!("ks_repack: {name} +{:.1} MB", n as f64 / 1048576.0);
+            }
+        }
         Ok(w)
     }
 

@@ -1623,7 +1623,26 @@ extern "C" __global__ void ds_ks_quant(const float* x, unsigned char* codes, flo
 // P = K + 32 bytes for conflict-free 8-byte reads, and scales) once, then takes work items
 // (row group br, K slice sb) = blockIdx.x, += gridDim.x. With SB > 1 slices, partials go to
 // part[sb][t][rows (× 2 for GU)] and the last block of a row group (cnt) sums them in order.
-template <int FMT, int GU>
+// fp8 [rows][cols] -> the fragment-native layout lin_mma RP = 1 reads: for 16-row tile T,
+// 32-column chunk G and lane L (g = L / 4, tig = L % 4) 16 bytes at ((T nch + G) 32 + L) 16:
+// row 16T + g's bytes [32G + 8tig, +8), then row 16T + g + 8's (zero past rows). One 16-byte
+// load a lane, a warp's 512 bytes contiguous, holding exactly the AS-is la / lb.
+extern "C" __global__ void ds_ks_repack(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst,
+                                        int rows, int cols) {
+    long long nch = cols / 32, n = (long long)((rows + 15) / 16) * nch * 32;
+    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x; e < n;
+         e += (long long)gridDim.x * blockDim.x) {
+        int L = (int)(e & 31), g = L >> 2, tig = L & 3;
+        long long q = e >> 5, G = q % nch, T = q / nch;
+        long long ra = T * 16 + g, rb = ra + 8, c = G * 32 + 8 * tig;
+        uint2 a = ra < rows ? *(const uint2*)(src + ra * cols + c) : make_uint2(0, 0);
+        uint2 b = rb < rows ? *(const uint2*)(src + rb * cols + c) : make_uint2(0, 0);
+        *(uint4*)(dst + e * 16) = make_uint4(a.x, a.y, b.x, b.y);
+    }
+}
+
+// RP = 1 (fp8, GU = 0): w.w is the ds_ks_repack copy; scales as ever. Same values, same math.
+template <int FMT, int GU, int RP = 0>
 __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __restrict__ xc,
                                         const float* __restrict__ xsc, float* __restrict__ y, int t, int round,
                                         const float* __restrict__ rw, float lim, int S, int SB, int nbr, float* part,
@@ -1679,7 +1698,18 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
                 int G = q0 + u * S;
                 la[u] = lb[u] = make_uint2(0, 0);
                 ca[u] = cb[u] = 0;
-                if (G < ghi) {
+                if (RP && G < ghi) {
+                    if (va) {
+                        uint4 q = __ldg((const uint4*)((const unsigned char*)w.w +
+                                                       (((long long)(n0 >> 4) * nch + G) * 32 + lane) * 16));
+                        la[u] = make_uint2(q.x, q.y);
+                        ca[u] = __ldg(sa + G);
+                        if (vb) {
+                            lb[u] = make_uint2(q.z, q.w);
+                            cb[u] = __ldg(sbp + G);
+                        }
+                    }
+                } else if (G < ghi) {
                     if (va) {
                         if (FMT == 3) la[u].x = __ldg((const unsigned int*)(pa + (long long)G * 16));
                         else la[u] = __ldg((const uint2*)(pa + (long long)G * 32));
@@ -1838,6 +1868,12 @@ DS_KS2(2)
 DS_KS2(3)
 DS_KS(2, 0)
 DS_KS(3, 0)
+// ds_ks_f2_g0 on the fragment-native copy (ds_ks_repack), bit for bit
+extern "C" __global__ void __launch_bounds__(256) ds_ksr_f2(DsW w, DsW w3, const unsigned char* xc, const float* xsc,
+                                                            float* y, int t, int round, const float* rw, float lim,
+                                                            int S, int SB, int nbr, float* part, int* cnt) {
+    lin_mma<2, 0, 1>(w, w3, xc, xsc, y, t, round, rw, lim, S, SB, nbr, part, cnt, 0);
+}
 DS_KS(2, 1)
 DS_KS(3, 1)
 

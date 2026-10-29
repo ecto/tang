@@ -666,6 +666,9 @@ mod tests {
             ("wq_b (fp8, ds_ks)", 32768, 1280, 2, 0),
             ("wo_a (fp8, ds_wo_ks, 8 groups)", 8192, 4096, 2, 2),
             ("wo_b (fp8, ds_ks)", 5120, 8192, 2, 0),
+            ("wq_b (fp8, ds_ks repacked)", 32768, 1280, 2, 6),
+            ("wo_b (fp8, ds_ks repacked)", 5120, 8192, 2, 6),
+            ("wq_a (fp8, ds_ks repacked)", 1280, 5120, 2, 6),
             ("indexer wq_b (fp8, ds_ks)", 4096, 1280, 2, 0),
             ("compressor wkv (bf16, ds_linear_t8)", 512, 5120, 1, 3),
             ("compressor wgate (bf16, ds_linear_t8)", 512, 5120, 1, 3),
@@ -692,14 +695,19 @@ mod tests {
                     (a, b)
                 })
                 .collect();
-            if kind <= 1 || kind == 5 {
+            if kind == 6 {
+                for c in &ws {
+                    k.ks_repack(&s, &c.0 .1)?;
+                }
+            }
+            if kind <= 1 || kind >= 5 {
                 k.ks_quant_to(&s, x.ptr, xc, xs, t * c)?;
             }
             let run = |s: &Stream, i: usize| -> Result<()> {
                 let (a, b) = &ws[i % copies];
                 let w = &a.1;
                 match kind {
-                    0 => k.ks_gemv(s, w, None, xc, xs, y.ptr, t, true, 0, 0.0)?,
+                    0 | 6 => k.ks_gemv(s, w, None, xc, xs, y.ptr, t, true, 0, 0.0)?,
                     1 => k.ks_gemv(
                         s,
                         w,
@@ -721,7 +729,7 @@ mod tests {
                 }
                 Ok(())
             };
-            if kind <= 1 || kind == 5 {
+            if kind <= 1 || kind >= 5 {
                 ensure!(k.ks_ok(&ws[0].0 .1), "{name}: not on the K-split path");
             }
             run(&s, 0)?;

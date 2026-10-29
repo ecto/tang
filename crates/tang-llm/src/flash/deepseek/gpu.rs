@@ -100,6 +100,11 @@ pub struct Kernels {
     fast: [[[Func; 2]; 4]; 2],
     /// `ds_ks_f{fmt}_g{gu}`, the tensor-core K-split GEMV, by (fmt - 2, gu).
     ks: [[Func; 2]; 2],
+    /// `ds_ksr_f2`: `ds_ks_f2_g0` on a [`Kernels::ks_repack`] copy
+    ksr: Func,
+    ks_repack_f: Func,
+    /// fp8 weight pointer -> its fragment-native copy (`DS_KS_REPACK=1`)
+    ks_rp: std::sync::Mutex<std::collections::HashMap<u64, DevBuf>>,
     /// `ds_ks2_f2` / `ds_ks2_f3`: two K-split GEMVs on one activation
     ks2: [Func; 2],
     /// `ds_moe_{gu,down}_f{fmt}_t{tm}`, the grouped MoE projections, by (fmt - 2, log2 tm,
@@ -382,6 +387,9 @@ impl Kernels {
             wo_ks: [m.func("ds_wo_ks_f2")?, m.func("ds_wo_ks_f3")?],
             ks2: [m.func("ds_ks2_f2")?, m.func("ds_ks2_f3")?],
             wo_x: DevBuf::alloc(WO_X)?,
+            ksr: m.func("ds_ksr_f2")?,
+            ks_repack_f: m.func("ds_ks_repack")?,
+            ks_rp: Default::default(),
             ks: [
                 [m.func("ds_ks_f2_g0")?, m.func("ds_ks_f2_g1")?],
                 [m.func("ds_ks_f3_g0")?, m.func("ds_ks_f3_g1")?],
@@ -412,6 +420,7 @@ impl Kernels {
                 for n in [
                     "ds_ks_f2_g0",
                     "ds_ks_f2_g1",
+                    "ds_ksr_f2",
                     "ds_ks2_f2",
                     "ds_ks2_f3",
                     "ds_ks_f3_g0",
@@ -975,6 +984,35 @@ impl Kernels {
         Ok(())
     }
 
+    /// A fragment-native copy of fp8 `w` (`ds_ks_repack`, 16-byte loads) that [`Kernels::ks_gemv`]
+    /// uses from then on (bit for bit the same result); the original stays for every other
+    /// kernel. Returns the bytes added (0 when `w` is not fp8 or already repacked).
+    pub fn ks_repack(&self, s: &Stream, w: &DsW) -> Result<usize> {
+        if w.fmt != 2 || w.cols % 32 != 0 || w.w % 16 != 0 {
+            return Ok(0);
+        }
+        let mut m = self.ks_rp.lock().unwrap();
+        if m.contains_key(&w.w) {
+            return Ok(0);
+        }
+        let (rows, cols) = (w.rows, w.cols);
+        let n = (rows as usize).div_ceil(16) * (cols as usize / 32) * 32;
+        let dst = DevBuf::alloc(n * 16)?;
+        let (src, d) = (w.w, dst.ptr);
+        unsafe {
+            super::obs::launch(
+                self.ks_repack_f,
+                (n.div_ceil(256).min(65535) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![src, d, rows, cols],
+            )?;
+        }
+        m.insert(w.w, dst);
+        Ok(n * 16)
+    }
+
     /// Whether [`Kernels::linear_ks`] runs `w` on the K-split GEMV (rather than falling back to
     /// the exact kernels), so its activation needs no separate `fp8_qdq`.
     pub fn ks_ok(&self, w: &DsW) -> bool {
@@ -1037,7 +1075,16 @@ impl Kernels {
         if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
             sb = 1;
         }
-        let f = self.ks[w.fmt as usize - 2][gu];
+        let rp = if gu == 0 && w.fmt == 2 {
+            self.ks_rp.lock().unwrap().get(&w.w).map(|b| b.ptr)
+        } else {
+            None
+        };
+        let f = if rp.is_some() {
+            self.ksr
+        } else {
+            self.ks[w.fmt as usize - 2][gu]
+        };
         let smem = n * pitch + n * nch * 4;
         let mut per_sm = 0i32;
         unsafe {
@@ -1052,7 +1099,10 @@ impl Kernels {
             )?
         };
         let grid = (br * sb).min(self.sms * per_sm.max(1) as usize);
-        let (wv, w3v) = (*w, *w3.unwrap_or(w));
+        let (mut wv, w3v) = (*w, *w3.unwrap_or(w));
+        if let Some(p) = rp {
+            wv.w = p;
+        }
         let (ni, r) = (n as i32, round as i32);
         let (si, sbi, bri) = (sp as i32, sb as i32, br as i32);
         let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
@@ -4073,6 +4123,68 @@ mod tests {
                         gb / u1
                     );
                 }
+            }
+        }
+    }
+
+    /// `ks_gemv` on a `ks_repack` copy is the plain `ks_gemv` bit for bit (rows not a multiple
+    /// of 16 too, and K-split shapes).
+    #[test]
+    fn ks_repack_matches() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        for (rows, cols) in [
+            (1000usize, 1280usize),
+            (4096, 1280),
+            (512, 5120),
+            (1024, 8192),
+        ] {
+            let codes: Vec<u8> = (0..rows * cols)
+                .map(|i| ((i as u64 * 2654435761 + 7) % 255) as u8 & 0x7e)
+                .collect();
+            let sc: Vec<u8> = (0..rows.div_ceil(32) * (cols / 32))
+                .map(|i| 120 + (i % 7) as u8)
+                .collect();
+            let (wb, sb) = (
+                DevBuf::from_slice(&codes).unwrap(),
+                DevBuf::from_slice(&sc).unwrap(),
+            );
+            let w = DsW {
+                w: wb.ptr,
+                s: sb.ptr,
+                rows: rows as i32,
+                cols: cols as i32,
+                fmt: 2,
+                _pad: 0,
+            };
+            if !k.ks_ok(&w) {
+                continue;
+            }
+            for t in [1usize, 6, 7] {
+                let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
+                let (xc, xs) = k.ks_x_ptrs();
+                k.ks_quant_to(&s, x.ptr, xc, xs, t * cols).unwrap();
+                let (y0, y1) = (
+                    DevBuf::alloc(t * rows * 4).unwrap(),
+                    DevBuf::alloc(t * rows * 4).unwrap(),
+                );
+                k.ks_gemv(&s, &w, None, xc, xs, y0.ptr, t, true, 0, 0.0)
+                    .unwrap();
+                k.ks_repack(&s, &w).unwrap();
+                k.ks_gemv(&s, &w, None, xc, xs, y1.ptr, t, true, 0, 0.0)
+                    .unwrap();
+                s.sync().unwrap();
+                let (a, b) = (
+                    y0.read::<f32>(0, t * rows).unwrap(),
+                    y1.read::<f32>(0, t * rows).unwrap(),
+                );
+                assert!(
+                    a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "{rows}x{cols} t {t}"
+                );
+                k.ks_rp.lock().unwrap().clear();
             }
         }
     }
