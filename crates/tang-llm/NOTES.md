@@ -4,6 +4,16 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 (integration round 8) — forward f92a4f07: MTP K=1 127.0 tok/s at -n 128 (1.26× plain); auto opt-in (branch frog/glm5-forward)
+
+= 3cc07f5b (kda4 round 4, k5d_tailt) + claude/glm5-mtp-win dafc4955 (round 6). The MTP agent's B300
+runs on that tree, bench prompt, B flags: plain 100.80 / 115.26 tok/s (-n 128 / 512); fixed K=1
+**127.0** / 112.5, K=2 125.3 / 106.4; `--mtp auto` 110.5 / 107.2 (per-pass argmax too noisy, opt-in
+only). ids = plain everywhere (7174cdd6 / 1453cf0e). MTP K=1 is within 2.4% of plain at -n 512.
+Open: the sticky-auto / context-rule default (mtp-win round 7) and the mew sticky
+CUDA_ERROR_ILLEGAL_ADDRESS (pre-existing, reproduced on forward with the KDA row path off; kda4
+round 5 is hunting it with compute-sanitizer).
+
 ## 2026-10-29 — MTP round 6: `--mtp auto` (adaptive K) does NOT beat the best fixed K; MoE window grouping not done (branch claude/glm5-mtp-win)
 
 Built (mtp.rs `AutoK`, `--mtp auto` / `TANG_GLM5_MTP=auto`, cap 3): EWMA conditional acceptance
