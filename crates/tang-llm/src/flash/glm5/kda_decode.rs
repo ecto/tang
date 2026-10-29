@@ -98,6 +98,8 @@ pub struct Fast {
     tail: sys::CUfunction,
     /// `k5_qgemvt9` / `k5_qgemvt17` (kda_k5.cuh): the t-row window GEMV (rows_enqueue).
     qgt9: sys::CUfunction,
+    /// `k5d_tailt`: k5d_tail over a window's t rows in one launch (rows_fast).
+    tailt: sys::CUfunction,
     qgt17: sys::CUfunction,
     /// The captured decode step and the `TANG_GLM5_GEMV8` value it was captured with.
     graph: Option<(Graph, bool)>,
@@ -126,7 +128,12 @@ impl Fast {
             sys::cuFuncSetAttribute(tail, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
         };
         anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tail smem attribute: {r:?}");
-        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, qgt9: f("k5_qgemvt9")?, qgt17: f("k5_qgemvt17")?, graph: None, _m: m })
+        let tailt = f("k5d_tailt")?;
+        let r = unsafe {
+            sys::cuFuncSetAttribute(tailt, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
+        };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tailt smem attribute: {r:?}");
+        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, qgt9: f("k5_qgemvt9")?, tailt, qgt17: f("k5_qgemvt17")?, graph: None, _m: m })
     }
 }
 
@@ -1001,6 +1008,12 @@ fn tail_flag() -> bool {
 }
 
 /// `TANG_GLM5_KDA_ROWS_FAST=0`: rows_enqueue keeps the generic t-row kernels.
+/// `TANG_GLM5_KDA_TAILT=0`: rows_fast runs k5d_tail once per row instead of k5d_tailt.
+fn tailt_flag() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_TAILT").map_or(true, |v| v != "0"))
+}
+
 fn rows_fast() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_ROWS_FAST").map_or(true, |v| v != "0"))
@@ -1043,7 +1056,23 @@ impl DevLayer {
                 args![self.segx.as_ref().unwrap().ptr, 5u32, codes, codes + (self.max_t * hidden) as u64,
                     hidden as u32, 3u32, (3 * di) as u32, t as u32],
             )?;
-            for i in 0..t {
+            if tailt_flag() {
+                // one launch for the t rows; the checkpoints are written from registers
+                let (ckp, ckf) = ck.map_or((0u64, 0u64), |(b, st)| (b, (st / 4) as u64));
+                launch(
+                    fast.tailt,
+                    (self.nh as u32, 1, 1),
+                    (self.hd as u32, 1, 1),
+                    (self.hidden * 4 + 16) as u32,
+                    s,
+                    args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
+                        self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, regs[0].0, self.core.wconv.ptr, regs[1].0,
+                        self.on.ptr, self.cfg.eps, self.bb.ptr, self.gb_out.ptr, self.g2b.ptr,
+                        self.ob.ptr, self.yb.ptr, self.xq8.ptr, self.max_t as u32, self.hidden as u32, t as u32,
+                        ckp, ckf, (regs[0].1 / 4) as u64],
+                )?;
+            }
+            for i in 0..if tailt_flag() { 0 } else { t } {
                 self.tail_launch(s, fast, self.core.h0.ptr, self.core.st.ptr, lb, i)?;
                 if let (Some((base, stride)), true) = (ck, i + 1 < t) {
                     let b = base + (i * stride) as u64;

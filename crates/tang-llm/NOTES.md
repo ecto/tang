@@ -4,6 +4,41 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 — KDA window tail in one launch (k5d_tailt): per extra verify row 0.95 -> 0.72 ms, ids = plain; 0.5 ms NOT reached (branch claude/glm5-kda4, round 4)
+
+`k5d_tailt` (kda_decode.cuh): k5d_tail looped over the window's t rows inside ONE launch (grid nh,
+block hd). f_b / g_b / b_proj rows staged once; the state column stays in registers across rows and
+S is written once after the last row; x is re-staged per row. The per-row body is k5d_tail verbatim
+(bit-equal). The rewind checkpoints are written in-kernel from registers to the same buffers and
+layout the per-row path's d2d copies used (h0 region then state, `CK + row * ck_bytes/4`).
+`rows_fast` uses it by default; `TANG_GLM5_KDA_TAILT=0` = one k5d_tail per row (round 3).
+
+B300 (shared), B flags, bench prompt -n 128, `TANG_GLM5_WIN_PROF=1` (syncs around every item):
+
+| t (K) | win.kda ms/window TAILT=0 -> 1 | trunk ms/pass (prof) 0 -> 1 |
+|---|---|---|
+| 2 (1) | 3.09 -> 2.83 | 16.16 -> 15.91 |
+| 3 (2) | 4.00 -> 3.56 | 20.44 -> 20.33 |
+| 4 (3) | 4.98 -> 4.27 | 24.48 -> 23.88 |
+
+So the slope is ~0.95 -> ~0.72 ms per extra row. Without prof, trunk ms/pass 0 -> 1: K=1 13.84 -> 13.67,
+K=2 17.92 -> 17.63; K=2 -n 512 18.85. tok/s = tok/pass / (trunk + draft): K=1 104.6 -> 106.0;
+K=2 104.3 -> 99.9, but there the draft moved 5.96 -> 7.29 ms/pass on the shared pod (the trunk
+improved), so the K=2 tok/s is noise from the draft. ids: every run 7174cdd6 (-n 128, K=1/2/3),
+K=2 -n 512 1453cf0e, haiku `--mtp 2` = oracle; plain 100.12 tok/s (ids OK).
+
+mew flake hunt (full `flash::glm5`, under the lock): this tree (TAILT on) with ROWS_FAST=1
+85/0. Forward 405a5194 with ROWS_FAST=1 85/0, and with ROWS_FAST=0 81/4: gpu_gemv_fast_matches_cpu,
+mtp_device_draft_matches_host, cuda_naive_matches_cpu and cuda_resident_flow_matches_upload, all
+with a sticky CUDA_ERROR_ILLEGAL_ADDRESS from some other test's kernel in the same process. Since it
+also fails with the rows path OFF, it is not the t-row path.
+
+The remaining ~0.72 ms/row (~21 us per layer per row) is not split out yet (no nsys on this round).
+It is the extra token in k5_qgemvt9/17 plus the serial row body of k5d_tailt. That body still does
+the row-independent work serially: gate rows (2 x 128-long fma chains a thread), beta, the conv and
+the q/k norms. Next: a parallel (nh x t) pre-pass for those, writing per-row scratch, so the
+serial loop does only the state step + norm + yb q8.
+
 ## 2026-10-29 (integration round 6) — forward 405a5194 on the B300: plain 98.4 / 113.7 tok/s; MTP 104.3 at -n 128 (branch frog/glm5-forward)
 
 405a5194 = forward + claude/glm5-mhc3 d92ab5b2 + claude/glm5-mtp-win a0557c96 (device DraftCell) +
