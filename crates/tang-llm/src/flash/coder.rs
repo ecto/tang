@@ -1969,6 +1969,17 @@ impl Coder {
     /// slots, at most `MAX_T`. Feeds each slot its token and returns each row's next token
     /// (greedy). A slot's result is the one a window of that slot alone would give.
     pub fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        Ok(self.decode_batch_keep(rows, false)?.0)
+    }
+
+    /// [`decode_batch`](Self::decode_batch), also returning the window's logits (`[b][vocab]`,
+    /// row `i` for `rows[i]`) when `keep`: downloaded before the MTP pass reuses the head
+    /// buffer. Structured output masks these on the host.
+    pub fn decode_batch_keep(
+        &mut self,
+        rows: &[(usize, u32)],
+        keep: bool,
+    ) -> Result<(Vec<u32>, Option<Vec<f32>>)> {
         let b = rows.len();
         ensure!((1..=MAX_T).contains(&b), "{b} rows");
         ensure!(self.sampler.is_none(), "batched windows are greedy for now");
@@ -1996,6 +2007,7 @@ impl Coder {
             ..Default::default()
         };
         let out = self.run_staged(st, w0, b, false, nchunk, b, None)?;
+        let logits = keep.then(|| self.logits(b));
         if self.mtp_on() {
             let nexts: Vec<[u32; 1]> = out.iter().map(|&k| [k]).collect();
             let groups: Vec<(usize, usize, usize, &[u32])> = staged
@@ -2008,7 +2020,7 @@ impl Coder {
                 self.slot_chain[r.0] = c.0;
             }
         }
-        Ok(out)
+        Ok((out, logits))
     }
 
     pub fn reset(&mut self) {
@@ -3935,6 +3947,17 @@ impl Coder {
         self.last_commit_ms = tc.elapsed().as_secs_f64() * 1e3;
         self.mtp_after(pos, &targets[..n], true)?;
         Ok(targets[..n].to_vec())
+    }
+
+    /// [`verify`](Self::verify) of `cur` with no drafts, also returning that row's logits
+    /// (downloaded before the MTP pass reuses the head buffer).
+    pub fn step_logits(&mut self, cur: u32) -> Result<(u32, Vec<f32>)> {
+        let pos = self.tokens.len();
+        self.tokens.push(cur);
+        let next = self.window(pos, 1, None)?[0];
+        let logits = self.logits(1);
+        self.mtp_after(pos, &[next], true)?;
+        Ok((next, logits))
     }
 
     /// Append `tok` and run it as a T=1 window; returns the next token.
