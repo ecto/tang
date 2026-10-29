@@ -100,6 +100,8 @@ pub struct Kernels {
     fast: [[[Func; 2]; 4]; 2],
     /// `ds_ks_f{fmt}_g{gu}`, the tensor-core K-split GEMV, by (fmt - 2, gu).
     ks: [[Func; 2]; 2],
+    /// `ds_ks2_f2` / `ds_ks2_f3`: two K-split GEMVs on one activation
+    ks2: [Func; 2],
     /// `ds_moe_{gu,down}_f{fmt}_t{tm}`, the grouped MoE projections, by (fmt - 2, log2 tm,
     /// down).
     moe: [[[Func; 2]; 4]; 2],
@@ -314,8 +316,12 @@ fn moe_table(m: &Module) -> Result<[[[Func; 2]; 4]; 2]> {
 /// The K split for `tiles` 16-row warp tiles with `groups` 32-column groups: S slices within a
 /// block of 8 warps (RW = 8 / S tiles a block) and SB blocks along K, aiming at ≥ 2 blocks of 8
 /// warps per SM while keeping ≥ 4 groups a warp. Returns (S, row-group blocks, SB).
+/// Work items target `DS_KS_TGT` (default 6) × SMs. 2 is faster on H100 (wq_b 24.5 -> 23.8,
+/// wo_b 36.4 -> 32.6 us at t = 6) but changes the partial-sum order, and greedy acceptance fell.
 fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
-    let target = 6 * sms;
+    static TGT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let tgt = *TGT.get_or_init(|| env_usize("DS_KS_TGT").unwrap_or(6).max(1));
+    let target = tgt * sms;
     let mut sp = 1;
     while sp < 8 && tiles.div_ceil(8 / sp) < target && groups >= sp * 2 * 4 {
         sp *= 2;
@@ -374,6 +380,7 @@ impl Kernels {
                 a
             },
             wo_ks: [m.func("ds_wo_ks_f2")?, m.func("ds_wo_ks_f3")?],
+            ks2: [m.func("ds_ks2_f2")?, m.func("ds_ks2_f3")?],
             wo_x: DevBuf::alloc(WO_X)?,
             ks: [
                 [m.func("ds_ks_f2_g0")?, m.func("ds_ks_f2_g1")?],
@@ -405,6 +412,8 @@ impl Kernels {
                 for n in [
                     "ds_ks_f2_g0",
                     "ds_ks_f2_g1",
+                    "ds_ks2_f2",
+                    "ds_ks2_f3",
                     "ds_ks_f3_g0",
                     "ds_ks_f3_g1",
                     "ds_kst_f2_g0",
@@ -1024,12 +1033,12 @@ impl Kernels {
         let out = if gu == 1 { 8 } else { 16 };
         let pitch = cols.div_ceil(128) * 128 + 32;
         let nch = cols / 32;
-        let f = self.ks[w.fmt as usize - 2][gu];
-        let smem = n * pitch + n * nch * 4;
         let (sp, br, mut sb) = ks_split(rows.div_ceil(out), nch, self.sms);
         if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
             sb = 1;
         }
+        let f = self.ks[w.fmt as usize - 2][gu];
+        let smem = n * pitch + n * nch * 4;
         let mut per_sm = 0i32;
         unsafe {
             gpu::check(
@@ -1055,6 +1064,81 @@ impl Kernels {
                 smem as u32,
                 s,
                 tang_moe::args![wv, w3v, codes, scales, y, ni, r, rw, lim, si, sbi, bri, part, cnt],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [`Kernels::ks_gemv`] of `w` into `y` and `wb` into `yb` on the same quantized activation
+    /// in one launch (`ds_ks2_*`), each bit for bit its own `ks_gemv` (no `w3`, no `rw`).
+    /// Falls back to two launches when the formats or columns differ or the scratch is short.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ks_gemv2(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        wb: &DsW,
+        codes: u64,
+        scales: u64,
+        y: u64,
+        yb: u64,
+        n: usize,
+        round: bool,
+    ) -> Result<()> {
+        let split = |w: &DsW| {
+            let (rows, nch) = (w.rows as usize, w.cols as usize / 32);
+            let (sp, br, mut sb) = ks_split(rows.div_ceil(16), nch, self.sms);
+            if sb * n * rows > KS_PART || br > KS_CNT {
+                sb = 1;
+            }
+            (sp, br, sb)
+        };
+        let (a, b) = (split(w), split(wb));
+        let pa = a.2 * n * w.rows as usize;
+        if w.fmt != wb.fmt
+            || w.cols != wb.cols
+            || std::env::var("DS_KS2").is_ok_and(|v| v == "0")
+            || pa + b.2 * n * wb.rows as usize > KS_PART
+            || a.1 + b.1 > KS_CNT
+        {
+            self.ks_gemv(s, w, None, codes, scales, y, n, round, 0, 0.0)?;
+            return self.ks_gemv(s, wb, None, codes, scales, yb, n, round, 0, 0.0);
+        }
+        let f = self.ks2[w.fmt as usize - 2];
+        let cols = w.cols as usize;
+        let pitch = cols.div_ceil(128) * 128 + 32;
+        let smem = n * pitch + n * (cols / 32) * 4;
+        let mut per_sm = 0i32;
+        unsafe {
+            gpu::check(
+                cudarc::driver::sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &mut per_sm,
+                    f,
+                    256,
+                    smem,
+                ),
+                "occupancy",
+            )?
+        };
+        let items = a.1 * a.2 + b.1 * b.2;
+        let grid = items.min(self.sms * per_sm.max(1) as usize);
+        let (ni, r) = (n as i32, round as i32);
+        let (sa, sba, bra) = (a.0 as i32, a.2 as i32, a.1 as i32);
+        let (sb_, sbb, brb) = (b.0 as i32, b.2 as i32, b.1 as i32);
+        let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
+        let (partb, cntb) = (part + (pa * 4) as u64, cnt + (a.1 * 4) as u64);
+        let (wv, wbv) = (*w, *wb);
+        unsafe {
+            super::obs::launch(
+                f,
+                (grid as u32, 1, 1),
+                (256, 1, 1),
+                smem as u32,
+                s,
+                tang_moe::args![
+                    wv, wbv, codes, scales, y, yb, ni, r, sa, sba, bra, sb_, sbb, brb, part, partb,
+                    cnt, cntb
+                ],
             )?;
         }
         Ok(())
@@ -3989,6 +4073,96 @@ mod tests {
                         gb / u1
                     );
                 }
+            }
+        }
+    }
+
+    /// `ks_gemv2` (two weights, one launch) is two `ks_gemv`s bit for bit, at the wq_a / wkv
+    /// shapes; with `DS_BENCH_GEMV=1` also times both.
+    #[test]
+    fn ks_gemv2_matches_two() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let cols = 4096usize;
+        let mk = |rows: usize, seed: u64| {
+            let codes: Vec<u8> = (0..rows * cols)
+                .map(|i| ((i as u64 * 2654435761 + seed) % 255) as u8 & 0x7e)
+                .collect();
+            let sc: Vec<u8> = (0..(rows / 32) * (cols / 32))
+                .map(|i| 120 + (i % 7) as u8)
+                .collect();
+            let (wb, sb) = (
+                DevBuf::from_slice(&codes).unwrap(),
+                DevBuf::from_slice(&sc).unwrap(),
+            );
+            let w = DsW {
+                w: wb.ptr,
+                s: sb.ptr,
+                rows: rows as i32,
+                cols: cols as i32,
+                fmt: 2,
+                _pad: 0,
+            };
+            (w, wb, sb)
+        };
+        let (wa, _a0, _a1) = mk(1024, 1);
+        let (wk, _b0, _b1) = mk(512, 2);
+        if !k.ks_ok(&wa) || !k.ks_ok(&wk) {
+            return;
+        }
+        for t in [1usize, 6, 7, 8] {
+            let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
+            let (xc, xs) = k.ks_x_ptrs();
+            k.ks_quant_to(&s, x.ptr, xc, xs, t * cols).unwrap();
+            let ys: Vec<DevBuf> = (0..4)
+                .map(|i| DevBuf::alloc(t * if i % 2 == 0 { 1024 } else { 512 } * 4).unwrap())
+                .collect();
+            k.ks_gemv(&s, &wa, None, xc, xs, ys[0].ptr, t, true, 0, 0.0)
+                .unwrap();
+            k.ks_gemv(&s, &wk, None, xc, xs, ys[1].ptr, t, true, 0, 0.0)
+                .unwrap();
+            k.ks_gemv2(&s, &wa, &wk, xc, xs, ys[2].ptr, ys[3].ptr, t, true)
+                .unwrap();
+            s.sync().unwrap();
+            for (i, n) in [(0usize, 1024usize), (1, 512)] {
+                let (a, b) = (
+                    ys[i].read::<f32>(0, t * n).unwrap(),
+                    ys[i + 2].read::<f32>(0, t * n).unwrap(),
+                );
+                assert!(
+                    a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "t {t} out {i}"
+                );
+            }
+            if std::env::var("DS_BENCH_GEMV").is_ok_and(|v| v == "1") {
+                let ev = |f: &dyn Fn()| {
+                    f();
+                    s.sync().unwrap();
+                    let (e0, e1) = (
+                        gpu::Event::new(true).unwrap(),
+                        gpu::Event::new(true).unwrap(),
+                    );
+                    e0.record(&s).unwrap();
+                    for _ in 0..50 {
+                        f();
+                    }
+                    e1.record(&s).unwrap();
+                    e1.sync().unwrap();
+                    e1.since(&e0).unwrap() as f64 * 1e3 / 50.0
+                };
+                let u0 = ev(&|| {
+                    k.ks_gemv(&s, &wa, None, xc, xs, ys[0].ptr, t, true, 0, 0.0)
+                        .unwrap();
+                    k.ks_gemv(&s, &wk, None, xc, xs, ys[1].ptr, t, true, 0, 0.0)
+                        .unwrap();
+                });
+                let u1 = ev(&|| {
+                    k.ks_gemv2(&s, &wa, &wk, xc, xs, ys[2].ptr, ys[3].ptr, t, true)
+                        .unwrap()
+                });
+                eprintln!("ks_gemv2 t {t}: two launches {u0:.1} us, one {u1:.1} us");
             }
         }
     }
