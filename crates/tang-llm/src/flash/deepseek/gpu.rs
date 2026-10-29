@@ -110,6 +110,9 @@ pub struct Kernels {
     /// `ds_moe_ks_{gu,down}_f{fmt}_s{sfmt}`: [`Kernels::moe_ks`] with the shared expert (format
     /// sfmt) as one more slot, by (fmt - 2, sfmt - 2, down).
     moe_ks_sh: [[[Func; 2]; 2]; 2],
+    /// `ds_moe_kp_{gu,down}_f{fmt}_s{sfmt}`: the persistent one-wave form of `moe_ks_sh`
+    /// (`DS_MOE_KP=0` keeps the slot grid), same index.
+    moe_kp: Option<[[[Func; 2]; 2]; 2]>,
     /// `ds_wo_ks_f{fmt}`, wo_a's grouped K-split GEMV, by fmt - 2, and its quantized activation.
     wo_ks: [Func; 2],
     wo_x: DevBuf,
@@ -394,6 +397,20 @@ impl Kernels {
                 }
                 a
             },
+            moe_kp: if std::env::var("DS_MOE_KP").is_ok_and(|v| v == "0") {
+                None
+            } else {
+                let mut a = [[[std::ptr::null_mut(); 2]; 2]; 2];
+                for (f, af) in a.iter_mut().enumerate() {
+                    for (sf, asf) in af.iter_mut().enumerate() {
+                        for (di, kind) in ["gu", "down"].iter().enumerate() {
+                            asf[di] =
+                                m.func(&format!("ds_moe_kp_{kind}_f{}_s{}", f + 2, sf + 2))?;
+                        }
+                    }
+                }
+                Some(a)
+            },
             wo_ks: [m.func("ds_wo_ks_f2")?, m.func("ds_wo_ks_f3")?],
             ks2: [m.func("ds_ks2_f2")?, m.func("ds_ks2_f3")?],
             wo_x: DevBuf::alloc(WO_X)?,
@@ -454,6 +471,10 @@ impl Kernels {
                 .chain((0..8).map(|i| {
                     let kind = ["gu", "down"][i & 1];
                     format!("ds_moe_ks_{kind}_f{}_s{}", 2 + (i >> 1 & 1), 2 + (i >> 2))
+                }))
+                .chain((0..8).map(|i| {
+                    let kind = ["gu", "down"][i & 1];
+                    format!("ds_moe_kp_{kind}_f{}_s{}", 2 + (i >> 1 & 1), 2 + (i >> 2))
                 })) {
                     let f = m.func(&n)?;
                     // the most dynamic memory the kernel's own static shared memory leaves
@@ -1511,6 +1532,23 @@ impl Kernels {
             && self.moe_ks_ok(t, inter, n)
     }
 
+    /// The persistent MoE launch's grid: as many blocks as fit on the GPU at once.
+    fn kp_grid(&self, f: Func, smem: usize) -> Result<u32> {
+        let mut per_sm = 0i32;
+        unsafe {
+            gpu::check(
+                cudarc::driver::sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &mut per_sm,
+                    f,
+                    256,
+                    smem,
+                ),
+                "occupancy",
+            )?
+        };
+        Ok((self.sms * per_sm.max(1) as usize) as u32)
+    }
+
     /// [`Kernels::moe_gu`] on the K-split path with the shared expert (`s1`, `s3`) as one more
     /// slot when `on` (every token at weight 1, into `h` rows `n = t * k` ..): one launch for
     /// the routed and shared gate/up. See [`Kernels::moe_sh_ok`].
@@ -1544,12 +1582,31 @@ impl Kernels {
             *s3,
         );
         let gy = slots + on as usize;
+        let smem = t * (d.div_ceil(128) * 128 + 32) + t * (d / 32) * 4;
+        if let (Some(kp), true) = (&self.moe_kp, slots <= 64) {
+            let f = kp[fmt as usize - 2][s1.fmt as usize - 2][0];
+            let (g, ci) = (self.kp_grid(f, smem)?, slots as i32);
+            unsafe {
+                super::obs::launch(
+                    f,
+                    (g, 1, 1),
+                    (256, 1, 1),
+                    smem as u32,
+                    s,
+                    tang_moe::args![
+                        w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3,
+                        ts, ni, ci
+                    ],
+                )?
+            }
+            return Ok(());
+        }
         unsafe {
             super::obs::launch(
                 f,
                 (gx as u32, gy.max(1) as u32, 1),
                 (256, 1, 1),
-                (t * (d.div_ceil(128) * 128 + 32) + t * (d / 32) * 4) as u32,
+                smem as u32,
                 s,
                 tang_moe::args![
                     w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3, ts, ni
@@ -1585,12 +1642,28 @@ impl Kernels {
             *s2,
         );
         let gy = slots + on as usize;
+        let smem = t * (inter.div_ceil(128) * 128 + 32) + t * (inter / 32) * 4;
+        if let (Some(kp), true) = (&self.moe_kp, slots <= 64) {
+            let f = kp[fmt as usize - 2][s2.fmt as usize - 2][1];
+            let (g, ci) = (self.kp_grid(f, smem)?, slots as i32);
+            unsafe {
+                super::obs::launch(
+                    f,
+                    (g, 1, 1),
+                    (256, 1, 1),
+                    smem as u32,
+                    s,
+                    tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni, ci],
+                )?
+            }
+            return Ok(());
+        }
         unsafe {
             super::obs::launch(
                 f,
                 (gx as u32, gy.max(1) as u32, 1),
                 (256, 1, 1),
-                (t * (inter.div_ceil(128) * 128 + 32) + t * (inter / 32) * 4) as u32,
+                smem as u32,
                 s,
                 tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni],
             )?

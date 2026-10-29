@@ -2007,6 +2007,26 @@ impl GpuModel {
                 c.route_scale,
             )?;
             self.end(s);
+            // DS_ROUTE_DUMP=path (direct path, DS_GRAPH=0): append "layer t ids..." per MoE
+            // call to path.<thread> (one file per rank's thread), for replaying the real
+            // routing in mega_moe_slots
+            if let Some(path) = std::env::var_os("DS_ROUTE_DUMP") {
+                use std::io::Write;
+                self.sync()?;
+                let v = ids.dev().read::<i32>(0, t * topk)?;
+                let mut line = format!("{lid} {t}");
+                for i in &v {
+                    line.push_str(&format!(" {i}"));
+                }
+                line.push('\n');
+                let mut p = std::path::PathBuf::from(path).into_os_string();
+                p.push(format!(".{:?}", std::thread::current().id()).replace(['(', ')'], ""));
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)?
+                    .write_all(line.as_bytes())?;
+            }
             // per-expert CSR on the device; with the shared expert folded, the plan and the
             // GU's activation quantization ride in the same launch
             let s = self.span("route");

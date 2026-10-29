@@ -636,10 +636,14 @@ mod tests {
         }
     }
 
-    /// One EP rank's grouped MoE launches at the decode shape (t = 7, top-6, 384 experts of
-    /// which `live` routed fp4 experts land here, one token each, plus the fp8 shared expert
-    /// folded in): `moe_gu_sh` and `moe_down_sh` (with its h quant) timed apart, CUDA graph
-    /// replay, weight copies rotated past L2. `--ignored --nocapture mega_moe_slots`.
+    /// One EP rank's grouped MoE launches at the decode shape (t = 7, top-6, 384 experts on
+    /// rank `e % 8`, the fp8 shared expert folded in): `moe_gu_sh` and `moe_down_sh` (with its
+    /// h quant) timed apart, CUDA graph replay, expert weights drawn from a pool of 48 so
+    /// consecutive launches miss L2. Synthetic cases (`live` local experts, one token each),
+    /// then with `DS_ROUTE_FILE` (a `DS_ROUTE_DUMP` file) the real routing of its first
+    /// verify step (t = 7 lines, one per MoE layer) on every rank: per-rank ms per step and
+    /// the step's critical path (Σ over layers of the slowest rank).
+    /// `--ignored --nocapture mega_moe_slots`.
     #[test]
     #[ignore]
     fn mega_moe_slots() -> Result<()> {
@@ -650,14 +654,48 @@ mod tests {
         g.bind()?;
         let k = Kernels::new(&g)?;
         let s = Stream::new()?;
-        let (t, topk, ne, d, inter) = (7usize, 6usize, 384usize, 5120usize, 2304usize);
+        let (t, topk, ne, d, inter, world) = (7usize, 6usize, 384usize, 5120usize, 2304usize, 8);
         let x = DevBuf::from_slice(&rnd(t * d, 3, unif))?;
         let (xc, xs) = k.ks_x_ptrs();
-        println!("| live | gu µs | gu GB/s | down µs | down GB/s | gu+down % of 3350 |");
-        println!("|---|---|---|---|---|---|");
-        for live in [1usize, 5, 8] {
-            let copies = 4usize;
-            let mut keep = vec![];
+        let pool_n = 48usize;
+        let mut keep = vec![];
+        let mut pool = vec![];
+        for i in 0..pool_n {
+            let sd = i as u64 * 3;
+            let (a, b, c) = (
+                bytes_w(inter, d, 3, sd + 1),
+                bytes_w(inter, d, 3, sd + 2),
+                bytes_w(d, inter, 3, sd + 3),
+            );
+            pool.push((a.1, b.1, c.1));
+            keep.extend(a.0.into_iter().chain(b.0).chain(c.0));
+        }
+        let mut shs = vec![];
+        for c in 0..2u64 {
+            let (s1, s3, s2) = (
+                bytes_w(inter, d, 2, c * 7 + 50),
+                bytes_w(inter, d, 2, c * 7 + 51),
+                bytes_w(d, inter, 2, c * 7 + 52),
+            );
+            shs.push((s1.1, s3.1, s2.1));
+            keep.extend(s1.0.into_iter().chain(s3.0).chain(s2.0));
+        }
+        let slot = |r: usize, c: usize, fmt: i32| {
+            let mut v = DsW::default();
+            (v.rows, v.cols, v.fmt) = (r as i32, c as i32, fmt);
+            wbytes(&v)
+        };
+        k.ks_quant_to(&s, x.ptr, xc, xs, t * d)?;
+        let mut next = 0usize;
+        // (gu µs, down µs, live experts, bytes) of one routing on rank `rank`
+        let mut case = |ids: &[i32], rank: usize| -> Result<(f32, f32, usize, usize)> {
+            let local: std::collections::BTreeSet<usize> = ids
+                .iter()
+                .map(|&e| e as usize)
+                .filter(|e| e % world == rank)
+                .collect();
+            let live = local.len();
+            let copies = 2usize;
             let mut tabs = vec![];
             for c in 0..copies {
                 let (mut w1, mut w3, mut w2) = (
@@ -665,52 +703,30 @@ mod tests {
                     vec![DsW::default(); ne],
                     vec![DsW::default(); ne],
                 );
-                for i in 0..live {
-                    let e = i * 7 + 1;
-                    let sd = (c * 100 + i * 3) as u64;
-                    let (a, b, cc) = (
-                        bytes_w(inter, d, 3, sd + 1),
-                        bytes_w(inter, d, 3, sd + 2),
-                        bytes_w(d, inter, 3, sd + 3),
-                    );
-                    (w1[e], w3[e], w2[e]) = (a.1, b.1, cc.1);
-                    keep.extend(a.0.into_iter().chain(b.0).chain(cc.0));
+                for &e in &local {
+                    let p = &pool[next % pool_n];
+                    next += 1;
+                    (w1[e], w3[e], w2[e]) = (p.0, p.1, p.2);
                 }
-                let (s1, s3, s2) = (
-                    bytes_w(inter, d, 2, c as u64 * 7 + 50),
-                    bytes_w(inter, d, 2, c as u64 * 7 + 51),
-                    bytes_w(d, inter, 2, c as u64 * 7 + 52),
-                );
                 tabs.push((
                     DevBuf::from_slice(&w1)?,
                     DevBuf::from_slice(&w3)?,
                     DevBuf::from_slice(&w2)?,
-                    (s1.1, s3.1, s2.1),
+                    shs[c].clone(),
                 ));
-                keep.extend(s1.0.into_iter().chain(s3.0).chain(s2.0));
             }
-            // routes: token i's first pick -> expert i * 7 + 1 (i < live); every other pick
-            // to an expert off this rank (mask 0)
-            let ids: Vec<i32> = (0..t * topk)
-                .map(|j| {
-                    if j % topk == 0 && j / topk < live {
-                        ((j / topk) * 7 + 1) as i32
-                    } else {
-                        (200 + j % 150) as i32
-                    }
-                })
-                .collect();
-            let ids = DevBuf::from_slice(&ids)?;
+            let ids = DevBuf::from_slice(ids)?;
             let wts = DevBuf::from_slice(&vec![0.2f32; t * topk])?;
             let (counts, off) = (DevBuf::zeroed(ne * 4)?, DevBuf::zeroed((ne + 1) * 4)?);
             let (rows, rw) = (DevBuf::zeroed(t * topk * 4)?, DevBuf::zeroed(t * topk * 4)?);
             k.route(
                 &s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
             )?;
-            let mask: Vec<i32> = (0..ne).map(|e| (e < 200) as i32).collect();
+            let mask: Vec<i32> = (0..ne).map(|e| (e % world == rank) as i32).collect();
             let mask = DevBuf::from_slice(&mask)?;
-            let elist = DevBuf::zeroed(live * 4)?;
-            let (nei, ci) = (ne as i32, live as i32);
+            let cap = (t * topk).min(ne / world);
+            let elist = DevBuf::zeroed(cap * 4)?;
+            let (nei, ci) = (ne as i32, cap as i32);
             unsafe {
                 k.go(
                     "ds_moe_plan",
@@ -734,7 +750,7 @@ mod tests {
                     (&tb.3 .0, &tb.3 .1, true),
                     0,
                     h.ptr,
-                    (t, nall, live, inter, d),
+                    (t, nall, cap, inter, d),
                     10.0,
                 )
             };
@@ -747,16 +763,10 @@ mod tests {
                     (&tb.3 .2, true),
                     h.ptr,
                     part.ptr,
-                    (t, nall, live, d, inter),
+                    (t, nall, cap, d, inter),
                 )
             };
-            k.ks_quant_to(&s, x.ptr, xc, xs, t * d)?;
-            let sh = &tabs[0].3;
-            ensure!(
-                k.moe_sh_ok([&sh.0, &sh.1, &sh.2], 3, t, topk, d, inter),
-                "not on the folded K-split path"
-            );
-            let reps = 20usize;
+            let reps = 10usize;
             let mut us = [0f32; 2];
             let fs: [&dyn Fn(&Stream, usize) -> Result<()>; 2] = [&gu, &down];
             for (j, f) in fs.into_iter().enumerate() {
@@ -768,24 +778,85 @@ mod tests {
                     }
                     Ok(())
                 })?;
-                us[j] = time(&s, 10, || Ok(gr.launch(&s)?))? / reps as f32;
+                us[j] = time(&s, 5, || Ok(gr.launch(&s)?))? / reps as f32;
             }
-            let slot = |r: usize, c: usize, fmt: i32| {
-                let mut v = DsW::default();
-                (v.rows, v.cols, v.fmt) = (r as i32, c as i32, fmt);
-                wbytes(&v)
-            };
-            let bgu = live * 2 * slot(inter, d, 3) + 2 * slot(inter, d, 2);
-            let bdn = live * slot(d, inter, 3) + slot(d, inter, 2);
-            let (g1, g2) = (bgu as f32 / us[0] / 1e3, bdn as f32 / us[1] / 1e3);
+            let bytes = live * (2 * slot(inter, d, 3) + slot(d, inter, 3))
+                + 2 * slot(inter, d, 2)
+                + slot(d, inter, 2);
+            Ok((us[0], us[1], live, bytes))
+        };
+        println!("| live | gu µs | down µs | GB/s | % of 3350 |");
+        println!("|---|---|---|---|---|");
+        for live in [1usize, 5, 8] {
+            // token i's first pick -> expert 8 * i (rank 0) for i < live, the rest elsewhere
+            let ids: Vec<i32> = (0..t * topk)
+                .map(|j| {
+                    if j % topk == 0 && j / topk < live {
+                        (8 * (j / topk)) as i32
+                    } else {
+                        (8 * j + 1 + j % 7) as i32 % ne as i32 | 1
+                    }
+                })
+                .collect();
+            let (a, b, _, by) = case(&ids, 0)?;
+            let gbs = by as f32 / (a + b) / 1e3;
             println!(
-                "| {live} | {:.1} | {g1:.0} | {:.1} | {g2:.0} | {:.0}% |",
-                us[0],
-                us[1],
-                (bgu + bdn) as f32 / (us[0] + us[1]) / 1e3 / 33.5
+                "| {live} | {a:.1} | {b:.1} | {gbs:.0} | {:.0}% |",
+                gbs / 33.5
             );
-            drop(keep);
         }
+        let Ok(path) = std::env::var("DS_ROUTE_FILE") else {
+            return Ok(());
+        };
+        // the first verify step: consecutive distinct t = 7 lines until a layer id repeats
+        let text = std::fs::read_to_string(path)?;
+        let mut step: Vec<(usize, Vec<i32>)> = vec![];
+        for l in text.lines() {
+            let v: Vec<i64> = l.split(' ').filter_map(|w| w.parse().ok()).collect();
+            if v.len() != 2 + t * topk || v[1] as usize != t {
+                continue;
+            }
+            let lid = v[0] as usize;
+            let ids: Vec<i32> = v[2..].iter().map(|&e| e as i32).collect();
+            if step.last().is_some_and(|(l, i)| *l == lid && *i == ids) {
+                continue; // the other ranks' copy of the same line
+            }
+            if step.iter().any(|(l, _)| *l == lid) {
+                break;
+            }
+            step.push((lid, ids));
+        }
+        println!(
+            "\nreal routing, {} MoE layers of one verify step",
+            step.len()
+        );
+        let mut rank_ms = vec![0f32; world];
+        let mut crit = 0f32;
+        let mut lives = vec![0usize; world];
+        for (lid, ids) in &step {
+            let mut worst = 0f32;
+            let mut row = vec![];
+            for r in 0..world {
+                let (a, b, live, _) = case(ids, r)?;
+                rank_ms[r] += (a + b) / 1e3;
+                lives[r] += live;
+                worst = worst.max(a + b);
+                row.push(format!("{:.0}({live})", a + b));
+            }
+            crit += worst / 1e3;
+            println!("layer {lid}: {}", row.join(" "));
+        }
+        println!(
+            "per-rank gu+down ms/step: {}",
+            rank_ms
+                .iter()
+                .map(|v| format!("{v:.2}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!("per-rank live experts/step: {lives:?}");
+        println!("critical path (Σ layers of the slowest rank): {crit:.2} ms/step");
+        drop(keep);
         Ok(())
     }
 
