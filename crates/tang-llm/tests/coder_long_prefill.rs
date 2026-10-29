@@ -24,6 +24,8 @@ use tang_llm::flash::coder::{Coder, CoderOpts};
 const LEN: usize = 3318;
 /// Wide window rows (serve's default).
 const ROWS: usize = 256;
+/// The prompt text, chat-encoded then cycled.
+const PROMPT: &str = "def quicksort(xs): return xs if len(xs) < 2 else";
 /// Greedy decode steps compared after each prefill.
 const STEPS: usize = 8;
 
@@ -80,8 +82,10 @@ fn wide_prefill_of_thousands_of_tokens_matches_narrow() -> Result<()> {
     let mut e = Coder::load(&path, opts)?;
     ensure!(e.temperature == 0.0, "greedy only");
     e.enable_wide(ROWS)?;
-    // Arbitrary nonzero ids, not periodic in the window size.
-    let ids: Vec<u32> = (0..LEN as u32).map(|i| 1000 + (i * 7919) % 30000).collect();
+    // A real prompt cycled to `LEN` tokens, as `flash-wide-check` builds it (random ids put
+    // the model in a degenerate loop where even a correct wide prefill misses the bar).
+    let base = tang_llm::flash::tokenize::encode_chat(&path, PROMPT, None)?;
+    let ids: Vec<u32> = base.iter().cycle().take(LEN).copied().collect();
 
     let s1 = e.alloc_slot()?;
     let n1 = e.prefill_slot(s1, &ids)?;
