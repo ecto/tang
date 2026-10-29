@@ -446,6 +446,31 @@ loads, wait, then stage x), plus launching through `pdl::launch` when `DS_PDL=1`
 with the kernel lanes is the next step; the expected win on the dense stretch is ~1–2 µs per
 kernel boundary (~1 ms a step), more where a prologue is restructured to load weights first.
 
+**DS_PDL=1 wired** (0d155a69): every kernel in kernels.cu / kernels_select.cu /
+kernels_graph.cu / kernels_mega.cu opens with `DS_PDL_ENTRY` (launch_dependents, then wait);
+`ds_ks` triggers, L2-prefetches its first work item's weight slice, then waits; `obs::launch`
+(every deepseek launch) uses `cuLaunchKernelEx` with the attribute when `DS_PDL=1`. NCCL,
+memcpy and event edges are untouched (a PDL launch after a non-kernel node is an ordinary
+dependency). Full tiny GPU suite with `DS_PDL=1` on H100: 41 passed, 0 failed (bit-exact
+tests included; graph capture keeps the attribute). Step, 8× H100, same binary:
+
+| | DS_PDL off | DS_PDL=1 |
+|---|---|---|
+| graph verify gpu ms | 23.10 | 23.24 |
+| graph draft gpu ms | 3.92 | 3.90 |
+| direct verify gpu ms (948 launches) | 27.77 | 27.25 |
+| greedy tok/s (warm ×2) / acceptance | 147.1, 147.7 / 153 of 235 | 146.3, 144.8 / 153 of 235 |
+| sampled 0.6 tok/s | 127.6, 141.7 | 149.5, 137.5 |
+| prefill tok/s | ~460 | ~415 |
+
+So **no step gain in the graph** (+0.14 ms verify, within noise to slightly worse), −0.5 ms on
+the direct path (where it hides stream launch gaps), and prefill 10% slower (early-launched
+dependents holding SM resources next to big tiled kernels). Inside a graph the nodes are
+already back to back, and the real kernels' prologues are not weight-only (most load their
+activation first), so there is little to overlap with a wait at entry. Stays off. What would
+make PDL pay is per-kernel restructuring (weights first, activation after the wait) inside
+the big projections, which belongs with the kernel lanes' bandwidth work above.
+
 ## How to profile a step
 
 The step timeline (`flash/deepseek/obs.rs`, [observability.md](observability.md#deepseek-v41-flash-the-step-timeline-flashdeepseekobsrs))

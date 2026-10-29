@@ -10,7 +10,8 @@ use tang_moe::gpu::{self, Stream};
 
 /// Whether `DS_PDL=1`.
 pub fn on() -> bool {
-    std::env::var("DS_PDL").is_ok_and(|v| v == "1")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PDL").is_ok_and(|v| v == "1"))
 }
 
 /// [`gpu::launch`] with the programmatic-serialization attribute when `pdl`.
