@@ -143,4 +143,51 @@ mod tests {
             h.join().unwrap();
         }
     }
+
+    /// All-reduce latency at the decode MoE's sizes (t × 5120 f32, t = 1..8), `NCCL_TEST_WORLD`
+    /// ranks, back-to-back on each rank's stream: µs per call (rank 0 prints). Set NCCL_ALGO /
+    /// NCCL_PROTO / NCCL_NCHANNELS to compare. `--ignored --nocapture nccl_small_bench`.
+    #[test]
+    #[ignore]
+    fn nccl_small_bench() {
+        let world = std::env::var("NCCL_TEST_WORLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8usize);
+        let id = unique_id().expect("libnccl");
+        let hs: Vec<_> = (0..world)
+            .map(|rank| {
+                std::thread::spawn(move || {
+                    let g = Gpu::at(rank).unwrap();
+                    g.bind().unwrap();
+                    let s = Stream::new().unwrap();
+                    let comm = Comm::new(rank, world, id).unwrap();
+                    let buf = DevBuf::zeroed(8 * 5120 * 4).unwrap();
+                    for t in [1usize, 7, 8] {
+                        let n = t * 5120;
+                        for _ in 0..50 {
+                            comm.all_reduce_sum_f32(&buf, n, &s).unwrap();
+                        }
+                        s.sync().unwrap();
+                        let iters = 500;
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            comm.all_reduce_sum_f32(&buf, n, &s).unwrap();
+                        }
+                        s.sync().unwrap();
+                        let us = t0.elapsed().as_secs_f64() / iters as f64 * 1e6;
+                        if rank == 0 {
+                            println!(
+                                "nccl all-reduce {world} ranks, {} KB: {us:.1} us",
+                                n * 4 / 1024
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+    }
 }
