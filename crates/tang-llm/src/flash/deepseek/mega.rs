@@ -103,8 +103,10 @@ fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
 }
 
 const PART: usize = 1 << 21;
-/// `mg_glue`'s dynamic shared memory cap.
-const SMEM_MAX: usize = 96 * 1024;
+/// `mg_glue`'s dynamic shared memory cap (the largest staged activation is ~47 KB; leaves
+/// room under the 99 KB opt-in for the phases' static arrays, which grew when mg_hc took
+/// ds_hc_fused_ks's shared body).
+const SMEM_MAX: usize = 64 * 1024;
 const CNT: usize = 1 << 13;
 
 /// The megakernel's module and persistent scratch.
@@ -469,7 +471,7 @@ mod tests {
                         args![
                             h.ptr, h2, res.ptr, post.ptr, comb.ptr, o[0].ptr, hw, o[1].ptr,
                             pre.ptr, o[5].ptr, nw, scale.ptr, base.ptr, o[2].ptr, o[3].ptr,
-                            o[4].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps
+                            o[4].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps, 0i32
                         ],
                     )?;
                 }

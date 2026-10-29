@@ -249,6 +249,9 @@ pub struct AttnRope {
     pub stride: i32,
     /// q too (else o only: q came rope'd)
     pub q: bool,
+    /// also quantize o into wo_ks's activation buffer (`ds_attn_fd` paths; then
+    /// [`Kernels::wo_ks_pre`] skips its quantize)
+    pub wo_quant: bool,
 }
 
 /// Floats of cross-block K-split partials, and row-group counters.
@@ -1027,21 +1030,38 @@ impl Kernels {
         g: usize,
         ol: usize,
     ) -> Result<()> {
+        self.wo_ks_inner(s, w, x, y, t, g, ol, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wo_ks_inner(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        x: u64,
+        y: u64,
+        t: usize,
+        g: usize,
+        ol: usize,
+        quant: bool,
+    ) -> Result<()> {
         if !self.wo_ks_ok(w, t, g, ol) {
             bail!("wo_ks: shape t {t} g {g} ol {ol} cols {}", w.cols);
         }
         let gd = w.cols as usize;
         let (codes, scales) = (self.wo_x.ptr, self.wo_x.ptr + (8 * WO_X_COLS) as u64);
         let ng = (t * g * gd / 32) as i32;
-        unsafe {
-            super::obs::launch(
-                self.ks_quant,
-                blocks(t * g * gd, 256),
-                (256, 1, 1),
-                0,
-                s,
-                tang_moe::args![x, codes, scales, ng],
-            )?
+        if quant {
+            unsafe {
+                super::obs::launch(
+                    self.ks_quant,
+                    blocks(t * g * gd, 256),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    tang_moe::args![x, codes, scales, ng],
+                )?
+            }
         }
         let (sp, nbr, gx) = self.moe_ks_grid(ol, 16, gd);
         let (ti, oli, si, nbri) = (t as i32, ol as i32, sp as i32, nbr as i32);
@@ -1057,6 +1077,20 @@ impl Kernels {
             )?;
         }
         Ok(())
+    }
+
+    /// [`Kernels::wo_ks`] on an activation already quantized into its buffer (by the
+    /// attention's merge, [`AttnRope::wo_quant`]): the grouped GEMV alone.
+    pub fn wo_ks_pre(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        y: u64,
+        t: usize,
+        g: usize,
+        ol: usize,
+    ) -> Result<()> {
+        self.wo_ks_inner(s, w, 0, y, t, g, ol, false)
     }
 
     /// [`Kernels::linear_ks`] for t > 8 rows in one launch (`ds_kst_*`): the activation
@@ -1689,6 +1723,13 @@ impl Kernels {
                 o + (t0 * h * d * 4) as u64,
             );
             let (hi, di, ki) = (h as i32, d as i32, k as i32);
+            let (qc, qsc) = match r.wo_quant {
+                true => (
+                    self.wo_x.ptr + (t0 * h * d) as u64,
+                    self.wo_x.ptr + (8 * WO_X_COLS + t0 * h * d / 8) as u64,
+                ),
+                false => (0, 0),
+            };
             unsafe {
                 super::obs::launch(
                     self.more[fname],
@@ -1707,7 +1748,9 @@ impl Kernels {
                     (256, 1, 1),
                     0,
                     s,
-                    tang_moe::args![part, ml, sink, oo, hi, di, ns, r.tab, pp, rd, add, ps],
+                    tang_moe::args![
+                        part, ml, sink, oo, hi, di, ns, r.tab, pp, rd, add, ps, qc, qsc
+                    ],
                 )?;
             }
             t0 += n;
@@ -3644,6 +3687,7 @@ mod tests {
                     add: add as i32,
                     stride: st as i32,
                     q: true,
+                    wo_quant: false,
                 };
                 k.sparse_attn_r(
                     &s,
@@ -3757,6 +3801,7 @@ mod tests {
                 add: 0,
                 stride: 1,
                 q: true,
+                wo_quant: false,
             };
             let scale = (d as f32).powf(-0.5);
             let o = DevBuf::alloc(t * h * d * 4).unwrap();
@@ -3797,6 +3842,32 @@ mod tests {
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
             assert_eq!(bad, 0, "mode {mode} t {t} sp {sp} kc {kc}: {bad} differ");
+            // the merge's quantize of o (wo_quant) is ds_ks_quant's, bit for bit
+            let rq = AttnRope {
+                wo_quant: true,
+                ..rope
+            };
+            k.attn_fd_win(
+                &s, q.ptr, kv.ptr, split, kv1, sink.ptr, o.ptr, t, h, d, k_all, scale, rq, w,
+            )
+            .unwrap();
+            s.sync().unwrap();
+            let n = t * h * d;
+            let got_c = k.wo_x.read::<u8>(0, n).unwrap();
+            let got_s = k.wo_x.read::<f32>(8 * WO_X_COLS, n / 32).unwrap();
+            let qb = DevBuf::alloc(n + n / 8).unwrap();
+            k.ks_quant_to(&s, o.ptr, qb.ptr, qb.ptr + n as u64, n)
+                .unwrap();
+            s.sync().unwrap();
+            assert_eq!(got_c, qb.read::<u8>(0, n).unwrap(), "codes");
+            let ws = qb.read::<f32>(n, n / 32).unwrap();
+            assert!(
+                got_s
+                    .iter()
+                    .zip(&ws)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "scales"
+            );
         }
     }
 
@@ -5140,6 +5211,11 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
         let (hci, di, eps, neps) = (hc as i32, d as i32, 1e-6f32, 1e-6f32);
+        // DS_BENCH_HC_STUB: ds_hc_fused_ks's phases stubbed out (timing only, see the kernel)
+        let stub: i32 = std::env::var("DS_BENCH_HC_STUB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         for t in [1usize, 6, 13] {
             let ti = t as i32;
             let x = up(&data(t * hc * d, 1, 1.0));
@@ -5407,7 +5483,7 @@ mod tests {
                         tang_moe::args![
                             0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, qa.ptr, pre0.ptr, b[4].ptr,
                             w0, scale.ptr, base.ptr, b[1].ptr, b[2].ptr, b[3].ptr, cnt.ptr, ti,
-                            hci, di, it, eps, neps, neps
+                            hci, di, it, eps, neps, neps, stub
                         ],
                     )?;
                     k.go(
@@ -5419,7 +5495,7 @@ mod tests {
                         tang_moe::args![
                             ha.ptr, 0u64, x.ptr, b[2].ptr, b[3].ptr, b[5].ptr, w1, qf.ptr,
                             b[1].ptr, b[10].ptr, w0, scale.ptr, base.ptr, b[7].ptr, b[8].ptr,
-                            b[9].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps
+                            b[9].ptr, cnt.ptr, ti, hci, di, it, eps, neps, neps, stub
                         ],
                     )?;
                     k.go(
@@ -5434,6 +5510,26 @@ mod tests {
                     )?;
                 }
                 Ok(())
+            };
+            // one ds_hc_fused_ks launch alone (the first stage's), for the phase timings
+            let fk1 = |s: &Stream| -> Result<()> {
+                let b = &g4;
+                let (w0, wa) = (nv, fw(0));
+                let g = (gxf as u32, t.div_ceil(8) as u32, 1);
+                unsafe {
+                    k.go(
+                        "ds_hc_fused_ks",
+                        g,
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![
+                            0u64, 0u64, x.ptr, 0u64, 0u64, x.ptr, wa, qa.ptr, pre0.ptr, b[4].ptr,
+                            w0, scale.ptr, base.ptr, b[1].ptr, b[2].ptr, b[3].ptr, cnt.ptr, ti,
+                            hci, di, it, eps, neps, neps, stub
+                        ],
+                    )
+                }
             };
             old(&s).unwrap();
             new(&s).unwrap();
@@ -5451,7 +5547,7 @@ mod tests {
                 .enumerate()
                 .flat_map(|(i, n)| [(i, (n, &g3)), (i, (n, &g4))])
             {
-                if !one && std::ptr::eq(gb, &g4) {
+                if (!one && std::ptr::eq(gb, &g4)) || stub != 0 {
                     continue;
                 }
                 if i == 0 || i == 6 {
@@ -5497,6 +5593,7 @@ mod tests {
                 ("fused (5 launches/layer)", &new),
                 ("ks (5 launches/layer)", &ks),
                 ("fused ks (3 launches/layer)", &fk),
+                ("fused ks, 1 stage launch alone", &fk1),
             ] {
                 if !one && name.starts_with("fused ks") {
                     continue;
@@ -5524,6 +5621,61 @@ mod tests {
                 eprintln!(
                     "hc_glue t {t} {name}: {us:.0} us / 40 layers, {:.1} us / layer",
                     us / 40.0
+                );
+                // the same launches direct (no graph), each wrapped in a timing-event pair as
+                // the obs op table's spans are: what the direct-path table charges them
+                let evs: Vec<_> = (0..80).map(|_| gpu::Event::new(true).unwrap()).collect();
+                body(&s).unwrap();
+                s.sync().unwrap();
+                let mut tot = 0.0;
+                for _ in 0..n {
+                    for l in 0..40 {
+                        evs[2 * l].record(&s).unwrap();
+                        body(&s).unwrap();
+                        evs[2 * l + 1].record(&s).unwrap();
+                    }
+                    s.sync().unwrap();
+                    for l in 0..40 {
+                        tot += evs[2 * l + 1].since(&evs[2 * l]).unwrap() as f64 * 1e3;
+                    }
+                }
+                eprintln!(
+                    "hc_glue t {t} {name}, direct + span events: {:.1} us / layer",
+                    tot / (n * 40) as f64
+                );
+                // and with L2 flushed before each layer (in the model the MoE's ~100 MB of
+                // expert weights run between stages)
+                let fl = 32usize << 20;
+                let (fa, fb) = (
+                    DevBuf::alloc(fl * 4).unwrap(),
+                    DevBuf::alloc(fl * 4).unwrap(),
+                );
+                let mut tot = 0.0;
+                for _ in 0..4 {
+                    for l in 0..40 {
+                        unsafe {
+                            k.go(
+                                "ds_copy",
+                                blocks(fl, 256),
+                                (256, 1, 1),
+                                0,
+                                &s,
+                                tang_moe::args![fa.ptr, fb.ptr, fl as i64],
+                            )
+                            .unwrap()
+                        };
+                        evs[2 * l].record(&s).unwrap();
+                        body(&s).unwrap();
+                        evs[2 * l + 1].record(&s).unwrap();
+                    }
+                    s.sync().unwrap();
+                    for l in 0..40 {
+                        tot += evs[2 * l + 1].since(&evs[2 * l]).unwrap() as f64 * 1e3;
+                    }
+                }
+                eprintln!(
+                    "hc_glue t {t} {name}, direct + span events, cold L2: {:.1} us / layer",
+                    tot / (4 * 40) as f64
                 );
             }
         }

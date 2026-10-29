@@ -184,6 +184,18 @@ struct Mix {
     comb: Buf,
 }
 
+/// `DS_OBS_HC_SPLIT=1`: the K-split block's three mHC spans under their own names (`hc.pend`
+/// the carried attention stage, `hc.ffn`, `hc.next` the closing post-mix + next stage), else
+/// all `hc` (the per-rank table reads that name).
+fn hc_name(split: &'static str) -> &'static str {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("DS_OBS_HC_SPLIT").is_ok_and(|v| v == "1")) {
+        split
+    } else {
+        "hc"
+    }
+}
+
 /// The attention's key index rows: built ([`Buf`] [t][k]) or left to `ds_attn_fdm`.
 #[derive(Clone, Copy)]
 enum Ix {
@@ -1131,6 +1143,7 @@ impl GpuModel {
         let c = &self.cpu.cfg;
         let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
         let s = self.span("sparse_attn");
+        let mut wo_pre = false;
         let sink = self.dw(&format!("{p}.attn.attn_sink"))?;
         let o = self.fbuf(t * h * hd)?;
         // the tiled kernels at the real shapes (see `Kernels::sparse_attn`), else the exact one
@@ -1149,6 +1162,7 @@ impl GpuModel {
                 add: add as i32,
                 stride: stride as i32,
                 q: !q_roped,
+                wo_quant: false,
             }),
             _ => None,
         };
@@ -1160,9 +1174,15 @@ impl GpuModel {
                 &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, di.ptr, o.ptr, t, h, hd, k, scale,
                 rope,
             )?,
-            (Ix::Win(w), Some(r)) => self.k.attn_fd_win(
-                &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
-            )?,
+            (Ix::Win(w), Some(mut r)) => {
+                // the merge also quantizes o for wo_ks (one launch fewer)
+                let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
+                r.wo_quant = self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol);
+                wo_pre = r.wo_quant;
+                self.k.attn_fd_win(
+                    &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
+                )?
+            }
             (Ix::Win(_), None) => bail!("attn_out: in-kernel indices want the fused rope"),
         }
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
@@ -1175,7 +1195,11 @@ impl GpuModel {
         let mid = self.fbuf(t * g * ol)?;
         if self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol) {
             // the quantize is ds_ks_quant's (bit-identical to ds_fp8_qdq)
-            self.k.wo_ks(&self.s, &wo_a.v, o.ptr, mid.ptr, t, g, ol)?;
+            if wo_pre {
+                self.k.wo_ks_pre(&self.s, &wo_a.v, mid.ptr, t, g, ol)?;
+            } else {
+                self.k.wo_ks(&self.s, &wo_a.v, o.ptr, mid.ptr, t, g, ol)?;
+            }
         } else {
             self.k.fp8_qdq(&self.s, o.ptr, t * h * hd)?;
             self.wo_a(o, &wo_a.v, mid, t, g, ol)?;
@@ -2624,7 +2648,7 @@ impl GpuModel {
                 args![
                     h.ptr, h2, res.ptr, post, comb, xo.ptr, wv, part.ptr, pre.ptr, hin.ptr, nv,
                     scp, bp, o.pre.ptr, o.post.ptr, o.comb.ptr, cnt, ti, hci, di, it, eps, neps,
-                    neps
+                    neps, 0i32
                 ],
             )?
         };
@@ -2791,27 +2815,29 @@ impl GpuModel {
         pre_mix: Buf,
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
-        let s = self.span("hc");
         let next = self.next_hc.take();
         let norm = format!("{p}.attn_norm.weight");
         if !matches!(attn, Attn::Main) || sp == 0 {
             self.glue_flush()?;
         }
+        // a span only when there is a launch (the carried stage costs nothing here, and an
+        // empty span still charges its event pair, ~5 us, to the op table)
         let (am, h) = match self.pend_stage.take() {
             Some(st) => st,
             None => {
+                let s = self.span(hc_name("hc.pend"));
                 let (_, am, h) = self.hc_fused(x, None, x, None, t, p, "attn", pre_mix, &norm)?;
+                self.end(s);
                 (am, h)
             }
         };
-        self.end(s);
         let s = self.span("attn");
         let h = match attn {
             Attn::Main => self.attention(p, lid, h, t, sp)?,
             Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
         };
         self.end(s);
-        let s = self.span("hc");
+        let s = self.span(hc_name("hc.ffn"));
         let norm = format!("{p}.ffn_norm.weight");
         let (x, fm, h) = self.hc_fused(h, None, x, Some(&am), t, p, "ffn", am.pre, &norm)?;
         self.end(s);
@@ -2823,7 +2849,7 @@ impl GpuModel {
         let h = r?;
         let sh = self.sh.take();
         self.end(s);
-        let s = self.span("hc");
+        let s = self.span(hc_name("hc.next"));
         let x = match next {
             Some(np) => {
                 let norm = format!("{np}.attn_norm.weight");

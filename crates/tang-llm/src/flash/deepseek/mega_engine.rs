@@ -103,7 +103,7 @@ impl GpuModel {
                 args![
                     g.h.ptr, g.h2, g.res.ptr, g.post, g.comb, g.xo.ptr, wv, g.part.ptr, g.pre.ptr,
                     g.hin.ptr, nv, scp, bp, g.o[0].ptr, g.o[1].ptr, g.o[2].ptr, cnt, ti, hci, di,
-                    it, eps, neps, neps
+                    it, eps, neps, neps, 0i32
                 ],
             )?
         };
