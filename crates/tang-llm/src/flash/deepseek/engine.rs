@@ -140,6 +140,18 @@ struct Mix {
     comb: Buf,
 }
 
+/// `DS_OBS_HC_SPLIT=1`: the K-split block's three mHC spans under their own names (`hc.pend`
+/// the carried attention stage, `hc.ffn`, `hc.next` the closing post-mix + next stage), else
+/// all `hc` (the per-rank table reads that name).
+fn hc_name(split: &'static str) -> &'static str {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("DS_OBS_HC_SPLIT").is_ok_and(|v| v == "1")) {
+        split
+    } else {
+        "hc"
+    }
+}
+
 /// The attention's key index rows: built ([`Buf`] [t][k]) or left to `ds_attn_fdm`.
 #[derive(Clone, Copy)]
 enum Ix {
@@ -2587,24 +2599,26 @@ impl GpuModel {
         pre_mix: Buf,
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
-        let s = self.span("hc");
         let next = self.next_hc.take();
         let norm = format!("{p}.attn_norm.weight");
+        // a span only when there is a launch (the carried stage costs nothing here, and an
+        // empty span still charges its event pair, ~5 us, to the op table)
         let (am, h) = match self.pend_stage.take() {
             Some(st) => st,
             None => {
+                let s = self.span(hc_name("hc.pend"));
                 let (_, am, h) = self.hc_fused(x, None, x, None, t, p, "attn", pre_mix, &norm)?;
+                self.end(s);
                 (am, h)
             }
         };
-        self.end(s);
         let s = self.span("attn");
         let h = match attn {
             Attn::Main => self.attention(p, lid, h, t, sp)?,
             Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
         };
         self.end(s);
-        let s = self.span("hc");
+        let s = self.span(hc_name("hc.ffn"));
         let norm = format!("{p}.ffn_norm.weight");
         let (x, fm, h) = self.hc_fused(h, None, x, Some(&am), t, p, "ffn", am.pre, &norm)?;
         self.end(s);
@@ -2616,7 +2630,7 @@ impl GpuModel {
         let h = r?;
         let sh = self.sh.take();
         self.end(s);
-        let s = self.span("hc");
+        let s = self.span(hc_name("hc.next"));
         let x = match next {
             Some(np) => {
                 let norm = format!("{np}.attn_norm.weight");

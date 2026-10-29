@@ -5223,6 +5223,61 @@ mod tests {
                     "hc_glue t {t} {name}: {us:.0} us / 40 layers, {:.1} us / layer",
                     us / 40.0
                 );
+                // the same launches direct (no graph), each wrapped in a timing-event pair as
+                // the obs op table's spans are: what the direct-path table charges them
+                let evs: Vec<_> = (0..80).map(|_| gpu::Event::new(true).unwrap()).collect();
+                body(&s).unwrap();
+                s.sync().unwrap();
+                let mut tot = 0.0;
+                for _ in 0..n {
+                    for l in 0..40 {
+                        evs[2 * l].record(&s).unwrap();
+                        body(&s).unwrap();
+                        evs[2 * l + 1].record(&s).unwrap();
+                    }
+                    s.sync().unwrap();
+                    for l in 0..40 {
+                        tot += evs[2 * l + 1].since(&evs[2 * l]).unwrap() as f64 * 1e3;
+                    }
+                }
+                eprintln!(
+                    "hc_glue t {t} {name}, direct + span events: {:.1} us / layer",
+                    tot / (n * 40) as f64
+                );
+                // and with L2 flushed before each layer (in the model the MoE's ~100 MB of
+                // expert weights run between stages)
+                let fl = 32usize << 20;
+                let (fa, fb) = (
+                    DevBuf::alloc(fl * 4).unwrap(),
+                    DevBuf::alloc(fl * 4).unwrap(),
+                );
+                let mut tot = 0.0;
+                for _ in 0..4 {
+                    for l in 0..40 {
+                        unsafe {
+                            k.go(
+                                "ds_copy",
+                                blocks(fl, 256),
+                                (256, 1, 1),
+                                0,
+                                &s,
+                                tang_moe::args![fa.ptr, fb.ptr, fl as i64],
+                            )
+                            .unwrap()
+                        };
+                        evs[2 * l].record(&s).unwrap();
+                        body(&s).unwrap();
+                        evs[2 * l + 1].record(&s).unwrap();
+                    }
+                    s.sync().unwrap();
+                    for l in 0..40 {
+                        tot += evs[2 * l + 1].since(&evs[2 * l]).unwrap() as f64 * 1e3;
+                    }
+                }
+                eprintln!(
+                    "hc_glue t {t} {name}, direct + span events, cold L2: {:.1} us / layer",
+                    tot / (4 * 40) as f64
+                );
             }
         }
     }
