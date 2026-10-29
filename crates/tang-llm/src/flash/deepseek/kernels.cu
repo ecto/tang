@@ -1527,7 +1527,7 @@ DS_MOE_T(3)
 // the slices meeting in shared memory in a fixed order (deterministic). Within an mma's k step
 // columns are permuted freely (A and B agree), so each lane's weight bytes are contiguous.
 
-#define KS_UG 8  // groups in flight per warp
+#define KS_UG 4  // groups in flight per warp (4 beats 8 on H100: shorter ragged tails per item)
 
 __device__ __forceinline__ unsigned short f2h_exact(float v) {
     unsigned int b = __float_as_uint(v);

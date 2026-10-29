@@ -316,8 +316,12 @@ fn moe_table(m: &Module) -> Result<[[[Func; 2]; 4]; 2]> {
 /// The K split for `tiles` 16-row warp tiles with `groups` 32-column groups: S slices within a
 /// block of 8 warps (RW = 8 / S tiles a block) and SB blocks along K, aiming at ≥ 2 blocks of 8
 /// warps per SM while keeping ≥ 4 groups a warp. Returns (S, row-group blocks, SB).
+/// Work items target `DS_KS_TGT` (default 6) × SMs. 2 is faster on H100 (wq_b 24.5 -> 23.8,
+/// wo_b 36.4 -> 32.6 us at t = 6) but changes the partial-sum order, and greedy acceptance fell.
 fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
-    let target = 6 * sms;
+    static TGT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let tgt = *TGT.get_or_init(|| env_usize("DS_KS_TGT").unwrap_or(6).max(1));
+    let target = tgt * sms;
     let mut sp = 1;
     while sp < 8 && tiles.div_ceil(8 / sp) < target && groups >= sp * 2 * 4 {
         sp *= 2;
@@ -1029,12 +1033,12 @@ impl Kernels {
         let out = if gu == 1 { 8 } else { 16 };
         let pitch = cols.div_ceil(128) * 128 + 32;
         let nch = cols / 32;
-        let f = self.ks[w.fmt as usize - 2][gu];
-        let smem = n * pitch + n * nch * 4;
         let (sp, br, mut sb) = ks_split(rows.div_ceil(out), nch, self.sms);
         if sb * n * rows * (1 + gu) > KS_PART || br > KS_CNT {
             sb = 1;
         }
+        let f = self.ks[w.fmt as usize - 2][gu];
+        let smem = n * pitch + n * nch * 4;
         let mut per_sm = 0i32;
         unsafe {
             gpu::check(
