@@ -64,7 +64,15 @@ struct MtpDev {
     p: super::mla_dev::MlaProj,
     c: super::engine::DsaCache,
     moe: super::moe::gpu::DevMoe,
+    /// eh_proj on the device (`k5_gemv`, GGUF storage type), its input `[t][2n]` / output
+    /// `[t][n]` scratch (MAX_EH rows). Opt-in `TANG_GLM5_MTP_EH_DEV=1`: on the generic
+    /// thread-per-row `k5_gemv` it measured 2.9 ms a cell vs 0.9 on the host (B300).
+    eh: Option<(super::moe::gpu::DevW, super::moe::gpu::Kernels5, tang_moe::gpu::DevBuf, tang_moe::gpu::DevBuf)>,
 }
+
+/// Rows the device eh_proj scratch holds (a cells call past it runs eh_proj on the host).
+#[cfg(feature = "cuda")]
+const MAX_EH: usize = 16;
 
 /// What a batch of cells gives back.
 pub struct CellOut {
@@ -128,7 +136,22 @@ impl Mtp {
         let p = super::mla_dev::MlaProj::new(gpu, g, self.layer, &self.mla)?;
         let mp = super::moe::MoeParams::from_gguf(g, self.layer)?;
         let moe = super::moe::gpu::DevMoe::new(&mp)?;
-        self.dev = Some(MtpDev { cu, p, c: Default::default(), moe });
+        let eh = if !std::env::var("TANG_GLM5_MTP_EH_DEV").is_ok_and(|v| v == "1") {
+            None
+        } else {
+            let info = g.info(&super::t(self.layer, "nextn.eh_proj.weight"))?;
+            let n = self.n;
+            let dw = super::moe::gpu::upload(&super::moe::W::Gguf(g, info), 1, n, 2 * n)?;
+            let k5 = super::moe::gpu::Kernels5::new(gpu)?;
+            let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp eh_proj: {er}");
+            Some((
+                dw,
+                k5,
+                tang_moe::gpu::DevBuf::zeroed_elems::<f32>(MAX_EH * 2 * n).map_err(ge)?,
+                tang_moe::gpu::DevBuf::zeroed_elems::<f32>(MAX_EH * n).map_err(ge)?,
+            ))
+        };
+        self.dev = Some(MtpDev { cu, p, c: Default::default(), moe, eh });
         eprintln!("glm5: MTP layer blk.{} resident on GPU 0 (DSA + FFN + head)", self.layer);
         Ok(())
     }
@@ -196,7 +219,46 @@ impl Mtp {
             row[n..].copy_from_slice(&h[i * n..(i + 1) * n]);
             rms_norm_mul(&mut row[n..], &self.hnorm, eps);
         }
-        let mut x = self.eh.apply(&cat, t, false);
+        let pr = |k: &'static str, t0: Instant| {
+            #[cfg(feature = "cuda")]
+            if super::engine::resident::prof_on() {
+                super::engine::resident::prof_add(k, t0.elapsed().as_secs_f64());
+            }
+            let _ = (k, t0);
+        };
+        let t0 = Instant::now();
+        #[cfg(feature = "cuda")]
+        let dev_x = match self.dev.as_ref().and_then(|d| d.eh.as_ref()).filter(|_| t <= MAX_EH) {
+            Some((dw, k5, xin, xout)) => {
+                let (gpu, _) = e.gpu.as_ref().context("mtp: no GPU")?.dev0();
+                gpu.bind().map_err(|er| anyhow::anyhow!("bind (mtp): {er}"))?;
+                let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp eh_proj: {er}");
+                xin.write(0, &cat).map_err(ge)?;
+                let s = tang_moe::gpu::Stream::blocking().map_err(ge)?;
+                unsafe {
+                    tang_moe::gpu::launch(
+                        k5.gemv,
+                        ((t * n).div_ceil(128) as u32, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        &s,
+                        tang_moe::args![dw.w, 0u32, xin.ptr, xout.ptr, n as u32, t as u32, n as u32, (2 * n) as u32],
+                    )
+                    .map_err(ge)?;
+                }
+                s.sync().map_err(ge)?;
+                Some(xout.read::<f32>(0, t * n).map_err(ge)?)
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let dev_x: Option<Vec<f32>> = None;
+        let mut x = match dev_x {
+            Some(x) => x,
+            None => self.eh.apply(&cat, t, false),
+        };
+        pr("draft.eh_proj", t0);
+        let t0 = Instant::now();
         // ---- attention half (the engine's dsa_cpu, on this block's own cache)
         let mut xa = x.clone();
         xa.par_chunks_mut(n)
@@ -214,6 +276,8 @@ impl Mtp {
         #[cfg(not(feature = "cuda"))]
         let y = self.dsa_host(&xa, t, pos0);
         x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+        pr("draft.dsa", t0);
+        let t0 = Instant::now();
         // ---- FFN half
         let mut xf = x.clone();
         xf.par_chunks_mut(n)
@@ -235,12 +299,18 @@ impl Mtp {
             super::moe::moe_layer(&p, &xf, t)?
         };
         x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+        pr("draft.moe", t0);
+        let t0 = Instant::now();
         // ---- shared head
         x.par_chunks_mut(n)
             .for_each(|r| rms_norm_mul(r, &self.shnorm, eps));
         let nv = self.head.rows;
         #[cfg(feature = "cuda")]
         if let Some(gf) = e.gpu.as_ref().filter(|_| self.dev.is_some()) {
+            if let Some(top) = e.head_top(&x)? {
+                pr("draft.head", t0);
+                return Ok(CellOut { h: x, top });
+            }
             let mut top = Vec::with_capacity(t);
             for i in 0..t {
                 match gf.head_logits(&x[i * n..(i + 1) * n], n, nv)? {
@@ -248,6 +318,7 @@ impl Mtp {
                     None => top.push(argmax(&self.head.apply(&x[i * n..(i + 1) * n], 1, false))),
                 }
             }
+            pr("draft.head", t0);
             return Ok(CellOut { h: x, top });
         }
         let logits = self.head.apply(&x, t, false);
@@ -599,6 +670,10 @@ pub fn cli_run(
     println!("ids: {line}");
     println!("decode: {} tokens in {:.2} s (incl. prefill)", gen.len(), s);
     print!("{}", st.report());
+    #[cfg(feature = "cuda")]
+    if super::engine::resident::prof_on() {
+        print!("{}", super::engine::resident::prof_report());
+    }
     if !quiet {
         let tk = crate::flash::tokenize::FlashTokenizer::from_gguf(&e.m.g);
         if let Ok(text) = tk.and_then(|t| t.decode(&gen)) {

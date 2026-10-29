@@ -71,7 +71,7 @@ impl DsaCache {
 /// The device-resident decode step (one stream, no per-stage host copies).
 #[cfg(feature = "cuda")]
 #[path = "resident.rs"]
-mod resident;
+pub(crate) mod resident;
 
 /// warps per k5_gemv8 block (kda_k5.cuh's K5_WARPS: one staged row per warp).
 #[cfg(feature = "cuda")]

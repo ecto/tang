@@ -4,6 +4,54 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MTP window stage profile: the per-row cost is KDA + MoE and is mostly inherent; K=2 ~79 tok/s, 1.3x NOT reached (branch claude/glm5-mtp-win, round 2)
+
+Instrument: `TANG_GLM5_WIN_PROF=1` runs the resident window eagerly with a sync around every
+item and times the draft's stages (`prof ...` lines after the MTP report);
+`TANG_GLM5_WIN_PROF_UNION=1` also logs the routed-expert union per layer per window
+(moe_gpu.rs: new read-only `last_route_ids`, the only edit there). Wall ms with syncs, bench
+prompt, -n 128, B flags, B300 (shared pod). Per window:
+
+| t (K) | mhC | KDA | DSA | MoE | head | sum |
+|---|---|---|---|---|---|---|
+| 2 (1) | 2.06 | 4.68 | 4.61 | 5.66 | 0.69 | 17.7 |
+| 3 (2) | 2.12 | 6.90 | 5.51 | 7.65 | 1.03 | 23.2 |
+| 4 (3) | 2.03 | 9.08 | 6.36 | 9.65 | 1.37 | 28.5 |
+
+Slope per extra row: KDA ~2.2 ms, MoE ~2.0, DSA ~0.9, head ~0.34. MoE union over the t rows
+(routed slots only, all layers x windows): t=2 13.9 of 16, t=3 19.2 of 24, t=4 23.7 of 32
+distinct experts (87/80/74 %): rows mostly route to different experts, so the MoE row cost is
+mostly inherent (a dedup could save at most ~20 % of the routed reads at t=3).
+Draft per cell (K=2 run, 102 cells): host eh_proj 0.93 ms, DSA 0.80, MoE 0.36, head 2.70.
+
+Tried:
+- KDA projections batched over the t rows (`DevLayer::rows_enqueue`, opt-in
+  `TANG_GLM5_RES_KDA_ROWS=1`): KDA per t=3 window 6.90 -> 13.5 ms (SLOWER: the t>1 path
+  runs the generic `fast.gemv` / thread-per-row `k5_gemv` gate kernels instead of the tuned
+  t=1 qgemv/tail) and ids baced18e (= the old batched-KDA drift at token 29). Default off.
+- Device eh_proj on `k5_gemv` (opt-in `TANG_GLM5_MTP_EH_DEV=1`): 2.9 ms/cell vs 0.9 host.
+  Default off.
+- Kept: draft greedy ids on the device head (`Glm5Engine::head_top`: q8 + gemv8 +
+  `rs_argmax`, 4 bytes back instead of the logits row): draft head 2.70 -> 2.09 ms/cell,
+  same ids.
+
+Bench after (defaults), tok/s = tok/pass / (trunk + draft ms/pass):
+
+| run | -n | tok/pass | trunk ms | draft ms | tok/s | ids md5 |
+|---|---|---|---|---|---|---|
+| plain | 128 / 512 | | | | 83.11 / 82.83 | 7174cdd6 / 1453cf0e |
+| K=1 | 128 | 1.896 | 17.40 | 6.40 | 79.7 | 7174cdd6 |
+| K=2 | 128 | 2.490 | 23.03 | 8.36 | 79.3 | 7174cdd6 |
+| K=3 | 128 | 2.953 | 28.86 | 11.05 | 74.0 | 7174cdd6 |
+| K=2 | 512 | 2.231 | 22.68 | 4.84 | 81.1 | 1453cf0e |
+
+mew 3090 `flash::glm5` 85 passed / 0 failed / 2 ignored; haiku `--mtp 2` = oracle. Target
+(>= 108 tok/s at K=2) NOT reached. Even a free draft gives K=2 2.49 / 23.0 ms = 108 tok/s at
+-n 128, so the target needs BOTH a ~1 ms draft (a captured device cell: embed gather, eh_proj
+on a tuned GEMV, the DSA/MoE/head with no host syncs; today a cell is ~4 ms of mostly
+sync/launch latency) AND cheaper window rows: a t-row KDA projection kernel as fast per row
+as the tuned t=1 qgemv (the batched path here is not), and grouping MoE rows by expert.
+
 ## 2026-10-28 — MTP verify on the resident path: 85 -> 17-28 ms/pass, ids = plain, but only ~1.04x plain at best (branch claude/glm5-mtp-win)
 
 What was wrong: the MTP verify ran the host `window()` (~85 ms/pass) plus a host KDA snapshot

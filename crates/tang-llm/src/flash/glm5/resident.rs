@@ -541,7 +541,7 @@ impl Glm5Engine {
             }
             let items = plan(&hp);
             let is_dsa = |it: &Item| matches!(it, Item::Dsa(_));
-            let graph_on = !std::env::var("TANG_GLM5_RES_WINDOW_GRAPH").is_ok_and(|v| v == "0");
+            let graph_on = !prof_on() && !std::env::var("TANG_GLM5_RES_WINDOW_GRAPH").is_ok_and(|v| v == "0");
             let have = res.wgraphs.iter().any(|(tt, _)| *tt == t);
             if graph_on && !have && res.wwarm.contains(&t) {
                 // capture pass: records only (the mHC host state walked once, DSA cores
@@ -591,7 +591,35 @@ impl Glm5Engine {
                     res.whole_cap = 0;
                 }
                 for it in &items {
+                    let t0 = prof_on().then(|| {
+                        let _ = s.sync();
+                        std::time::Instant::now()
+                    });
                     wexec(*it, &mut f, g, &res, dsa, &mla_w, &hp, pos0, t, &s, Pass::Eager)?;
+                    if let Some(t0) = t0 {
+                        s.sync().map_err(ge)?;
+                        let k = match it {
+                            Item::PreAttn(_) | Item::PreFfn(_) => "win.mhc",
+                            Item::Kda(_) => "win.kda",
+                            Item::Dsa(_) => "win.dsa",
+                            Item::Ffn(_) => "win.moe",
+                            Item::Head => "win.head",
+                        };
+                        prof_add(k, t0.elapsed().as_secs_f64());
+                        // the routed experts' union over the t rows (one line per layer)
+                        if let (Item::Ffn(l), true) = (it, std::env::var("TANG_GLM5_WIN_PROF_UNION").is_ok_and(|v| v == "1")) {
+                            if let Some(m) = g.layers[*l].as_ref().filter(|m| m.exps.is_some()) {
+                                let nr = m.p.top_k;
+                                if let Some(ids) = super::super::moe::gpu::last_route_ids(&g.devs[0].1, t * nr)? {
+                                    let mut u = ids.clone();
+                                    u.sort_unstable();
+                                    u.dedup();
+                                    eprintln!("prof union l{l} t {t}: {} distinct of {} routed", u.len(), t * nr);
+                                    prof_add("win.moe_union", u.len() as f64 / (t * nr) as f64);
+                                }
+                            }
+                        }
+                    }
                 }
                 if !res.wwarm.contains(&t) {
                     res.wwarm.push(t);
@@ -666,6 +694,49 @@ impl Glm5Engine {
         }
         self.tokens.truncate(pos);
         Ok(())
+    }
+
+    /// The LM head's greedy id for each normed row of `hn` (`[t][n]`, already normed), on
+    /// the device head (q8 + gemv8 + `rs_argmax` per row: the t=1 head numerics); one
+    /// upload, one sync, `4 * t` bytes back. `None` without the device head or before the
+    /// resident state exists (the caller reads the logits back instead). The MTP drafter.
+    pub(crate) fn head_top(&self, hn: &[f32]) -> Result<Option<Vec<u32>>> {
+        let (n, nv) = (self.m.hp.n_embd, self.m.hp.n_vocab);
+        let Some(g) = self.gpu.as_ref() else { return Ok(None) };
+        let (Some(hd), Some(res)) = (g.head_dev.as_ref(), g.resident.as_ref()) else { return Ok(None) };
+        let Some(wb) = res.win.as_ref() else { return Ok(None) };
+        let t = hn.len() / n;
+        if t == 0 || t > wb.cap {
+            return Ok(None);
+        }
+        let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 head_top: {e}");
+        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        let s = &hd.s;
+        // the draft rows go through the window's h buffer (free between windows)
+        wb.hn.write_async(0, hn, s).map_err(ge)?;
+        let af = res.m.func("rs_argmax").map_err(ge)?;
+        for i in 0..t {
+            let xi = wb.hn.ptr + (i * n * 4) as u64;
+            unsafe {
+                launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![xi, hd.xq8.ptr, n as u32, 1u32])?;
+                launch(
+                    hd.k5.gemv8,
+                    (nv.div_ceil(K5_WARPS) as u32, 1, 1),
+                    (128, 1, 1),
+                    (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                    s,
+                    args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr, nv as u32, 1u32, nv as u32, n as u32],
+                )?;
+                let (lg, nvi, tp, inc) = (hd.out.ptr, nv as i32, wb.ids.ptr + 4 * i as u64, 0i32);
+                launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![lg, nvi, tp, inc])?;
+            }
+        }
+        s.sync().map_err(ge)?;
+        let ids = wb.ids.read::<u32>(0, t).map_err(ge)?;
+        if prof_on() {
+            prof_add("draft.head_top", 0.0);
+        }
+        Ok(Some(ids))
     }
 
     /// Drop the captured step segments (any host window: it may reallocate their scratch).
@@ -825,6 +896,41 @@ fn step_whole(
     Ok(Some(t))
 }
 
+/// `TANG_GLM5_RES_KDA_ROWS=1` (default off): the window's KDA layers batch their
+/// projections over the t rows (`DevLayer::rows_enqueue`). Measured SLOWER on the B300
+/// (13.5 vs 6.9 ms of KDA per t=3 window: the t>1 projection / gate kernels are not the
+/// tuned t=1 ones) and not bit-identical; off = the per-row t=1 decodes (= plain decode).
+fn kda_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TANG_GLM5_RES_KDA_ROWS").is_ok_and(|v| v == "1"))
+}
+
+/// `TANG_GLM5_WIN_PROF=1`: the resident window runs eagerly with a sync around every item
+/// and the MTP draft times its stages; [`prof_report`] prints per-stage ms per call.
+pub(crate) fn prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TANG_GLM5_WIN_PROF").is_ok_and(|v| v == "1"))
+}
+
+static PROF: std::sync::Mutex<Vec<(&'static str, f64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Accumulate `secs` under `k` (one call).
+pub(crate) fn prof_add(k: &'static str, secs: f64) {
+    let mut p = PROF.lock().unwrap();
+    match p.iter_mut().find(|e| e.0 == k) {
+        Some(e) => {
+            e.1 += secs;
+            e.2 += 1;
+        }
+        None => p.push((k, secs, 1)),
+    }
+}
+
+/// The accumulated stages: `name total_ms calls`, one line each.
+pub(crate) fn prof_report() -> String {
+    PROF.lock().unwrap().iter().map(|(k, s, c)| format!("prof {k}: {:.2} ms total, {c} calls\n", s * 1e3)).collect()
+}
+
 /// One [`Item`] of [`Glm5Engine::window_resident`] (t rows) on `s`. `Pass` as for
 /// [`exec`]: `Capture` records (KDA enqueues its kernels instead of its own graph), a DSA
 /// item is the segment boundary (`HostOnly`: its mHC post; `Replay`: its device work).
@@ -854,11 +960,18 @@ fn wexec(
     let capture = pass == Pass::Capture;
     match it {
         Item::PreAttn(l) => {
-            let dst = if hp.is_kda[l] { wb.kx.ptr } else { g.mla_p[l].as_ref().context("mla not resident")?.x_ptr(t)? };
+            let dst = if hp.is_kda[l] {
+                if kda_rows() { g.kda_l[l].as_ref().context("kda not resident")?.x_ptr() } else { wb.kx.ptr }
+            } else { g.mla_p[l].as_ref().context("mla not resident")?.x_ptr(t)? };
             f.pre_dev(g.mhc_g[l].as_ref().context("mhc not resident")?, l, 0, dst)?;
         }
         Item::Kda(l) => {
             let k = g.kda_l[l].as_mut().context("kda not resident")?;
+            if kda_rows() {
+                let ck = wb.ck[l].as_ref().map(|b| (b.ptr, wb.ck_bytes[l]));
+                k.rows_enqueue(s, t, ck)?;
+                return f.post_dev(k.y_ptr());
+            }
             let regs = k.state_regions(0);
             for i in 0..t {
                 d2d(k.x_ptr(), wb.kx.ptr + (i * rb) as u64, rb, s).map_err(ge)?;

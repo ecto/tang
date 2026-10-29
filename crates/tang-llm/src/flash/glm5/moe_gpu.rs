@@ -532,6 +532,17 @@ pub fn ffn(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) ->
 /// The fast path's `ffn` without the sync: queued on `s`, `x` / `y` device-resident, so a
 /// caller that keeps the residual stream on the device (or captures a graph) pays no host
 /// round trip for the layer. Errors when `k.fast` is off (naive syncs internally).
+/// Debug: the routed expert ids of the last fast-path FFN (`n` u32s from the route
+/// scratch; the caller syncs its stream first). `None` before any routed call.
+pub fn last_route_ids(k: &Kernels, n: usize) -> Result<Option<Vec<u32>>> {
+    let pool = k.pool.borrow();
+    let Some(Some(b)) = pool.bufs.get(P_IDS) else { return Ok(None) };
+    if b.len < n * 4 {
+        return Ok(None);
+    }
+    Ok(Some(b.read::<u32>(0, n)?))
+}
+
 pub fn ffn_async(k: &Kernels, s: &Stream, m: &DevMoe, x: u64, y: u64, t_len: usize) -> Result<()> {
     ensure!(k.fast, "ffn_async: fast path only (TANG_GLM5_MOE=fast)");
     let mut pool = k.pool.borrow_mut();
