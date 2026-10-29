@@ -655,6 +655,18 @@ impl GpuModel {
         Ok(y)
     }
 
+    /// [`GpuModel::raw`] for the decode step's small bf16 linears on [`Kernels::gemv_bf16`]
+    /// (relaxed: summation order); `raw` itself under `DS_EXACT` or off the fast path.
+    fn raw_bf(&self, x: u64, t: usize, name: &str) -> Result<Buf> {
+        if !self.fast {
+            return self.raw(x, t, name);
+        }
+        let w = self.dw(name)?;
+        let y = self.fbuf(t * w.v.rows as usize)?;
+        self.k.gemv_bf16(&self.s, &w.v, x, y.ptr, t)?;
+        Ok(y)
+    }
+
     fn rms(&self, x: Buf, rows: usize, name: &str) -> Result<()> {
         let w = self.dw(name)?;
         self.k
@@ -1544,8 +1556,8 @@ impl GpuModel {
             self.rms(kv, t, &norm)?;
             kv
         } else {
-            let kv = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
-            let sc = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
+            let kv = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+            let sc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
             let (kst, sst) = {
                 let (a, bb) = &self.cst[&lid];
                 (b(a), b(bb))
