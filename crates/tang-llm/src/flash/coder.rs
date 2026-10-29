@@ -925,7 +925,12 @@ impl Coder {
         let eps = hp.eps;
 
         // Where a two-GPU split cuts the layer list (`TANG_SPLIT_AT`, or the balanced point).
-        let split_at = split_point(&g, &hp);
+        // One GPU loads every layer.
+        let split_at = if super::split::gpus() == 2 && hp.n_layer > 1 {
+            split_point(&g, &hp)
+        } else {
+            hp.n_layer
+        };
 
         let dev = CudaComputeDevice::new().map_err(|e| anyhow!("CUDA: {e:?}"))?;
         let gpu = Gpu {
