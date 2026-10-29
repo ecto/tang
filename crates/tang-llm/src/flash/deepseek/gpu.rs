@@ -693,6 +693,9 @@ impl Kernels {
         k: usize,
         ne: usize,
     ) -> Result<()> {
+        if ne > 512 {
+            bail!("route: ne {ne} > 512");
+        }
         let (ti, ki, nei) = (t as i32, k as i32, ne as i32);
         unsafe {
             self.go(
@@ -3031,6 +3034,52 @@ mod tests {
         );
     }
 
+    /// `gemv_bf16` against the exact `linear` at the router's real shape: relaxed order only.
+    #[test]
+    fn router_gemv_matches_linear() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (ne, d) = (384usize, 5120usize);
+        let wb: Vec<u16> = data(ne * d, 5, 0.05)
+            .iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let wdev = DevBuf::from_slice(&wb).unwrap();
+        let w = DsW {
+            w: wdev.ptr,
+            s: 0,
+            rows: ne as i32,
+            cols: d as i32,
+            fmt: 1,
+            _pad: 0,
+        };
+        for t in [1usize, 6, 8] {
+            let x = DevBuf::from_slice(&data(t * d, 7, 1.0)).unwrap();
+            let (a, b) = (
+                DevBuf::alloc(t * ne * 4).unwrap(),
+                DevBuf::alloc(t * ne * 4).unwrap(),
+            );
+            k.linear(&s, &w, x.ptr, a.ptr, t, false).unwrap();
+            k.gemv_bf16(&s, &w, x.ptr, b.ptr, t).unwrap();
+            s.sync().unwrap();
+            let (a, b) = (
+                a.read::<f32>(0, t * ne).unwrap(),
+                b.read::<f32>(0, t * ne).unwrap(),
+            );
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = a
+                .iter()
+                .zip(&b)
+                .fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+            assert!(
+                err <= 1e-5 * scale.max(1.0),
+                "t {t}: err {err} scale {scale}"
+            );
+        }
+    }
+
     /// One layer's routed MoE by the grouped kernels at the real shapes (384 experts, top-6,
     /// d = 5120, inter = 2304, fp4) with random weights: plan, GU, h quant, down, reduce
     /// (manual: `--ignored --nocapture moe_grouped_bench`). Bytes = the live experts' weights
@@ -4437,6 +4486,9 @@ mod tests {
         };
         time("gate", &|| {
             k.linear(&s, &w, x.ptr, raw.ptr, t, false).unwrap();
+        });
+        time("gate_gemv", &|| {
+            k.gemv_bf16(&s, &w, x.ptr, raw.ptr, t).unwrap();
         });
         time("ds_router", &|| {
             k.router(

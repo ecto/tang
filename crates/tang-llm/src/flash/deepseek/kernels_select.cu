@@ -189,26 +189,48 @@ extern "C" __global__ void ds_idx_cat(int* dst, const int* src, int t, int k, in
 
 // MoE routing lists, one block: ids/wts [t][k] -> per-expert CSR, rows ascending within an
 // expert: counts[ne], off[ne + 1], rows[t * k] (token), rw[t * k] (route weight).
+#define ROUTE_NE 512  // experts at most for ds_route (256 threads, 2 each)
+// ds_route's body for one block of 256 threads: counts in shared memory and a block scan for the
+// offsets (the old serial prefix over ne global reads was ~15 µs alone), then the stable fill.
 __device__ __forceinline__ void route_body(const int* ids, const float* wts, int* counts, int* off, int* rows,
                                            float* rw, int t, int k, int ne) {
-    int n = t * k;
-    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+    __shared__ int sc[ROUTE_NE];
+    __shared__ int wsum[8];
+    int n = t * k, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    for (int e = tid; e < ne; e += blockDim.x) {
         int c = 0;
         for (int i = 0; i < n; i++) c += ids[i] == e;
+        sc[e] = c;
         counts[e] = c;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        int s = 0;
-        for (int e = 0; e < ne; e++) {
-            off[e] = s;
-            s += counts[e];
-        }
-        off[ne] = s;
+    // each thread owns ROUTE_NE / 256 consecutive experts: local sums, warp scan, block offsets
+    const int per = ROUTE_NE / 256;
+    int e0 = tid * per, loc = 0;
+    for (int j = 0; j < per; j++) loc += e0 + j < ne ? sc[e0 + j] : 0;
+    int inc = loc;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int u = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += u;
     }
+    if (lane == 31) wsum[wid] = inc;
     __syncthreads();
-    for (int e = threadIdx.x; e < ne; e += blockDim.x) {
+    int base = 0;
+    for (int q = 0; q < wid; q++) base += wsum[q];
+    int run = base + inc - loc;
+    for (int j = 0; j < per; j++) {
+        int e = e0 + j;
+        if (e < ne) {
+            off[e] = run;
+            run += sc[e];
+        }
+    }
+    if (tid == 255) off[ne] = run;
+    __syncthreads();
+    for (int e = tid; e < ne; e += blockDim.x) {
         int o = off[e];
+        if (!sc[e]) continue;
         for (int i = 0; i < n; i++)
             if (ids[i] == e) {
                 rows[o] = i / k;

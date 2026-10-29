@@ -282,6 +282,9 @@ pub struct GpuModel {
     /// The shared expert folded into the grouped K-split launches at t <= 8 (`DS_MOE_SH=0`
     /// keeps its own MLP; never under `DS_EXACT=1`).
     pub moe_sh: bool,
+    /// The router's gate GEMV in `ds_linear_t8`'s bit-exact order (`DS_ROUTER_EXACT=1`; also
+    /// under `DS_EXACT=1`); otherwise [`Kernels::gemv_bf16`].
+    pub router_exact: bool,
     /// Set by the forward loop: the next block's prefix when it reads this block's stream
     /// as is, so the last post-mix also computes its attention mixes (`pend_mixes`).
     next_hc: Option<String>,
@@ -476,6 +479,7 @@ impl GpuModel {
             sh: Cell::new(None),
             zero_rows: DevBuf::from_slice(&vec![0f32; 8 * c.dim])?,
             moe_sh: std::env::var("DS_MOE_SH").map_or(true, |v| v != "0"),
+            router_exact: std::env::var("DS_ROUTER_EXACT").is_ok_and(|v| v == "1"),
             next_hc: None,
             pend_mixes: None,
             pend_stage: None,
@@ -1979,7 +1983,14 @@ impl GpuModel {
             self.end(s);
         } else {
             let s = self.span("router");
-            let raw = self.raw(x.ptr, t, &format!("{p}.ffn.gate.weight"))?;
+            // the gate GEMV in a relaxed order unless DS_EXACT / DS_ROUTER_EXACT=1
+            let raw = if self.k.exact || self.router_exact {
+                self.raw(x.ptr, t, &format!("{p}.ffn.gate.weight"))?
+            } else {
+                let raw = self.fbuf(t * ne)?;
+                self.k.gemv_bf16(&self.s, &gw.v, x.ptr, raw.ptr, t)?;
+                raw
+            };
             self.k.router(
                 &self.s,
                 raw.ptr,
