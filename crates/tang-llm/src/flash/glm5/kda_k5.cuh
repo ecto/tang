@@ -119,6 +119,55 @@ extern "C" __global__ void __launch_bounds__(128) k5_gemv8(
     if (t >= (int)T) return;
     const unsigned char* xrow = xq + (size_t)t * COLS;
 
+    // Direct path (NOTES 2026-10-28 kda4): no shared staging. Each lane reads its own
+    // 8 codes per step straight from global as aligned u32 words (+ the block's d word),
+    // U steps' words issued before any dp4a. Same e0 = lane*8 + 256i walk, same
+    // dp4a(w0, dp4a(w1, 0)) and fmaf chain and xor tree: bit-equal to the staged path.
+    // Needs 4-byte-aligned rows (row_bytes % 4 == 0, base % 4 == 0); the dynamic smem
+    // the launchers still pass goes unused. TANG-side switch: none (always on when aligned).
+    if (((rb | (unsigned)mbase) & 3u) == 0u && (COLS & 255u) == 0u) {
+        const unsigned row = blockIdx.x * K5_WARPS + warp;
+        if (row >= ROWS) return;
+        const unsigned char* src = (const unsigned char*)(mbase + (unsigned long long)row * rb);
+        const float* xdt = xd + (size_t)t * (COLS / 32);
+        const int k = lane & 3;
+        const int nst = (int)(COLS >> 8);
+        float acc = 0.f;
+        constexpr int U = 8;
+        for (int i0 = 0; i0 < nst; i0 += U) {
+            unsigned wdw[U], u0[U], u1[U], u2[U];
+#pragma unroll
+            for (int j = 0; j < U; j++) {
+                if (i0 + j < nst) {
+                    const unsigned b = (unsigned)(lane >> 2) + 8u * (unsigned)(i0 + j);
+                    const unsigned od = 34u * b, oq = od + 2u + 8u * (unsigned)k;
+                    const unsigned* pq = (const unsigned*)(src + (oq & ~3u));
+                    wdw[j] = __ldcs((const unsigned*)(src + (od & ~3u)));
+                    u0[j] = __ldcs(pq);
+                    u1[j] = __ldcs(pq + 1);
+                    u2[j] = (oq & 3u) ? __ldcs(pq + 2) : 0u;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < U; j++) {
+                if (i0 + j >= nst) break;
+                const int e0 = lane * 8 + 256 * (i0 + j);
+                const unsigned b = (unsigned)(e0 >> 5);
+                const unsigned sh = ((34u * b + 2u) & 3u) * 8u;
+                const float dw = g5_h2f((b & 1u) ? (wdw[j] >> 16) : (wdw[j] & 0xffffu));
+                const int w0 = (int)__funnelshift_r(u0[j], u1[j], sh);
+                const int w1 = (int)__funnelshift_r(u1[j], u2[j], sh);
+                const uint2 xv = *(const uint2*)(xrow + e0);
+                const float dx = xdt[e0 / 32];
+                const int s = __dp4a(w0, (int)xv.x, __dp4a(w1, (int)xv.y, 0));
+                acc = fmaf(dx * dw, k5_i2f(s), acc);
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) y[(unsigned long long)t * ystride + row] = acc;
+        return;
+    }
+
     {
         const unsigned row = blockIdx.x * K5_WARPS + warp;
         if (row >= ROWS) return;
@@ -183,50 +232,77 @@ __device__ __forceinline__ uint4 k5_ldnc(const uint4* p) {
 // the low half of word 8), every word of the row issued up front (ld.global.cs). Same
 // per-block integer dot, same fmaf chain over i and xor tree: bit-equal to the staged
 // kernel. Word 8 of an even b never runs past the row: rb % 16 == 0 (host-checked).
-template <int K5Q_MAXNB>
-__device__ __forceinline__ void k5_qgemv_body(
+// R rows a warp (TANG_GLM5_KDA_QR2=1: R = 2, flagged by bit 31 of nseg so the launch
+// signature and the kernel names stay): rows 2p, 2p+1 of a segment share each lane's
+// activation loads (x codes + xd), every word of both rows issued before any dp4a. Each
+// row's chain is the R = 1 chain verbatim (same blocks, same order): bit-equal.
+template <int K5Q_MAXNB, int R>
+__device__ __forceinline__ void k5_qgemv_body_r(
     const K5Seg* __restrict__ segs, unsigned nseg, const unsigned char* __restrict__ xq,
     const float* __restrict__ xd, unsigned COLS) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
     unsigned g = blockIdx.x * nw + warp;
     unsigned s = 0;
     for (; s < nseg; s++) {
-        if (g < segs[s].rows) break;
-        g -= segs[s].rows;
+        const unsigned rr = (segs[s].rows + R - 1) / R;
+        if (g < rr) break;
+        g -= rr;
     }
     if (s >= nseg) return;
+    g *= R;
     const int nb = (int)(COLS >> 5);
-    const unsigned char* row = (const unsigned char*)(segs[s].base + (unsigned long long)g * segs[s].row_bytes);
-    unsigned wd[K5Q_MAXNB][9];
+    unsigned wd[R][K5Q_MAXNB][9];
 #pragma unroll
-    for (int i = 0; i < K5Q_MAXNB; i++) {
-        const int b = lane + 32 * i;
-        if (b < nb) {
-            const unsigned* p = (const unsigned*)(row + ((34u * (unsigned)b) & ~3u));
+    for (int r = 0; r < R; r++) {
+        const bool live = g + r < segs[s].rows;
+        const unsigned char* row = (const unsigned char*)(segs[s].base + (unsigned long long)(g + r) * segs[s].row_bytes);
 #pragma unroll
-            for (int j = 0; j < 9; j++) wd[i][j] = __ldcs(p + j);
+        for (int i = 0; i < K5Q_MAXNB; i++) {
+            const int b = lane + 32 * i;
+            if (live && b < nb) {
+                const unsigned* p = (const unsigned*)(row + ((34u * (unsigned)b) & ~3u));
+#pragma unroll
+                for (int j = 0; j < 9; j++) wd[r][i][j] = __ldcs(p + j);
+            }
         }
     }
-    float acc = 0.f;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.f;
 #pragma unroll
     for (int i = 0; i < K5Q_MAXNB; i++) {
         const int b = lane + 32 * i;
         if (b >= nb) break;
         const bool odd = b & 1;
-        const float dw = g5_h2f(odd ? (wd[i][0] >> 16) : (wd[i][0] & 0xffffu));
-        int w[8];
-#pragma unroll
-        for (int j = 0; j < 8; j++) w[j] = odd ? (int)wd[i][j + 1] : (int)__funnelshift_r(wd[i][j], wd[i][j + 1], 16);
         const int4* xv = (const int4*)(xq + 32 * b);
         const int4 x0 = __ldg(xv), x1 = __ldg(xv + 1);
-        int si = __dp4a(w[0], x0.x, 0);
-        si = __dp4a(w[1], x0.y, si); si = __dp4a(w[2], x0.z, si); si = __dp4a(w[3], x0.w, si);
-        si = __dp4a(w[4], x1.x, si); si = __dp4a(w[5], x1.y, si); si = __dp4a(w[6], x1.z, si);
-        si = __dp4a(w[7], x1.w, si);
-        acc = fmaf(xd[b] * dw, k5_i2f(si), acc);
+        const float xdb = xd[b];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const float dw = g5_h2f(odd ? (wd[r][i][0] >> 16) : (wd[r][i][0] & 0xffffu));
+            int w[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) w[j] = odd ? (int)wd[r][i][j + 1] : (int)__funnelshift_r(wd[r][i][j], wd[r][i][j + 1], 16);
+            int si = __dp4a(w[0], x0.x, 0);
+            si = __dp4a(w[1], x0.y, si); si = __dp4a(w[2], x0.z, si); si = __dp4a(w[3], x0.w, si);
+            si = __dp4a(w[4], x1.x, si); si = __dp4a(w[5], x1.y, si); si = __dp4a(w[6], x1.z, si);
+            si = __dp4a(w[7], x1.w, si);
+            acc[r] = fmaf(xdb * dw, k5_i2f(si), acc[r]);
+        }
     }
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-    if (lane == 0) ((float*)segs[s].y)[g] = acc;
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        float a = acc[r];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0 && g + r < segs[s].rows) ((float*)segs[s].y)[g + r] = a;
+    }
+}
+template <int K5Q_MAXNB>
+__device__ __forceinline__ void k5_qgemv_body(
+    const K5Seg* __restrict__ segs, unsigned nseg, const unsigned char* __restrict__ xq,
+    const float* __restrict__ xd, unsigned COLS) {
+    if (nseg & 0x80000000u) k5_qgemv_body_r<K5Q_MAXNB, 2>(segs, nseg & 0x7fffffffu, xq, xd, COLS);
+    else k5_qgemv_body_r<K5Q_MAXNB, 1>(segs, nseg, xq, xd, COLS);
 }
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv9(const K5Seg* segs, unsigned nseg,
     const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<5>(segs, nseg, xq, xd, COLS); }

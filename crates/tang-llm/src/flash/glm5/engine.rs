@@ -752,6 +752,9 @@ pub struct Glm5Engine {
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
     pub verbose: bool,
+    /// set by [`Glm5Engine::prefill_slot`]: a prefill window needs only its last row's
+    /// logits, so the device head runs once (not t times) and the window returns that row.
+    prefill_last: bool,
     /// CPU DSA path: round the latent cache to bf16 (the GPU cache's format), so a CPU
     /// engine is the like-for-like oracle of the GPU MLA path (tests).
     pub(crate) bf16_latents: bool,
@@ -808,6 +811,7 @@ impl Glm5Engine {
             mla_wkv: (0..nl).map(|_| None).collect(),
             head: None,
             verbose: false,
+            prefill_last: false,
             bf16_latents: false,
             dump: super::dump::DumpSink::open(),
             #[cfg(feature = "cuda")]
@@ -1682,14 +1686,15 @@ impl Glm5Engine {
             // same (q8-activation) head numerics as the t=1 decode it replaces
             Some(g) => {
                 let (n, nv) = (self.m.hp.n_embd, self.m.hp.n_vocab);
-                let mut all = Vec::with_capacity(t * nv);
-                for i in 0..t {
+                let r0 = if self.prefill_last { t - 1 } else { 0 };
+                let mut all = Vec::with_capacity((t - r0) * nv);
+                for i in r0..t {
                     match g.head_logits(&h[i * n..(i + 1) * n], n, nv)? {
                         Some(l) => all.extend_from_slice(&l),
                         None => break,
                     }
                 }
-                (all.len() == t * nv).then_some(all)
+                (all.len() == (t - r0) * nv).then_some(all)
             }
             None => None,
         };
@@ -1715,7 +1720,7 @@ impl Glm5Engine {
             d.finish(
                 &toks,
                 &h[last_row * n..(last_row + 1) * n],
-                &logits[(t - 1) * hp.n_vocab..t * hp.n_vocab],
+                &logits[logits.len() - hp.n_vocab..],
                 hp.n_vocab,
             )?;
         }
@@ -1879,10 +1884,19 @@ impl Glm5Engine {
         ensure!(!ids.is_empty(), "empty prompt");
         let nv = self.m.hp.n_vocab;
         let mut last = Vec::new();
+        self.prefill_last = true;
         for c in ids.chunks(chunk.max(1)) {
-            let lg = self.window_slot(slot, c)?;
-            last = lg[(c.len() - 1) * nv..].to_vec();
+            let lg = self.window_slot(slot, c);
+            let lg = match lg {
+                Ok(l) => l,
+                Err(e) => {
+                    self.prefill_last = false;
+                    return Err(e);
+                }
+            };
+            last = lg[lg.len() - nv..].to_vec();
         }
+        self.prefill_last = false;
         Ok(argmax(&last))
     }
 

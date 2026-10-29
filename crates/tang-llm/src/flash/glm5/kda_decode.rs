@@ -102,8 +102,14 @@ pub struct Fast {
 
 impl Fast {
     pub fn new(g: &Gpu, cfg: &super::KdaConfig) -> Result<Self> {
+        // TANG_GLM5_KDA_NORM=exact: k5d_tail's serial f64 norm chain (default: f64 tree)
+        let norm = if std::env::var("TANG_GLM5_KDA_NORM").is_ok_and(|v| v == "exact") {
+            "#define K5D_NORM_EXACT 1"
+        } else {
+            ""
+        };
         let src = format!(
-            "{}\n{}\n{}",
+            "{norm}\n{}\n{}\n{}",
             super::super::kda_cuda::prelude(cfg),
             super::super::moe::SRC,
             include_str!("kda_decode.cuh")
