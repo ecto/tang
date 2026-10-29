@@ -328,6 +328,14 @@ impl DevLayer {
         };
         // the Q8_0 kernels stage nothing (kda_k5.cuh): 4 warps a block, no shared memory
         let (nw, smem) = if rb as usize == cols / 256 * 144 { (nw, nw as u32 * rb) } else { (4, 0) };
+        // two rows a warp on k5_qgemv9 (bit 31 of nseg; every segment's rows are even here:
+        // di, hd), same per-row chains: B300 23.4 -> 22.1 us. Not on k5_qgemv17 (o_proj:
+        // 11.8 -> 12.7 us, 2 x 81 words a lane). TANG_GLM5_KDA_QR2=0: one row a warp.
+        static QR2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let qr2 = smem == 0
+            && rb as usize <= 9 * 32 * 16
+            && *QR2.get_or_init(|| !std::env::var("TANG_GLM5_KDA_QR2").is_ok_and(|v| v == "0"));
+        let (rows_total, nseg) = if qr2 { (rows_total.div_ceil(2), nseg as u32 | 0x8000_0000) } else { (rows_total, nseg as u32) };
         tang_moe::gpu::trace::bytes(bytes);
         unsafe {
             launch(
@@ -336,7 +344,7 @@ impl DevLayer {
                 ((32 * nw) as u32, 1, 1),
                 smem,
                 s,
-                args![tab.ptr, nseg as u32, codes, scales, cols as u32],
+                args![tab.ptr, nseg, codes, scales, cols as u32],
             )?;
         }
         Ok(())
