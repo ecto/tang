@@ -1488,7 +1488,7 @@ impl Glm5Engine {
     fn mhc_pre(
         &self,
         l: usize,
-        _block: usize,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] block: usize,
         w: &super::mhc::MhcWeights,
         r: &[f32],
         t: usize,
@@ -2614,7 +2614,8 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     }
     // TANG_GLM5_LOGITS_DUMP=path: the f32 logits of every decode step (device LM head,
     // TANG_GLM5_GPU_HEAD=1), n_vocab floats each, appended in order (numerics A/B)
-    let dump = match std::env::var("TANG_GLM5_LOGITS_DUMP") {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut dump = match std::env::var("TANG_GLM5_LOGITS_DUMP") {
         Ok(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
         Err(_) => None,
     };
