@@ -799,6 +799,43 @@ impl Glm5Engine {
         Ok(Some(ids))
     }
 
+    /// After a resident decode step ([`Self::step_resident`]): the device pointers of its
+    /// greedy token (`Resident::tok[0]`) and its normed h row (the device head's input).
+    pub(crate) fn step_out_ptrs(&self) -> Option<(u64, u64)> {
+        let g = self.gpu.as_ref()?;
+        Some((g.resident.as_ref()?.tok.ptr, g.head_dev.as_ref()?.xf.ptr))
+    }
+
+    /// The last resident step's normed h row, read back (the host drafter's fallback).
+    pub(crate) fn step_h_read(&self) -> Result<Option<Vec<f32>>> {
+        let Some(g) = self.gpu.as_ref() else { return Ok(None) };
+        let Some(hd) = g.head_dev.as_ref() else { return Ok(None) };
+        Ok(Some(hd.xf.read::<f32>(0, self.m.hp.n_embd).map_err(|e| anyhow::anyhow!("step h: {e}"))?))
+    }
+
+    /// Order the next trunk launch (the fused mHC stream) after `ev`.
+    pub(crate) fn trunk_wait(&self, ev: &tang_moe::gpu::Event) -> Result<()> {
+        if let Some(f) = self.gpu.as_ref().and_then(|g| g.mhc_f.as_ref()) {
+            f.stream().wait(ev).map_err(|e| anyhow::anyhow!("trunk wait: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// After a resident step: copy its greedy token and normed h row into `dst` (`[tok u32]`
+    /// then `[h f32; n]`) ON the trunk stream (in order: the next step cannot overwrite them
+    /// first), and return an event recorded after the copy.
+    pub(crate) fn step_out_stage(&self, dst_tok: u64, dst_h: u64) -> Result<Option<tang_moe::gpu::Event>> {
+        let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("step stage: {e}");
+        let Some((tp, hp)) = self.step_out_ptrs() else { return Ok(None) };
+        let Some(f) = self.gpu.as_ref().and_then(|g| g.mhc_f.as_ref()) else { return Ok(None) };
+        let s = f.stream();
+        tang_moe::gpu::copy_d2d_async(dst_tok, tp, 4, s).map_err(ge)?;
+        tang_moe::gpu::copy_d2d_async(dst_h, hp, self.m.hp.n_embd * 4, s).map_err(ge)?;
+        let ev = tang_moe::gpu::Event::new(false).map_err(ge)?;
+        ev.record(s).map_err(ge)?;
+        Ok(Some(ev))
+    }
+
     /// The last resident window's device outputs: (argmax ids `[t]` u32, normed h `[t][n]`).
     pub(crate) fn window_out_ptrs(&self) -> Option<(u64, u64)> {
         let wb = self.gpu.as_ref()?.resident.as_ref()?.win.as_ref()?;
@@ -1337,6 +1374,13 @@ static GRAPH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// draft into `tp[0]`, advances `tp[1]`), and `hin <- hout` for the next chained cell. No
 /// host sync inside; the host only keeps the cache watermarks. Graphs `[dense, sparse]`.
 pub(crate) struct DraftCell {
+    /// The cell's own MoE kernels (their scratch pool is private: a cell may run
+    /// concurrently with a trunk step, `run`'s `after`).
+    mk: super::super::moe::gpu::Kernels,
+    stage_t: DevBuf,
+    stage_h: DevBuf,
+    stage_i: usize,
+    warm: bool,
     own_head: Option<super::super::moe::gpu::DevW>,
     m: Module,
     s: tang_moe::gpu::Stream,
@@ -1365,6 +1409,9 @@ pub(crate) struct DraftCell {
     /// What `tp[1]` holds on the device once the queued cells ran (`None`: unknown).
     dev_pos: Option<usize>,
 }
+
+/// [`DraftCell::stage_next`]'s ring length.
+const STAGE: usize = 8;
 
 /// `TANG_GLM5_MTP_CELL_DEV=0`: the drafter keeps the host-staged cell.
 pub(crate) fn cell_dev_on() -> bool {
@@ -1404,6 +1451,11 @@ impl DraftCell {
             None
         };
         Ok(Some(Self {
+            mk: super::super::moe::gpu::Kernels::new(gpu)?,
+            stage_t: DevBuf::zeroed_elems::<u32>(STAGE).map_err(ge)?,
+            stage_h: DevBuf::zeroed_elems::<f32>(STAGE * n).map_err(ge)?,
+            stage_i: 0,
+            warm: false,
             own_head,
             m: gpu.module(SRC).map_err(ge)?,
             s: tang_moe::gpu::Stream::blocking().map_err(ge)?,
@@ -1436,6 +1488,15 @@ impl DraftCell {
 
     pub(crate) fn stream(&self) -> &tang_moe::gpu::Stream {
         &self.s
+    }
+
+    /// The next staging slot a concurrent observe reads (`[tok]`, `[h; n]`): a ring of
+    /// `STAGE` slots, so a later step's stage copy never overwrites a row a queued cell has
+    /// not read yet (a cell is ~0.5 ms GPU against a ~9 ms step).
+    pub(crate) fn stage_next(&mut self, n: usize) -> (u64, u64) {
+        let i = self.stage_i % STAGE;
+        self.stage_i += 1;
+        (self.stage_t.ptr + 4 * i as u64, self.stage_h.ptr + (i * n * 4) as u64)
     }
 
     /// The cell's launches on `s` (capturable).
@@ -1517,7 +1578,7 @@ impl DraftCell {
             launch(ad, addg, (256, 1, 1), 0, s, args![xp, y, ni2])?;
             launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w3, fx, ni, eps])?;
         }
-        super::super::moe::gpu::ffn_async(&g.devs[0].1, s, moe, fx, fy, 1)?;
+        super::super::moe::gpu::ffn_async(&self.mk, s, moe, fx, fy, 1)?;
         chk("ffn")?;
         let hq = self.hq8.ptr;
         let lg = self.logits.ptr;
@@ -1570,6 +1631,7 @@ impl DraftCell {
         c: &mut DsaCache,
         tok_h: Option<(u32, &[f32])>,
         dev_src: Option<(u64, u64)>,
+        after: Option<&tang_moe::gpu::Event>,
     ) -> Result<bool> {
         let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
         let g = e.gpu.as_ref().context("draft cell: no GPU")?;
@@ -1595,7 +1657,8 @@ impl DraftCell {
         }
         let sparse = !super::super::mla::indexer_is_dense(kv_len, w.topk);
         let sp = usize::from(sparse);
-        let eager = std::env::var("TANG_GLM5_MTP_CELL_EAGER").is_ok_and(|v| v == "1");
+        // the first cell runs eagerly: its private MoE pool allocates (not capturable)
+        let eager = std::env::var("TANG_GLM5_MTP_CELL_EAGER").is_ok_and(|v| v == "1") || !self.warm;
         if self.graphs[sp].is_none() && !eager {
             let me: &Self = self;
             let gr = tang_moe::gpu::Graph::capture(&me.s, |cs| {
@@ -1605,6 +1668,9 @@ impl DraftCell {
             self.graphs[sp] = Some(gr);
         }
         let s = &self.s;
+        if let Some(ev) = after {
+            s.wait(ev).map_err(ge)?;
+        }
         match tok_h {
             _ if dev_src.is_some() => {
                 // teacher-forced from device rows (the verify window's ids / hn)
@@ -1641,6 +1707,7 @@ impl DraftCell {
             self.graphs[sp].as_ref().unwrap().launch(s).map_err(ge)?;
         }
         self.replays += 1;
+        self.warm = true;
         self.dev_pos = Some(kv_len);
         c.lat16.resize(kv_len * dl, 0);
         c.idx_k.resize(kv_len * idd, 0.0);

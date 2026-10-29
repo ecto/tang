@@ -432,6 +432,13 @@ pub trait Drafter {
     fn observe_window(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<()> {
         self.observe(e, h, toks)
     }
+    /// [`Self::observe`] of ONE row whose token / h live on the device (after a plain
+    /// resident step): async; returns the event the next trunk launch must wait on, or
+    /// `None` when the drafter can't (the caller has no host row to fall back to).
+    #[cfg(feature = "cuda")]
+    fn observe_ptrs(&mut self, _e: &Glm5Engine, _tok: u64, _h: u64) -> Result<Option<tang_moe::gpu::Event>> {
+        Ok(None)
+    }
     /// After [`Self::draft_async`]: wait for and read its `n` ids (the host-window fallback).
     #[cfg(feature = "cuda")]
     fn async_ids(&mut self, _n: usize) -> Result<Vec<u32>> {
@@ -462,7 +469,7 @@ impl MtpDrafter {
         let Some(cell) = d.cell.as_mut() else { return Ok(0) };
         e.gpu.as_ref().context("mtp: no GPU")?.dev0().0.bind().map_err(|er| anyhow::anyhow!("bind: {er}"))?;
         for (i, &tk) in toks.iter().enumerate() {
-            if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, Some((tk, &h[i * n..(i + 1) * n])), None)? {
+            if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, Some((tk, &h[i * n..(i + 1) * n])), None, None)? {
                 return Ok(i);
             }
         }
@@ -476,11 +483,11 @@ impl MtpDrafter {
         let keep = self.mtp.len();
         let d = self.mtp.dev.as_mut().context("mtp: no device block")?;
         let cell = d.cell.as_mut().context("mtp: no device cell")?;
-        let k = k.min(16);
+        let k = k.min(15);
         let mut got = 0usize;
         let tr = ProfT::new("draft.chain_enqueue");
         while got < k {
-            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None)? {
+            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None, None)? {
                 break;
             }
             tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
@@ -528,10 +535,10 @@ impl Drafter for MtpDrafter {
         let keep = self.mtp.len();
         let d = self.mtp.dev.as_mut().context("mtp: no device block")?;
         let cell = d.cell.as_mut().context("mtp: no device cell")?;
-        let k = k.min(16);
+        let k = k.min(15);
         let mut got = 0usize;
         while got < k {
-            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None)? {
+            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None, None)? {
                 break;
             }
             tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
@@ -545,6 +552,24 @@ impl Drafter for MtpDrafter {
     }
 
     #[cfg(feature = "cuda")]
+    fn observe_ptrs(&mut self, e: &Glm5Engine, _tok: u64, _h: u64) -> Result<Option<tang_moe::gpu::Event>> {
+        if !self.dev_last {
+            return Ok(None);
+        }
+        let n = self.mtp.n;
+        let Some(d) = self.mtp.dev.as_mut() else { return Ok(None) };
+        let Some(cell) = d.cell.as_mut() else { return Ok(None) };
+        // the step's outputs staged on the trunk stream; the cell runs concurrently with the
+        // next trunk launch (own MoE pool, own MLA caches): the trunk never waits for it
+        let (st, sh) = cell.stage_next(n);
+        let Some(ev) = e.step_out_stage(st, sh)? else { return Ok(None) };
+        if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, Some((st, sh)), Some(&ev))? {
+            return Ok(None);
+        }
+        Ok(Some(ev))
+    }
+
+    #[cfg(feature = "cuda")]
     fn observe_window(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<()> {
         let n = self.mtp.n;
         let ptrs = e.window_out_ptrs();
@@ -554,7 +579,7 @@ impl Drafter for MtpDrafter {
                 let _t = ProfT::new("draft.observe_window");
                 for i in 0..toks.len() {
                     let src = (ip + 4 * i as u64, hp + (i * n * 4) as u64);
-                    if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, Some(src))? {
+                    if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, Some(src), None)? {
                         self.dev_last = false;
                         return self.observe(e, &h[i * n..], &toks[i..]);
                     }
@@ -636,6 +661,9 @@ pub struct Stats {
     pub res_rewinds: usize,
     /// passes whose draft cells and verify window ran chained (one host wake)
     pub chained: usize,
+    /// `--mtp auto`: plain resident steps taken (K = 0) and passes per K
+    pub plain_steps: usize,
+    pub auto_picks: Vec<usize>,
     /// the prompt's teacher-forced draft cells (once, after the prefill)
     pub observe0_s: f64,
     pub rewind_s: f64,
@@ -664,6 +692,9 @@ impl Stats {
             self.draft_s,
             self.trunk_s
         );
+        if !self.auto_picks.is_empty() {
+            s += &format!("mtp: auto K picks (K=0..): {:?}; {} plain steps\n", self.auto_picks, self.plain_steps);
+        }
         if self.res_windows > 0 {
             s += &format!(
                 "mtp: resident verify: {} windows ({} chained), {} device rewinds ({:.3} ms each); trunk {:.2} ms/pass, draft {:.2} ms/pass; prompt cells {:.1} ms (prefill, not in draft)\n",
@@ -677,6 +708,74 @@ impl Stats {
             );
         }
         s
+    }
+}
+
+/// `--mtp auto` / `TANG_GLM5_MTP=auto`: [`generate`] picks K in `0..=cap` every pass.
+pub static AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The adaptive-K controller: EWMAs of the conditional acceptance per draft depth and of the
+/// wall ms of a pass per K (draft + verify + observe; K = 0 is a plain resident step + its
+/// observe cell). Each pass takes the K with the most expected tokens per ms,
+/// `(1 + sum_d prod_{j<=d} p_j) / cost_K`; untried K first, then one exploration pass of the
+/// stalest K every `EXPLORE` passes so the estimates follow the text.
+struct AutoK {
+    cap: usize,
+    p: Vec<f64>,
+    cost: Vec<Option<f64>>,
+    last: Vec<usize>,
+    pass: usize,
+    picks: Vec<usize>,
+    seen: Vec<usize>,
+}
+
+const EXPLORE: usize = 16;
+
+impl AutoK {
+    fn new(cap: usize) -> Self {
+        Self { cap, p: vec![0.7; cap], cost: vec![None; cap + 1], last: vec![0; cap + 1], pass: 0, picks: vec![0; cap + 1], seen: vec![0; cap + 1] }
+    }
+
+    fn expect(&self, k: usize) -> f64 {
+        let (mut e, mut q) = (1.0, 1.0);
+        for d in 0..k {
+            q *= self.p[d];
+            e += q;
+        }
+        e
+    }
+
+    fn pick(&mut self) -> usize {
+        self.pass += 1;
+        let k = if let Some(k) = (0..=self.cap).rev().find(|&k| self.cost[k].is_none()) {
+            k
+        } else if self.pass % EXPLORE == 0 {
+            (0..=self.cap).min_by_key(|&k| self.last[k]).unwrap()
+        } else {
+            (0..=self.cap)
+                .max_by(|&a, &b| {
+                    let r = |k: usize| self.expect(k) / self.cost[k].unwrap();
+                    r(a).partial_cmp(&r(b)).unwrap()
+                })
+                .unwrap()
+        };
+        self.last[k] = self.pass;
+        self.picks[k] += 1;
+        k
+    }
+
+    /// A pass of `k` drafts took `ms`; `a` drafts were accepted.
+    fn update(&mut self, k: usize, a: usize, ms: f64) {
+        let ew = |o: &mut Option<f64>, v: f64, al: f64| *o = Some(o.map_or(v, |x| x + al * (v - x)));
+        // a K's first pass pays its one-time graph captures / eager warm-up: not a sample
+        self.seen[k] += 1;
+        if self.seen[k] > 1 {
+            ew(&mut self.cost[k], ms, 0.3);
+        }
+        for d in 0..k.min(a + 1) {
+            let v = if d < a { 1.0 } else { 0.0 };
+            self.p[d] += 0.1 * (v - self.p[d]);
+        }
     }
 }
 
@@ -716,10 +815,46 @@ pub fn generate(
     dr.observe(e, &hs, &nexts)?;
     // the prompt's teacher-forced cells are prefill work: reported apart, not in draft_s
     st.observe0_s = td.elapsed().as_secs_f64();
+    let auto = AUTO.load(std::sync::atomic::Ordering::Relaxed);
+    let mut ak = AutoK::new(k);
+    #[cfg(feature = "cuda")]
+    let mut pending: Option<tang_moe::gpu::Event> = None;
     while gen.len() < n {
         let td = Instant::now();
         // never draft past n: the window is cur + drafts
-        let kk = k.min(n - gen.len());
+        let kk = if auto { ak.pick() } else { k }.min(n - gen.len());
+        let tp0 = td;
+        #[cfg(feature = "cuda")]
+        if let Some(ev) = pending.take() {
+            e.trunk_wait(&ev)?;
+        }
+        // K = 0: one plain resident step; the drafter observes its h / next token from the
+        // device (no host rows), ordered before the next trunk launch by `pending`
+        #[cfg(feature = "cuda")]
+        if kk == 0 {
+            let next = e.step(cur)?;
+            let ptrs = e.step_out_ptrs();
+            let ev = match ptrs {
+                Some((tp, hp)) => dr.observe_ptrs(e, tp, hp)?,
+                None => None,
+            };
+            match ev {
+                Some(_) => {}
+                None => {
+                    // the device cell can't take it (cache capacity): the host row
+                    let h = e.step_h_read()?.context("mtp auto: K=0 without a device head")?;
+                    dr.observe(e, &h, &[next])?;
+                }
+            }
+            st.plain_steps += 1;
+            gen.push(next);
+            st.tokens += 1;
+            cur = next;
+            let ms = td.elapsed().as_secs_f64() * 1e3;
+            st.trunk_s += ms / 1e3;
+            ak.update(0, 0, ms);
+            continue;
+        }
         // chained: the draft cells and the verify window enqueued back to back, one host wake
         #[cfg(feature = "cuda")]
         let mut pre: Option<(Vec<u32>, Vec<f32>)> = None;
@@ -791,6 +926,7 @@ pub fn generate(
             cur = *new.last().unwrap();
             gen.extend_from_slice(&new);
             st.tokens += new.len();
+            ak.update(drafts.len(), a, tp0.elapsed().as_secs_f64() * 1e3);
             continue;
         }
         let snap = e.snapshot()?;
@@ -851,6 +987,9 @@ pub fn generate(
     gen.truncate(n);
     // the last window may run past n; count only the kept tokens
     st.tokens = gen.len() - 1;
+    if auto {
+        st.auto_picks = ak.picks.clone();
+    }
     Ok((gen, st))
 }
 

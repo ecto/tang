@@ -4,6 +4,41 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 — MTP round 6: `--mtp auto` (adaptive K) does NOT beat the best fixed K; MoE window grouping not done (branch claude/glm5-mtp-win)
+
+Built (mtp.rs `AutoK`, `--mtp auto` / `TANG_GLM5_MTP=auto`, cap 3): EWMA conditional acceptance
+per depth (alpha 0.1) and EWMA wall ms per pass per K (alpha 0.3, each K's first pass ignored:
+captures), pick argmax (1 + sum prod p) / cost, untried K first, the stalest K every 16
+passes. K = 0 is a plain resident step (`step` / whole-step graph) whose drafter observe runs
+CONCURRENTLY: the step's token + normed h (`Resident::tok`, the device head's `xf`) are staged
+D2D on the trunk stream into a ring (`DraftCell::stage_next`, 8 slots), the cell stream waits
+an event and runs the cell with its own MoE `Kernels` (private scratch pool; first cell eager
+to allocate it) — the trunk never waits for it.
+
+B300, bench prompt; tok/s = tokens / ((trunk + draft) ms/pass x verify passes) from the
+report lines (K=0 steps are inside trunk_s); mew `flash::glm5` 87 passed / 0 failed; plain this pod 100.80 (-n 128) / 115.26 (-n 512):
+
+| run | -n | picks K=0/1/2/3 | trunk+draft ms/pass | tok/s | ids |
+|---|---|---|---|---|---|
+| K=1 | 128 | | 13.87+1.06 (67 passes) | 127.0 | 7174cdd6 |
+| K=2 | 128 | | 17.92+1.96 (51) | 125.3 | 7174cdd6 |
+| auto | 128 | 3/57/3/4 | 16.72+1.23 (64) | 110.5 | 7174cdd6 |
+| K=1 | 512 | | 15.01+1.04 (283) | 112.5 | 1453cf0e |
+| K=2 | 512 | | 19.14+1.84 (229) | 106.4 | 1453cf0e |
+| auto | 512 | 7/155/92/8 | 17.32+1.38 (255) | 107.2 | 1453cf0e |
+
+(the first auto version, alpha 0.2 / explore 24 / first samples kept: 112.6 / 107.5.) Gates:
+haiku `--mtp auto` and `--mtp 2` = oracle; every run's ids = plain. Targets (>= 118 at 128,
+>= 114.9 at 512) NOT met by auto; fixed K=1 meets the -n 128 one (127.0) and misses -n 512
+(112.5 vs 115.3). Auto loses because K=1 vs K=2 vs K=0 are within ~5 % in expected tok/ms
+and the per-pass cost samples are noisier than that, so it keeps mixing in K=2 (and the
+exploration passes cost too); K=0 (~1 tok per ~9 ms) is rarely picked, its cost samples not
+inspected (not logged per K — next: print the final cost / p estimates).
+
+Not done: (2) grouping the window MoE (row, slot) pairs by expert (moe_cuda.cuh g5f_gux /
+down launch over unique experts). Bound from the round-3 union measurement: at t=3 ~20 % of
+the routed slots repeat an expert, i.e. at most ~20 % of the routed weight reads (~1-1.5 ms of a
+~18-20 ms window) — not attempted this round.
 ## 2026-10-29 — KDA window tail in one launch (k5d_tailt): per extra verify row 0.95 -> 0.72 ms, ids = plain; 0.5 ms NOT reached (branch claude/glm5-kda4, round 4)
 
 `k5d_tailt` (kda_decode.cuh): k5d_tail looped over the window's t rows inside ONE launch (grid nh,
