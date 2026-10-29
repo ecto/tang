@@ -100,6 +100,9 @@ pub struct Fast {
     qgt9: sys::CUfunction,
     /// `k5d_tailt`: k5d_tail over a window's t rows in one launch (rows_fast).
     tailt: sys::CUfunction,
+    /// `k5d_pret` / `k5d_stept`: the window tail split (rows_fast, TANG_GLM5_KDA_SPLIT).
+    pret: sys::CUfunction,
+    stept: sys::CUfunction,
     qgt17: sys::CUfunction,
     /// The captured decode step and the `TANG_GLM5_GEMV8` value it was captured with.
     graph: Option<(Graph, bool)>,
@@ -133,7 +136,12 @@ impl Fast {
             sys::cuFuncSetAttribute(tailt, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
         };
         anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tailt smem attribute: {r:?}");
-        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, qgt9: f("k5_qgemvt9")?, tailt, qgt17: f("k5_qgemvt17")?, graph: None, _m: m })
+        let pret = f("k5d_pret")?;
+        let r = unsafe {
+            sys::cuFuncSetAttribute(pret, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
+        };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_pret smem attribute: {r:?}");
+        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, qgt9: f("k5_qgemvt9")?, tailt, pret, stept: f("k5d_stept")?, qgt17: f("k5_qgemvt17")?, graph: None, _m: m })
     }
 }
 
@@ -1009,6 +1017,12 @@ fn tail_flag() -> bool {
 
 /// `TANG_GLM5_KDA_ROWS_FAST=0`: rows_enqueue keeps the generic t-row kernels.
 /// `TANG_GLM5_KDA_TAILT=0`: rows_fast runs k5d_tail once per row instead of k5d_tailt.
+/// `TANG_GLM5_KDA_SPLIT=0`: rows_fast runs k5d_tailt (round 4) instead of k5d_pret + k5d_stept.
+fn split_flag() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_SPLIT").map_or(true, |v| v != "0"))
+}
+
 fn tailt_flag() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_TAILT").map_or(true, |v| v != "0"))
@@ -1056,7 +1070,31 @@ impl DevLayer {
                 args![self.segx.as_ref().unwrap().ptr, 5u32, codes, codes + (self.max_t * hidden) as u64,
                     hidden as u32, 3u32, (3 * di) as u32, t as u32],
             )?;
-            if tailt_flag() {
+            if split_flag() {
+                // heads x rows pre-pass (state independent), then the serial state rows
+                let (ckp, ckf) = ck.map_or((0u64, 0u64), |(b, st)| (b, (st / 4) as u64));
+                launch(
+                    fast.pret,
+                    (self.nh as u32, t as u32, 1),
+                    (self.hd as u32, 1, 1),
+                    (self.hidden * 4 + 16) as u32,
+                    s,
+                    args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
+                        self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, regs[0].0, self.core.wconv.ptr, regs[1].0,
+                        self.on.ptr, self.cfg.eps, self.bb.ptr, self.gb_out.ptr, self.g2b.ptr,
+                        self.rsc.ptr, self.hidden as u32, t as u32, ckp, ckf],
+                )?;
+                launch(
+                    fast.stept,
+                    (self.nh as u32, 1, 1),
+                    (self.hd as u32, 1, 1),
+                    0,
+                    s,
+                    args![self.qkvb.ptr, regs[0].0, regs[1].0, self.on.ptr, self.cfg.eps, self.bb.ptr,
+                        self.g2b.ptr, self.rsc.ptr, self.ob.ptr, self.yb.ptr, self.xq8.ptr, self.max_t as u32,
+                        t as u32, ckp, ckf, (regs[0].1 / 4) as u64],
+                )?;
+            } else if tailt_flag() {
                 // one launch for the t rows; the checkpoints are written from registers
                 let (ckp, ckf) = ck.map_or((0u64, 0u64), |(b, st)| (b, (st / 4) as u64));
                 launch(
@@ -1072,7 +1110,7 @@ impl DevLayer {
                         ckp, ckf, (regs[0].1 / 4) as u64],
                 )?;
             }
-            for i in 0..if tailt_flag() { 0 } else { t } {
+            for i in 0..if tailt_flag() || split_flag() { 0 } else { t } {
                 self.tail_launch(s, fast, self.core.h0.ptr, self.core.st.ptr, lb, i)?;
                 if let (Some((base, stride)), true) = (ck, i + 1 < t) {
                     let b = base + (i * stride) as u64;

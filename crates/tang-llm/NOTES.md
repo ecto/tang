@@ -4,6 +4,48 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 — mew ILLEGAL_ADDRESS root cause: use-after-free of the selection buffer in mla.rs; KDA window tail split (k5d_pret + k5d_stept): 0.68 -> 0.50 ms per extra row, ids = plain (branch claude/glm5-kda4, round 5)
+
+**The mew flake.** `compute-sanitizer --tool memcheck` on `flash::glm5::mla::` (test binary, --test-threads=1)
+reports `Invalid __global__ read of size 4` in `mla_attn_naive` (cuda_naive_matches_cpu; 3 of 11
+mla tests fail under memcheck). The address is just past a live allocation, and the read is uniform
+across the block. The cause is mla.rs `attend` (naive) and the absorbed attend:
+`let sel_ptr = sd.map(|b| b.ptr).unwrap_or(0);` MOVES the `Option<DevBuf>` into the closure, so
+the selection buffer is FREED before the launch. After the fix: memcheck on mla 0 errors, 11/11 pass; full `flash::glm5` 87 passed / 0 failed. The kernel reads freed memory, the driver can hand
+it to the next allocation, and in a multi-threaded test process another test's allocation or free
+races it: a sticky CUDA_ERROR_ILLEGAL_ADDRESS that surfaces in whatever test syncs next (moe, mtp,
+mla). Fix: `sd.as_ref().map(..)` at both sites (mla.rs, 2 lines). There is no regression test that
+catches this without the sanitizer; the existing mla cuda tests do under memcheck. No other
+`opt.map(|b| b.ptr)` on an owned DevBuf in the crates. Not checked: whether the MTP agent's eh_proj
+g5f_gemv fault was this (any test process sharing a context with a freed sel buffer could see it).
+
+**KDA window tail split.** `rows_fast` now runs (default, `TANG_GLM5_KDA_SPLIT=0` = round-4 k5d_tailt):
+- `k5d_pret` (grid nh x t): everything that does not depend on the recurrent state, per row:
+  - conv, with row i's history read as `seq[i..i+KC-1]` of (pre-window H0 ++ the window's QKV rows),
+    same fma order;
+  - the gate rows, beta and the q/k norms;
+  - the conv checkpoints;
+  - outputs: G / G2 / BETA, plus scratch [t][4][di] (q·qs·scale, k·ks, v, expf(g)), a new `rsc`
+    buffer in DevLayer.
+- `k5d_stept` (grid nh): commits H0 after the window, then per row only the state step, o, the
+  norm, y and yb's q8; the state stays in registers, with state checkpoints as before.
+
+Every expression is k5d_tail's: bit-equal.
+
+B300 (shared), B flags, bench prompt -n 128, win.kda ms per window (WIN_PROF):
+
+| t (K) | SPLIT=0 (tailt) | SPLIT=1 |
+|---|---|---|
+| 2 (1) | 2.86 | 2.74 |
+| 3 (2) | 3.46 | 3.18 |
+| 4 (3) | 4.22 | 3.73 |
+
+The slope per extra row is 0.68 -> ~0.50 ms. Trunk ms/pass (WIN_PROF) 0 -> 1: K=1 16.07 -> 15.88,
+K=2 19.86 -> 19.61, K=3 23.80 -> 23.42. Without prof: K=1 13.69 -> 13.58, K=2 17.66 -> 17.33,
+K=2 -n 512 18.56. tok/s = tok/pass / (trunk + draft), K=1: 128.5 -> 129.6; K=2: 126.9 -> 129.1;
+K=2 -n 512: 109.4. ids: every run 7174cdd6, -n 512 1453cf0e, haiku `--mtp 2` = oracle; plain
+100.52 tok/s (ids OK).
+
 ## 2026-10-29 (integration round 8) — forward f92a4f07: MTP K=1 127.0 tok/s at -n 128 (1.26× plain); auto opt-in (branch frog/glm5-forward)
 
 = 3cc07f5b (kda4 round 4, k5d_tailt) + claude/glm5-mtp-win dafc4955 (round 6). The MTP agent's B300

@@ -2774,7 +2774,7 @@ pub mod cuda {
                 width as i32,
             );
             let mut scale = 1.0f32 / (self.dk as f32).sqrt();
-            let sel_ptr = sd.map(|b| b.ptr).unwrap_or(0);
+            let sel_ptr = sd.as_ref().map(|b| b.ptr).unwrap_or(0); // as_ref: a moved DevBuf frees before the launch
             let smem = ((self.dk + self.dv) * 4) as u32;
             // TANG_GLM5_TRACE: the resident f32 K/V decompress weights + the bf16 latents
             // it attends over, once each (the ideal; the naive kernel re-reads per query)
@@ -3248,7 +3248,7 @@ pub mod cuda {
                 width as i32,
             );
             let mut scale = 1.0f32 / (self.dk as f32).sqrt();
-            let sel_ptr = sd.map(|b| b.ptr).unwrap_or(0);
+            let sel_ptr = sd.as_ref().map(|b| b.ptr).unwrap_or(0); // as_ref: a moved DevBuf frees before the launch
             let smem = (self.dl * 4) as u32;
             unsafe {
                 gpu::launch(
