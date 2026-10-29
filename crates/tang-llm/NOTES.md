@@ -4,6 +4,50 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 — MTP round 5: the draft is ~1 ms/cell; the "6 ms" was the prompt's cells; chaining loses; K=1 118 tok/s vs plain 101 at -n 128 (branch claude/glm5-mtp-win)
+
+What was wrong: draft ms/pass (5.99 at K=2) was misread as per-pass cost. `TANG_GLM5_WIN_PROF=1`
+scopes (K=2 -n 128, 51 passes): `observe_window` 1.94 ms total, chain enqueue 0.45 ms,
+`draft.sync` 95.0 ms (1.9 ms/pass = the GPU running ~3.5 cells), and ~200 ms in TWO host-staged
+cells = the one-time teacher-forced observe of the 238-token prompt, which was being charged
+to `draft_s`. nsys (`--cuda-graph-trace=node`, K=2 -n 64, kernels on the cell stream): 47.40 ms
+of GPU over 89 cells = **0.533 ms GPU per cell** (k5_gemv8 0.200 [eh_proj + head], g5f_gemv
+0.099, rs_norm 0.054, rs_argmax 0.043, MoE g5f_gux 0.030 / down 0.022, MLA ~0.06).
+
+Changes:
+- The prompt's cells are reported apart (`prompt cells X ms (prefill, not in draft)`).
+- `observe_window`: the post-verify teacher-forced cells take their token / h row straight
+  from the window's device outputs (D2D, no host rows; `TANG_GLM5_MTP_OBS_DEV=0` off). The cell
+  writes its position only when out of step. (Neither moved the numbers: host time was not it.)
+- Chained pass (opt-in `TANG_GLM5_MTP_CHAIN=1`): draft cells, then the verify window's rows
+  gathered on the device from the draft ids (`window_resident_dev`, `rs_embed` per row after a
+  cross-stream event), one host wake per pass. Measured SLOWER: K=2 trunk+draft 23.60 vs 22.13
+  ms/pass (unattributed). Default off.
+- g5f_gemv fault: a stand-alone repro of the eh_proj shape (4096x8192 Q8_0, t=1, the cell's
+  call; test `g5f_gemv_q8_4096x8192`) is clean under compute-sanitizer memcheck on the 3090
+  (0 errors, rel 1.9e-4) and passes on the B300, so the kernel/shape is not the fault; the
+  round-4 fault in the cell is still unexplained. The cell keeps k5 q8 + gemv8 for Q8_0
+  (`TANG_GLM5_MTP_EH_G5F=1` re-tries g5f_gemv; not re-run).
+- mew: the cell also builds on an f32 head (own k5_gemv head), so the tiny fixture runs it:
+  new `mtp_device_cell_matches_host`: 48/48 drafts identical to the host cell, 47 replays.
+
+B300, bench prompt, defaults; tok/s = tok/pass / (trunk + draft ms/pass); plain this pod now:
+
+| run | -n | tok/pass | trunk ms | draft ms | tok/s | x plain | ids md5 |
+|---|---|---|---|---|---|---|---|
+| plain | 128 / 512 | | | | 101.12 / 114.93 | | 7174cdd6 / 1453cf0e |
+| K=1 | 128 | 1.896 | 15.00 | 1.06 | 118.1 | 1.17 | 7174cdd6 |
+| K=2 | 128 | 2.490 | 20.17 | 1.96 | 112.5 | 1.11 | 7174cdd6 |
+| K=3 | 128 | 2.953 | 25.36 | 2.77 | 105.0 | 1.04 | 7174cdd6 |
+| K=2 chained | 128 | 2.490 | 23.52 | 0.08 | 105.5 | | 7174cdd6 |
+| K=1 | 512 | 1.806 | 16.18 | 1.04 | 104.9 | 0.91 | 1453cf0e |
+| K=2 | 512 | 2.231 | 21.39 | 1.85 | 96.0 | 0.84 | 1453cf0e |
+| K=3 | 512 | 2.517 | 26.45 | 2.57 | 86.7 | 0.75 | 1453cf0e |
+
+Haiku `--mtp 2` = oracle; mew `flash::glm5` 87 passed / 0 failed / 2 ignored. The draft is no
+longer the problem (~1 ms/cell wall, 0.53 GPU); the window is: ~5.2 ms per extra row against a
+plain step that is now 8.7-9.9 ms, so MTP loses at -n 512 where the accept rate drops.
+
 ## 2026-10-28 — MTP draft cell as one device graph: draft 8.36 -> 5.99 ms/pass (K=2), MTP 1.14-1.18x plain (branch claude/glm5-mtp-win, round 4)
 
 What was wrong: each NextN draft cell was host-staged (~4 ms: host eh_proj 0.93, DSA 0.80,

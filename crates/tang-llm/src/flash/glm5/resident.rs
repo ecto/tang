@@ -199,6 +199,8 @@ struct WinBufs {
     fy: DevBuf,
     hn: DevBuf,
     ids: DevBuf,
+    /// The window's tokens when they come from the device ([`Glm5Engine::window_resident_dev`]).
+    wtok: DevBuf,
     /// Per layer (`None` for DSA): `cap - 1` checkpoints of `ck_bytes[l]` bytes each.
     ck: Vec<Option<DevBuf>>,
     ck_bytes: Vec<usize>,
@@ -456,8 +458,31 @@ impl Glm5Engine {
     /// `None` when the resident path does not apply (the caller runs [`Self::window`]).
     /// The tokens are appended to slot 0.
     pub(crate) fn window_resident(&mut self, toks: &[u32]) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        Ok(self.window_resident_src(toks, None)?.map(|(_, ids, hn)| (ids, hn)))
+    }
+
+    /// [`Self::window_resident`] whose rows after `toks` come from the device: `dev =
+    /// (ids ptr, k, event)` appends k rows whose tokens are the u32s at `ids` (the MTP draft
+    /// cells' output, ready once `event` fires). The embed is gathered on the device, so
+    /// the host does not wait for the drafts. Returns (all t tokens, ids, hn).
+    pub(crate) fn window_resident_dev(
+        &mut self,
+        cur: u32,
+        ids: u64,
+        k: usize,
+        ev: &tang_moe::gpu::Event,
+    ) -> Result<Option<(Vec<u32>, Vec<u32>, Vec<f32>)>> {
+        self.window_resident_src(&[cur], Some((ids, k, ev)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn window_resident_src(
+        &mut self,
+        toks: &[u32],
+        dev: Option<(u64, usize, &tang_moe::gpu::Event)>,
+    ) -> Result<Option<(Vec<u32>, Vec<u32>, Vec<f32>)>> {
         let slot = 0;
-        let t = toks.len();
+        let t = toks.len() + dev.map_or(0, |d| d.1);
         if t == 0 || std::env::var("TANG_GLM5_RES_WINDOW").is_ok_and(|v| v == "0") || !self.resident_ready(slot) {
             return Ok(None);
         }
@@ -479,8 +504,12 @@ impl Glm5Engine {
             None
         };
         let embd = self.m.g.info("token_embd.weight")?;
-        let mut r = vec![0f32; t * hc * n];
-        for (i, &tk) in toks.iter().enumerate() {
+        if dev.is_some() && embed_ty(embd.ty).is_none() {
+            return Ok(None);
+        }
+        let gguf = &self.m.g;
+        let mut r = vec![0f32; if dev.is_some() { 0 } else { t * hc * n }];
+        for (i, &tk) in toks.iter().enumerate().filter(|_| dev.is_none()) {
             let e = self.m.g.rows(embd, tk as usize, 1)?;
             for c in 0..hc {
                 r[(i * hc + c) * n..(i * hc + c + 1) * n].copy_from_slice(&e);
@@ -524,6 +553,7 @@ impl Glm5Engine {
                 fy: f4(cap * n)?,
                 hn: f4(cap * n)?,
                 ids: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
+                wtok: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
                 ck,
                 ck_bytes,
             });
@@ -531,7 +561,7 @@ impl Glm5Engine {
         let mut f = g.mhc_f.take().unwrap();
         let s = std::mem::ManuallyDrop::new(tang_moe::gpu::Stream(f.stream().0));
         let dsa = &mut self.dsa[slot];
-        let out = (|| -> Result<(Vec<u32>, Vec<f32>)> {
+        let out = (|| -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
             res.dev_tp = None;
             // a DSA regrow moves the cache bases the whole-step graphs baked in
             let mut regrow = false;
@@ -576,7 +606,31 @@ impl Glm5Engine {
                 res.wgraphs.push((t, graphs));
                 eprintln!("glm5: resident window graph captured (t {t}, {} segments)", res.wgraphs.last().unwrap().1.len());
             }
-            f.begin_async(&r)?;
+            match dev {
+                None => f.begin_async(&r)?,
+                Some((ids, k, ev)) => {
+                    if res.embd.is_none() {
+                        let rb = embd.row_bytes()? as u64;
+                        let ty = embed_ty(embd.ty).unwrap();
+                        res.embd = Some(Some((DevBuf::from_slice(gguf.bytes(embd)).map_err(ge)?, rb, ty)));
+                    }
+                    let (tab, rbb, ty) = {
+                        let e = res.embd.as_ref().unwrap().as_ref().context("embed table")?;
+                        (e.0.ptr, e.1, e.2)
+                    };
+                    let wb = res.win.as_ref().unwrap();
+                    s.wait(ev).map_err(ge)?;
+                    wb.wtok.write_async(0, &[toks[0]], &s).map_err(ge)?;
+                    tang_moe::gpu::copy_d2d_async(wb.wtok.ptr + 4, ids, 4 * k, &s).map_err(ge)?;
+                    let ef = res.m.func("rs_embed").map_err(ge)?;
+                    let (ni, hci) = (n as i32, hc as i32);
+                    for i in 0..t {
+                        let (tp, rp) = (wb.wtok.ptr + 4 * i as u64, f.r_ptr() + (i * hc * n * 4) as u64);
+                        unsafe { launch(ef, (n.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, &s, args![tab, rbb, ty, tp, rp, ni, hci])? };
+                    }
+                    f.set_window(t)?;
+                }
+            }
             let gi = res.wgraphs.iter().position(|(tt, _)| *tt == t).filter(|_| graph_on);
             if let Some(gi) = gi {
                 let graphs = &res.wgraphs[gi].1;
@@ -635,7 +689,8 @@ impl Glm5Engine {
             s.sync().map_err(ge)?;
             let ids = wb.ids.read::<u32>(0, t).map_err(ge)?;
             let hn = wb.hn.read::<f32>(0, t * n).map_err(ge)?;
-            Ok((ids, hn))
+            let all = if dev.is_some() { wb.wtok.read::<u32>(0, t).map_err(ge)? } else { toks.to_vec() };
+            Ok((all, ids, hn))
         })();
         if out.is_err() {
             // the mHC state machine may be mid-window
@@ -644,12 +699,11 @@ impl Glm5Engine {
         res.win_count[0] += 1;
         g.mhc_f = Some(f);
         g.resident = Some(res);
-        let (ids, hn) = out?;
-        // the host's view of the DSA device watermarks (window_dev advanced them)
-        self.slot_tokens_mut(slot).extend_from_slice(toks);
+        let (all, ids, hn) = out?;
+        self.slot_tokens_mut(slot).extend_from_slice(&all);
         self.last_h.clear();
         self.last_h.extend_from_slice(&hn);
-        Ok(Some((ids, hn)))
+        Ok(Some((all, ids, hn)))
     }
 
     /// After a [`Self::window_resident`] of `t` rows: keep only the first `keep` (1..=t).
@@ -743,6 +797,12 @@ impl Glm5Engine {
             prof_add("draft.head_top", 0.0);
         }
         Ok(Some(ids))
+    }
+
+    /// The last resident window's device outputs: (argmax ids `[t]` u32, normed h `[t][n]`).
+    pub(crate) fn window_out_ptrs(&self) -> Option<(u64, u64)> {
+        let wb = self.gpu.as_ref()?.resident.as_ref()?.win.as_ref()?;
+        Some((wb.ids.ptr, wb.hn.ptr))
     }
 
     /// Drop the captured step segments (any host window: it may reallocate their scratch).
@@ -1276,6 +1336,7 @@ static GRAPH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// draft into `tp[0]`, advances `tp[1]`), and `hin <- hout` for the next chained cell. No
 /// host sync inside; the host only keeps the cache watermarks. Graphs `[dense, sparse]`.
 pub(crate) struct DraftCell {
+    own_head: Option<super::super::moe::gpu::DevW>,
     m: Module,
     s: tang_moe::gpu::Stream,
     k5: super::super::moe::gpu::Kernels5,
@@ -1300,6 +1361,8 @@ pub(crate) struct DraftCell {
     gen: u64,
     cap: usize,
     pub(crate) replays: usize,
+    /// What `tp[1]` holds on the device once the queued cells ran (`None`: unknown).
+    dev_pos: Option<usize>,
 }
 
 /// `TANG_GLM5_MTP_CELL_DEV=0`: the drafter keeps the host-staged cell.
@@ -1313,9 +1376,6 @@ impl DraftCell {
     /// read): the caller keeps the host cell.
     pub(crate) fn new(e: &Glm5Engine, layer: usize, norms: [&[f32]; 5], eps: f32) -> Result<Option<Self>> {
         let Some(g) = e.gpu.as_ref() else { return Ok(None) };
-        if g.head_dev.is_none() {
-            return Ok(None);
-        }
         let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
         let gpu = &g.devs[0].0;
         gpu.bind().map_err(ge)?;
@@ -1332,7 +1392,18 @@ impl DraftCell {
         let f4 = |k: usize| DevBuf::zeroed_elems::<f32>(k).map_err(ge);
         let b = |k: usize| DevBuf::zeroed(k).map_err(ge);
         let up = |v: &[f32]| DevBuf::from_slice(v).map_err(ge);
+        // no Q8_0 device head (the tiny f32 fixture): the cell's own head on k5_gemv
+        let own_head = if g.head_dev.is_none() {
+            let info = match gg.get("output.weight") {
+                Some(t) => t,
+                None => gg.info("token_embd.weight")?,
+            };
+            Some(super::super::moe::gpu::upload(&super::super::moe::W::Gguf(gg, info), 1, nv, n)?)
+        } else {
+            None
+        };
         Ok(Some(Self {
+            own_head,
             m: gpu.module(SRC).map_err(ge)?,
             s: tang_moe::gpu::Stream::blocking().map_err(ge)?,
             k5: super::super::moe::gpu::Kernels5::new(gpu)?,
@@ -1358,6 +1429,7 @@ impl DraftCell {
             gen: u64::MAX,
             cap: 0,
             replays: 0,
+            dev_pos: None,
         }))
     }
 
@@ -1380,7 +1452,6 @@ impl DraftCell {
         s: &tang_moe::gpu::Stream,
     ) -> Result<()> {
         let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
-        let hd = g.head_dev.as_ref().context("draft cell: no device head")?;
         let f = |k: &str| self.m.func(k).map_err(ge);
         let (nf, af, ad, ef) = (f("rs_norm")?, f("rs_argmax")?, f("rs_add")?, f("rs_embed")?);
         let (ni, eps) = (n as i32, self.eps);
@@ -1406,13 +1477,13 @@ impl DraftCell {
         chk("embed+norms")?;
         // eh_proj: Q8_0 on the k5 q8 + gemv8 pair (the trunk's KDA / head projection
         // kernels; g5f_gemv faulted on this 4096x8192 Q8_0 matrix, not diagnosed), else g5f_gemv
-        if self.eh.w.ty == 8 {
+        if self.eh.w.ty == 8 && !std::env::var("TANG_GLM5_MTP_EH_G5F").is_ok_and(|v| v == "1") {
             let (cq, xp) = (self.cq.ptr, self.x.ptr);
             let n2 = (2 * n) as u32;
             unsafe {
-                launch(hd.k5.q8, ((2 * n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![cat, cq, n2, 1u32])?;
+                launch(self.k5.q8, ((2 * n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![cat, cq, n2, 1u32])?;
                 launch(
-                    hd.k5.gemv8,
+                    self.k5.gemv8,
                     (n.div_ceil(K5_WARPS) as u32, 1, 1),
                     (128, 1, 1),
                     (K5_WARPS * ((self.eh.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
@@ -1452,15 +1523,30 @@ impl DraftCell {
         unsafe {
             launch(ad, addg, (256, 1, 1), 0, s, args![xp, fy, ni2])?;
             launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w4, ho, ni, eps])?;
-            launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![ho, hq, n as u32, 1u32])?;
-            launch(
-                hd.k5.gemv8,
-                (nv.div_ceil(K5_WARPS) as u32, 1, 1),
-                (128, 1, 1),
-                (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
-                s,
-                args![hd.dw.w, 0u32, hq, hq + n as u64, lg, nv as u32, 1u32, nv as u32, n as u32],
-            )?;
+            match (g.head_dev.as_ref(), self.own_head.as_ref()) {
+                (Some(hd), _) => {
+                    launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![ho, hq, n as u32, 1u32])?;
+                    launch(
+                        hd.k5.gemv8,
+                        (nv.div_ceil(K5_WARPS) as u32, 1, 1),
+                        (128, 1, 1),
+                        (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                        s,
+                        args![hd.dw.w, 0u32, hq, hq + n as u64, lg, nv as u32, 1u32, nv as u32, n as u32],
+                    )?;
+                }
+                (None, Some(oh)) => {
+                    launch(
+                        self.k5.gemv,
+                        (nv.div_ceil(128) as u32, 1, 1),
+                        (128, 1, 1),
+                        0,
+                        s,
+                        args![oh.w, 0u32, ho, lg, nv as u32, 1u32, nv as u32, n as u32],
+                    )?;
+                }
+                (None, None) => anyhow::bail!("draft cell: no head"),
+            }
             let (nvi, inc) = (nv as i32, 1i32);
             launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![lg, nvi, tpp, inc])?;
         }
@@ -1482,6 +1568,7 @@ impl DraftCell {
         moe: &super::super::moe::gpu::DevMoe,
         c: &mut DsaCache,
         tok_h: Option<(u32, &[f32])>,
+        dev_src: Option<(u64, u64)>,
     ) -> Result<bool> {
         let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
         let g = e.gpu.as_ref().context("draft cell: no GPU")?;
@@ -1518,13 +1605,26 @@ impl DraftCell {
         }
         let s = &self.s;
         match tok_h {
+            _ if dev_src.is_some() => {
+                // teacher-forced from device rows (the verify window's ids / hn)
+                let (tk, hp) = dev_src.unwrap();
+                tang_moe::gpu::copy_d2d_async(self.tp.ptr, tk, 4, s).map_err(ge)?;
+                tang_moe::gpu::copy_d2d_async(self.hin.ptr, hp, n * 4, s).map_err(ge)?;
+                if self.dev_pos != Some(pos) {
+                    self.tp.write_async(4, &[pos as u32], s).map_err(ge)?;
+                }
+            }
             Some((tok, h)) => {
                 self.tp.write_async(0, &[tok, pos as u32], s).map_err(ge)?;
                 self.hin.write_async(0, h, s).map_err(ge)?;
             }
             None => {
-                // the chain: tp[1] was advanced by the last cell; keep it honest anyway
-                self.tp.write_async(4, &[pos as u32], s).map_err(ge)?;
+                // the chain: tp[1] was advanced by the last cell's argmax. A pageable H2D
+                // here would wait for the stream (one GPU cell of host stall per cell), so
+                // the position is written only when it is out of step (after a truncate).
+                if self.dev_pos != Some(pos) {
+                    self.tp.write_async(4, &[pos as u32], s).map_err(ge)?;
+                }
             }
         }
         if sparse {
@@ -1540,6 +1640,7 @@ impl DraftCell {
             self.graphs[sp].as_ref().unwrap().launch(s).map_err(ge)?;
         }
         self.replays += 1;
+        self.dev_pos = Some(kv_len);
         c.lat16.resize(kv_len * dl, 0);
         c.idx_k.resize(kv_len * idd, 0.0);
         c.idx_g.resize(kv_len * idd, 0.0);
@@ -1565,4 +1666,60 @@ pub(crate) fn refresh_cell_mirrors(cu: &super::super::mla::cuda::MlaCuda, c: &mu
     }
     c.stale_from = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod draft_cell_tests {
+    use super::super::super::moe::gpu::{Act, Kernels5, G5W};
+    use tang_moe::gpu::{DevBuf, Gpu, Stream};
+
+    /// The MTP eh_proj shape (4096 x 8192 Q8_0) on `g5f_gemv` (one token, the draft cell's
+    /// call) against a host dot over the same int8 activations: the round-4 fault repro.
+    #[test]
+    fn g5f_gemv_q8_4096x8192() {
+        let Some(gpu) = Gpu::for_test() else { return };
+        let (rows, cols) = (4096usize, 8192usize);
+        let rb = cols / 32 * 34;
+        let mut w = vec![0u8; rows * rb];
+        let mut st = 12345u32;
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        for b in w.chunks_mut(34) {
+            b[0] = 0x00;
+            b[1] = 0x20; // f16 2^-7
+            for q in &mut b[2..] {
+                *q = (rnd() % 31) as u8;
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|_| (rnd() % 1000) as f32 / 1000.0 - 0.5).collect();
+        let k5 = Kernels5::new(&gpu).unwrap();
+        let wd = DevBuf::from_slice(&w).unwrap();
+        let g5 = G5W { base: wd.ptr, estride: (rows * rb) as u64, row_bytes: rb as u32, ty: 8 };
+        let xb = DevBuf::from_slice(&x).unwrap();
+        let (xq, xq2, xd) = (DevBuf::zeroed(8 * cols).unwrap(), DevBuf::zeroed(8 * cols).unwrap(), DevBuf::zeroed(8 * cols / 8).unwrap());
+        let y = DevBuf::zeroed(rows * 4).unwrap();
+        let s = Stream::blocking().unwrap();
+        k5.fast.q8(&s, xb.ptr, xq.ptr, xq2.ptr, xd.ptr, cols, 1).unwrap();
+        let a = Act { xf: xb.ptr, xq: xq.ptr, xq2: xq2.ptr, xd: xd.ptr, xs: cols };
+        k5.fast.gemv(&s, g5, 0, a, y.ptr, rows, 1, rows, cols).unwrap();
+        s.sync().expect("g5f_gemv 4096x8192 Q8_0");
+        let got = y.read::<f32>(0, rows).unwrap();
+        // host reference in f32 over the dequantised weights
+        let mut worst = 0f32;
+        for r in 0..rows {
+            let mut acc = 0f64;
+            for c in 0..cols {
+                let b = &w[r * rb + (c / 32) * 34..];
+                let q = b[2 + c % 32] as i8 as f64;
+                acc += q * (1.0 / 128.0) * x[c] as f64;
+            }
+            worst = worst.max((got[r] - acc as f32).abs() / (acc.abs() as f32).max(1.0));
+        }
+        eprintln!("g5f_gemv 4096x8192 Q8_0: worst rel {worst:.3e}");
+        assert!(worst < 2e-2, "worst {worst}");
+    }
 }

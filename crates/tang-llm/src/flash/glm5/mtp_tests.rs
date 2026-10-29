@@ -166,3 +166,53 @@ fn mtp_device_draft_matches_host() {
     eprintln!("mtp device vs host: {same}/64 drafts identical, {clear} with a clear margin (all equal), worst hn rel {worst:.2e}");
     assert!(worst < 2e-2, "device hn rel {worst}");
 }
+
+/// The device draft cell (`DraftCell`, one graph per cell) against the host cell on the
+/// tiny fixture: teacher-forced observe + 1 draft per step through `MtpDrafter`; ids must
+/// agree wherever the host's top-2 margin is clear of reordering noise, and the device
+/// cell must actually have replayed (not the host fallback).
+#[cfg(feature = "cuda")]
+#[test]
+fn mtp_device_cell_matches_host() {
+    let _env = crate::flash::glm5::env_write();
+    let Some(p) = tiny() else { return };
+    std::env::set_var("TANG_GLM5_MOE", "fast");
+    let mut e = Glm5Engine::open(Path::new(&p)).unwrap();
+    if !e.use_gpu().unwrap() {
+        std::env::remove_var("TANG_GLM5_MOE");
+        assert!(std::env::var("TANG_REQUIRE_CUDA").is_err(), "no GPU");
+        return;
+    }
+    let mut dd = MtpDrafter::new(Mtp::load(&e).unwrap());
+    let mut hm = Mtp::load(&e).unwrap().host_only();
+    let nv = e.m.hp.n_vocab;
+    let lg = e.window(&PROMPT).unwrap();
+    let mut cur = super::engine::argmax(&lg[(PROMPT.len() - 1) * nv..]);
+    let mut nexts = PROMPT[1..].to_vec();
+    nexts.push(cur);
+    let mut h = e.last_h.clone();
+    let (mut clear, mut same) = (0, 0);
+    for i in 0..48 {
+        dd.observe(&e, &h, &nexts).unwrap();
+        let da = dd.draft(&e, 1).unwrap()[0];
+        let b = hm.cells(&e, &h, &nexts).unwrap();
+        let n = b.h.len() / nexts.len();
+        let lgh = hm.host_logits(&b.h[b.h.len() - n..]);
+        let top = super::engine::argmax(&lgh) as usize;
+        let second = lgh.iter().enumerate().filter(|(j, _)| *j != top).map(|(_, v)| *v).fold(f32::MIN, f32::max);
+        let db = *b.top.last().unwrap();
+        if lgh[top] - second > 0.05 {
+            clear += 1;
+            assert_eq!(da, db, "step {i}: clear margin {} but device cell {da} != host {db}", lgh[top] - second);
+        }
+        same += usize::from(da == db);
+        let lg = e.window(&[cur]).unwrap();
+        cur = super::engine::argmax(&lg[..nv]);
+        h = e.last_h.clone();
+        nexts = vec![cur];
+    }
+    let replays = dd.mtp.cell_replays();
+    std::env::remove_var("TANG_GLM5_MOE");
+    eprintln!("mtp device cell vs host: {same}/48 identical, {clear} clear-margin (all equal), {replays} cell replays");
+    assert!(replays > 0, "the device cell never ran (host fallback only)");
+}
