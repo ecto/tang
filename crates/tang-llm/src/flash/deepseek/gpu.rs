@@ -166,6 +166,7 @@ const MORE: &[&str] = &[
     "ds_attn_fdm",
     "ds_attn_fd_comb",
     "ds_copy",
+    "ds_copy_many",
     "ds_hc_scale",
     "ds_hc_sinkhorn",
     "ds_hc_pre",
