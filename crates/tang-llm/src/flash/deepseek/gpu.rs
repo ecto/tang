@@ -352,11 +352,21 @@ pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
 
 impl Kernels {
     pub fn new(g: &Gpu) -> Result<Self> {
-        // ds_ks's L2 prefetch prologue only pays off under PDL (kernels.cu ks_pf)
-        let m = if super::pdl::on() {
-            g.module(&format!("#define DS_PDL_PF 1\n{SRC}"))?
-        } else {
+        // ds_ks's L2 prefetch prologue only pays off under PDL (kernels.cu ks_pf);
+        // DS_KS_DEFS="NAME=v,...": extra #defines ahead of the source (kernel sweeps)
+        let mut defs = String::new();
+        if super::pdl::on() {
+            defs.push_str("#define DS_PDL_PF 1\n");
+        }
+        if let Ok(v) = std::env::var("DS_KS_DEFS") {
+            for (n, x) in v.split(',').filter_map(|d| d.split_once('=')) {
+                defs.push_str(&format!("#define {n} {x}\n"));
+            }
+        }
+        let m = if defs.is_empty() {
             g.module(SRC)?
+        } else {
+            g.module(&format!("{defs}{SRC}"))?
         };
         Ok(Kernels {
             linear: m.func("ds_linear")?,
@@ -707,6 +717,9 @@ impl Kernels {
         k: usize,
         ne: usize,
     ) -> Result<()> {
+        if ne > 512 {
+            bail!("route: ne {ne} > 512");
+        }
         let (ti, ki, nei) = (t as i32, k as i32, ne as i32);
         unsafe {
             self.go(
@@ -3120,6 +3133,52 @@ mod tests {
         );
     }
 
+    /// `gemv_bf16` against the exact `linear` at the router's real shape: relaxed order only.
+    #[test]
+    fn router_gemv_matches_linear() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (ne, d) = (384usize, 5120usize);
+        let wb: Vec<u16> = data(ne * d, 5, 0.05)
+            .iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let wdev = DevBuf::from_slice(&wb).unwrap();
+        let w = DsW {
+            w: wdev.ptr,
+            s: 0,
+            rows: ne as i32,
+            cols: d as i32,
+            fmt: 1,
+            _pad: 0,
+        };
+        for t in [1usize, 6, 8] {
+            let x = DevBuf::from_slice(&data(t * d, 7, 1.0)).unwrap();
+            let (a, b) = (
+                DevBuf::alloc(t * ne * 4).unwrap(),
+                DevBuf::alloc(t * ne * 4).unwrap(),
+            );
+            k.linear(&s, &w, x.ptr, a.ptr, t, false).unwrap();
+            k.gemv_bf16(&s, &w, x.ptr, b.ptr, t).unwrap();
+            s.sync().unwrap();
+            let (a, b) = (
+                a.read::<f32>(0, t * ne).unwrap(),
+                b.read::<f32>(0, t * ne).unwrap(),
+            );
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = a
+                .iter()
+                .zip(&b)
+                .fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+            assert!(
+                err <= 1e-5 * scale.max(1.0),
+                "t {t}: err {err} scale {scale}"
+            );
+        }
+    }
+
     /// One layer's routed MoE by the grouped kernels at the real shapes (384 experts, top-6,
     /// d = 5120, inter = 2304, fp4) with random weights: plan, GU, h quant, down, reduce
     /// (manual: `--ignored --nocapture moe_grouped_bench`). Bytes = the live experts' weights
@@ -4617,6 +4676,9 @@ mod tests {
         time("gate", &|| {
             k.linear(&s, &w, x.ptr, raw.ptr, t, false).unwrap();
         });
+        time("gate_gemv", &|| {
+            k.gemv_bf16(&s, &w, x.ptr, raw.ptr, t).unwrap();
+        });
         time("ds_router", &|| {
             k.router(
                 &s, raw.ptr, bias.ptr, ids.ptr, wts.ptr, t, ne, topk, true, 1.5,
@@ -4642,6 +4704,38 @@ mod tests {
         });
         let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
         let elist = DevBuf::alloc(t * topk * 4).unwrap();
+        time("ds_moe_plan", &|| unsafe {
+            let (nei, ci) = (ne as i32, (t * topk) as i32);
+            k.go(
+                "ds_moe_plan",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                &s,
+                tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+            )
+            .unwrap();
+        });
+        let rpq = || {
+            k.route_plan_q(
+                &s,
+                (ids.ptr, wts.ptr),
+                (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                (mask.ptr, elist.ptr, t * topk),
+                x.ptr,
+                (t, topk, ne, d),
+            )
+            .unwrap();
+        };
+        time("route_plan_q", &rpq);
+        time("gemv + router + route_plan_q (default path)", &|| {
+            k.gemv_bf16(&s, &w, x.ptr, raw.ptr, t).unwrap();
+            k.router(
+                &s, raw.ptr, bias.ptr, ids.ptr, wts.ptr, t, ne, topk, true, 1.5,
+            )
+            .unwrap();
+            rpq();
+        });
         time("ds_moe_gate (fused, + plan)", &|| {
             k.moe_gate(
                 &s,

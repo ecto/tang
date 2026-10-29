@@ -1568,7 +1568,9 @@ DS_MOE_T(3)
 // the slices meeting in shared memory in a fixed order (deterministic). Within an mma's k step
 // columns are permuted freely (A and B agree), so each lane's weight bytes are contiguous.
 
+#ifndef KS_UG
 #define KS_UG 4  // groups in flight per warp (4 beats 8 on H100: shorter ragged tails per item)
+#endif
 
 __device__ __forceinline__ unsigned short f2h_exact(float v) {
     unsigned int b = __float_as_uint(v);
@@ -1623,7 +1625,7 @@ extern "C" __global__ void ds_ks_quant(const float* x, unsigned char* codes, flo
 // P = K + 32 bytes for conflict-free 8-byte reads, and scales) once, then takes work items
 // (row group br, K slice sb) = blockIdx.x, += gridDim.x. With SB > 1 slices, partials go to
 // part[sb][t][rows (× 2 for GU)] and the last block of a row group (cnt) sums them in order.
-template <int FMT, int GU>
+template <int FMT, int GU, int UG = KS_UG>
 __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __restrict__ xc,
                                         const float* __restrict__ xsc, float* __restrict__ y, int t, int round,
                                         const float* __restrict__ rw, float lim, int S, int SB, int nbr, float* part,
@@ -1671,11 +1673,11 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
             (const unsigned char*)(GU ? w3.s : w.s) + (FMT == 3 ? (long long)rb * nch : (long long)(rb / 32) * nch);
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
         int glo = sb * gpb, ghi = min(nch, glo + gpb);
-        for (int q0 = glo + si; q0 < ghi; q0 += KS_UG * S) {
-            uint2 la[KS_UG], lb[KS_UG];
-            unsigned char ca[KS_UG], cb[KS_UG];
+        for (int q0 = glo + si; q0 < ghi; q0 += UG * S) {
+            uint2 la[UG], lb[UG];
+            unsigned char ca[UG], cb[UG];
 #pragma unroll
-            for (int u = 0; u < KS_UG; u++) {
+            for (int u = 0; u < UG; u++) {
                 int G = q0 + u * S;
                 la[u] = lb[u] = make_uint2(0, 0);
                 ca[u] = cb[u] = 0;
@@ -1693,7 +1695,7 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
                 }
             }
 #pragma unroll
-            for (int u = 0; u < KS_UG; u++) {
+            for (int u = 0; u < UG; u++) {
                 int G = q0 + u * S;
                 if (G >= ghi) break;
                 uint2 X = g < t ? *(const uint2*)(xs + g * P + G * 32 + 8 * tig) : make_uint2(0, 0);
@@ -1843,13 +1845,16 @@ DS_KS(3, 0)
 DS_KS(2, 1)
 DS_KS(3, 1)
 
+#ifndef KS_MOE_MINB
+#define KS_MOE_MINB 4  // the grouped K-split MoE kernels' min blocks an SM (register cap)
+#endif
 // Grouped MoE on the K-split path: the DS_MOE contract (blockIdx.y a slot of `elist`, expert
 // e's rows its CSR segment off[e]..off[e+1], at most 8) with lin_mma per slot, SB = 1 (no
 // cross-block partials: the slots give the parallelism) and blockIdx.x striding the expert's
 // nbr row groups. The activation codes/scales come from ds_ks_quant: GU gathers the token rows
 // of xc [t][d] through `rows`; down reads hq's codes [t*k][inter] at the segment.
 #define DS_MOE_KS(F)                                                                                           \
-    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_gu_f##F(                                       \
+    extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_gu_f##F(                                       \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
         const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr) { DS_PDL_ENTRY                      \
         int e = elist[blockIdx.y];                                                                              \
@@ -1860,7 +1865,7 @@ DS_KS(3, 1)
         lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, n, 1, rw + o, lim, S, 1, nbr, 0, 0,       \
                       rows + o);                                                                                \
     }                                                                                                           \
-    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_down_f##F(                                     \
+    extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_down_f##F(                                     \
         const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
         float* part, int S, int nbr) { DS_PDL_ENTRY                                                                          \
         int e = elist[blockIdx.y];                                                                              \
@@ -1880,7 +1885,7 @@ DS_MOE_KS(3)
 // h[n + ti], down from hc rows n.. into part[n + ti] for ds_moe_reduce's `sh` term. The
 // routed slots are ds_moe_ks_*_f F's exactly.
 #define DS_MOE_KS_SH(F, SF)                                                                                    \
-    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_gu_f##F##_s##SF(                              \
+    extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_gu_f##F##_s##SF(                              \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
         const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr, DsW s1, DsW s3, int t, \
         int n) { DS_PDL_ENTRY                                                                                                \
@@ -1896,7 +1901,7 @@ DS_MOE_KS(3)
         lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, m, 1, rw + o, lim, S, 1, nbr, 0, 0,       \
                       rows + o);                                                                                \
     }                                                                                                           \
-    extern "C" __global__ void __launch_bounds__(256) ds_moe_ks_down_f##F##_s##SF(                            \
+    extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_down_f##F##_s##SF(                            \
         const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
         float* part, int S, int nbr, DsW s2, int t, int n) { DS_PDL_ENTRY                                                    \
         if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
