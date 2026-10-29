@@ -173,6 +173,14 @@ f32 sampler). The greedy path's remaining gap to 1000 tok/s (~4 ms per token-ste
 count and per-layer glue: 1386 launches for 26 ms of graph replay on 8 H100s, where the
 bytes per rank (experts/8 + dense) put the bandwidth floor near 3 ms.
 
+Wave 7 sample lane (same pod, 200 tokens): sampled T=0.6 now **130.1 / 134.1 tok/s** (46 steps,
+154–156/225 accepted) against greedy 126.0 / 132.8 on the same binary; graph draft 4.7 ms gpu
+(was 13.2), graph verify 26.3 ms with ~0.05 ms host. `ds_spark_sample` buckets w by exponent in
+one pass and sorts only the smallest bucket holding the top-p mass (<= 2048 tokens; the old
+key search is the fallback), drawing bit for bit as `SpecSampler`; the verify's rejection walk
+runs on the device (`ds_spec_dist` per row + `ds_spec_walk`, one small read-back,
+`DS_SPEC_HOST=1` for the host walk), also bit-exact against `verify_rows`.
+
 Wave 7 attn3 lane, first step (cc255a81, 8× H100): q's rope and o's inverse rope fused into the
 tiled attention's q load / o store, and the window + top-k index rows in one `dg_win_idx`
 launch. Verify step 1386 → 1268 launches, direct gpu 31.58 → 31.51 ms (`layer.attn` 12.75 →
@@ -181,6 +189,74 @@ tok/s (noise), acceptance 152/235 unchanged. Launch count alone buys little here
 kernels are latency-bound in themselves (~45 µs a sparse_attn span for ~8 MB of keys).
 `DS_ATTN_FUSE=1` (soft+pv in one launch) measured no better (3.84 ms) and stays opt-in.
 
+Wave 7a merged (sample + attn3 first step, 15a7af70) on the **1017 weights** (swapped in
+2026-10-28 20:18 UTC; the Oct 16 `chat_template.jinja` copied over), 8× H100, 200 tokens:
+greedy **134.9 / 134.2** tok/s (47 steps, 152/230), sampled T=0.6 **131.7 / 132.0** (45–46
+steps, 156–157/220–225), sampled T=1.0 top-p 1.0 (DeepSeek's recommendation) 122.2 (49 steps,
+152/240), direct path greedy 101.6; prefill 460–475 tok/s. Full GPU suite green on mew (19
+engine/EP/forward + 17 kernel tests).
+
+Wave 7b merged (+ attn3 split-K tensor-core attention and unrolled Sinkhorn, 3c44a203), 1017
+weights, 8× H100, 200 tokens: greedy **147.0 / 147.0** tok/s (46 steps, 158/225), sampled T=0.6
+141.3 / **152.7** (43–45 steps, 157–158/210–220), sampled T=1.0 145.8, direct greedy 109.6,
+prefill 460–470.
+
+Wave 7c merged (+ moe3: shared expert folded into the grouped launches, route+plan+quant in
+one launch, `MOE_KS_ITEMS` 4 → 2; 4854062f), 1017 weights, 8× H100, 200 tokens: greedy
+**147.3 / 147.2** (48 steps, 153/235; 28.3 ms per step vs 29.6 at 7b — the step got faster, the
+run took two more steps), sampled T=0.6 **148.4 / 150.2**, T=1.0 146.1, direct greedy 109.7.
+
+Wave 7d merged (+ attn3 03076460: index rows built inside `ds_attn_fdm`, one launch per layer
+gone; d1ad44b0), 1017 weights, 8× H100, 200 tokens: greedy **149.2 / 149.1** (48 steps, 153/235;
+27.9 ms per step), sampled T=0.6 148.1 / **152.1**, T=1.0 172.4 (39 steps, 165/190 — an
+acceptance-lucky run), direct greedy 112.3. Per step the verify+draft is now ~28 ms; the
+remaining budget split is roughly attn 10.6, moe 10.5, hc 3.7 ms on the direct path.
+
+Wave 7e merged (+ attn3 f0d801c9 o-quant in the attention merge, 23213c65 hc stage 21.9 → 16.1
+µs per launch; 2eb3da81), 1017 weights, 8× H100, 200 tokens: greedy **154.2 / 152.9** (48 steps,
+154/235; 27.0 ms per step), sampled T=0.6 145.9 / **153.5**, T=1.0 137.6 (50 steps), direct
+greedy 114.8. The moe3 lane's second round (h quantised in the down kernel, relaxed-order router
+GEMV, persistent gu+act+down) measured no gain and was dropped; `layer.moe` stays 10.6 ms,
+latency-bound per expert slot (gu 63 µs for ~12 MB of fp4 per layer ≈ 190 GB/s) — the grouped
+kernels' grids are the next target, not more fusion.
+Wave 8 spec lane (draft length, 1017 weights, 8× H100, 200 tokens, one server per setting;
+tok/s is the second greedy run, the first carries captures): `DS_DRAFT_N` sets the drafts a
+verify window takes. Below the trained block of 5 the drafter still runs 5 and the window keeps
+a prefix; above it the drafter's block grows (more noise tokens than trained), which DSpark
+tolerates: the 6th draft is still accepted often.
+
+| n | greedy tok/s | steps | accepted | tokens/step | sampled 0.6 tok/s (2 runs) |
+|---|---|---|---|---|---|
+| 4 | 136.0 | 53 | 146/208 | 3.77 | 136.7 / 125.2 |
+| 5 | 148.9 | 48 | 153/235 | 4.17 | 139.0 / 155.2 |
+| **6** | **158.0 / 157.0** | 41 | 163/240 | 4.88 | 82.7 (captures) / 161.7, 132.8 / 139.4 |
+| 7 | 151.2 | 41 | 159/280 | 4.88 | 128.1 / 142.3 |
+| 8 | 96.5 | 40 | 161/312 | 5.00 | 89.5 / 94.1 |
+
+The step is not flat in t: ~28.0 ms at t 6, 30.9 at t 7, 32.3 at t 8 (≈1.4 ms a row), and
+t 9 leaves the 8-row K-split kernels for the prefill path (+20 ms). So serve defaults to
+n = 6 (`SERVE_DRAFT_N`); n = 7 wins nothing, its 7th draft rarely lands. `DS_DRAFT_CONF`
+(keep the prefix whose product of sigmoid(confidence) stays above it) measured no gain: n 6
+c 0.3 156.5 (45 steps, 156/192), n 7 c 0.3 156.1, n 7 c 0.6 141.4 (it cuts drafts that would
+have landed). Served default (n 6, b8b2fc79, `measure.sh`): greedy 148.5 / 155.4 / 156.5
+(41 steps, 163/240), sampled T=0.6 132.3 / 140.7 (44–45 steps, 156–158/258–264), T=1.0 134.2,
+direct greedy 121.3 (7d: 112.3). Greedy gains ~5%; sampled at n 6 over six runs averages ~141
+against n 5's 139 / 155 here and 148 / 152 at 7d, so sampled may prefer n 5 (its 6th draft
+lands less): a per-request n (greedy 6, sampled 5) is the follow-up. n = 7 first failed to launch: the shared-folded grouped MoE kernels
+(`ds_moe_ks_*_s*`) take 46 KB dynamic smem at t 8 over d 5120 and were not opted into > 48 KB.
+
+Wave 8a merged (+ spec lane draft n = 6 default, attn3 99e40728 bf16 split-K GEMV for the
+compressor; 850b5e9e), 1017 weights, 8× H100, 200 tokens: greedy **155.7 / 155.8** (43 steps,
+162/252, 4.65 tokens/step), sampled T=0.6 148.0 / 143.0, T=1.0 133.4, direct greedy 120.1.
+
+Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
+continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
+byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
+speed numbers carry over. DeepSeek reports better reasoning/coding/agentic scores and shorter
+outputs; recommended sampling T=1.0, top-p 1.0. Packaging differs: no `chat_template.jinja` (the
+formatting lives in `encoding/encoding.py` with test vectors under `encoding/tests/`, worth
+using as conformance vectors for the Rust formatter). Not yet on the pod: its 700 GB volume
+holds the Oct 16 weights (476 GB) and cannot hold both.
 Wave 7 attn3, kernel speed (5e153ea2, df2b224a, 8× H100): split-K decode attention
 (`ds_attn_fd` → `ds_attn_fdm` on bf16 mma, one block per row × 64 heads × key split, online
 softmax, `ds_attn_fd_comb` merge + o rope; `DS_ATTN_FD=0` / `DS_ATTN_FDM=0` fall back) and
@@ -224,6 +300,151 @@ So tokens/forward is where it needs to be (DSpark gives 3.8× over plain decodin
 a host callback), so EP steps run the direct path with its syncs; (2) the MoE loop launches
 ~5 kernels for each of the 384 experts per layer (~80k launches a forward) instead of one
 grouped launch over the routing CSR.
+
+## Wave 8 mega lane: the per-step floor and the megakernel question (2026-10-28, 8× H100)
+
+**Launch floor** (`mega::tests::mega_launch_floor`, one H100, 132 SMs, CUDA 12.8): a captured
+graph of N dependent trivial kernels, µs per node, flat in N (300–2400):
+
+| chain | µs / node |
+|---|---|
+| graph, 1-block kernels | 0.91 |
+| graph, 132-block kernels | 1.10 |
+| graph, 132-block, a memcpy node every 10 | 1.08 |
+| plain stream launches, 1 block | 1.81 |
+| plain stream launches, 132 blocks | 1.99 |
+| grid barrier inside one persistent kernel, 132 × 256 (ds_hc_fused_ks's) | 2.08 |
+| grid barrier, 132 × 1024 / 264 × 256 / 64 × 256 / 8 × 256 | 2.10 / 2.71 / 1.97 / 1.69 |
+
+So the verify graph's ~1188 nodes cost **~1.3 ms** of its 23 ms replay as pure node overhead.
+The rest is ~19 µs per node of kernel bodies, mostly latency-bound: memory round trips,
+serial phases, and tails on kernels that move a few MB. **A grid barrier costs as much as two
+graph nodes.** A persistent kernel saves nothing on synchronization; it only wins where it
+overlaps work across what used to be kernel boundaries.
+
+**Per-layer launch inventory** (nsys on the tiny fixture, verify window t = 6, direct path,
+254 kernels over 8 layers + head, ~30 per layer; the real model at 948 direct launches per
+verify is ~24 per layer): mHC 2 (`ds_hc_fused_ks` attn + ffn, plus `ds_mean_hc` on DSpark
+target layers); attention prologue 5 + 1 memcpy (`ds_ks_quant`, wq_a and wkv `ds_ks`, ring copy,
+`ds_qkv_post`, wq_b `ds_ks`); compressor/indexer 3–8 on compressing layers (`ds_linear_t8`,
+`dg_rope`, `dg_index_score`, `dg_topk`, ...); attention core 1–2 (`ds_attn_fdm` + comb, or
+`dg_win_idx` + sparse attn); wo 2–3 (`ds_wo_ks`, wo_b quant + `ds_ks`); MoE 5 (`ds_router`,
+`ds_route_plan_q`, grouped gu, grouped down, `ds_moe_reduce_sh` + the NCCL all-reduce).
+
+**The dense-glue megakernel** (`mg_glue` in kernels_mega.cu, `DS_MEGA=1`, e93df959 + 3e4e8677): the 6
+launches + 1 memcpy from the MoE all-reduce of layer l−1 to the attention core of layer l
+(the attention mHC stage, the block input's quantization folded into its store, wq_a, wkv, the
+ring copy, `ds_qkv_post` with its 1024-thread reductions replayed in order by 256 threads,
+wq_b) as one persistent launch with 3 grid barriers (+ one among the mHC blocks), idle blocks
+prefetching the projections' weights into L2. **Bit for bit** the separate launches
+(`gpu_tiny_mega_matches` on mew and H100; `mega_glue_bench` at real shapes). Measured:
+
+| | separate | mg_glue |
+|---|---|---|
+| bench, real shapes, t = 1 / t = 6, µs per layer (graph of 40, weights rotated past L2) | 89.6 / 103.0 | 105.1 / 117.9 (2 blocks/SM; 1/SM: 126 / 137; L2 prefetch 0–40 MB: ±2) |
+| server, direct verify: launches | 948 | 744 |
+| server, direct op table: glue stretch per layer | ~119 µs (hc attn stage + q + window_kv) | 126 µs (`layer.attn.glue`) |
+| server, graph verify / draft gpu ms | 22.98 / 3.89 | 23.58 / 3.90 |
+| greedy 200 tok/s (×2 warm) / acceptance | 148.4 / 153 of 235 | 143.9 / 153 of 235 |
+
+So it is **slower by ~15 µs per layer and stays off**. Why: the separate `ds_ks` launches
+each size their grid from their own occupancy (3–4 blocks per SM for the small wq_a/wkv
+staging), the megakernel must keep every block co-resident for its barriers and so runs all
+phases at the worst phase's occupancy (2 per SM, set by wq_a's 35 KB activation staging and
+the mHC phase's static arrays); its 3 barriers (~2 µs each) replace 6 nodes (~1.1 µs each); and
+L2 prefetch buys nothing because the phases are latency-bound, not bandwidth-bound (wq_b's
+42 MB at 3.35 TB/s is 12.5 µs of the ~100).
+
+**Plan for the next wave.** The step is ~23 ms of graph against a ~3 ms HBM floor and a ~1.3 ms
+node floor; launch count is worth ≤ 1.3 ms in total, so neither a full per-layer megakernel
+nor fewer launches alone gets near 4.3 ms. The time is in latency-bound kernel bodies: the
+glue stretch moves ~51 MB a layer (15 µs at HBM rate) in ~100 µs; MoE ~264 µs a layer for
+~1/8 of 6 × 3 fp4 experts + the shared one.
+
+- *Full per-layer persistent megakernel* (one launch per layer, ~10 phases, ~10 barriers):
+  saves ≤ 24 nodes × 1.1 µs − 10 × 2.1 µs ≈ 5 µs a layer, 0.2 ms a step, before the
+  occupancy penalty measured above, and the NCCL all-reduce cannot live inside it (it needs a
+  device-initiated reduce: NVSHMEM or a hand-rolled NVLink P2P reduce over mapped peer
+  memory, itself a wave). Estimated step: 22–23 ms. Not worth scheduling as is.
+- *Few big kernels per layer* (≈ 4: mHC+prologue GEMVs, attention+wo, router+route+grouped
+  MoE, reduce+post-mix), each a **stream-K / split-K GEMV that keeps every SM busy and
+  overlaps the next weight stream with the current reduction** (the real win of fusion, which
+  needs per-phase occupancy, not one co-resident grid): the target is each kernel at ≥ 60% of
+  HBM rate. At that rate a layer's ~55 MB dense + ~8 MB expert bytes per rank is ~30 µs, a step
+  ~1.5–3 ms of bandwidth + ~0.2 ms of nodes + the all-reduces (40 × ~30 µs = 1.2 ms today on
+  NVLink; overlap with the shared expert already exists). Estimated step ~5–6 ms, the
+  realistic road to 1000 tok/s. Concretely: (1) make `ds_ks` / `lin_mma` bandwidth-bound at
+  t ≤ 8 (measure each projection's achieved GB/s with `mega_glue_bench`'s harness; wq_b is
+  42 MB in ~25 µs today); (2) chain kernels with programmatic dependent launch
+  (`cudaLaunchAttributeProgrammaticStreamSerialization`, graph-capturable) so a kernel's weight
+  loads start under its predecessor's tail, which is the overlap a megakernel would buy
+  without its occupancy cost; (3) only then fuse the tiny ones (`ds_ks_quant` into its
+  producer, as `mg_glue` does bit for bit).
+
+Code: `flash/deepseek/mega.rs` (benches, `Mega`), `kernels_mega.cu`, `mega_engine.rs` (the
+deferral hooks in `block_ks` / `qkv_fused`; flushes before any other reader of the stage).
+
+### Wave 8b: per-projection bandwidth and programmatic dependent launch (8× H100 pod, one GPU)
+
+**Bandwidth targets** (`mega::tests::mega_bw_table`, t = 6, real shapes, random weights,
+each through the launcher the engine uses, copies rotated past L2, graph replay; % of
+3.35 TB/s):
+
+| projection | rows × cols | MB | µs | GB/s | % HBM |
+|---|---|---|---|---|---|
+| wq_a (fp8, `ds_ks`) | 1280 × 5120 | 6.3 | 14.1 | 466 | 14% |
+| wkv (fp8, `ds_ks`) | 512 × 5120 | 2.5 | 9.5 | 275 | 8% |
+| wq_b (fp8, `ds_ks`) | 32768 × 1280 | 40.0 | 28.9 | 1450 | 43% |
+| wo_a (fp8, `ds_wo_ks`, 8 groups) | 8192 × 4096 | 32.0 | 25.6 | 1313 | 39% |
+| wo_b (fp8, `ds_ks`) | 5120 × 8192 | 40.0 | 41.5 | 1013 | 30% |
+| indexer wq_b (fp8, `ds_ks`) | 4096 × 1280 | 5.0 | 6.7 | 789 | 24% |
+| compressor wkv (bf16, `ds_linear_t8`) | 512 × 5120 | 5.0 | 33.3 | 157 | 5% |
+| compressor wgate (bf16, `ds_linear_t8`) | 512 × 5120 | 5.0 | 33.3 | 157 | 5% |
+| indexer weights_proj (bf16, `ds_linear_t8`) | 32 × 5120 | 0.3 | 30.8 | 11 | 0% |
+| router gate (bf16, `ds_linear_t8`) | 384 × 5120 | 3.8 | 33.0 | 119 | 4% |
+| hc mixes (f32, `ds_linear_t8`; the engine runs them inside `ds_hc_fused_ks`) | 24 × 20480 | 1.9 | 104.4 | 19 | 1% |
+| expert gu, one slot (fp4, `ds_ks` gu; a stand-in for the grouped launch) | 2 × 2304 × 5120 | 12.0 | 22.5 | 557 | 17% |
+| expert down, one slot (fp4, `ds_ks`; stand-in) | 5120 × 2304 | 6.0 | 13.9 | 451 | 13% |
+| head (bf16, `ds_head_bf16`) | 129280 × 5120 | 1262.5 | 516.9 | 2561 | 76% |
+
+Read: only the head streams well. `ds_linear_t8` has a ~31 µs floor whatever the size (the
+router, compressor and indexer weights; ~4 of them a compressing layer, ~2.5 ms a step): move
+the bf16 t ≤ 8 linears onto a K-split GEMV (bf16 `lin_mma` variant), the cheapest ms in the
+step. The small fp8 projections (wq_a, wkv) sit at 8–14%: they are a fixed ~9 µs of
+ramp/reduction; batching wq_a + wkv into one launch (same activation) and the K-split reduce
+in fewer rounds are the levers. The big ones (wq_b, wo_a, wo_b) are at 30–43%; target ≥ 70%
+(the head's kernel shows the hardware gives it at t ≤ 8).
+
+**Programmatic dependent launch** (`pdl.rs`: `cuLaunchKernelEx` +
+`CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`; `mg_pdl_step` triggers
+`griddepcontrol.launch_dependents` first, streams its own weights, then
+`griddepcontrol.wait`s and bumps the counters its predecessor bumped;
+`mega::tests::mega_pdl_floor`, chain of 400, 264 × 256 blocks). **The attribute survives graph
+capture** and the order holds (every counter exactly the expected count):
+
+| per-kernel weights | graph plain µs | graph PDL µs | stream plain | stream PDL | bytes at 3.35 TB/s |
+|---|---|---|---|---|---|
+| 0 | 1.19 | 0.82 | 2.05 | 1.43 | 0 |
+| 256 KB | 1.80 | 0.83 | 2.79 | 1.42 | 0.08 |
+| 1 MB | 2.40 | 0.86 | 3.57 | 1.43 | 0.31 |
+| 4 MB | 3.85 | 1.36 | 5.20 | 1.69 | 1.25 |
+| 16 MB | 9.65 | 5.26 | 11.01 | 5.27 | 5.0 |
+
+So PDL takes the node cost from 1.2 to 0.8 µs and, more usefully, **hides a kernel's
+independent weight stream under its predecessor** (4 MB: 3.85 → 1.36 µs, at the bandwidth
+line). At ~24 kernels a layer that is ≥ 0.4 µs × 960 ≈ 0.4 ms a step from the nodes alone, and
+up to each kernel's ramp (the ~9 µs floor of the small projections above) where the weight
+loads can move before the wait.
+
+Not wired into the engine yet: a PDL launch is only safe for a kernel that
+`griddepcontrol.wait`s before reading its predecessor's outputs, and the dense stretch's
+kernels (`ds_ks`/`lin_mma`, `ds_qkv_post`, `ds_hc_fused_ks`, `ds_wo_ks`) live in kernels.cu,
+owned by the kernel lanes. The change per kernel is two lines (`mg_pdl_trigger()` at entry,
+`mg_pdl_wait()` after the weight-only prologue; in `lin_mma` that is after the activation
+staging would move below the first weight loads, i.e. issue the first `KS_UG` groups' weight
+loads, wait, then stage x), plus launching through `pdl::launch` when `DS_PDL=1`. Scheduling it
+with the kernel lanes is the next step; the expected win on the dense stretch is ~1–2 µs per
+kernel boundary (~1 ms a step), more where a prologue is restructured to load weights first.
 
 ## How to profile a step
 

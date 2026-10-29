@@ -25,6 +25,10 @@ pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]
+pub mod mega;
+#[cfg(feature = "cuda")]
+pub mod pdl;
+#[cfg(feature = "cuda")]
 pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod obs;
@@ -93,6 +97,24 @@ pub struct Config {
     /// `DS41_CTX` overrides it.
     #[serde(default = "max_seq")]
     pub max_seq_len: usize,
+    /// Runtime, not in the checkpoint: drafts a greedy speculative step verifies at most
+    /// (`DS_DRAFT_N`, else `DS_DRAFT_N_GREEDY`, else the trained block). Below the trained
+    /// block the drafter still runs it and the window keeps the first `draft_n` drafts; above
+    /// it the drafter's block grows to `draft_n` (more noise tokens than trained).
+    #[serde(skip)]
+    pub draft_n: usize,
+    /// As `draft_n` for sampled steps (`DS_DRAFT_N`, else `DS_DRAFT_N_SAMPLED`, else the
+    /// trained block). The draft graphs are keyed by sampler, so each mode has its own.
+    #[serde(skip)]
+    pub draft_n_sampled: usize,
+    /// The checkpoint's `dspark_block_size`; [`Config::load`] raises `dspark_block_size` to
+    /// the largest block either mode drafts (it sizes windows and caches).
+    #[serde(skip)]
+    pub trained_block: usize,
+    /// Runtime: `DS_DRAFT_CONF`, the confidence early stop. The window keeps the longest
+    /// draft prefix whose product of sigmoid(confidence) is >= this (0 = off).
+    #[serde(skip)]
+    pub draft_conf: f32,
 }
 
 fn yes() -> bool {
@@ -111,7 +133,50 @@ impl Config {
         if let Some(n) = std::env::var("DS41_CTX").ok().and_then(|v| v.parse().ok()) {
             cfg.max_seq_len = n;
         }
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+        let tb = cfg.dspark_block_size;
+        let n = |k: &str| {
+            env("DS_DRAFT_N")
+                .or_else(|| env(k))
+                .map_or(tb, |n| (n as usize).max(1))
+        };
+        (cfg.trained_block, cfg.draft_n, cfg.draft_n_sampled) =
+            (tb, n("DS_DRAFT_N_GREEDY"), n("DS_DRAFT_N_SAMPLED"));
+        cfg.dspark_block_size = tb.max(cfg.draft_n).max(cfg.draft_n_sampled);
+        cfg.draft_conf = env("DS_DRAFT_CONF").unwrap_or(0.0) as f32;
         Ok(cfg)
+    }
+
+    /// The drafter's block for a greedy or sampled step: the trained block, or the step's
+    /// draft length when that is longer.
+    pub fn draft_block(&self, greedy: bool) -> usize {
+        self.trained_block.max(self.n_for(greedy))
+    }
+
+    fn n_for(&self, greedy: bool) -> usize {
+        if greedy {
+            self.draft_n
+        } else {
+            self.draft_n_sampled
+        }
+    }
+
+    /// How many of a draft's drafts (confidences `conf`, one per draft) the verify window
+    /// of a greedy or sampled step takes: at most its draft length, cut at the first draft where the running product
+    /// of sigmoid(conf) falls below [`Config::draft_conf`] (at least one draft is kept).
+    pub fn draft_keep(&self, conf: &[f32], greedy: bool) -> usize {
+        let n = self.n_for(greedy).min(conf.len());
+        if self.draft_conf <= 0.0 {
+            return n;
+        }
+        let mut p = 1f64;
+        for (i, &c) in conf[..n].iter().enumerate() {
+            p /= 1.0 + (-(c as f64)).exp();
+            if i > 0 && p < self.draft_conf as f64 {
+                return i;
+            }
+        }
+        n
     }
 
     /// Routed experts and how many a token picks, for layer `lid` (DSpark stages have their own).

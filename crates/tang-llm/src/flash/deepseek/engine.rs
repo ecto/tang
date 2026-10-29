@@ -42,6 +42,9 @@ use std::rc::Rc;
 use tang_moe::args;
 use tang_moe::gpu::{DevBuf, Event, Gpu, Graph, Stream};
 
+#[path = "mega_engine.rs"]
+mod mega_engine;
+
 const B256: (u32, u32, u32) = (256, 1, 1);
 
 /// Stands in for the start position in a decode step's host code, which must not depend on
@@ -113,6 +116,47 @@ impl SparkPack {
             rng,
             len: rng + 2,
         }
+    }
+}
+
+/// Entries a row of a device-kept distribution (`DS_SS_CAP` in kernels_select.cu).
+const SS_CAP: usize = 2048;
+
+/// The device speculative sampler's buffers (fixed addresses: a captured draft writes the
+/// Q rows): the draft's kept distributions Q [blk][SS_CAP] (ids i32, probs f64, count), the
+/// verify window's P [blk + 1][...], P's f64 scratch [blk + 1][V], the window ids and the
+/// walk's result [ok, k, tokens[blk + 1], rng lo, rng hi].
+struct SpecDev {
+    qi: DevBuf,
+    qp: DevBuf,
+    qn: DevBuf,
+    pi: DevBuf,
+    pp: DevBuf,
+    pn: DevBuf,
+    w: DevBuf,
+    ids: DevBuf,
+    out: DevBuf,
+}
+
+/// `DS_SPEC_HOST=1`: sampled verify walks on the host (the reference path).
+fn host_walk() -> bool {
+    std::env::var("DS_SPEC_HOST").is_ok_and(|v| v == "1")
+}
+
+impl SpecDev {
+    fn new(blk: usize, v: usize) -> Result<Self> {
+        let n = blk + 1;
+        Ok(Self {
+            qi: DevBuf::alloc(blk * SS_CAP * 4)?,
+            qp: DevBuf::alloc(blk * SS_CAP * 8)?,
+            qn: DevBuf::zeroed(blk * 4)?,
+            pi: DevBuf::alloc(n * SS_CAP * 4)?,
+            pp: DevBuf::alloc(n * SS_CAP * 8)?,
+            pn: DevBuf::zeroed(n * 4)?,
+            w: DevBuf::alloc(n * v * 8)?,
+            ids: DevBuf::alloc(n * 4)?,
+            out: DevBuf::alloc((n + 4) * 4)?,
+        })
     }
 }
 
@@ -233,6 +277,11 @@ pub struct GpuModel {
     /// unsummed, for the post-mix to add (`ds_add_round` folded into `ds_hc_post`).
     defer_sh: Cell<bool>,
     sh: Cell<Option<Buf>>,
+    /// 8 rows of f32 zeros: the `sh` of a folded shared expert (the post-mix's `bf(y + 0)`).
+    zero_rows: DevBuf,
+    /// The shared expert folded into the grouped K-split launches at t <= 8 (`DS_MOE_SH=0`
+    /// keeps its own MLP; never under `DS_EXACT=1`).
+    pub moe_sh: bool,
     /// Set by the forward loop: the next block's prefix when it reads this block's stream
     /// as is, so the last post-mix also computes its attention mixes (`pend_mixes`).
     next_hc: Option<String>,
@@ -270,6 +319,13 @@ pub struct GpuModel {
     snap: Option<(Vec<DevBuf>, HashMap<usize, (DevBuf, DevBuf)>)>,
     /// DSpark's Markov embedding table [V][rank] f32, for the device-side greedy draft.
     spark_tab: Option<DevBuf>,
+    /// The device rejection sampler's buffers (see [`SpecDev`]), once a sampled draft ran.
+    spec_dev: Option<SpecDev>,
+    /// Whether the last draft left its kept distributions in `spec_dev` (a device sampled
+    /// draft), so a verify may walk on the device.
+    spec_q: bool,
+    /// Sampled verify walks run on the device, and on the host (a fallback).
+    pub spec_walks: (usize, usize),
     /// Expert parallelism ([`super::ep`]): the routed experts this rank runs. Others are
     /// skipped in `moe` and never uploaded. All of them when unsharded.
     pub owns_expert: Box<dyn Fn(usize) -> bool>,
@@ -306,6 +362,10 @@ pub struct GpuModel {
     join: Event,
     /// `ds_hc_fused_ks`'s grid barrier: arrivals (zero between launches) and generation.
     hc_cnt: DevBuf,
+    /// `DS_MEGA=1`: the dense-glue megakernel ([`super::mega`]) and the deferred mHC stage
+    /// it takes over (see mega_engine.rs).
+    mega: Option<super::mega::Mega>,
+    pend_glue: Option<mega_engine::GluePend>,
     // last: dropped after every buffer and graph above (see `Drop`)
     k: Kernels,
     gk: GKernels,
@@ -387,6 +447,11 @@ impl GpuModel {
             fork: Event::new(false)?,
             join: Event::new(false)?,
             hc_cnt: DevBuf::from_slice(&[0i32; 2])?,
+            mega: match super::mega::on() {
+                true => Some(super::mega::Mega::new(&g)?),
+                false => None,
+            },
+            pend_glue: None,
             _g: g,
             w: RefCell::new(HashMap::new()),
             experts: RefCell::new(ExpertCache::default()),
@@ -409,6 +474,8 @@ impl GpuModel {
             qk: RefCell::new(HashMap::new()),
             defer_sh: Cell::new(false),
             sh: Cell::new(None),
+            zero_rows: DevBuf::from_slice(&vec![0f32; 8 * c.dim])?,
+            moe_sh: std::env::var("DS_MOE_SH").map_or(true, |v| v != "0"),
             next_hc: None,
             pend_mixes: None,
             pend_stage: None,
@@ -431,6 +498,9 @@ impl GpuModel {
             journal: Vec::new(),
             snap: None,
             spark_tab: None,
+            spec_dev: None,
+            spec_q: false,
+            spec_walks: (0, 0),
             owns_expert: Box::new(|_| true),
             moe_reduce: None,
             moe_grouped: std::env::var("DS_MOE_LOOP").map_or(true, |v| v != "1"),
@@ -826,7 +896,11 @@ impl GpuModel {
             && wqa.rows % 32 == 0
             && hd % 32 == 0;
         if !ok {
+            self.glue_flush()?;
             return Ok(None);
+        }
+        if let Some(r) = self.glue_qkv(p, lid, x, t, [wqa, wkv, wqb, qn, kn])? {
+            return Ok(Some(r));
         }
         let (d, ql) = (wqa.cols as usize, wqa.rows as usize);
         let at = At::Dev {
@@ -1868,7 +1942,12 @@ impl GpuModel {
         // on the 3090 bench so far, so opt-in for sweeping on H200)
         let fused = std::env::var("DS_MOE_GATE").is_ok_and(|v| v == "1")
             && Kernels::moe_gate_ok(&gw.v, t, ne, topk);
+        let sh = match &tab {
+            Some(tb) => self.moe_sh_weights(p, tb, t, topk)?,
+            None => None,
+        };
         let mut elist = None;
+        let mut preq = false;
         if fused {
             // gate GEMV + router + CSR (+ the grouped plan) in one launch
             let s = self.span("router");
@@ -1913,19 +1992,41 @@ impl GpuModel {
                 c.route_scale,
             )?;
             self.end(s);
-            // per-expert CSR on the device
+            // per-expert CSR on the device; with the shared expert folded, the plan and the
+            // GU's activation quantization ride in the same launch
             let s = self.span("route");
-            self.k.route(
-                &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
-            )?;
+            match (&tab, &sh) {
+                (Some(tb), Some(_)) => {
+                    let cap = (t * topk).min(tb.local);
+                    let el = self.fbuf(cap)?;
+                    self.k.route_plan_q(
+                        &self.s,
+                        (ids.ptr, wts.ptr),
+                        (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                        (tb.mask.ptr, el.ptr, cap),
+                        x.ptr,
+                        (t, topk, ne, d),
+                    )?;
+                    elist = Some(el);
+                    preq = true;
+                }
+                _ => self.k.route(
+                    &self.s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+                )?,
+            }
             self.end(s);
         }
         if let Some(tab) = tab {
-            let y = if t <= 8 {
-                self.moe_grouped_routed(&tab, x, t, topk, ne, ids, counts, off, rows, rw, elist)?
-            } else {
-                self.moe_grouped_tiled(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?
-            };
+            if t <= 8 {
+                let (y, folded) = self.moe_grouped_routed(
+                    p, &tab, x, t, topk, ne, ids, counts, off, rows, rw, elist, sh, preq,
+                )?;
+                if folded {
+                    return self.moe_finish_folded(x, t, y);
+                }
+                return self.moe_finish(p, x, t, y);
+            }
+            let y = self.moe_grouped_tiled(&tab, x, t, topk, ne, ids, counts, off, rows, rw)?;
             return self.moe_finish(p, x, t, y);
         }
         // the expert LRU uploads on the host's say: it alone reads the counts back, to skip
@@ -1996,11 +2097,42 @@ impl GpuModel {
         self.moe_finish(p, x, t, y)
     }
 
+    /// The shared expert's weights when it folds into the grouped launches as one more slot
+    /// (on rank 0 alone under EP, so the reduce sums it once): its MLP launches and the add
+    /// gone. `DS_MOE_SH=0` keeps the MLP.
+    fn moe_sh_weights(
+        &self,
+        p: &str,
+        tab: &MoeTab,
+        t: usize,
+        topk: usize,
+    ) -> Result<Option<[Rc<DevW>; 3]>> {
+        if !self.moe_sh || t > 8 {
+            return Ok(None);
+        }
+        let pe = format!("{p}.ffn.shared_experts");
+        let ws = [
+            self.dw(&format!("{pe}.w1.weight"))?,
+            self.dw(&format!("{pe}.w3.weight"))?,
+            self.dw(&format!("{pe}.w2.weight"))?,
+        ];
+        let ok = self.k.moe_sh_ok(
+            [&ws[0].v, &ws[1].v, &ws[2].v],
+            tab.fmt,
+            t,
+            topk,
+            self.cpu.cfg.dim,
+            tab.inter,
+        );
+        Ok(ok.then_some(ws))
+    }
+
     /// The routed experts' partial sum y [t][d] by the grouped kernels: plan (live local
     /// experts), gate/up + SwiGLU, quantize, down to per-slot partials, ordered reduce.
     #[allow(clippy::too_many_arguments)]
     fn moe_grouped_routed(
         &self,
+        p: &str,
         tab: &MoeTab,
         x: Buf,
         t: usize,
@@ -2012,7 +2144,9 @@ impl GpuModel {
         rows: Buf,
         rw: Buf,
         planned: Option<Buf>,
-    ) -> Result<Buf> {
+        sh: Option<[Rc<DevW>; 3]>,
+        preq: bool,
+    ) -> Result<(Buf, bool)> {
         let d = self.cpu.cfg.dim;
         let (n, inter) = (t * topk, tab.inter);
         let slots = n.min(tab.local);
@@ -2042,8 +2176,60 @@ impl GpuModel {
         } else {
             self.qdq(x, t * d)?
         };
-        let h = self.fbuf(n * inter)?;
         let lim = self.cpu.cfg.swiglu_limit;
+        if let Some(ws) = sh {
+            let on = self.obs.rank.get() == 0;
+            let h = self.fbuf((n + t) * inter)?;
+            self.k.moe_gu_sh(
+                &self.s,
+                tab.fmt,
+                (tab.w1.ptr, tab.w3.ptr, elist.ptr),
+                (off.ptr, rows.ptr, rw.ptr),
+                (&ws[0].v, &ws[1].v, on),
+                if preq { 0 } else { x.ptr },
+                h.ptr,
+                (t, n, slots, inter, d),
+                lim,
+            )?;
+            self.end(s);
+            let s = self.span("grouped_down");
+            let part = self.fbuf((n + t) * d)?;
+            self.k.moe_down_sh(
+                &self.s,
+                tab.fmt,
+                (tab.w2.ptr, elist.ptr, off.ptr),
+                (&ws[2].v, on),
+                h.ptr,
+                part.ptr,
+                (t, n, slots, d, inter),
+            )?;
+            let y = self.fbuf(t * d)?;
+            let (ti, ki, di, shi) = (t as i32, topk as i32, d as i32, on as i32);
+            unsafe {
+                self.k.go(
+                    "ds_moe_reduce_sh",
+                    blocks(t * d, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![
+                        y.ptr,
+                        part.ptr,
+                        ids.ptr,
+                        off.ptr,
+                        rows.ptr,
+                        tab.mask.ptr,
+                        ti,
+                        ki,
+                        di,
+                        shi
+                    ],
+                )?
+            };
+            self.end(s);
+            return Ok((y, true));
+        }
+        let h = self.fbuf(n * inter)?;
         self.k.moe_gu(
             &self.s, tab.fmt, tab.w1.ptr, tab.w3.ptr, elist.ptr, off.ptr, rows.ptr, rw.ptr, xq.ptr,
             h.ptr, t, slots, inter, d, lim,
@@ -2081,7 +2267,7 @@ impl GpuModel {
             )?
         };
         self.end(s);
-        Ok(y)
+        Ok((y, false))
     }
 
     /// [`Self::moe_grouped_routed`] for t > 8 (prefill): the same plan and ordered reduce,
@@ -2254,6 +2440,36 @@ impl GpuModel {
                 0,
                 &self.s,
                 args![y.ptr, sh.ptr, nn],
+            )?
+        };
+        self.end(s);
+        Ok(y)
+    }
+
+    /// [`Self::moe_finish`] when the grouped launches already summed the shared expert into
+    /// `y` (unrounded): the EP reduce in order, then the one bf16 rounding — deferred to the mHC
+    /// post-mix as `bf(y + 0)` (a zero `sh`) or here.
+    fn moe_finish_folded(&self, _x: Buf, t: usize, y: Buf) -> Result<Buf> {
+        let d = self.cpu.cfg.dim;
+        if let Some(reduce) = &self.moe_reduce {
+            let s = self.span("reduce");
+            reduce(&y.dev(), t * d, &self.s)?;
+            self.end(s);
+        }
+        if self.defer_sh.get() {
+            self.sh.set(Some(Buf::from(&self.zero_rows)));
+            return Ok(y);
+        }
+        let s = self.span("finish");
+        let nn = (t * d) as i64;
+        unsafe {
+            self.k.go(
+                "ds_round",
+                blocks(t * d, 256),
+                B256,
+                0,
+                &self.s,
+                args![y.ptr, nn],
             )?
         };
         self.end(s);
@@ -2612,6 +2828,9 @@ impl GpuModel {
     ) -> Result<(Buf, Buf)> {
         let next = self.next_hc.take();
         let norm = format!("{p}.attn_norm.weight");
+        if !matches!(attn, Attn::Main) || sp == 0 {
+            self.glue_flush()?;
+        }
         // a span only when there is a launch (the carried stage costs nothing here, and an
         // empty span still charges its event pair, ~5 us, to the op table)
         let (am, h) = match self.pend_stage.take() {
@@ -2645,8 +2864,10 @@ impl GpuModel {
         let x = match next {
             Some(np) => {
                 let norm = format!("{np}.attn_norm.weight");
-                let (x, nm, nh) =
-                    self.hc_fused(h, sh, x, Some(&fm), t, &np, "attn", fm.pre, &norm)?;
+                let (x, nm, nh) = match self.mega.is_some() {
+                    true => self.glue_defer(h, sh, x, &fm, t, &np, fm.pre)?,
+                    false => self.hc_fused(h, sh, x, Some(&fm), t, &np, "attn", fm.pre, &norm)?,
+                };
                 self.pend_stage = Some((nm, nh));
                 x
             }
@@ -3023,6 +3244,7 @@ impl GpuModel {
         let mut mains: Vec<Buf> = Vec::new();
         self.pend_mixes = None;
         self.pend_stage = None;
+        self.pend_glue = None;
         for i in 0..c.n_layers {
             let p = format!("layers.{i}");
             let sp_layer = self.obs.span(&self.s, "layer", Some(i));
@@ -3037,6 +3259,7 @@ impl GpuModel {
                 self.end(se);
             }
             if c.dspark_target_layer_ids.contains(&i) {
+                self.glue_flush()?;
                 let sh = self.span("hc");
                 let m = self.fbuf(t * d)?;
                 let (ti, hci, di) = (t as i32, hc as i32, d as i32);
@@ -3063,6 +3286,7 @@ impl GpuModel {
             pre_mix = npm;
             self.end(sp_layer);
             if let Some(hk) = hook.as_mut() {
+                self.glue_flush()?;
                 hk(&format!("layer{i}"), &self.read(h, t * hc * d)?);
             }
         }
@@ -3271,6 +3495,7 @@ impl GpuModel {
                 })
                 .collect()
         };
+        self.spec_q = false;
         if let Draw::Host(draw) = &mut how {
             // the Markov head samples left to right: each position's bias (its predecessor's
             // Markov embedding through the head, a rank x V GEMV) on the device, the row read
@@ -3320,6 +3545,10 @@ impl GpuModel {
             _ => None,
         };
         let key = (t, samp.map(|(a, b)| (a.to_bits(), b.to_bits())));
+        if samp.is_some() && self.spec_dev.is_none() {
+            self.spec_dev = Some(SpecDev::new(blk, v)?);
+        }
+        self.spec_q = samp.is_some();
         let gen = self.gen();
         let lay = SparkPack::new(blk, v, d);
         let pk = if self.graphable(sp, false) {
@@ -3459,6 +3688,10 @@ impl GpuModel {
             }
             None => None,
         };
+        let (qi, qp, qn) = self
+            .spec_dev
+            .as_ref()
+            .map_or((0u64, 0u64, 0u64), |sd| (sd.qi.ptr, sd.qp.ptr, sd.qn.ptr));
         for i in 0..blk {
             let bias = self.raw(memb.ptr, 1, &mhead)?;
             let row = pk.ptr + (i * v * 4) as u64;
@@ -3481,7 +3714,7 @@ impl GpuModel {
                         &self.s,
                         args![
                             row, vi, idp, slot, tab, ri, memb.ptr, temp, top_p, rng, w.ptr,
-                            bias.ptr
+                            bias.ptr, qi, qp, qn
                         ],
                     )?,
                 }
@@ -3560,6 +3793,61 @@ impl GpuModel {
         Ok(())
     }
 
+    /// Speculative sampling's accept walk over the last verify window on the device
+    /// (`ds_spec_dist` per row, then `ds_spec_walk` against the draft's kept Q rows): the
+    /// accepted count, the tokens and the advanced RNG, from one small read-back; `None` when
+    /// a row the walk reached has no device distribution (the host walks instead).
+    fn spec_walk(
+        &mut self,
+        ids: &[usize],
+        temp: f32,
+        top_p: f32,
+        rng: u64,
+    ) -> Result<Option<(usize, Vec<usize>, u64)>> {
+        let v = self.cpu.cfg.vocab_size;
+        let n = ids.len();
+        let out = self.last.as_ref().context("spec_walk: no verify window")?;
+        if out.rows != n {
+            bail!("spec_walk: {} rows for {n} ids", out.rows);
+        }
+        let lp = out.logits.ptr;
+        let sd = self.spec_dev.as_ref().context("spec_walk: no draft")?;
+        sd.ids
+            .write(0, &ids.iter().map(|&i| i as i32).collect::<Vec<_>>())?;
+        let (vi, ni) = (v as i32, n as i32);
+        unsafe {
+            self.k.go(
+                "ds_spec_dist",
+                (n as u32, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![lp, vi, temp, top_p, sd.w.ptr, sd.pi.ptr, sd.pp.ptr, sd.pn.ptr],
+            )?;
+            self.k.go(
+                "ds_spec_walk",
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                &self.s,
+                args![
+                    sd.ids.ptr, ni, sd.pi.ptr, sd.pp.ptr, sd.pn.ptr, sd.qi.ptr, sd.qp.ptr,
+                    sd.qn.ptr, rng, sd.out.ptr
+                ],
+            )?;
+        }
+        self.sync()?;
+        super::obs::d2h((n + 4) * 4);
+        let o = sd.out.read::<i32>(0, n + 4)?;
+        if o[0] != 1 {
+            return Ok(None);
+        }
+        let k = o[1] as usize;
+        let tokens = o[2..3 + k].iter().map(|&t| t as usize).collect();
+        let rng = o[2 + n] as u32 as u64 | (o[3 + n] as u32 as u64) << 32;
+        Ok(Some((k, tokens, rng)))
+    }
+
     /// As [`Model::decode_spec`].
     pub fn decode_spec(
         &mut self,
@@ -3573,23 +3861,42 @@ impl GpuModel {
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
         let (start, t0) = (std::time::SystemTime::now(), std::time::Instant::now());
+        // the drafter's block for this mode (the spark reads it from the config)
+        let greedy = pick.greedy();
+        self.cpu.cfg.dspark_block_size = c.draft_block(greedy);
         let draft = if pick.greedy_draft() {
-            self.spark(token, main, sp, Draw::Greedy)?
+            self.spark(token, main, sp, Draw::Greedy)
         } else if let Some(sm) = pick.as_sampler() {
-            self.spark(token, main, sp, Draw::Sample(sm))?
+            self.spark(token, main, sp, Draw::Sample(sm))
         } else {
-            self.spark(token, main, sp, Draw::Host(&mut |q: &[f32]| pick.draft(q)))?
-        }
-        .context("decode_spec needs sp > 0")?;
+            self.spark(token, main, sp, Draw::Host(&mut |q: &[f32]| pick.draft(q)))
+        };
+        self.cpu.cfg.dspark_block_size = c.dspark_block_size;
+        let draft = draft?.context("decode_spec needs sp > 0")?;
         let mut ids = draft.ids;
+        ids.truncate(1 + c.draft_keep(&draft.conf, greedy));
         edit(pos0 + 1, &mut ids[1..]);
         let t1 = std::time::Instant::now();
         let snap = self.snapshot()?;
         let amax = self.verify_window(&ids, pos0)?;
         let n = ids.len();
+        let dev = match pick.as_sampler() {
+            Some(sm) if !SpecSampler::greedy(sm) && self.spec_q && !host_walk() => {
+                let r = self.spec_walk(&ids, sm.temp, sm.top_p, sm.rng)?;
+                if let Some((_, _, rng)) = &r {
+                    sm.rng = *rng;
+                }
+                r
+            }
+            _ => None,
+        };
         let (k, tokens) = if pick.greedy() {
             super::forward::verify_greedy(&amax, &ids)
+        } else if let Some((k, tokens, _)) = dev {
+            self.spec_walks.0 += 1;
+            (k, tokens)
         } else {
+            self.spec_walks.1 += 1;
             // only the rows the walk reaches are read back
             let mut err = None;
             let mut row = |r: usize| {
@@ -3677,6 +3984,71 @@ mod tests {
     }
 
     /// Step 0 intermediates, device against the CPU reference on the same forced input.
+    /// The launch inventory of a verify window (t = 6) on the direct path: the fixture's
+    /// steps up to it, then that step between cuProfilerStart/Stop, for
+    /// `nsys profile --capture-range=cudaProfilerApi` (`DS_MEGA=1` for the megakernel).
+    #[test]
+    #[ignore]
+    fn gpu_tiny_inventory() {
+        std::env::set_var("DS_GRAPH", "0");
+        let Some((mut m, meta)) = open() else { return };
+        for step in meta["steps"].as_array().unwrap() {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            let mark = ids.len() == 6;
+            if mark {
+                m.s.sync().unwrap();
+                unsafe { cudarc::driver::sys::cuProfilerStart() };
+            }
+            m.forward(&ids, sp, None).unwrap();
+            if mark {
+                m.s.sync().unwrap();
+                unsafe { cudarc::driver::sys::cuProfilerStop() };
+            }
+        }
+    }
+
+    /// `DS_MEGA=1`'s dense-glue megakernel against the separate launches: the same logits,
+    /// bit for bit, over the fixture's steps (prefill, then decode and verify windows).
+    #[test]
+    fn gpu_tiny_mega_matches() {
+        let Some((mut a, meta)) = open() else { return };
+        if a.k.exact || a.hc_exact {
+            eprintln!("skip: exact kernels");
+            return;
+        }
+        let mut b = GpuModel::open(&Path::new(&tiny()).join("hf")).unwrap();
+        a.mega = Some(super::super::mega::Mega::new(&Gpu::at(0).unwrap()).unwrap());
+        let n0 = super::super::mega::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        for (s, step) in meta["steps"].as_array().unwrap().iter().enumerate() {
+            let ids: Vec<usize> = step["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sp = step["start_pos"].as_u64().unwrap() as usize;
+            for rep in 0..2 {
+                let (la, _) = a.forward(&ids, sp, None).unwrap();
+                let (lb, _) = b.forward(&ids, sp, None).unwrap();
+                let diff = la.iter().zip(&lb).filter(|(x, y)| x != y).count();
+                eprintln!(
+                    "step {s} (t {}, sp {sp}) rep {rep}: {diff} logits differ",
+                    ids.len()
+                );
+                assert_eq!(la, lb, "step {s} rep {rep}");
+            }
+        }
+        let n = super::super::mega::LAUNCHES.load(std::sync::atomic::Ordering::Relaxed) - n0;
+        eprintln!("{n} mg_glue launches");
+        assert!(n > 0, "the megakernel never ran");
+    }
+
     #[test]
     #[ignore]
     fn gpu_tiny_taps() {
@@ -4308,10 +4680,13 @@ mod tests {
                 .decode_spec(tok, &ma, sp, &mut |_, _| {}, &mut pa)
                 .unwrap();
             let pos0 = sp + mb.len() / w;
-            let d = b
+            b.cpu.cfg.dspark_block_size = c.draft_block(false);
+            let mut d = b
                 .forward_spec_with(tok, &mb, sp, &mut |q: &[f32]| pb.draft(q))
                 .unwrap()
                 .unwrap();
+            // the window decode_spec verifies (DS_DRAFT_N* / DS_DRAFT_CONF)
+            d.ids.truncate(1 + c.draft_keep(&d.conf, false));
             let snap = b.snapshot().unwrap();
             let (logits, mains) = b.forward_all(&d.ids, pos0).unwrap();
             let (k, tokens) =
@@ -4324,7 +4699,10 @@ mod tests {
             tok = *tokens.last().unwrap();
             (ma, mb, sp) = (st.main, mains[..(k + 1) * w].to_vec(), pos0);
         }
-        eprintln!("8 sampled steps: {rows} logits rows read");
+        eprintln!(
+            "8 sampled steps: {rows} logits rows; walks device/host {:?}",
+            a.spec_walks
+        );
     }
 
     #[test]
@@ -4404,6 +4782,78 @@ mod tests {
                 100.0 * accepted as f64 / drafted.max(1) as f64
             );
             assert_eq!(out, want, "{name}");
+        }
+    }
+
+    /// `DS_DRAFT_N_GREEDY` below (3) and above (7, the drafter's block grown past the trained 5) the
+    /// trained block, and the confidence early stop: greedy spec equals plain greedy, with
+    /// windows of at most n + 1 rows.
+    #[test]
+    fn gpu_tiny_spec_draft_n() {
+        let Some((mut m, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let (n, len) = (ids.len(), 40);
+        let (mut l, _) = m.forward(&ids, 0, None).unwrap();
+        let mut want = Vec::new();
+        while want.len() < len {
+            want.push(argmax(&l));
+            l = m
+                .forward(&[*want.last().unwrap()], n + want.len() - 1, None)
+                .unwrap()
+                .0;
+        }
+        drop(m);
+        let keep = [
+            "DS_DRAFT_N",
+            "DS_DRAFT_N_GREEDY",
+            "DS_DRAFT_N_SAMPLED",
+            "DS_DRAFT_CONF",
+        ]
+        .map(|k| (k, std::env::var_os(k)));
+        for (dn, conf) in [("3", "0"), ("7", "0"), ("7", "0.3")] {
+            // the greedy length alone; sampled steps keep their own (3 here)
+            std::env::remove_var("DS_DRAFT_N");
+            std::env::set_var("DS_DRAFT_N_GREEDY", dn);
+            std::env::set_var("DS_DRAFT_N_SAMPLED", "3");
+            std::env::set_var("DS_DRAFT_CONF", conf);
+            let m = GpuModel::open(&Path::new(&tiny()).join("hf"));
+            for (k, v) in &keep {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            let mut m = m.unwrap();
+            let dn: usize = dn.parse().unwrap();
+            assert_eq!((m.cpu.cfg.draft_n, m.cpu.cfg.draft_n_sampled), (dn, 3));
+            assert_eq!(m.cpu.cfg.dspark_block_size, dn.max(5));
+            let (l, main) = m.forward(&ids, 0, None).unwrap();
+            let t0 = argmax(&l);
+            m.forward_spec(t0, &main, 0).unwrap();
+            let (l, mut main) = m.forward(&[t0], n, None).unwrap();
+            let mut out = vec![t0, argmax(&l)];
+            let (mut sp, mut drafted, mut accepted, mut steps) = (n, 0, 0, 0);
+            while out.len() < len {
+                let s = m
+                    .decode_spec(
+                        *out.last().unwrap(),
+                        &main,
+                        sp,
+                        &mut |_, _| {},
+                        &mut super::super::forward::Greedy,
+                    )
+                    .unwrap();
+                assert!(s.drafted <= dn && s.drafted >= 1, "drafted {}", s.drafted);
+                drafted += s.drafted;
+                accepted += s.accepted;
+                steps += 1;
+                out.extend(s.tokens);
+                main = s.main;
+                sp = s.sp;
+            }
+            out.truncate(len);
+            eprintln!("n {dn} conf {conf}: accepted {accepted}/{drafted} in {steps} steps");
+            assert_eq!(out, want, "n {dn} conf {conf}");
         }
     }
 }

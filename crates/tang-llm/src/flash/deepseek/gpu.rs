@@ -107,6 +107,9 @@ pub struct Kernels {
     moe: [[[Func; 2]; 4]; 2],
     /// `ds_moe_ks_{gu,down}_f{fmt}`, the grouped MoE on the K-split path, by (fmt - 2, down).
     moe_ks: [[Func; 2]; 2],
+    /// `ds_moe_ks_{gu,down}_f{fmt}_s{sfmt}`: [`Kernels::moe_ks`] with the shared expert (format
+    /// sfmt) as one more slot, by (fmt - 2, sfmt - 2, down).
+    moe_ks_sh: [[[Func; 2]; 2]; 2],
     /// `ds_wo_ks_f{fmt}`, wo_a's grouped K-split GEMV, by fmt - 2, and its quantized activation.
     wo_ks: [Func; 2],
     wo_x: DevBuf,
@@ -203,8 +206,12 @@ const MORE: &[&str] = &[
     "ds_copy_u8",
     "ds_spark_pick",
     "ds_spark_sample",
+    "ds_spec_dist",
+    "ds_spec_walk",
     "ds_moe_plan",
     "ds_moe_reduce",
+    "ds_moe_reduce_sh",
+    "ds_route_plan_q",
     "ds_moe_gate",
     "ds_moe_plan_tiles",
     "ds_kst_f2_g0",
@@ -265,7 +272,7 @@ const KS_X: usize = 8 * 16384 * 2;
 const WO_X_COLS: usize = 32768;
 const WO_X: usize = 8 * WO_X_COLS + 8 * WO_X_COLS / 8;
 /// Row groups each grouped K-split block takes (blockIdx.x strides them).
-const MOE_KS_ITEMS: usize = 4;
+const MOE_KS_ITEMS: usize = 2;
 
 fn env_usize(k: &str) -> Option<usize> {
     std::env::var(k).ok().and_then(|v| v.parse().ok())
@@ -356,6 +363,18 @@ impl Kernels {
                 [m.func("ds_moe_ks_gu_f2")?, m.func("ds_moe_ks_down_f2")?],
                 [m.func("ds_moe_ks_gu_f3")?, m.func("ds_moe_ks_down_f3")?],
             ],
+            moe_ks_sh: {
+                let mut a = [[[std::ptr::null_mut(); 2]; 2]; 2];
+                for (f, af) in a.iter_mut().enumerate() {
+                    for (sf, asf) in af.iter_mut().enumerate() {
+                        for (di, kind) in ["gu", "down"].iter().enumerate() {
+                            asf[di] =
+                                m.func(&format!("ds_moe_ks_{kind}_f{}_s{}", f + 2, sf + 2))?;
+                        }
+                    }
+                }
+                a
+            },
             wo_ks: [m.func("ds_wo_ks_f2")?, m.func("ds_wo_ks_f3")?],
             ks2: [m.func("ds_ks2_f2")?, m.func("ds_ks2_f3")?],
             wo_x: DevBuf::alloc(WO_X)?,
@@ -409,12 +428,30 @@ impl Kernels {
                     "ds_moe_ks_tdown_f3",
                     "ds_attn_fd",
                     "ds_attn_fdm",
-                ] {
+                ]
+                .map(String::from)
+                .into_iter()
+                // the shared-expert-folded grouped kernels: past 48 KB at t 8 over d 5120
+                .chain((0..8).map(|i| {
+                    let kind = ["gu", "down"][i & 1];
+                    format!("ds_moe_ks_{kind}_f{}_s{}", 2 + (i >> 1 & 1), 2 + (i >> 2))
+                })) {
+                    let f = m.func(&n)?;
+                    // the most dynamic memory the kernel's own static shared memory leaves
+                    let mut st = 0i32;
+                    let r = unsafe {
+                        cudarc::driver::sys::cuFuncGetAttribute(
+                            &mut st,
+                            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                            f,
+                        )
+                    };
+                    gpu::check(r, "cuFuncGetAttribute")?;
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
-                            m.func(n)?,
+                            f,
                             cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            mx - 4352, // static: red + last
+                            mx - st.max(4352), // static: red + last
                         )
                     };
                     gpu::check(r, "cuFuncSetAttribute")?;
@@ -670,6 +707,36 @@ impl Kernels {
                 0,
                 s,
                 tang_moe::args![ids, wts, counts, off, rows, rw, ti, ki, nei],
+            )
+        }
+    }
+
+    /// [`Kernels::route`], `ds_moe_plan` (`elist` [cap] over `mask`) and the K-split quantization
+    /// of `x` [t][d] that [`Kernels::moe_gu_sh`] then takes as is (`pre`), in one launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_plan_q(
+        &self,
+        s: &Stream,
+        (ids, wts): (u64, u64),
+        (counts, off, rows, rw): (u64, u64, u64, u64),
+        (mask, elist, cap): (u64, u64, usize),
+        x: u64,
+        (t, k, ne, d): (usize, usize, usize, usize),
+    ) -> Result<()> {
+        let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
+        let ng = t * d / 32;
+        let (ti, ki, nei, ci, ngi) = (t as i32, k as i32, ne as i32, cap as i32, ng as i32);
+        unsafe {
+            self.go(
+                "ds_route_plan_q",
+                ((1 + ng.div_ceil(8)) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![
+                    ids, wts, counts, off, rows, rw, ti, ki, nei, mask, elist, ci, x, codes,
+                    scales, ngi
+                ],
             )
         }
     }
@@ -1391,6 +1458,119 @@ impl Kernels {
                 0,
                 s,
                 tang_moe::args![w2s, elist, off, hq, part],
+            )?
+        }
+        Ok(())
+    }
+
+    /// Whether [`Kernels::moe_gu_sh`] / [`Kernels::moe_down_sh`] take `t` tokens with the
+    /// shared expert `sh` (w1, w3, w2) folded in as one more slot of a layer whose routed
+    /// experts are `fmt`, `inter` × `d`: the K-split path only (never under `DS_EXACT`), the
+    /// shared expert of the routed shape, and `t * (k + 1)` hidden rows fitting `ks_x`.
+    pub fn moe_sh_ok(
+        &self,
+        sh: [&DsW; 3],
+        fmt: i32,
+        t: usize,
+        k: usize,
+        d: usize,
+        inter: usize,
+    ) -> bool {
+        let [a, b, c] = sh;
+        let n = t * (k + 1);
+        !self.exact
+            && (2..=3).contains(&fmt)
+            && Self::fast_ok(a)
+            && Self::fast_ok(c)
+            && (a.rows as usize, a.cols as usize) == (inter, d)
+            && (b.fmt, b.rows, b.cols) == (a.fmt, a.rows, a.cols)
+            && (c.fmt, c.rows as usize, c.cols as usize) == (a.fmt, d, inter)
+            && self.moe_ks_ok(t, d, t)
+            && self.moe_ks_ok(t, inter, n)
+    }
+
+    /// [`Kernels::moe_gu`] on the K-split path with the shared expert (`s1`, `s3`) as one more
+    /// slot when `on` (every token at weight 1, into `h` rows `n = t * k` ..): one launch for
+    /// the routed and shared gate/up. See [`Kernels::moe_sh_ok`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gu_sh(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        (w1s, w3s, elist): (u64, u64, u64),
+        (off, rows, rw): (u64, u64, u64),
+        (s1, s3, on): (&DsW, &DsW, bool),
+        xq: u64,
+        h: u64,
+        (t, n, slots, inter, d): (usize, usize, usize, usize, usize),
+        lim: f32,
+    ) -> Result<()> {
+        let f = self.moe_ks_sh[fmt as usize - 2][s1.fmt as usize - 2][0];
+        // xq == 0: route_plan_q already quantized the activation into ks_x
+        let (codes, scales) = if xq == 0 {
+            (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64)
+        } else {
+            self.ks_quantize(s, xq, t, d)?
+        };
+        let (sp, nbr, gx) = self.moe_ks_grid(inter, 8, d);
+        let (si, nbri, ts, ni, s1, s3) = (
+            sp as i32,
+            nbr as i32,
+            (t * on as usize) as i32,
+            n as i32,
+            *s1,
+            *s3,
+        );
+        let gy = slots + on as usize;
+        unsafe {
+            super::obs::launch(
+                f,
+                (gx as u32, gy.max(1) as u32, 1),
+                (256, 1, 1),
+                (t * (d.div_ceil(128) * 128 + 32) + t * (d / 32) * 4) as u32,
+                s,
+                tang_moe::args![
+                    w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3, ts, ni
+                ],
+            )?
+        }
+        Ok(())
+    }
+
+    /// [`Kernels::moe_down`] on the K-split path with the shared expert's `s2` as one more
+    /// slot when `on`: `hq` rows `n = t * k` .. `n + t` (quantized with the routed rows) into
+    /// `part` rows `n` .., for `ds_moe_reduce_sh`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_sh(
+        &self,
+        s: &Stream,
+        fmt: i32,
+        (w2s, elist, off): (u64, u64, u64),
+        (s2, on): (&DsW, bool),
+        hq: u64,
+        part: u64,
+        (t, n, slots, d, inter): (usize, usize, usize, usize, usize),
+    ) -> Result<()> {
+        let f = self.moe_ks_sh[fmt as usize - 2][s2.fmt as usize - 2][1];
+        let rows = n + if on { t } else { 0 };
+        let (codes, scales) = self.ks_quantize(s, hq, rows, inter)?;
+        let (sp, nbr, gx) = self.moe_ks_grid(d, 16, inter);
+        let (si, nbri, ts, ni, s2) = (
+            sp as i32,
+            nbr as i32,
+            (t * on as usize) as i32,
+            n as i32,
+            *s2,
+        );
+        let gy = slots + on as usize;
+        unsafe {
+            super::obs::launch(
+                f,
+                (gx as u32, gy.max(1) as u32, 1),
+                (256, 1, 1),
+                (t * (inter.div_ceil(128) * 128 + 32) + t * (inter / 32) * 4) as u32,
+                s,
+                tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni],
             )?
         }
         Ok(())
@@ -4001,6 +4181,243 @@ mod tests {
         (0..t)
             .map(|ti| if causal { (ti + 1) / r } else { width })
             .collect()
+    }
+
+    /// Logits shaped like a model's: bf16 noise of amplitude `amp`, `peaks` boosted tokens.
+    fn peaky(v: usize, seed: u64, amp: f32, peaks: usize) -> Vec<f32> {
+        let mut l = data(v, seed, amp);
+        for j in 0..peaks {
+            let i = (seed as usize * 7919 + j * 104729) % v;
+            l[i] = amp * 3.0 + (j % 4) as f32 * 0.25;
+        }
+        l
+    }
+
+    /// `ds_spark_sample` against `SpecSampler::sample` on the real vocab size: the same draw
+    /// and RNG state, and the kept distribution it leaves for the device verify equal to
+    /// `SpecSampler::dist` (ids exactly, probabilities to f64 rounding). Covers the fast
+    /// bucketed path and the full-vocab fallback (a flat row's nucleus exceeds the cap).
+    #[test]
+    fn spark_sample_matches_host() {
+        use super::super::forward::SpecSampler;
+        use tang_moe::args;
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let v = 129280usize;
+        let cap = 2048usize;
+        let (ids, w) = (DevBuf::zeroed(8).unwrap(), DevBuf::alloc(v * 8).unwrap());
+        let (qi, qp, qn) = (
+            DevBuf::alloc(cap * 4).unwrap(),
+            DevBuf::alloc(cap * 8).unwrap(),
+            DevBuf::zeroed(4).unwrap(),
+        );
+        let (mut fast, mut full) = (0, 0);
+        let (mut ms, mut fms) = (0.0, 0.0);
+        for trial in 0..120u64 {
+            let (temp, top_p) =
+                [(0.6f32, 0.95f32), (1.0, 0.9), (0.3, 0.99), (0.6, 1.0)][trial as usize % 4];
+            let amp = [1.0f32, 8.0, 16.0, 30.0][(trial / 4) as usize % 4];
+            let l = peaky(v, trial + 1, amp, 1 + (trial as usize % 40));
+            let row = DevBuf::from_slice(&l).unwrap();
+            let rng = DevBuf::from_slice(&[trial * 977 + 5]).unwrap();
+            let (vi, slot, null, ri) = (v as i32, 1i32, 0u64, 0i32);
+            let t = std::time::Instant::now();
+            unsafe {
+                k.go(
+                    "ds_spark_sample",
+                    (1, 1, 1),
+                    (1024, 1, 1),
+                    0,
+                    &s,
+                    args![
+                        row.ptr, vi, ids.ptr, slot, null, ri, null, temp, top_p, rng.ptr, w.ptr,
+                        null, qi.ptr, qp.ptr, qn.ptr
+                    ],
+                )
+                .unwrap()
+            };
+            s.sync().unwrap();
+            let kt = t.elapsed().as_secs_f64() * 1e3;
+            ms += kt;
+            let mut host = SpecSampler::new(temp, top_p, trial * 977 + 5);
+            let want = host.sample(&l);
+            let got = ids.read::<i32>(4, 1).unwrap()[0] as usize;
+            assert_eq!(got, want, "trial {trial} amp {amp} T {temp} p {top_p}");
+            assert_eq!(rng.read::<u64>(0, 1).unwrap()[0], host.rng, "trial {trial}");
+            let n = qn.read::<i32>(0, 1).unwrap()[0] as usize;
+            if n == 0 {
+                full += 1;
+                continue;
+            }
+            fast += 1;
+            fms += kt;
+            let d = SpecSampler::new(temp, top_p, 0).dist(&l);
+            assert_eq!(n, d.len(), "trial {trial} kept");
+            let (gi, gp) = (qi.read::<i32>(0, n).unwrap(), qp.read::<f64>(0, n).unwrap());
+            for (j, &(i, p)) in d.iter().enumerate() {
+                assert_eq!(gi[j] as usize, i, "trial {trial} entry {j}");
+                assert!(
+                    (gp[j] - p).abs() <= 1e-12 * p.max(1e-300),
+                    "trial {trial} p {j}"
+                );
+            }
+        }
+        eprintln!(
+            "spark_sample: {fast} fast ({:.3} ms/draw), {full} full-vocab ({:.3} ms/draw)",
+            fms / fast.max(1) as f64,
+            (ms - fms) / full.max(1) as f64,
+        );
+        assert!(fast > 40 && full > 0, "{fast} fast {full} full");
+    }
+
+    /// The device speculative-sampling walk (`ds_spec_dist` + `ds_spec_walk`) against the
+    /// host's `verify_rows` with a `SpecSampler`: drafts drawn on the device from Q rows,
+    /// target rows P near Q (so walks accept, reject and reach the bonus row), and also
+    /// forced wrong drafts. Same accepted count, tokens and RNG state; and over many walks
+    /// the emitted first token's frequencies match a plain draw from P (chi-square).
+    #[test]
+    fn spec_walk_matches_host() {
+        use super::super::forward::{verify_rows, SpecSampler};
+        use tang_moe::args;
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (v, blk, cap) = (129280usize, 5usize, 2048usize);
+        let n = blk + 1;
+        let null = 0u64;
+        let (qi, qp, qn) = (
+            DevBuf::alloc(blk * cap * 4).unwrap(),
+            DevBuf::alloc(blk * cap * 8).unwrap(),
+            DevBuf::zeroed(blk * 4).unwrap(),
+        );
+        let (pi, pp, pn) = (
+            DevBuf::alloc(n * cap * 4).unwrap(),
+            DevBuf::alloc(n * cap * 8).unwrap(),
+            DevBuf::zeroed(n * 4).unwrap(),
+        );
+        let (w, pw) = (
+            DevBuf::alloc(v * 8).unwrap(),
+            DevBuf::alloc(n * v * 8).unwrap(),
+        );
+        let out = DevBuf::alloc((n + 4) * 4).unwrap();
+        let dids = DevBuf::zeroed((n + 1) * 4).unwrap();
+        let (mut walks, mut acc, mut ms) = (0, 0, 0.0);
+        for trial in 0..60u64 {
+            let (temp, top_p) = [(0.6f32, 0.95f32), (1.0, 0.9)][trial as usize % 2];
+            let amp = [12.0f32, 20.0][(trial / 2) as usize % 2];
+            let peaks = 2 + trial as usize % 12;
+            // Q rows, and P = Q plus a perturbation
+            let q: Vec<f32> = (0..blk)
+                .flat_map(|r| peaky(v, trial * 31 + r as u64 + 1, amp, peaks))
+                .collect();
+            let p: Vec<f32> = (0..n)
+                .flat_map(|r| {
+                    let base = if r < blk {
+                        q[r * v..(r + 1) * v].to_vec()
+                    } else {
+                        peaky(v, trial * 31 + 99, amp, peaks)
+                    };
+                    let e = data(v, trial * 131 + r as u64, 1.5);
+                    base.iter().zip(e).map(|(a, b)| a + b).collect::<Vec<_>>()
+                })
+                .collect();
+            let dq = DevBuf::from_slice(&q).unwrap();
+            let dp = DevBuf::from_slice(&p).unwrap();
+            let seed = trial * 7 + 3;
+            let rng = DevBuf::from_slice(&[seed]).unwrap();
+            let vi = v as i32;
+            for r in 0..blk {
+                let (row, slot, ri) = (dq.ptr + (r * v * 4) as u64, r as i32 + 1, 0i32);
+                unsafe {
+                    k.go(
+                        "ds_spark_sample",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &s,
+                        args![
+                            row, vi, dids.ptr, slot, null, ri, null, temp, top_p, rng.ptr, w.ptr,
+                            null, qi.ptr, qp.ptr, qn.ptr
+                        ],
+                    )
+                    .unwrap()
+                };
+            }
+            s.sync().unwrap();
+            let mut host = SpecSampler::new(temp, top_p, seed);
+            let mut ids: Vec<usize> = vec![7];
+            for r in 0..blk {
+                ids.push(host.sample(&q[r * v..(r + 1) * v]));
+            }
+            let got: Vec<usize> = dids
+                .read::<i32>(4, blk)
+                .unwrap()
+                .iter()
+                .map(|&x| x as usize)
+                .collect();
+            assert_eq!(got, ids[1..], "trial {trial} drafts");
+            assert_eq!(rng.read::<u64>(0, 1).unwrap()[0], host.rng);
+            for force in [false, true] {
+                let mut ids = ids.clone();
+                if force {
+                    ids[1 + trial as usize % blk] = (trial as usize * 4099) % v;
+                }
+                let r0 = host.rng;
+                let mut h = SpecSampler::new(temp, top_p, r0);
+                let (wk, wt) = verify_rows(&p, &q, &ids, v, &mut h);
+                let di =
+                    DevBuf::from_slice(&ids.iter().map(|&x| x as i32).collect::<Vec<_>>()).unwrap();
+                let ni = n as i32;
+                let t = std::time::Instant::now();
+                unsafe {
+                    k.go(
+                        "ds_spec_dist",
+                        (n as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &s,
+                        args![dp.ptr, vi, temp, top_p, pw.ptr, pi.ptr, pp.ptr, pn.ptr],
+                    )
+                    .unwrap();
+                    k.go(
+                        "ds_spec_walk",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &s,
+                        args![
+                            di.ptr, ni, pi.ptr, pp.ptr, pn.ptr, qi.ptr, qp.ptr, qn.ptr, r0, out.ptr
+                        ],
+                    )
+                    .unwrap();
+                }
+                s.sync().unwrap();
+                ms += t.elapsed().as_secs_f64() * 1e3;
+                let o = out.read::<i32>(0, n + 4).unwrap();
+                assert_eq!(
+                    o[0],
+                    1,
+                    "trial {trial}: no device walk, pn {:?} qn {:?}",
+                    pn.read::<i32>(0, n).unwrap(),
+                    qn.read::<i32>(0, blk).unwrap()
+                );
+                let gk = o[1] as usize;
+                let gt: Vec<usize> = o[2..3 + gk].iter().map(|&x| x as usize).collect();
+                let grng = o[2 + n] as u32 as u64 | (o[3 + n] as u32 as u64) << 32;
+                assert_eq!((gk, &gt), (wk, &wt), "trial {trial} force {force}");
+                assert_eq!(grng, h.rng, "trial {trial} force {force} rng");
+                walks += 1;
+                acc += gk;
+            }
+        }
+        eprintln!(
+            "spec_walk: {walks} walks, {acc} accepted, {:.3} ms/walk (dist + walk)",
+            ms / walks as f64
+        );
+        assert!(acc > 0);
     }
 
     #[test]

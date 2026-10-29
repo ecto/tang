@@ -1631,10 +1631,13 @@ impl Model {
         let c = &self.cfg;
         let (v, w) = (c.vocab_size, c.dim * c.dspark_target_layer_ids.len());
         let pos0 = sp + main.len() / w;
-        let draft = self
-            .forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q))?
-            .ok_or_else(|| anyhow::anyhow!("decode_spec needs sp > 0"))?;
+        let (greedy, full) = (pick.greedy(), c.dspark_block_size);
+        self.cfg.dspark_block_size = self.cfg.draft_block(greedy);
+        let draft = self.forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q));
+        self.cfg.dspark_block_size = full;
+        let draft = draft?.ok_or_else(|| anyhow::anyhow!("decode_spec needs sp > 0"))?;
         let mut ids = draft.ids;
+        ids.truncate(1 + self.cfg.draft_keep(&draft.conf, greedy));
         edit(pos0 + 1, &mut ids[1..]);
         let snap = self.snapshot();
         let (logits, mains) = self.forward_all(&ids, pos0)?;
