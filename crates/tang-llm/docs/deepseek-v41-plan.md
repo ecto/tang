@@ -262,6 +262,14 @@ ds_ks; 6e597f68), 1017 weights, 8× H100, 200 tokens: greedy **177.8 / 179.0** (
 159/246), sampled T=0.6 153.5 / 175.3, T=1.0 177.4, direct greedy 133.9, prefill ~455.
 Mew: `engine::tests::gpu_tiny` 14/0 and `gpu::` 21/0 on 47586ccb (6e597f68 adds docs only).
 
+Wave 8e merged (+ attn3 host fixes: table-driven Engram row decode, bit-exact, `inputs()` 1.35 →
+0.13–0.88 ms; greedy decode skips the 3 MB draft-logits readback; 77f95b9f), 1017 weights, 8×
+H100, 200 tokens: greedy **192.2 / 193.0** (42 steps, 159/246, identical acceptance), prefill
+~507 (Engram gather), direct greedy 141.8. Sampled T=0.6 166.4 / 171.8 in one run vs 182.2 /
+188.5 on the base build: being re-measured interleaved before it is called a regression. Of the
+~3.4 ms between graphs, verify → draft was 0.83 ms (readbacks, ~60 host-launched rewind copies,
+spark_setup staging) and draft → verify 2.24 ms (draft-pack readback, snapshot copies, `inputs()`).
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
