@@ -714,26 +714,50 @@ impl Stats {
 /// `--mtp auto` / `TANG_GLM5_MTP=auto`: [`generate`] picks K in `0..=cap` every pass.
 pub static AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The adaptive-K controller: EWMAs of the conditional acceptance per draft depth and of the
-/// wall ms of a pass per K (draft + verify + observe; K = 0 is a plain resident step + its
-/// observe cell). Each pass takes the K with the most expected tokens per ms,
-/// `(1 + sum_d prod_{j<=d} p_j) / cost_K`; untried K first, then one exploration pass of the
-/// stalest K every `EXPLORE` passes so the estimates follow the text.
+/// The adaptive-K controller. Acceptance per draft depth: EWMA (alpha 0.1) of the conditional
+/// accept. Cost per K: the MEDIAN wall ms of its last `WIN` passes (draft + verify + observe;
+/// K = 0 = a measured plain resident step + its concurrent observe), each K's first pass
+/// dropped (captures). Sticky: the current K stays unless another K's expected tokens per ms
+/// `(1 + sum_d prod_{j<=d} p_j) / cost_K` beats it by >= `MARGIN` for `STREAK` consecutive
+/// passes; one probe of an untried / stalest K at most every `PROBE` passes.
 struct AutoK {
     cap: usize,
     p: Vec<f64>,
-    cost: Vec<Option<f64>>,
+    samples: Vec<std::collections::VecDeque<f64>>,
+    seen: Vec<usize>,
     last: Vec<usize>,
     pass: usize,
+    cur: usize,
+    streak: usize,
+    cand: usize,
+    probe_at: usize,
+    probing: Option<usize>,
     picks: Vec<usize>,
-    seen: Vec<usize>,
+    log: bool,
 }
 
-const EXPLORE: usize = 16;
+const WIN: usize = 16;
+const MARGIN: f64 = 1.05;
+const STREAK: usize = 8;
+const PROBE: usize = 64;
 
 impl AutoK {
     fn new(cap: usize) -> Self {
-        Self { cap, p: vec![0.7; cap], cost: vec![None; cap + 1], last: vec![0; cap + 1], pass: 0, picks: vec![0; cap + 1], seen: vec![0; cap + 1] }
+        Self {
+            cap,
+            p: vec![0.7; cap],
+            samples: vec![Default::default(); cap + 1],
+            seen: vec![0; cap + 1],
+            last: vec![0; cap + 1],
+            pass: 0,
+            cur: 1.min(cap),
+            streak: 0,
+            cand: 0,
+            probe_at: 0,
+            probing: None,
+            picks: vec![0; cap + 1],
+            log: std::env::var("TANG_GLM5_MTP_AUTO_LOG").is_ok_and(|v| v == "1"),
+        }
     }
 
     fn expect(&self, k: usize) -> f64 {
@@ -745,20 +769,57 @@ impl AutoK {
         e
     }
 
+    fn cost(&self, k: usize) -> Option<f64> {
+        let mut v: Vec<f64> = self.samples[k].iter().copied().collect();
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(v[v.len() / 2])
+    }
+
+    fn rate(&self, k: usize) -> Option<f64> {
+        self.cost(k).map(|c| self.expect(k) / c)
+    }
+
     fn pick(&mut self) -> usize {
         self.pass += 1;
-        let k = if let Some(k) = (0..=self.cap).rev().find(|&k| self.cost[k].is_none()) {
-            k
-        } else if self.pass % EXPLORE == 0 {
-            (0..=self.cap).min_by_key(|&k| self.last[k]).unwrap()
+        // warm-up: two passes of every K (the first is dropped) before any decision
+        if let Some(k) = (0..=self.cap).find(|&k| self.seen[k] < 2) {
+            self.probing = None;
+            return self.take(k);
+        }
+        // a probe of the stalest K, at most once per PROBE passes
+        if self.pass >= self.probe_at + PROBE {
+            self.probe_at = self.pass;
+            let k = (0..=self.cap).filter(|&k| k != self.cur).min_by_key(|&k| self.last[k]).unwrap();
+            self.probing = Some(k);
+            return self.take(k);
+        }
+        self.probing = None;
+        let best = (0..=self.cap)
+            .max_by(|&a, &b| self.rate(a).unwrap_or(0.0).partial_cmp(&self.rate(b).unwrap_or(0.0)).unwrap())
+            .unwrap();
+        let (rb, rc) = (self.rate(best).unwrap_or(0.0), self.rate(self.cur).unwrap_or(0.0));
+        if best != self.cur && rb >= MARGIN * rc {
+            if best == self.cand {
+                self.streak += 1;
+            } else {
+                self.cand = best;
+                self.streak = 1;
+            }
+            if self.streak >= STREAK {
+                self.cur = best;
+                self.streak = 0;
+            }
         } else {
-            (0..=self.cap)
-                .max_by(|&a, &b| {
-                    let r = |k: usize| self.expect(k) / self.cost[k].unwrap();
-                    r(a).partial_cmp(&r(b)).unwrap()
-                })
-                .unwrap()
-        };
+            self.streak = 0;
+        }
+        let k = self.cur;
+        self.take(k)
+    }
+
+    fn take(&mut self, k: usize) -> usize {
         self.last[k] = self.pass;
         self.picks[k] += 1;
         k
@@ -766,16 +827,34 @@ impl AutoK {
 
     /// A pass of `k` drafts took `ms`; `a` drafts were accepted.
     fn update(&mut self, k: usize, a: usize, ms: f64) {
-        let ew = |o: &mut Option<f64>, v: f64, al: f64| *o = Some(o.map_or(v, |x| x + al * (v - x)));
-        // a K's first pass pays its one-time graph captures / eager warm-up: not a sample
         self.seen[k] += 1;
         if self.seen[k] > 1 {
-            ew(&mut self.cost[k], ms, 0.3);
+            let q = &mut self.samples[k];
+            q.push_back(ms);
+            while q.len() > WIN {
+                q.pop_front();
+            }
         }
         for d in 0..k.min(a + 1) {
             let v = if d < a { 1.0 } else { 0.0 };
             self.p[d] += 0.1 * (v - self.p[d]);
         }
+        if self.log && self.pass % 32 == 0 {
+            eprintln!("{}", self.report());
+        }
+    }
+
+    fn report(&self) -> String {
+        let mut s = format!("mtp auto @pass {} (cur K={}): p {:?}", self.pass, self.cur, self.p.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+        for k in 0..=self.cap {
+            s += &format!(
+                "; K={k} cost {} ms E {:.3} rate {} tok/ms",
+                self.cost(k).map_or("-".into(), |c| format!("{c:.2}")),
+                self.expect(k),
+                self.rate(k).map_or("-".into(), |r| format!("{r:.4}"))
+            );
+        }
+        s
     }
 }
 
@@ -989,6 +1068,7 @@ pub fn generate(
     st.tokens = gen.len() - 1;
     if auto {
         st.auto_picks = ak.picks.clone();
+        eprintln!("{}", ak.report());
     }
     Ok((gen, st))
 }
