@@ -6,7 +6,9 @@
 //!   `DS_PREFILL_CHUNK` tokens (1024) and then decodes; there is no prefix reuse across
 //!   requests yet.
 //! - Requests decode speculatively with DSpark (`DS_SPEC=0` turns it off): each forward
-//!   verifies the sampled token and its drafts as one window ([`forward::generate`]). Greedy
+//!   verifies the sampled token and its drafts as one window ([`forward::generate`]);
+//!   `DS_DRAFT_N` drafts a window ([`SERVE_DRAFT_N`]), `DS_DRAFT_CONF` cuts it at the
+//!   confidence head ([`Config::draft_keep`]). Greedy
 //!   gives the same tokens as plain greedy decoding; sampled requests use speculative
 //!   (rejection) sampling, the same distribution as plain temperature/top-p sampling
 //!   ([`SpecSampler`]). Sampled spec needs the engine's `decode_spec` to take a
@@ -40,9 +42,19 @@ pub enum Engine {
     Ep(super::ep::EpGroup),
 }
 
+/// The served draft length when `DS_DRAFT_N` is unset: one past the trained block of 5.
+/// Measured on 8x H100 (1017 weights, 200 tokens, greedy): n 4 / 5 / 6 / 7 / 8 = 136 / 149 /
+/// 158 / 151 / 96 tok/s, 3.8 / 4.2 / 4.9 / 4.9 / 5.0 tokens a step (t 9 leaves the 8-row
+/// kernels).
+pub const SERVE_DRAFT_N: usize = 6;
+
 impl Engine {
     /// One GPU, or expert-parallel over `devices` (more than one; needs the `ep` feature).
     pub fn open(dir: &Path, devices: &[usize]) -> Result<Self> {
+        // every rank's Config::load reads it
+        if std::env::var_os("DS_DRAFT_N").is_none() {
+            std::env::set_var("DS_DRAFT_N", SERVE_DRAFT_N.to_string());
+        }
         if devices.len() <= 1 {
             return Ok(Engine::Single(GpuModel::open_on(
                 dir,

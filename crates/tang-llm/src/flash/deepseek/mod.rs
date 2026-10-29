@@ -97,6 +97,16 @@ pub struct Config {
     /// `DS41_CTX` overrides it.
     #[serde(default = "max_seq")]
     pub max_seq_len: usize,
+    /// Runtime, not in the checkpoint: drafts a speculative step verifies at most
+    /// (`DS_DRAFT_N`, default the trained `dspark_block_size`). Below the block the drafter
+    /// still runs its trained block and the window keeps the first `draft_n` drafts; above
+    /// it, [`Config::load`] grows `dspark_block_size` (more noise tokens than trained).
+    #[serde(skip)]
+    pub draft_n: usize,
+    /// Runtime: `DS_DRAFT_CONF`, the confidence early stop. The window keeps the longest
+    /// draft prefix whose product of sigmoid(confidence) is >= this (0 = off).
+    #[serde(skip)]
+    pub draft_conf: f32,
 }
 
 fn yes() -> bool {
@@ -115,7 +125,29 @@ impl Config {
         if let Some(n) = std::env::var("DS41_CTX").ok().and_then(|v| v.parse().ok()) {
             cfg.max_seq_len = n;
         }
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+        cfg.draft_n = env("DS_DRAFT_N").map_or(cfg.dspark_block_size, |n| (n as usize).max(1));
+        cfg.dspark_block_size = cfg.dspark_block_size.max(cfg.draft_n);
+        cfg.draft_conf = env("DS_DRAFT_CONF").unwrap_or(0.0) as f32;
         Ok(cfg)
+    }
+
+    /// How many of a draft's drafts (confidences `conf`, one per draft) the verify window
+    /// takes: at most [`Config::draft_n`], cut at the first draft where the running product
+    /// of sigmoid(conf) falls below [`Config::draft_conf`] (at least one draft is kept).
+    pub fn draft_keep(&self, conf: &[f32]) -> usize {
+        let n = self.draft_n.min(conf.len());
+        if self.draft_conf <= 0.0 {
+            return n;
+        }
+        let mut p = 1f64;
+        for (i, &c) in conf[..n].iter().enumerate() {
+            p /= 1.0 + (-(c as f64)).exp();
+            if i > 0 && p < self.draft_conf as f64 {
+                return i;
+            }
+        }
+        n
     }
 
     /// Routed experts and how many a token picks, for layer `lid` (DSpark stages have their own).

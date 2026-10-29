@@ -219,6 +219,31 @@ greedy 114.8. The moe3 lane's second round (h quantised in the down kernel, rela
 GEMV, persistent gu+act+down) measured no gain and was dropped; `layer.moe` stays 10.6 ms,
 latency-bound per expert slot (gu 63 µs for ~12 MB of fp4 per layer ≈ 190 GB/s) — the grouped
 kernels' grids are the next target, not more fusion.
+Wave 8 spec lane (draft length, 1017 weights, 8× H100, 200 tokens, one server per setting;
+tok/s is the second greedy run, the first carries captures): `DS_DRAFT_N` sets the drafts a
+verify window takes. Below the trained block of 5 the drafter still runs 5 and the window keeps
+a prefix; above it the drafter's block grows (more noise tokens than trained), which DSpark
+tolerates: the 6th draft is still accepted often.
+
+| n | greedy tok/s | steps | accepted | tokens/step | sampled 0.6 tok/s (2 runs) |
+|---|---|---|---|---|---|
+| 4 | 136.0 | 53 | 146/208 | 3.77 | 136.7 / 125.2 |
+| 5 | 148.9 | 48 | 153/235 | 4.17 | 139.0 / 155.2 |
+| **6** | **158.0 / 157.0** | 41 | 163/240 | 4.88 | 82.7 (captures) / 161.7, 132.8 / 139.4 |
+| 7 | 151.2 | 41 | 159/280 | 4.88 | 128.1 / 142.3 |
+| 8 | 96.5 | 40 | 161/312 | 5.00 | 89.5 / 94.1 |
+
+The step is not flat in t: ~28.0 ms at t 6, 30.9 at t 7, 32.3 at t 8 (≈1.4 ms a row), and
+t 9 leaves the 8-row K-split kernels for the prefill path (+20 ms). So serve defaults to
+n = 6 (`SERVE_DRAFT_N`); n = 7 wins nothing, its 7th draft rarely lands. `DS_DRAFT_CONF`
+(keep the prefix whose product of sigmoid(confidence) stays above it) measured no gain: n 6
+c 0.3 156.5 (45 steps, 156/192), n 7 c 0.3 156.1, n 7 c 0.6 141.4 (it cuts drafts that would
+have landed). Served default (n 6, b8b2fc79, `measure.sh`): greedy 148.5 / 155.4 / 156.5
+(41 steps, 163/240), sampled T=0.6 132.3 / 140.7 (44–45 steps, 156–158/258–264), T=1.0 134.2,
+direct greedy 121.3 (7d: 112.3). Greedy gains ~5%; sampled at n 6 over six runs averages ~141
+against n 5's 139 / 155 here and 148 / 152 at 7d, so sampled may prefer n 5 (its 6th draft
+lands less): a per-request n (greedy 6, sampled 5) is the follow-up. n = 7 first failed to launch: the shared-folded grouped MoE kernels
+(`ds_moe_ks_*_s*`) take 46 KB dynamic smem at t 8 over d 5120 and were not opted into > 48 KB.
 
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json

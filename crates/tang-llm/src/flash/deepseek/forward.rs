@@ -1635,6 +1635,7 @@ impl Model {
             .forward_spec_with(token, main, sp, &mut |q: &[f32]| pick.draft(q))?
             .ok_or_else(|| anyhow::anyhow!("decode_spec needs sp > 0"))?;
         let mut ids = draft.ids;
+        ids.truncate(1 + self.cfg.draft_keep(&draft.conf));
         edit(pos0 + 1, &mut ids[1..]);
         let snap = self.snapshot();
         let (logits, mains) = self.forward_all(&ids, pos0)?;

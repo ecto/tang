@@ -414,12 +414,30 @@ impl Kernels {
                     "ds_moe_ks_tdown_f3",
                     "ds_attn_fd",
                     "ds_attn_fdm",
-                ] {
+                ]
+                .map(String::from)
+                .into_iter()
+                // the shared-expert-folded grouped kernels: past 48 KB at t 8 over d 5120
+                .chain((0..8).map(|i| {
+                    let kind = ["gu", "down"][i & 1];
+                    format!("ds_moe_ks_{kind}_f{}_s{}", 2 + (i >> 1 & 1), 2 + (i >> 2))
+                })) {
+                    let f = m.func(&n)?;
+                    // the most dynamic memory the kernel's own static shared memory leaves
+                    let mut st = 0i32;
+                    let r = unsafe {
+                        cudarc::driver::sys::cuFuncGetAttribute(
+                            &mut st,
+                            cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                            f,
+                        )
+                    };
+                    gpu::check(r, "cuFuncGetAttribute")?;
                     let r = unsafe {
                         cudarc::driver::sys::cuFuncSetAttribute(
-                            m.func(n)?,
+                            f,
                             cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            mx - 4352, // static: red + last
+                            mx - st.max(4352), // static: red + last
                         )
                     };
                     gpu::check(r, "cuFuncSetAttribute")?;
