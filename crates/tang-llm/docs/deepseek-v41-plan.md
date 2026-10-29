@@ -245,6 +245,10 @@ against n 5's 139 / 155 here and 148 / 152 at 7d, so sampled may prefer n 5 (its
 lands less): a per-request n (greedy 6, sampled 5) is the follow-up. n = 7 first failed to launch: the shared-folded grouped MoE kernels
 (`ds_moe_ks_*_s*`) take 46 KB dynamic smem at t 8 over d 5120 and were not opted into > 48 KB.
 
+Wave 8a merged (+ spec lane draft n = 6 default, attn3 99e40728 bf16 split-K GEMV for the
+compressor; 850b5e9e), 1017 weights, 8× H100, 200 tokens: greedy **155.7 / 155.8** (43 steps,
+162/252, 4.65 tokens/step), sampled T=0.6 148.0 / 143.0, T=1.0 133.4, direct greedy 120.1.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
