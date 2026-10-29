@@ -299,6 +299,7 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     os[x] = o;
     // (double)o * (double)o is exact (24-bit mantissas), so ss + v*v rounds once either
     // way: the squares are formed in parallel and thread 0 runs only the DADD chain
+#ifdef K5D_NORM_EXACT
     sq[x] = (double)o * (double)o;
     __syncthreads();
     // the f64 norm once per head (thread 0) and broadcast: every thread used to run the
@@ -311,6 +312,25 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
         g1s[0] = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
     }
     __syncthreads();
+#else
+    // default (NOTES 2026-10-28 kda4): the same f64 squares summed as a tree (xor shuffle
+    // within each warp, then the KDA_D/32 warp partials in order by thread 0): depth
+    // 5 + KDA_D/32 dependent DADDs instead of KDA_D. A summation-order change in f64, so
+    // the f32 r almost always rounds the same. TANG_GLM5_KDA_NORM=exact: the serial chain.
+    {
+        double v = (double)o * (double)o;
+        for (int o2 = 16; o2 > 0; o2 >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o2);
+        if (lane == 0) sq[warp] = v;
+    }
+    __syncthreads();
+    if (x == 0) {
+        double ss = 0.0;
+#pragma unroll
+        for (unsigned int d = 0; d < KDA_D / 32; d++) ss += sq[d];
+        g1s[0] = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
+    }
+    __syncthreads();
+#endif
     const float r = g1s[0];
     const float yv = os[x] * r * ON[x] / (1.f + expf(-g2v));
     Y[h * D + x] = yv;

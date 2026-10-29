@@ -4,6 +4,48 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — KDA round 2 + LM head: head 254 -> 175 us and 1 launch/token, qgemv9 23.4 -> 22.1, k5d_tail 18.4 -> 14.3; ids unchanged (branch claude/glm5-kda4)
+
+B300 shared pod, B flags, nsys `--cuda-graph-trace=node`, haiku prompt -n 32 (1054 = 34 x 31 KDA
+steps), median per launch:
+
+| kernel | before (kda3 NOTES / task) | after | change |
+|---|---|---|---|
+| k5_gemv8 (LM head, 154880 x 6144 Q8_0, 674 MB) | 254 us, 51 launches | 175.5 us, 32 launches | direct 32-bit reads, no smem staging |
+| k5_qgemv9 (q\|k\|v\|f_a\|g_a) | 23.4 us | 22.1 us | 2 rows a warp |
+| k5d_tail | 18.4 us | 14.2 us | f64 norm as a tree |
+| k5_qgemv17 (o_proj) | 11.8 us | 11.7 us | unchanged (2 rows a warp: 12.7, not taken) |
+
+Head launch count: `head_logits` (engine.rs window path) ran the device head once PER ROW of a
+window, so the prefill window (haiku prompt: 19 rows after the template) paid 19 head calls on
+top of the 32 resident-step heads (resident.rs, unchanged) = 51. Fix: `prefill_slot` sets
+`prefill_last`, the window then heads only its last row and returns that one row (prefill and the
+dump read the last n_vocab). MTP verify windows (no prefill_last) still head every row. Decode
+tok/s does not change from this (it was prefill-time).
+
+Changes:
+- kda_k5.cuh `k5_gemv8`: when row_bytes, base % 4 == 0 and COLS % 256 == 0, each lane reads its
+  8 codes a step + the block's d word straight from global (3-4 aligned u32 __ldcs, funnel-shifted),
+  8 steps' words issued before any dp4a; same e0 walk, dp4a pair, fmaf chain, xor tree: bit-equal.
+  The launchers' dynamic smem is now unused on that path (resident.rs / engine.rs launches untouched).
+- kda_k5.cuh `k5_qgemv_body_r<MAXNB, R>`: R = 2 rows a warp share the activation loads; selected by
+  bit 31 of nseg (kda_dev.rs qgemv_launch), only for k5_qgemv9; `TANG_GLM5_KDA_QR2=0` = 1 row.
+- kda_decode.cuh `k5d_tail`: the gated norm's f64 sum of squares as a warp xor tree + 4 warp
+  partials (depth 9 DADDs instead of 128). DEFAULT. `TANG_GLM5_KDA_NORM=exact` (kda_decode.rs,
+  a #define at nvrtc time) = the serial chain. Summation order changed, still f64.
+
+Gates: tier A for every change — ids md5 7174cdd6 (-n 128) and 1453cf0e (GLM5_N=512), haiku
+oracle OK. mew 3090 `flash::glm5` 84 passed / 0 failed / 2 ignored (an earlier run of the same
+tree had 4 failures, all CUDA_ERROR_STREAM_CAPTURE_IMPLICIT / the fused-decode test, with other
+agents' jobs sharing the GPU; the rerun was clean). Decode tok/s (scripts/glm5-bench.sh, traced):
+82.74 @128, 82.96 @512 (task baseline 82.38 / 81.55; my own base rerun was invalid, see below).
+KDA per token ~34 x (22.1 + 14.2 + 11.7 + ~2 q8) = ~1.70 ms vs 1.83: target 1.3 ms NOT reached.
+
+Not done / open: o_proj (k5_qgemv17) still 11.7 vs 7.4 us ceiling; launch folding (k5_q8 of x lives
+in the mHC output path, another agent's file); `rs_argmax` in the resident head is 43 us a token
+(154880 floats; resident.rs, MTP agent's file) — the next head win. A base-commit rerun on the pod
+came back at 32.8 tok/s with the host path (not resident): discarded.
+
 ## 2026-10-28 — MTP draft on the device (6.6 s -> ~10 ms/pass); verify windows made exact; MTP still 4x slower than plain (branch claude/glm5-mtp-dev)
 
 What was wrong: (1) the NextN block (blk.45) ran entirely on the host: ~6.6 s per draft pass
