@@ -352,17 +352,21 @@ pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
 
 impl Kernels {
     pub fn new(g: &Gpu) -> Result<Self> {
+        // ds_ks's L2 prefetch prologue only pays off under PDL (kernels.cu ks_pf);
         // DS_KS_DEFS="NAME=v,...": extra #defines ahead of the source (kernel sweeps)
-        let m = match std::env::var("DS_KS_DEFS") {
-            Ok(v) => {
-                let defs: String = v
-                    .split(',')
-                    .filter_map(|d| d.split_once('='))
-                    .map(|(n, x)| format!("#define {n} {x}\n"))
-                    .collect();
-                g.module(&format!("{defs}{SRC}"))?
+        let mut defs = String::new();
+        if super::pdl::on() {
+            defs.push_str("#define DS_PDL_PF 1\n");
+        }
+        if let Ok(v) = std::env::var("DS_KS_DEFS") {
+            for (n, x) in v.split(',').filter_map(|d| d.split_once('=')) {
+                defs.push_str(&format!("#define {n} {x}\n"));
             }
-            Err(_) => g.module(SRC)?,
+        }
+        let m = if defs.is_empty() {
+            g.module(SRC)?
+        } else {
+            g.module(&format!("{defs}{SRC}"))?
         };
         Ok(Kernels {
             linear: m.func("ds_linear")?,

@@ -1777,9 +1777,11 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
 
 // PDL prologue of ds_ks: L2 prefetches of this block's first work item's weight slice (its
 // rows of w, and w3's for GU), issued before DS_PDL_WAIT so they stream under the predecessor.
+// Only compiled with PDL on (DS_PDL_PF, set by Kernels::new): without PDL it costs wq_b 24.5 ->
+// 28.1 us and wo_b 36.4 -> 39.8 at t = 6 on H100.
 template <int FMT, int GU>
 __device__ __forceinline__ void ks_pf(const DsW& w, const DsW& w3, int S, int SB) {
-#if __CUDA_ARCH__ >= 900
+#if __CUDA_ARCH__ >= 900 && defined(DS_PDL_PF)
     int nch = w.cols / 32, gpb = (nch + SB - 1) / SB;
     int br = blockIdx.x / SB, sb = blockIdx.x % SB;
     int nr = (8 / S) * (GU ? 8 : 16), n0 = br * nr;
