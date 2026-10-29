@@ -1922,6 +1922,87 @@ DS_MOE_KS_SH(2, 2)
 DS_MOE_KS_SH(3, 3)
 DS_MOE_KS_SH(2, 3)
 
+// The persistent form of ds_moe_ks_*_s (DS_MOE_KP): a 1-D grid sized to fill the GPU once. The
+// work units are (slot, row item): the shared expert's nbr items first (cost 2: fp8, all t
+// rows), then each live slot's (cost 1). Each block takes a contiguous cost range, so it
+// mostly stays on one slot and restages the activation only when the slot changes; lin_mma's
+// arithmetic per item is the grid kernels' exactly (bit-identical). Live slots: elist entries
+// >= 0 with rows, in elist order, found by warp 0 (cap <= 64).
+__device__ __forceinline__ int moe_kp_live(const int* elist, const int* off, int cap, int* sl) {
+    __shared__ int nl;
+    if (threadIdx.x < 32) {
+        int base = 0;
+        for (int j0 = 0; j0 < cap; j0 += 32) {
+            int j = j0 + threadIdx.x, e = j < cap ? elist[j] : -1;
+            bool live = e >= 0 && off[e + 1] > off[e];
+            unsigned b = __ballot_sync(0xffffffffu, live);
+            if (live) sl[base + __popc(b & ((1u << threadIdx.x) - 1))] = e;
+            base += __popc(b);
+        }
+        if (threadIdx.x == 0) nl = base;
+    }
+    __syncthreads();
+    return nl;
+}
+// block b's unit range [lo, hi) of su cost-2 units then the rest at cost 1
+__device__ __forceinline__ void moe_kp_range(int su, int units, int* lo, int* hi) {
+    long long C = 2LL * su + (units - su), G = gridDim.x, b = blockIdx.x;
+    auto at = [&](long long c) -> int { return c <= 2LL * su ? (int)((c + 1) / 2) : (int)(su + c - 2LL * su); };
+    *lo = at(b * C / G);
+    *hi = min(units, at((b + 1) * C / G));
+}
+#define DS_MOE_KP(F, SF)                                                                                       \
+    extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_kp_gu_f##F##_s##SF(                  \
+        const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
+        const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr, DsW s1, DsW s3, int t, \
+        int n, int cap) { DS_PDL_ENTRY                                                                          \
+        __shared__ int sl[64];                                                                                  \
+        int nl = moe_kp_live(elist, off, cap, sl), su = t > 0 ? nbr : 0, lo, hi;                                \
+        moe_kp_range(su, su + nl * nbr, &lo, &hi);                                                              \
+        int prev = -2;                                                                                          \
+        for (int u = lo; u < hi; u++) {                                                                         \
+            int sidx = u < su ? -1 : (u - su) / nbr, item = u < su ? u : (u - su) % nbr;                        \
+            bool staged = sidx == prev;                                                                         \
+            prev = sidx;                                                                                        \
+            if (sidx < 0) {                                                                                     \
+                lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * s1.rows, t, 1, 0, lim, S, 1, nbr, 0, 0, 0,  \
+                               0, 0, item, staged);                                                             \
+                continue;                                                                                       \
+            }                                                                                                   \
+            int e = sl[sidx], o = off[e], m = off[e + 1] - o;                                                   \
+            DsW w = w1s[e];                                                                                     \
+            lin_mma<F, 1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, m, 1, rw + o, lim, S, 1, nbr, 0, 0,   \
+                          rows + o, 0, 0, item, staged);                                                        \
+        }                                                                                                       \
+    }                                                                                                           \
+    extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_kp_down_f##F##_s##SF(                \
+        const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
+        float* part, int S, int nbr, DsW s2, int t, int n, int cap) { DS_PDL_ENTRY                              \
+        __shared__ int sl[64];                                                                                  \
+        int nl = moe_kp_live(elist, off, cap, sl), su = t > 0 ? nbr : 0, lo, hi;                                \
+        moe_kp_range(su, su + nl * nbr, &lo, &hi);                                                              \
+        int prev = -2;                                                                                          \
+        for (int u = lo; u < hi; u++) {                                                                         \
+            int sidx = u < su ? -1 : (u - su) / nbr, item = u < su ? u : (u - su) % nbr;                        \
+            bool staged = sidx == prev;                                                                         \
+            prev = sidx;                                                                                        \
+            if (sidx < 0) {                                                                                     \
+                lin_mma<SF, 0>(s2, s2, hc + (long long)n * s2.cols, hsc + (long long)n * (s2.cols / 32),       \
+                               part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, 0, 0, item,     \
+                               staged);                                                                         \
+                continue;                                                                                       \
+            }                                                                                                   \
+            int e = sl[sidx], o = off[e], m = off[e + 1] - o;                                                   \
+            DsW w = w2s[e];                                                                                     \
+            lin_mma<F, 0>(w, w, hc + (long long)o * w.cols, hsc + (long long)o * (w.cols / 32),                \
+                          part + (long long)o * w.rows, m, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, 0, 0, item, staged);  \
+        }                                                                                                       \
+    }
+DS_MOE_KP(3, 2)
+DS_MOE_KP(2, 2)
+DS_MOE_KP(3, 3)
+DS_MOE_KP(2, 3)
+
 // wo_a on the K-split path in one launch: block-diagonal over blockIdx.y = group gi (ol rows of
 // w, its gd = w.cols columns of the token-major activation [t][g * gd]), quantized once by
 // ds_ks_quant over the whole row (gd % 32 == 0, so the 32-groups are the per-group ones), into
