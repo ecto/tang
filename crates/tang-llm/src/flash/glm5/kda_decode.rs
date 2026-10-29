@@ -96,6 +96,9 @@ pub struct Fast {
     step: sys::CUfunction,
     /// `k5d_tail`: beta + gate2 + step + o_proj's q8 in one launch (the G5F path).
     tail: sys::CUfunction,
+    /// `k5_qgemvt9` / `k5_qgemvt17` (kda_k5.cuh): the t-row window GEMV (rows_enqueue).
+    qgt9: sys::CUfunction,
+    qgt17: sys::CUfunction,
     /// The captured decode step and the `TANG_GLM5_GEMV8` value it was captured with.
     graph: Option<(Graph, bool)>,
 }
@@ -111,7 +114,7 @@ impl Fast {
         let src = format!(
             "{norm}\n{}\n{}\n{}",
             super::super::kda_cuda::prelude(cfg),
-            super::super::moe::SRC,
+            super::super::moe::K5_SRC,
             include_str!("kda_decode.cuh")
         );
         let m = g.module(&src).map_err(|e| anyhow::anyhow!("kda_decode nvrtc: {e}"))?;
@@ -123,7 +126,7 @@ impl Fast {
             sys::cuFuncSetAttribute(tail, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 4096 * 4 + 16)
         };
         anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "k5d_tail smem attribute: {r:?}");
-        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, graph: None, _m: m })
+        Ok(Fast { proj: f("k5d_proj")?, gate2: f("k5d_gate2")?, step: f("k5d_step")?, tail, qgt9: f("k5_qgemvt9")?, qgt17: f("k5_qgemvt17")?, graph: None, _m: m })
     }
 }
 
@@ -181,7 +184,7 @@ impl DevLayer {
                 self.g5f_x(s, 1)?;
                 if self.tail_ok() {
                     mark(1)?;
-                    self.tail_launch(s, fast, h0, st, lb)?;
+                    self.tail_launch(s, fast, h0, st, lb, 0)?;
                     mark(3)?;
                     match self.sego.as_ref() {
                         // k5d_tail wrote yb's k5_q8 codes: o_proj straight on k5_qgemv
@@ -997,7 +1000,71 @@ fn tail_flag() -> bool {
     *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_TAIL").map_or(true, |v| v != "0"))
 }
 
+/// `TANG_GLM5_KDA_ROWS_FAST=0`: rows_enqueue keeps the generic t-row kernels.
+fn rows_fast() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_ROWS_FAST").map_or(true, |v| v != "0"))
+}
+
 impl DevLayer {
+    /// [`Self::rows_enqueue`] on the tuned t=1 kernels, bit-equal per row to t serial
+    /// decode steps (NOTES 2026-10-28 kda4 round 3): k5_q8 over the t rows of x, ONE
+    /// k5_qgemvt9 (q|k|v|f_a|g_a, the weight stream read once for all t rows), then per row
+    /// k5d_tail (gates, beta, conv, the recurrent step, norm, yb's q8 at row i; the state
+    /// checkpoint after each row but the last), then ONE k5_qgemvt17 for o_proj.
+    /// The t-row fast path applies (resident.rs window_resident routes a t>1 KDA item
+    /// through [`Self::rows_enqueue`] when this holds).
+    pub fn rows_fast_ok(&self, t: usize) -> bool {
+        (2..=4).contains(&t) && rows_fast() && self.tail_ok() && self.segx.is_some() && self.sego.is_some()
+    }
+
+    unsafe fn rows_fast(&self, s: &Stream, t: usize, ck: Option<(u64, usize)>) -> Result<()> {
+        let fast = self.fast.as_ref().context("kda rows: kernels not built")?;
+        let (hd, di, hidden) = (self.hd, self.d_inner, self.hidden);
+        let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
+        let codes = self.xq8.ptr;
+        let regs = self.core.slot_state_regions(0);
+        unsafe {
+            launch(
+                self.gv.q8,
+                ((hidden / 32) as u32, t as u32, 1),
+                (32, 1, 1),
+                0,
+                s,
+                args![self.xb.ptr, codes, hidden as u32, self.max_t as u32],
+            )?;
+            let rows = 3 * di + 2 * hd;
+            launch(
+                if self.wq.w.row_bytes as usize <= 9 * 32 * 16 { fast.qgt9 } else { fast.qgt17 },
+                (rows.div_ceil(4) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.segx.as_ref().unwrap().ptr, 5u32, codes, codes + (self.max_t * hidden) as u64,
+                    hidden as u32, 3u32, (3 * di) as u32, t as u32],
+            )?;
+            for i in 0..t {
+                self.tail_launch(s, fast, self.core.h0.ptr, self.core.st.ptr, lb, i)?;
+                if let (Some((base, stride)), true) = (ck, i + 1 < t) {
+                    let b = base + (i * stride) as u64;
+                    tang_moe::gpu::copy_d2d_async(b, regs[0].0, regs[0].1, s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    tang_moe::gpu::copy_d2d_async(b + regs[0].1 as u64, regs[1].0, regs[1].1, s)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            launch(
+                if self.wo.w.row_bytes as usize <= 9 * 32 * 16 { fast.qgt9 } else { fast.qgt17 },
+                (hidden.div_ceil(4) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                s,
+                args![self.sego.as_ref().unwrap().ptr, 1u32, codes, codes + (self.max_t * di) as u64,
+                    di as u32, 0u32, 0u32, t as u32],
+            )?;
+        }
+        Ok(())
+    }
+
     /// `k5d_tail`'s preconditions (kda_decode.cuh): f_b / g_b / b_proj Q8_0 with hd-wide
     /// f_b / g_b rows, hd % 32 == 0, hidden <= K5D_HIDMAX and a multiple of 256.
     fn tail_ok(&self) -> bool {
@@ -1016,7 +1083,11 @@ impl DevLayer {
 
     /// One `k5d_tail` launch: grid nh, block hd. `h0` / `st` = the slot's conv history /
     /// state bases. Writes bb, gb_out, g2b, ob, yb and yb's k5_q8 codes into xq8.
-    unsafe fn tail_launch(&self, s: &Stream, fast: &Fast, h0: u64, st: u64, lb: f32) -> Result<()> {
+    /// `i` = the row of a t-row window (0 for a decode step): every per-row input / output
+    /// pointer moves by row i, the state (h0 / st) does not (rows run serially).
+    unsafe fn tail_launch(&self, s: &Stream, fast: &Fast, h0: u64, st: u64, lb: f32, i: usize) -> Result<()> {
+        let f = 4u64;
+        let (i, di, hd, nh) = (i as u64, self.d_inner as u64, self.hd as u64, self.nh as u64);
         unsafe {
             launch(
                 fast.tail,
@@ -1024,10 +1095,12 @@ impl DevLayer {
                 (self.hd as u32, 1, 1),
                 (self.hidden * 4 + 16) as u32,
                 s,
-                args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr, self.g1b.ptr, self.g2a.ptr,
-                    self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr, h0, self.core.wconv.ptr, st,
-                    self.on.ptr, self.cfg.eps, self.bb.ptr, self.gb_out.ptr, self.g2b.ptr,
-                    self.ob.ptr, self.yb.ptr, self.xq8.ptr, self.max_t as u32, self.hidden as u32],
+                args![self.fb.w, self.gb.w, self.bproj.w, self.xb.ptr + i * self.hidden as u64 * f,
+                    self.g1b.ptr + i * hd * f, self.g2a.ptr + i * hd * f,
+                    self.dt.ptr, self.rate.ptr, lb, self.qkvb.ptr + i * 3 * di * f, h0, self.core.wconv.ptr, st,
+                    self.on.ptr, self.cfg.eps, self.bb.ptr + i * nh * f, self.gb_out.ptr + i * di * f,
+                    self.g2b.ptr + i * di * f, self.ob.ptr + i * di * f, self.yb.ptr + i * di * f,
+                    self.xq8.ptr, self.max_t as u32, self.hidden as u32, i as u32],
             )?;
         }
         Ok(())
@@ -1117,7 +1190,7 @@ mod tail_tests {
             d.qgemv_launch(s, d.sego.as_ref().unwrap(), 1, d.wo.w.row_bytes, d.hidden, d.wo.w.estride, c, c + (d.max_t * d.d_inner) as u64, d.d_inner).unwrap();
         });
         let tail: K = Box::new(move |d, s| unsafe {
-            d.tail_launch(s, d.fast.as_ref().unwrap(), d.core.h0.ptr, d.core.st.ptr, lb).unwrap();
+            d.tail_launch(s, d.fast.as_ref().unwrap(), d.core.h0.ptr, d.core.st.ptr, lb, 0).unwrap();
         });
         let old: Vec<(&str, &K)> = vec![("k5_q8 x", &q8x), ("k5_qgemv q|k|v|f_a|g_a", &qx), ("k5_beta", &beta),
             ("k5d_gate2", &gate2), ("k5d_step", &step), ("k5_q8 yb", &q8y), ("k5_qgemv o", &qo)];
@@ -1208,6 +1281,9 @@ impl DevLayer {
     /// t=1 decode step (batched GEMVs; the windiff note in NOTES.md).
     pub fn rows_enqueue(&self, s: &Stream, t: usize, ck: Option<(u64, usize)>) -> Result<()> {
         ensure!(self.pf2 && t >= 1 && t <= self.max_t, "kda rows_enqueue: pf2 {} t {t}", self.pf2);
+        if self.rows_fast_ok(t) {
+            return unsafe { self.rows_fast(s, t, ck) };
+        }
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
         let f = std::mem::size_of::<f32>() as u64;

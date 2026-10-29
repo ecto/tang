@@ -961,13 +961,14 @@ fn wexec(
     match it {
         Item::PreAttn(l) => {
             let dst = if hp.is_kda[l] {
-                if kda_rows() { g.kda_l[l].as_ref().context("kda not resident")?.x_ptr() } else { wb.kx.ptr }
+                let k = g.kda_l[l].as_ref().context("kda not resident")?;
+                if kda_rows() || k.rows_fast_ok(t) { k.x_ptr() } else { wb.kx.ptr }
             } else { g.mla_p[l].as_ref().context("mla not resident")?.x_ptr(t)? };
             f.pre_dev(g.mhc_g[l].as_ref().context("mhc not resident")?, l, 0, dst)?;
         }
         Item::Kda(l) => {
             let k = g.kda_l[l].as_mut().context("kda not resident")?;
-            if kda_rows() {
+            if kda_rows() || k.rows_fast_ok(t) {
                 let ck = wb.ck[l].as_ref().map(|b| (b.ptr, wb.ck_bytes[l]));
                 k.rows_enqueue(s, t, ck)?;
                 return f.post_dev(k.y_ptr());

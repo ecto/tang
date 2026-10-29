@@ -178,7 +178,7 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
     float* __restrict__ H0, const float* __restrict__ W, float* __restrict__ S,
     const float* __restrict__ ON, float EPS, float* __restrict__ BETA, float* __restrict__ G,
     float* __restrict__ G2, float* __restrict__ O, float* __restrict__ Y,
-    unsigned char* __restrict__ XQ, unsigned MAXT, unsigned HID) {
+    unsigned char* __restrict__ XQ, unsigned MAXT, unsigned HID, unsigned TI) {
     const unsigned h = blockIdx.x, x = threadIdx.x, D = KDA_D, DI = KDA_H * KDA_D;
     const unsigned lane = x & 31, warp = x >> 5;
     __shared__ __align__(16) unsigned char wf[KDA_D * K5D_RB + 16], wg[KDA_D * K5D_RB + 16];
@@ -340,7 +340,8 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
         for (int o2 = 16; o2 > 0; o2 >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o2));
         const float d = amax / 127.0f;
         const int qi = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(yv / d), -127.f), 127.f);
-        XQ[h * D + x] = (unsigned char)(signed char)qi;
-        if (lane == 0) ((float*)(XQ + (size_t)MAXT * DI))[(h * D + x) / 32] = d;
+        // TI = this row's index in the window's k5_q8 layout (0 for a decode step)
+        XQ[(size_t)TI * DI + h * D + x] = (unsigned char)(signed char)qi;
+        if (lane == 0) ((float*)(XQ + (size_t)MAXT * DI))[TI * (DI / 32) + (h * D + x) / 32] = d;
     }
 }

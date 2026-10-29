@@ -4,6 +4,39 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — KDA t-row window path for the MTP verify: KDA per t=3 window 6.64 -> 3.93 ms, K=2 trunk 23.0 -> 20.2 ms/pass, ids = plain (branch claude/glm5-kda4, round 3)
+
+What was slow: `window_resident` ran a KDA item as t serial t=1 decodes, so every extra row
+re-read the 108 MB q|k|v|f_a|g_a stream + 35 MB o_proj (~2.2 ms/row over 34 layers). The opt-in
+generic batched path (`rows_enqueue`, TANG_GLM5_RES_KDA_ROWS=1) was slower and drifted (baced18e).
+
+Fix (`DevLayer::rows_fast`, kda_decode.rs; default on for t in 2..=4 when the tail + Q8_0 qgemv
+tables exist, `TANG_GLM5_KDA_ROWS_FAST=0` = the per-row decodes):
+- k5_q8 over the t rows of x (MAXT layout), then ONE `k5_qgemvt9` (kda_k5.cuh): each lane loads
+  a weight word once and keeps t accumulators; per token the chain is the t=1 chain verbatim
+  (same blocks, dp4a order, fmaf, xor tree) -> bit-equal. Output stride per segment (q|k|v 3*di).
+- per row i: `k5d_tail` with a new row index arg TI (all per-row pointers move by i; yb's q8 codes /
+  scales land at row i of xq8), the state checkpoint after each row but the last (same copies as
+  the per-row path). The recurrent core stays serial.
+- ONE `k5_qgemvt17` for o_proj over the t rows of yb's codes.
+- Fast module now compiles moe::K5_SRC (+ kda_k5.cuh) to get the qgemvt kernels.
+- resident.rs (2 lines): the PreAttn dst and the Kda item take the rows path when
+  `kda_rows() || k.rows_fast_ok(t)`.
+
+B300 (shared pod), B flags, bench prompt, `--mtp 2`:
+
+| run | ids md5 | trunk ms/pass | draft ms/pass | tok/pass | tok/s |
+|---|---|---|---|---|---|
+| K=2 -n 128 | 7174cdd6 | 20.23 (was 23.03) | 7.82 | 2.490 | 88.8 (was 79.3) |
+| K=2 -n 512 | 1453cf0e | 19.78 (was 22.68) | 4.55 | 2.231 | 91.7 (was 81.1) |
+| WIN_PROF K=2 -n 128, new | 7174cdd6 | 22.40 | | | win.kda 3.93 ms/window |
+| WIN_PROF K=2 -n 128, ROWS_FAST=0 | 7174cdd6 | 25.31 | | | win.kda 6.64 ms/window |
+
+Haiku `--mtp 2 -n 8` = oracle. Plain decode on this base: 97.10 tok/s @128 (ids OK), so MTP K=2 is
+still below plain. Per extra row KDA now ~0.85 ms (6.64/3 = 2.2 ms for a t=1 row with prof syncs,
+(3.93 - 2.2)/2): the 0.5 ms target is NOT reached; the rest is the per-row k5d_tail (~14 us x 34 =
+0.48 ms/row, serial on the state) plus the extra token's dp4a work in qgemvt.
+
 ## 2026-10-28 — MTP window stage profile: the per-row cost is KDA + MoE and is mostly inherent; K=2 ~79 tok/s, 1.3x NOT reached (branch claude/glm5-mtp-win, round 2)
 
 Instrument: `TANG_GLM5_WIN_PROF=1` runs the resident window eagerly with a sync around every

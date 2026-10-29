@@ -308,6 +308,78 @@ extern "C" __global__ void __launch_bounds__(256) k5_qgemv9(const K5Seg* segs, u
     const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<5>(segs, nseg, xq, xd, COLS); }
 extern "C" __global__ void __launch_bounds__(256) k5_qgemv17(const K5Seg* segs, unsigned nseg,
     const unsigned char* xq, const float* xd, unsigned COLS) { k5_qgemv_body<9>(segs, nseg, xq, xd, COLS); }
+// k5_qgemvt: k5_qgemv for the T (2..4) rows of ONE window (the MTP verify window,
+// NOTES 2026-10-28 kda4 round 3): each lane loads its row's weight words once and keeps T
+// accumulators, token u reading xq + u*COLS codes and xd + u*(COLS/32) scales (k5_q8's
+// MAXT layout with t = u). Per token the chain is the T = 1 chain verbatim (same blocks,
+// same dp4a order, same fmaf over i, same xor tree): bit-equal to T separate t=1 launches.
+// Output row u of segment s at y + u*stride: stride = SF for s < NF (q|k|v share qkvb at
+// 3*di), else the segment's rows.
+template <int K5Q_MAXNB, int TT>
+__device__ __forceinline__ void k5_qgemvt_body(
+    const K5Seg* __restrict__ segs, unsigned nseg, const unsigned char* __restrict__ xq,
+    const float* __restrict__ xd, unsigned COLS, unsigned NF, unsigned SF) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    unsigned g = blockIdx.x * nw + warp;
+    unsigned s = 0;
+    for (; s < nseg; s++) {
+        if (g < segs[s].rows) break;
+        g -= segs[s].rows;
+    }
+    if (s >= nseg) return;
+    const int nb = (int)(COLS >> 5);
+    const unsigned char* row = (const unsigned char*)(segs[s].base + (unsigned long long)g * segs[s].row_bytes);
+    unsigned wd[K5Q_MAXNB][9];
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXNB; i++) {
+        const int b = lane + 32 * i;
+        if (b < nb) {
+            const unsigned* p = (const unsigned*)(row + ((34u * (unsigned)b) & ~3u));
+#pragma unroll
+            for (int j = 0; j < 9; j++) wd[i][j] = __ldcs(p + j);
+        }
+    }
+    float acc[TT];
+#pragma unroll
+    for (int u = 0; u < TT; u++) acc[u] = 0.f;
+    const unsigned nbx = COLS >> 5;
+#pragma unroll
+    for (int i = 0; i < K5Q_MAXNB; i++) {
+        const int b = lane + 32 * i;
+        if (b >= nb) break;
+        const bool odd = b & 1;
+        const float dw = g5_h2f(odd ? (wd[i][0] >> 16) : (wd[i][0] & 0xffffu));
+        int w[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) w[j] = odd ? (int)wd[i][j + 1] : (int)__funnelshift_r(wd[i][j], wd[i][j + 1], 16);
+#pragma unroll
+        for (int u = 0; u < TT; u++) {
+            const int4* xv = (const int4*)(xq + (size_t)u * COLS + 32 * b);
+            const int4 x0 = __ldg(xv), x1 = __ldg(xv + 1);
+            int si = __dp4a(w[0], x0.x, 0);
+            si = __dp4a(w[1], x0.y, si); si = __dp4a(w[2], x0.z, si); si = __dp4a(w[3], x0.w, si);
+            si = __dp4a(w[4], x1.x, si); si = __dp4a(w[5], x1.y, si); si = __dp4a(w[6], x1.z, si);
+            si = __dp4a(w[7], x1.w, si);
+            acc[u] = fmaf(xd[u * nbx + b] * dw, k5_i2f(si), acc[u]);
+        }
+    }
+    const unsigned long long st = s < NF ? SF : segs[s].rows;
+#pragma unroll
+    for (int u = 0; u < TT; u++) {
+        float a = acc[u];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0) ((float*)segs[s].y)[u * st + g] = a;
+    }
+}
+#define K5QT(NAME, NB) \
+extern "C" __global__ void __launch_bounds__(128) NAME(const K5Seg* segs, unsigned nseg, \
+    const unsigned char* xq, const float* xd, unsigned COLS, unsigned NF, unsigned SF, unsigned T) { \
+    switch (T) { \
+    case 2: k5_qgemvt_body<NB, 2>(segs, nseg, xq, xd, COLS, NF, SF); break; \
+    case 3: k5_qgemvt_body<NB, 3>(segs, nseg, xq, xd, COLS, NF, SF); break; \
+    default: k5_qgemvt_body<NB, 4>(segs, nseg, xq, xd, COLS, NF, SF); break; } }
+K5QT(k5_qgemvt9, 5)
+K5QT(k5_qgemvt17, 9)
 // k5_qgemv_q4k: k5_qgemv for Q4_K rows (the requantized KDA projections, NOTES 2026-10-27
 // kda-q4). Same segment table, staging and launch shape; only the dot differs. A Q4_K
 // super-block (144 B, 256 values) = f16 d, f16 dmin, 12 B of packed 6-bit (scale, min) for
