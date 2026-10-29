@@ -791,6 +791,10 @@ struct Stage<'a> {
     stream: &'a Stream,
     k: &'a Kern,
     s: &'a Scratch,
+    /// The narrow set, even in a wide window: `gemv`'s per-row GEMVs (`MAX_T` rows at a
+    /// time) run the narrow kernels on the narrow `xq8`.
+    nk: &'a Kern,
+    ns: &'a Scratch,
     io: &'a Io,
     layers: &'a [Layer],
     side: &'a Stream,
@@ -921,7 +925,12 @@ impl Coder {
         let eps = hp.eps;
 
         // Where a two-GPU split cuts the layer list (`TANG_SPLIT_AT`, or the balanced point).
-        let split_at = split_point(&g, &hp);
+        // One GPU loads every layer.
+        let split_at = if super::split::gpus() == 2 && hp.n_layer > 1 {
+            split_point(&g, &hp)
+        } else {
+            hp.n_layer
+        };
 
         let dev = CudaComputeDevice::new().map_err(|e| anyhow!("CUDA: {e:?}"))?;
         let gpu = Gpu {
@@ -2059,7 +2068,13 @@ impl Coder {
             Stage {
                 dev: &self.dev,
                 stream: &self.stream,
-                k: &self.k,
+                // The wide set's kernels during a wide window: the narrow ones are compiled
+                // for `MAX_T` rows and overrun the wide scratch.
+                k: if in_wide {
+                    self.wide.as_ref().map(|w| &w.k).unwrap_or(&self.k)
+                } else {
+                    &self.k
+                },
                 s: if in_wide {
                     self.wide.as_ref().map(|w| &w.s).unwrap_or(&self.s)
                 } else {
@@ -2070,6 +2085,8 @@ impl Coder {
                 } else {
                     &self.io
                 },
+                nk: &self.k,
+                ns: &self.s,
                 layers: &self.layers,
                 side: &self.side,
                 wide: self.wide.as_ref().filter(|_| in_wide),
@@ -2094,6 +2111,8 @@ impl Coder {
                 } else {
                     &p.io
                 },
+                nk: &p.k,
+                ns: &p.s,
                 layers: &p.layers,
                 side: &p.side,
                 wide: p.wide.as_ref().filter(|_| in_wide),
@@ -2388,10 +2407,10 @@ impl Coder {
         let xq = match xq {
             Some(q) => q,
             None => {
-                let q = v.dev.buffer_addr(&v.s.xq8);
+                let q = v.dev.buffer_addr(&v.ns.xq8);
                 unsafe {
                     gpu::launch(
-                        v.k.q8,
+                        v.nk.q8,
                         ((w.k / 32) as u32, t as u32, 1),
                         (32, 1, 1),
                         0,
@@ -2406,10 +2425,10 @@ impl Coder {
         let kq = self.var.kq;
         if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
             let f = match kq {
-                8 => v.k.gemvk8[t - 1],
-                2 => v.k.gemvk2[t - 1],
-                1 => v.k.gemvk1[t - 1],
-                _ => v.k.gemvk[t - 1],
+                8 => v.nk.gemvk8[t - 1],
+                2 => v.nk.gemvk2[t - 1],
+                1 => v.nk.gemvk1[t - 1],
+                _ => v.nk.gemvk[t - 1],
             };
             unsafe {
                 gpu::launch(
@@ -2425,7 +2444,7 @@ impl Coder {
         } else {
             unsafe {
                 gpu::launch(
-                    v.k.gemv8[t - 1],
+                    v.nk.gemv8[t - 1],
                     (w.rows.div_ceil(8) as u32, 1, 1),
                     (128, 1, 1),
                     (8 * 16 * r16) as u32,
