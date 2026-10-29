@@ -120,6 +120,9 @@ pub struct Kernels {
     /// counters (left at zero by the last block). One launch at a time per `Kernels`.
     ks_part: DevBuf,
     ks_cnt: DevBuf,
+    /// `ds_gemv_bf16_r1`'s scratch: per-chunk partials, and row-group arrival counters (zero)
+    gemv_part: DevBuf,
+    gemv_cnt: DevBuf,
     /// The quantized activation for the K-split GEMV: e4m3 codes [t][K], then scales.
     ks_x: DevBuf,
     /// The quantized activation of a many-row (t > 8) K-split GEMV, grown on demand.
@@ -174,6 +177,7 @@ const MORE: &[&str] = &[
     "ds_swiglu",
     "ds_router",
     "ds_linear_t8",
+    "ds_gemv_bf16_r1",
     "ds_head_bf16",
     "ds_argmax_rows",
     "ds_gather_rows",
@@ -257,6 +261,9 @@ pub struct AttnRope {
 /// Floats of cross-block K-split partials, and row-group counters.
 const KS_PART: usize = 1 << 21;
 const KS_CNT: usize = 1 << 13;
+/// [`Kernels::gemv_bf16`]'s partials (floats) and row groups.
+const GEMV_PART: usize = 1 << 20;
+const GEMV_CNT: usize = 1 << 12;
 /// Bytes for the quantized activation: 8 tokens × 16384 columns, codes and scales.
 const KS_X: usize = 8 * 16384 * 2;
 /// Codes, then scales, of wo_a's activation: 8 tokens × 32768 (64 heads × 512) columns.
@@ -378,6 +385,8 @@ impl Kernels {
             scratch: DevBuf::alloc(ATTN_SCRATCH * 4)?,
             ks_part: DevBuf::alloc(KS_PART * 4)?,
             ks_cnt: DevBuf::from_slice(&vec![0i32; KS_CNT])?,
+            gemv_part: DevBuf::alloc(GEMV_PART * 4)?,
+            gemv_cnt: DevBuf::from_slice(&vec![0i32; GEMV_CNT])?,
             ks_x: DevBuf::alloc(KS_X)?,
             ks_big: std::sync::Mutex::new(None),
             ks_quant: m.func("ds_ks_quant")?,
@@ -778,6 +787,35 @@ impl Kernels {
             };
         }
         Ok(())
+    }
+
+    /// `y = x · wᵀ` for bf16 `w` and t <= 8 (no rounding) on `ds_gemv_bf16_r1`, a warp per row,
+    /// 16-byte weight loads: [`Kernels::linear`]'s values up to summation order (relaxed).
+    /// Falls back to [`Kernels::linear`] off its shapes or under `DS_EXACT`.
+    pub fn gemv_bf16(&self, s: &Stream, w: &DsW, x: u64, y: u64, t: usize) -> Result<()> {
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        if self.exact
+            || w.fmt != 1
+            || cols % 1024 != 0
+            || x % 16 != 0
+            || !(1..=8).contains(&t)
+            || rows.div_ceil(8) > GEMV_CNT
+            || cols / 1024 * t * rows > GEMV_PART
+        {
+            return self.linear(s, w, x, y, t, false);
+        }
+        let ti = t as i32;
+        let (part, cnt) = (self.gemv_part.ptr, self.gemv_cnt.ptr);
+        unsafe {
+            self.go(
+                "ds_gemv_bf16_r1",
+                (rows.div_ceil(8) as u32, (cols / 1024) as u32, 1),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![w.w, w.rows, w.cols, x, y, ti, part, cnt],
+            )
+        }
     }
 
     /// Whether [`Kernels::linear_fast`] takes `w`: fp8 or fp4 with whole 32-column groups.
@@ -3886,6 +3924,72 @@ mod tests {
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "scales"
             );
+        }
+    }
+
+    /// `gemv_bf16` (a warp per row) against `linear` (ds_linear_t8 / ds_linear) on bf16 weights:
+    /// summation order only. With `DS_BENCH_GEMV=1` also times both at the compressor shapes.
+    #[test]
+    fn gemv_bf16_matches_linear() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        for (rows, cols) in [(1024usize, 5120usize), (512, 4096), (64, 5120), (100, 2048)] {
+            let wb: Vec<u16> = data(rows * cols, 7, 0.05)
+                .iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect();
+            let wbuf = DevBuf::from_slice(&wb).unwrap();
+            let w = DsW {
+                w: wbuf.ptr,
+                s: 0,
+                rows: rows as i32,
+                cols: cols as i32,
+                fmt: 1,
+                _pad: 0,
+            };
+            for t in [1usize, 6, 8] {
+                let x = DevBuf::from_slice(&data(t * cols, 3, 2.0)).unwrap();
+                let (y0, y1) = (
+                    DevBuf::alloc(t * rows * 4).unwrap(),
+                    DevBuf::alloc(t * rows * 4).unwrap(),
+                );
+                k.linear(&s, &w, x.ptr, y0.ptr, t, false).unwrap();
+                k.gemv_bf16(&s, &w, x.ptr, y1.ptr, t).unwrap();
+                s.sync().unwrap();
+                let (a, b) = (
+                    y0.read::<f32>(0, t * rows).unwrap(),
+                    y1.read::<f32>(0, t * rows).unwrap(),
+                );
+                let r = rel(&b, &a);
+                assert!(r < 1e-5, "rows {rows} cols {cols} t {t}: rel {r}");
+                if std::env::var("DS_BENCH_GEMV").is_ok_and(|v| v == "1") {
+                    let ev = |f: &dyn Fn()| {
+                        f();
+                        s.sync().unwrap();
+                        let (e0, e1) = (
+                            gpu::Event::new(true).unwrap(),
+                            gpu::Event::new(true).unwrap(),
+                        );
+                        e0.record(&s).unwrap();
+                        for _ in 0..50 {
+                            f();
+                        }
+                        e1.record(&s).unwrap();
+                        e1.sync().unwrap();
+                        e1.since(&e0).unwrap() as f64 * 1e3 / 50.0
+                    };
+                    let u0 = ev(&|| k.linear(&s, &w, x.ptr, y0.ptr, t, false).unwrap());
+                    let u1 = ev(&|| k.gemv_bf16(&s, &w, x.ptr, y1.ptr, t).unwrap());
+                    let gb = (rows * cols * 2) as f64 / 1e3;
+                    eprintln!(
+                        "gemv_bf16 rows {rows} cols {cols} t {t}: linear {u0:.1} us ({:.0} GB/s), r1 {u1:.1} us ({:.0} GB/s)",
+                        gb / u0,
+                        gb / u1
+                    );
+                }
+            }
         }
     }
 

@@ -2579,3 +2579,70 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
         ml[(base + tid) * 2 + 1] = lrun[tid];
     }
 }
+
+// ds_head_bf16 with one row a warp (y [t][rows] = x [t][cols] . w^T, bf16 w, no rounding), for
+// the small bf16 linears (compressor wkv / wgate): block (8 rows, one 1024-column chunk), x's
+// chunk staged in shared memory; per-chunk partials part[chunk][t][rows], the last block of a
+// row group (cnt, left zero) sums them in chunk order. cols % 1024 == 0, t <= 8.
+extern "C" __global__ void __launch_bounds__(256) ds_gemv_bf16_r1(const unsigned short* w, int rows, int cols,
+                                                                  const float* x, float* y, int t, float* part,
+                                                                  int* cnt) {
+    __shared__ __align__(16) float xs[8][1024];
+    __shared__ int last;
+    int tid = threadIdx.x, lane = tid & 31, n = blockIdx.x * 8 + (tid >> 5), ch = blockIdx.y, nch = gridDim.y;
+    int c0 = ch * 1024;
+    for (int e = tid; e < t * 256; e += 256) {
+        int i = e / 256, c4 = e % 256;
+        *(float4*)&xs[i][4 * c4] = *(const float4*)(x + (long long)i * cols + c0 + 4 * c4);
+    }
+    float s[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) s[i] = 0.f;
+    const unsigned short* wr = w + (long long)min(n, rows - 1) * cols + c0;
+    uint4 v[4];
+#pragma unroll
+    for (int u = 0; u < 4; u++) v[u] = __ldcs((const uint4*)(wr + u * 256 + lane * 8));
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+        int c = u * 256 + lane * 8;
+        unsigned int q[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
+        float wf[8];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            wf[2 * j] = __uint_as_float(q[j] << 16);
+            wf[2 * j + 1] = __uint_as_float(q[j] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i >= t) break;
+            float4 a = *(const float4*)&xs[i][c], b = *(const float4*)&xs[i][c + 4];
+            float xv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int j = 0; j < 8; j++) s[i] = fmaf(xv[j], wf[j], s[i]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i >= t) break;
+        float r = s[i];
+        for (int o = 16; o; o >>= 1) r += __shfl_xor_sync(0xffffffffu, r, o);
+        if (lane == 0 && n < rows) part[((long long)ch * t + i) * rows + n] = r;
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(cnt + blockIdx.x, 1) == nch - 1;
+        if (last) cnt[blockIdx.x] = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int e = tid; e < 8 * t; e += 256) {
+        int i = e / 8, r = blockIdx.x * 8 + e % 8;
+        if (r >= rows) continue;
+        float a = 0.f;
+        for (int c = 0; c < nch; c++) a += __ldcg(part + ((long long)c * t + i) * rows + r);
+        y[(long long)i * rows + r] = a;
+    }
+}
