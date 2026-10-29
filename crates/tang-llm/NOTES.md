@@ -4,6 +4,16 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 (integration round 7) — forward 7de01d3a: MTP K=1 118.1 tok/s at -n 128 (1.17× plain), still < plain at 512 (branch frog/glm5-forward)
+
+= 405a5194 + claude/glm5-mtp-win 6eed4d61 (round 5). Numbers from the MTP agent's B300 runs on that
+tree, bench prompt, B flags: plain 101.12 / 114.93 tok/s (-n 128 / 512); K=1 118.1 / 104.9, K=2
+112.5 / 96.0, K=3 105.0 / 86.7; ids = plain everywhere (7174cdd6 / 1453cf0e). The draft is now
+~1 ms wall / 0.53 ms GPU per cell; earlier rounds' "draft ms" included ~200 ms of one-time prompt
+cells. The limit is the verify row (~5.2 ms per extra row vs a ~9 ms plain step) and acceptance at
+longer context. Next: adaptive K (never below plain), MoE rows grouped by expert in the window,
+batched k5d_tail across rows.
+
 ## 2026-10-29 — MTP round 5: the draft is ~1 ms/cell; the "6 ms" was the prompt's cells; chaining loses; K=1 118 tok/s vs plain 101 at -n 128 (branch claude/glm5-mtp-win)
 
 What was wrong: draft ms/pass (5.99 at K=2) was misread as per-pass cost. `TANG_GLM5_WIN_PROF=1`
