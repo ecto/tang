@@ -68,6 +68,8 @@ struct MtpDev {
     /// `[t][n]` scratch (MAX_EH rows). Opt-in `TANG_GLM5_MTP_EH_DEV=1`: on the generic
     /// thread-per-row `k5_gemv` it measured 2.9 ms a cell vs 0.9 on the host (B300).
     eh: Option<(super::moe::gpu::DevW, super::moe::gpu::Kernels5, tang_moe::gpu::DevBuf, tang_moe::gpu::DevBuf)>,
+    /// The whole cell as one device graph (`resident::DraftCell`; `None`: host-staged cells).
+    cell: Option<super::engine::resident::DraftCell>,
 }
 
 /// Rows the device eh_proj scratch holds (a cells call past it runs eh_proj on the host).
@@ -151,7 +153,17 @@ impl Mtp {
                 tang_moe::gpu::DevBuf::zeroed_elems::<f32>(MAX_EH * n).map_err(ge)?,
             ))
         };
-        self.dev = Some(MtpDev { cu, p, c: Default::default(), moe, eh });
+        let cell = if super::engine::resident::cell_dev_on() {
+            super::engine::resident::DraftCell::new(
+                e,
+                self.layer,
+                [&self.enorm, &self.hnorm, &self.attn_norm, &self.ffn_norm, &self.shnorm],
+                self.eps,
+            )?
+        } else {
+            None
+        };
+        self.dev = Some(MtpDev { cu, p, c: Default::default(), moe, eh, cell });
         eprintln!("glm5: MTP layer blk.{} resident on GPU 0 (DSA + FFN + head)", self.layer);
         Ok(())
     }
@@ -192,6 +204,12 @@ impl Mtp {
         #[cfg(feature = "cuda")]
         if let Some(d) = &mut self.dev {
             d.c.truncate_rows(pos, self.mla.kv_lora, self.mla.idx_dim);
+            // the device watermarks too (rows past `pos` are overwritten by the next append)
+            d.cu.set_seq(0);
+            if d.cu.row_cap() > 0 {
+                d.cu.append_done(pos, 0);
+                d.cu.set_pool_upto(d.cu.pool_upto().min(pos / self.mla.kpool.max(1)));
+            }
         }
         self.latent.truncate(pos * self.mla.kv_lora);
         self.idx_k.truncate(pos * self.mla.idx_dim);
@@ -208,6 +226,13 @@ impl Mtp {
             h.len(),
             t * n
         );
+        #[cfg(feature = "cuda")]
+        if let Some(d) = self.dev.as_mut() {
+            if let Some(c) = d.cell.as_ref() {
+                c.stream().sync().map_err(|er| anyhow::anyhow!("mtp: {er}"))?;
+            }
+            super::engine::resident::refresh_cell_mirrors(&d.cu, &mut d.c)?;
+        }
         let pos0 = self.len();
         let embd = g.info("token_embd.weight")?;
         // ---- [enorm(e) ; hnorm(h)] -> eh_proj
@@ -393,16 +418,70 @@ pub struct MtpDrafter {
     pub mtp: Mtp,
     /// the last committed cell's (hn, argmax)
     last: Option<(Vec<f32>, u32)>,
+    /// the last committed cell ran on the device (its hn / argmax live there)
+    dev_last: bool,
 }
 
 impl MtpDrafter {
     pub fn new(mtp: Mtp) -> Self {
-        Self { mtp, last: None }
+        Self { mtp, last: None, dev_last: false }
+    }
+
+    /// Teacher-forced device cells for every row (async). `Ok(i)`: rows `[0, i)` ran
+    /// (`i < t`: the rest must take the host cell).
+    #[cfg(feature = "cuda")]
+    fn observe_dev(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<usize> {
+        let n = self.mtp.n;
+        let Some(d) = self.mtp.dev.as_mut() else { return Ok(0) };
+        let Some(cell) = d.cell.as_mut() else { return Ok(0) };
+        e.gpu.as_ref().context("mtp: no GPU")?.dev0().0.bind().map_err(|er| anyhow::anyhow!("bind: {er}"))?;
+        for (i, &tk) in toks.iter().enumerate() {
+            if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, Some((tk, &h[i * n..(i + 1) * n])))? {
+                return Ok(i);
+            }
+        }
+        Ok(toks.len())
+    }
+
+    /// The chained device draft after a device observe: `k` ids, one sync.
+    #[cfg(feature = "cuda")]
+    fn draft_dev(&mut self, e: &Glm5Engine, k: usize) -> Result<Vec<u32>> {
+        let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft: {er}");
+        let keep = self.mtp.len();
+        let d = self.mtp.dev.as_mut().context("mtp: no device block")?;
+        let cell = d.cell.as_mut().context("mtp: no device cell")?;
+        let k = k.min(16);
+        let mut got = 0usize;
+        while got < k {
+            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None)? {
+                break;
+            }
+            tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
+            got += 1;
+        }
+        cell.stream().sync().map_err(ge)?;
+        let ids = cell.ids.read::<u32>(0, got).map_err(ge)?;
+        self.mtp.truncate(keep);
+        Ok(ids)
     }
 }
 
 impl Drafter for MtpDrafter {
     fn observe(&mut self, e: &Glm5Engine, h: &[f32], next_toks: &[u32]) -> Result<()> {
+        self.dev_last = false;
+        #[cfg(feature = "cuda")]
+        {
+            let done = self.observe_dev(e, h, next_toks)?;
+            if done == next_toks.len() && done > 0 {
+                self.dev_last = true;
+                self.last = None;
+                return Ok(());
+            }
+            if done > 0 {
+                let n = self.mtp.n;
+                return self.observe(e, &h[done * n..], &next_toks[done..]);
+            }
+        }
         let o = self.mtp.cells(e, h, next_toks)?;
         let n = self.mtp.n;
         let t = next_toks.len();
@@ -411,6 +490,10 @@ impl Drafter for MtpDrafter {
     }
 
     fn draft(&mut self, e: &Glm5Engine, k: usize) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        if self.dev_last {
+            return self.draft_dev(e, k);
+        }
         let Some((mut h, mut d)) = self.last.clone() else {
             return Ok(vec![]);
         };

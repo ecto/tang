@@ -4,6 +4,45 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — MTP draft cell as one device graph: draft 8.36 -> 5.99 ms/pass (K=2), MTP 1.14-1.18x plain (branch claude/glm5-mtp-win, round 4)
+
+What was wrong: each NextN draft cell was host-staged (~4 ms: host eh_proj 0.93, DSA 0.80,
+MoE 0.36, head 2.09 ms; mostly syncs and host round trips).
+
+Fix (resident.rs `DraftCell`, mtp.rs): the whole cell as ONE graph replay per cell
+(`[dense, sparse]` graphs, recaptured when shared scratch may move — a `GRAPH_GEN` bumped by
+host windows / new window lengths — or the drafter cache outgrows the captured capacity):
+`rs_embed` gather of the token in `tp[0]` (own copy of token_embd on the device), enorm /
+hnorm (`rs_norm`) into `[e ; h]`, eh_proj on k5 q8 + gemv8 (Q8_0; `g5f_gemv` faulted
+with CUDA_ERROR_ILLEGAL_ADDRESS on this 4096x8192 Q8_0 matrix — localised with
+`TANG_GLM5_MTP_CELL_EAGER=1` stage syncs, NOT diagnosed; other types keep g5f_gemv), attn_norm,
+the DSA block on `MlaProj::window_dev_pos` (position `tp[1]`), residual (`rs_add`), ffn_norm,
+`ffn_async`, residual, shared_head_norm, head q8 + gemv8 + `rs_argmax` (writes the draft to
+`tp[0]`, advances `tp[1]`), `hin <- hout`. The host only keeps the drafter cache watermarks.
+`observe` uploads (token, h row) per teacher-forced cell and launches without syncing;
+`draft` chains K-1 cells and copies each id (4 bytes D2D), then ONE sync + read of K ids.
+`Mtp::truncate` now also rewinds the device watermarks; the host cell refreshes stale mirrors
+first. Falls back to the host cell when the cache must grow. `TANG_GLM5_MTP_CELL_DEV=0`: off.
+Not done: chaining the cells and the following verify window without the host wake.
+
+Verification: draft accept rates identical to the host-cell runs (K=2 -n 128 88.2/72.7%,
+-n 512 77.3/60.2%), haiku `--mtp 2` = oracle, every MTP run's ids = plain. mew: the tiny
+fixture has no Q8_0 device head, so the cell does not build there (host cell path tested).
+B300, bench prompt, tok/s = tok/pass / (trunk + draft ms/pass):
+
+| run | -n | tok/pass | trunk ms | draft ms/pass (before) | tok/s (before) | ids md5 |
+|---|---|---|---|---|---|---|
+| plain | 128 / 512 | | | | 83.11 / 82.83 | 7174cdd6 / 1453cf0e |
+| K=1 | 128 | 1.896 | 15.13 | 4.23 (6.40) | 97.9 (79.7) | 7174cdd6 |
+| K=2 | 128 | 2.490 | 20.27 | 5.99 (8.36) | 94.8 (79.3) | 7174cdd6 |
+| K=3 | 128 | 2.953 | 25.44 | 8.04 (11.05) | 88.2 (74.0) | 7174cdd6 |
+| K=2 | 512 | 2.231 | 21.52 | 2.74 (4.84) | 92.0 (81.1) | 1453cf0e |
+
+(trunk ms/pass also fell vs the round-3 table, 23.0 -> 20.3 at K=2: same window code; the
+forward merge 462664fe carries other agents' kernel work.) Cells per K=2 pass ~3.5 (observe
+rows + 1 chained), so ~1.7 ms wall per cell including the per-cell H2D / launch and the
+final sync: the 1.5 ms target is not met. Target 108 tok/s at K=2 NOT reached (94.8).
+
 ## 2026-10-28 — MTP window stage profile: the per-row cost is KDA + MoE and is mostly inherent; K=2 ~79 tok/s, 1.3x NOT reached (branch claude/glm5-mtp-win, round 2)
 
 Instrument: `TANG_GLM5_WIN_PROF=1` runs the resident window eagerly with a sync around every
