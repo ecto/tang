@@ -239,9 +239,12 @@ pub fn expert_bytes(g: &Gguf, l: usize) -> Result<u64> {
 
 /// `y[r] = Σ_j w[r][j] x[j]` for a `rows × cols` row-major matrix (f64 accumulation).
 fn matvec(w: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+    use rayon::prelude::*;
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
-    w.chunks_exact(cols)
+    // parallel over output rows: each element's f64 dot is computed exactly as before
+    // (same order), so the result is bit-identical to the serial loop
+    w.par_chunks_exact(cols)
         .map(|r| {
             r.iter()
                 .zip(x)
@@ -358,15 +361,32 @@ pub fn experts(
             by_expert[id as usize].push((i / k, i));
         }
     }
+    // the routed experts in parallel (dequant + every (token, slot) pair's MLP per task),
+    // then the weighted sums into `y` in the serial loop's exact order (expert id, then
+    // pair) — so the floats round identically and the oracle stays bit-exact
+    use rayon::prelude::*;
+    let active: Vec<(usize, &Vec<(usize, usize)>)> = by_expert
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let outs: Vec<Vec<Vec<f32>>> = active
+        .par_iter()
+        .map(|&(e, pairs)| -> Result<Vec<Vec<f32>>> {
+            let (g, u, d) = (
+                gw.mat(e, ff, hid)?,
+                uw.mat(e, ff, hid)?,
+                dw.mat(e, hid, ff)?,
+            );
+            Ok(pairs
+                .iter()
+                .map(|&(t, _)| mlp(&g, &u, &d, ff, hid, &x[t * hid..(t + 1) * hid], p.limit_exp))
+                .collect())
+        })
+        .collect::<Result<_>>()?;
     let mut y = vec![0f32; t_len * hid];
-    for (e, pairs) in by_expert.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
-        let (g, u, d) = (
-            gw.mat(e, ff, hid)?,
-            uw.mat(e, ff, hid)?,
-            dw.mat(e, hid, ff)?,
-        );
-        for &(t, i) in pairs {
-            let out = mlp(&g, &u, &d, ff, hid, &x[t * hid..(t + 1) * hid], p.limit_exp);
+    for ((_, pairs), outs) in active.iter().zip(outs) {
+        for (&(t, i), out) in pairs.iter().zip(outs) {
             for (o, v) in y[t * hid..(t + 1) * hid].iter_mut().zip(out) {
                 *o += wts[i] * v;
             }

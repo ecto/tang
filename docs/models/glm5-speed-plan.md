@@ -50,6 +50,9 @@ memory/warp cooperation — a 4096-long row is streamed by ONE thread, (3) launc
 4. **mHC pre** — 24 GEMVs of 16384 each with 32 lanes/token is ~1/512 of the GPU.
    Batch tokens: one block per 8 tokens, or fold the mixes dot into the q/k/v GEMV's
    activation staging. Second-order; measure after (1)+(2).
+   **Done behind `TANG_GLM5_MHC_FUSED=1`** (`mhc_fused.rs`, NOTES.md 2026-10-26): streams
+   device-resident per window, post fused into the next pre, norm fused in; 3090 mHC
+   time per decode step 170.8 → 10.5 ms, ids = oracle.
 5. **MoE expert batch** — `g5_expert_gu` at T=1 launches 8 experts × 2 kernels; a
    grouped kernel (all selected experts in one launch, ids in shared) removes 16
    launches/layer. The Flash engine's grouped expert kernel is the template.

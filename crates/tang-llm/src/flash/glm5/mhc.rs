@@ -677,6 +677,17 @@ impl MhcGpu {
         })
     }
 
+    /// Block `block`'s resident weights as device addresses `(fn, base, scale)` plus the
+    /// shared `(iters, hc_eps, rms_eps)` — [`super::mhc_fused::MhcFused`] launches its own
+    /// kernels on them. `block`: 0 = hc_attn, 1 = hc_ffn.
+    pub(crate) fn dev_weights(&self, block: usize) -> ((u64, u64, u64), (u32, f32, f32)) {
+        let w = &self.w[block];
+        (
+            (w.fn_.ptr, w.base.ptr, w.scale.ptr),
+            (self.iters, self.eps, self.rms_eps),
+        )
+    }
+
     /// The resident block weights' fn row (for tests).
     #[cfg(test)]
     fn wfn_len(&self, block: usize) -> usize {
@@ -1076,7 +1087,7 @@ mod tests {
 
     /// Deterministic pseudo-random f32 in [-1, 1) from an integer state (xorshift-ish; no
     /// external rng dep). Different `seed`s give independent sequences.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[allow(dead_code)]
     fn rnd(state: &mut u64) -> f32 {
         // xorshift64*
         *state ^= *state >> 12;

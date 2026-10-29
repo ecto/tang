@@ -2240,6 +2240,9 @@ fn usage_json(u: &Usage) -> Value {
             "predicted_per_second": u.decode_tok_s,
             "draft_n": u.draft_tokens,
             "draft_n_accepted": u.accepted_tokens,
+            // decode forwards (verify windows with speculation): tokens per forward is
+            // completion_tokens / decode_steps
+            "decode_steps": u.decode_steps,
         },
     })
 }
