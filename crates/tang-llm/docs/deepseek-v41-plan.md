@@ -249,6 +249,13 @@ Wave 8a merged (+ spec lane draft n = 6 default, attn3 99e40728 bf16 split-K GEM
 compressor; 850b5e9e), 1017 weights, 8× H100, 200 tokens: greedy **155.7 / 155.8** (43 steps,
 162/252, 4.65 tokens/step), sampled T=0.6 148.0 / 143.0, T=1.0 133.4, direct greedy 120.1.
 
+Wave 8b merged (+ spec per-mode draft n: greedy 6, sampled 5; mega lane's shared mHC device
+function, DS_MEGA/DS_PDL still off; attn3 ds_ks2 wq_a+wkv in one launch and 4 groups in flight
+per warp, bit-exact; d14b36ea), 1017 weights, 8× H100, 200 tokens: greedy **160.1 / 160.4**
+(43 steps, 162/252, identical acceptance to 8a), sampled T=0.6 135.0 / 155.2, T=1.0 155.7,
+direct greedy 122.4. The moe3 lane's grouped-kernel occupancy work measured 176 greedy on its
+own branch and is being merged next.
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
