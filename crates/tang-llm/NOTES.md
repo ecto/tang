@@ -4,6 +4,16 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-29 (integration round 9) — forward a5447e57: use-after-free fixed; MTP K=1 129.6 / K=2 129.1 tok/s at -n 128 (branch frog/glm5-forward)
+
+= f92a4f07 + claude/glm5-kda4 c815b990. Correctness: the mew suite's sticky CUDA_ERROR_ILLEGAL_ADDRESS
+(seen since round 3 as flaky, cross-test failures) was a use-after-free in mla.rs —
+`sd.map(|b| b.ptr)` moved the DSA selection DevBuf into the closure, freeing it before the attend
+kernel launched. Fixed with `sd.as_ref()` at both sites; memcheck on mla 0 errors, full suite 87/0.
+Speed (the KDA agent's B300 runs on this tree, bench prompt, B flags): extra verify row KDA cost
+0.68 → 0.50 ms (k5d_pret heads×rows pre-pass + k5d_stept serial state); MTP K=1 **129.6** tok/s,
+K=2 129.1 at -n 128 vs plain 100.52 (1.29×); K=2 at -n 512 109.4. ids = plain everywhere.
+
 ## 2026-10-29 — mew ILLEGAL_ADDRESS root cause: use-after-free of the selection buffer in mla.rs; KDA window tail split (k5d_pret + k5d_stept): 0.68 -> 0.50 ms per extra row, ids = plain (branch claude/glm5-kda4, round 5)
 
 **The mew flake.** `compute-sanitizer --tool memcheck` on `flash::glm5::mla::` (test binary, --test-threads=1)
