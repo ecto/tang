@@ -4,6 +4,34 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — DSA round 3 on B300: decode attention split over blocks; context no longer costs ~1.6 ms/token at 238 tokens, ids unchanged (branch claude/glm5-dsa3)
+
+What was wrong: `mla_attn_lat_p` (dense decode attention, the whole-step graph) ran one block per head
+and walked every key inside it (scores 8 keys at a time, then the weighted latent sum one key per step).
+It was the ONLY kernel whose per-token cost grew with context.
+
+Evidence (nsys `--cuda-graph-trace=node`, forward f0d94cc2 binary, B flags, -n 32, per decode token
+between `rs_argmax`es, 20 tokens): median token period 8.83 ms (haiku, 20-token prompt) / 10.42 ms
+(bench prompt, 237) / 20.77 ms (bench prompt x8, 1812). `mla_attn_lat_p` per token: 193 / 1783 / 12389 us;
+every other kernel within 10 us across the three (MoE, mHC, KDA, head, `mla_hgemv`, `mla_idx_ln_p`,
+`mla_lat_norm_bf16_p`). Below topk=2048 the indexer is dense, so `idx_select_p`/`idx_pool_keys_p` are not
+in the graph at these lengths (the sparse path was not measured this round).
+
+Fix (`TANG_GLM5_ATTN_SPLITK`, default on; `=0` restores `mla_attn_lat_p`; needs dl % 32 == 0):
+- `mla_attn_sc_p`: grid (nh, keys/64), the same warp-per-key 512-dim dot + xor shuffle + scale, into
+  a [nh][width] f32 score scratch after qa's dn row (ensure_scratch grows qa_d by nh*width).
+- `mla_attn_acc_p`: grid (nh, dl/32), 256 threads. Max (order-free), then den with the old kernel's exact
+  256-thread strided partials + tree. Latent tiles of 256 keys x 32 columns are staged in shared memory
+  with one key per thread as 16-byte loads; then one thread per column sums keys IN KEY ORDER from 0,
+  like `lacc[l] += p * v`. So every float matches. (A column-per-thread walk straight from global was
+  load-latency bound: 1098 us/token at 1812; 2-byte staged loads 1085; 16-byte staged 723.)
+
+Verified: ids identical to forward on all three prompts at -n 32; scripts/glm5-bench.sh (B flags,
+9aac15f0) ids gate OK, -n 128 decode 96.48 tok/s (95.97 on a first run), md5 of the id list 7174cdd6;
+GLM5_N=512 108.86 tok/s, md5 1453cf0e (forward: 81.5 / 82.4). Token period after: 8.81 / 8.92 / 9.42 ms
+(haiku / 237 / 1812), i.e. +0.11 ms at 237 and +0.61 ms at 1812 over the haiku context;
+`mla_attn_sc_p` + `mla_attn_acc_p` = 173 / 306 / 1036 us per token. Remaining growth is the acc chain
+and staging (66 us/layer at 1812) and scores (28 us/layer).
 ## 2026-10-28 — MTP verify on the resident path: 85 -> 17-28 ms/pass, ids = plain, but only ~1.04x plain at best (branch claude/glm5-mtp-win)
 
 What was wrong: the MTP verify ran the host `window()` (~85 ms/pass) plus a host KDA snapshot
