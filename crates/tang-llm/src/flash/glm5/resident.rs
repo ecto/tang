@@ -66,6 +66,11 @@ extern "C" __global__ void rs_argmax(const float* v, int n, unsigned* out, int i
     }
 }
 
+// x[i] += y[i] (the MTP draft cell's residual adds)
+extern "C" __global__ void rs_add(float* x, const float* y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) x[i] += y[i];
+}
+
 // ---- the device embed gather (TANG_GLM5_STEP_GRAPH=2) ----
 // Row tok[0] of the GGUF token_embd table (its own quant type), dequantised exactly as the
 // host's gguf::dequantize (explicit _rn ops: no FMA contraction), broadcast to the hc
@@ -586,6 +591,7 @@ impl Glm5Engine {
                 if !res.wwarm.contains(&t) {
                     // a new window length may grow shared scratch (the FFN pool): every
                     // captured graph that could point at the old buffers goes
+                    GRAPH_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     res.wgraphs.clear();
                     res.whole = [None, None];
                     res.whole_cap = 0;
@@ -741,6 +747,7 @@ impl Glm5Engine {
 
     /// Drop the captured step segments (any host window: it may reallocate their scratch).
     pub(super) fn drop_step_graph(&mut self) {
+        GRAPH_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(r) = self.gpu.as_mut().and_then(|g| g.resident.as_mut()) {
             r.graphs = None;
             r.whole = [None, None];
@@ -1252,5 +1259,310 @@ fn exec(
             unsafe { launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![logits, nvi, tp, inc])? };
         }
     }
+    Ok(())
+}
+
+
+/// Bumped whenever shared scratch a captured graph may point at can be reallocated (a host
+/// window, a new resident window length): the MTP draft-cell graphs recapture after it.
+static GRAPH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The MTP draft cell on the device (`TANG_GLM5_MTP_CELL_DEV`, default on): one NextN cell
+/// at the drafter cache's next position as ONE graph replay — embed gather of the token in
+/// `tp[0]` (`rs_embed`), enorm / hnorm (`rs_norm`) into `[e ; h]`, eh_proj on the fast
+/// q8 + `g5f_gemv` (the MLA projections' kernel), attn_norm, the DSA block on the
+/// device-position kernels (`MlaProj::window_dev_pos`, position `tp[1]`), the FFN
+/// (`ffn_async`), shared_head_norm, the LM head (q8 + gemv8) and `rs_argmax` (writes the
+/// draft into `tp[0]`, advances `tp[1]`), and `hin <- hout` for the next chained cell. No
+/// host sync inside; the host only keeps the cache watermarks. Graphs `[dense, sparse]`.
+pub(crate) struct DraftCell {
+    m: Module,
+    s: tang_moe::gpu::Stream,
+    k5: super::super::moe::gpu::Kernels5,
+    eh: super::super::moe::gpu::DevW,
+    embd: (DevBuf, u64, u32),
+    norms: [DevBuf; 5],
+    eps: f32,
+    pub(crate) tp: DevBuf,
+    pub(crate) ids: DevBuf,
+    hin: DevBuf,
+    cat: DevBuf,
+    cq: DevBuf,
+    cq2: DevBuf,
+    cd: DevBuf,
+    x: DevBuf,
+    fx: DevBuf,
+    fy: DevBuf,
+    hout: DevBuf,
+    hq8: DevBuf,
+    logits: DevBuf,
+    graphs: [Option<tang_moe::gpu::Graph>; 2],
+    gen: u64,
+    cap: usize,
+    pub(crate) replays: usize,
+}
+
+/// `TANG_GLM5_MTP_CELL_DEV=0`: the drafter keeps the host-staged cell.
+pub(crate) fn cell_dev_on() -> bool {
+    !std::env::var("TANG_GLM5_MTP_CELL_DEV").is_ok_and(|v| v == "0")
+}
+
+impl DraftCell {
+    /// `norms` = enorm, hnorm, attn_norm, ffn_norm, shared_head_norm (host f32). `None` when
+    /// a piece is not supported (no device head, an embed / eh_proj type the kernels don't
+    /// read): the caller keeps the host cell.
+    pub(crate) fn new(e: &Glm5Engine, layer: usize, norms: [&[f32]; 5], eps: f32) -> Result<Option<Self>> {
+        let Some(g) = e.gpu.as_ref() else { return Ok(None) };
+        if g.head_dev.is_none() {
+            return Ok(None);
+        }
+        let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
+        let gpu = &g.devs[0].0;
+        gpu.bind().map_err(ge)?;
+        let (n, nv) = (e.m.hp.n_embd, e.m.hp.n_vocab);
+        let gg = &e.m.g;
+        let embd = gg.info("token_embd.weight")?;
+        let Some(ty) = embed_ty(embd.ty) else { return Ok(None) };
+        let info = gg.info(&super::super::t(layer, "nextn.eh_proj.weight"))?;
+        let eh = super::super::moe::gpu::upload(&super::super::moe::W::Gguf(gg, info), 1, n, 2 * n)?;
+        eprintln!(
+            "glm5: MTP draft cell on the device (eh_proj {} {}x{} row_bytes {}, embed {})",
+            info.ty.name(), n, 2 * n, eh.w.row_bytes, embd.ty.name()
+        );
+        let f4 = |k: usize| DevBuf::zeroed_elems::<f32>(k).map_err(ge);
+        let b = |k: usize| DevBuf::zeroed(k).map_err(ge);
+        let up = |v: &[f32]| DevBuf::from_slice(v).map_err(ge);
+        Ok(Some(Self {
+            m: gpu.module(SRC).map_err(ge)?,
+            s: tang_moe::gpu::Stream::blocking().map_err(ge)?,
+            k5: super::super::moe::gpu::Kernels5::new(gpu)?,
+            eh,
+            embd: (DevBuf::from_slice(gg.bytes(embd)).map_err(ge)?, embd.row_bytes()? as u64, ty),
+            norms: [up(norms[0])?, up(norms[1])?, up(norms[2])?, up(norms[3])?, up(norms[4])?],
+            eps,
+            tp: DevBuf::zeroed_elems::<u32>(2).map_err(ge)?,
+            ids: DevBuf::zeroed_elems::<u32>(16).map_err(ge)?,
+            hin: f4(n)?,
+            // g5f_gemv's token tile may touch 8 activation rows: size for 8
+            cat: f4(8 * 2 * n)?,
+            cq: b(8 * 2 * n)?,
+            cq2: b(8 * 2 * n)?,
+            cd: f4(8 * 2 * n / 32)?,
+            x: f4(n)?,
+            fx: f4(n)?,
+            fy: f4(n)?,
+            hout: f4(n)?,
+            hq8: b(n + n / 32 * 4 + 64)?,
+            logits: f4(nv)?,
+            graphs: [None, None],
+            gen: u64::MAX,
+            cap: 0,
+            replays: 0,
+        }))
+    }
+
+    pub(crate) fn stream(&self) -> &tang_moe::gpu::Stream {
+        &self.s
+    }
+
+    /// The cell's launches on `s` (capturable).
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
+        &self,
+        g: &GpuFfn,
+        cu: &super::super::mla::cuda::MlaCuda,
+        p: &super::super::mla_dev::MlaProj,
+        w: &MlaWeights,
+        moe: &super::super::moe::gpu::DevMoe,
+        n: usize,
+        nv: usize,
+        sparse: bool,
+        s: &tang_moe::gpu::Stream,
+    ) -> Result<()> {
+        let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
+        let hd = g.head_dev.as_ref().context("draft cell: no device head")?;
+        let f = |k: &str| self.m.func(k).map_err(ge);
+        let (nf, af, ad, ef) = (f("rs_norm")?, f("rs_argmax")?, f("rs_add")?, f("rs_embed")?);
+        let (ni, eps) = (n as i32, self.eps);
+        let addg = (n.div_ceil(256) as u32, 1, 1);
+        let ni2 = ni;
+        let (tab, rb, ty) = (self.embd.0.ptr, self.embd.1, self.embd.2);
+        let (tpp, cat, cat_h, hin) = (self.tp.ptr, self.cat.ptr, self.cat.ptr + (n * 4) as u64, self.hin.ptr);
+        let one = 1i32;
+        let nw = |i: usize| self.norms[i].ptr;
+        let dbg = std::env::var("TANG_GLM5_MTP_CELL_EAGER").is_ok_and(|v| v == "1");
+        let chk = |what: &str| -> Result<()> {
+            if dbg {
+                s.sync().map_err(|er| anyhow::anyhow!("draft cell stage {what}: {er}"))?;
+            }
+            Ok(())
+        };
+        unsafe {
+            launch(ef, addg, (256, 1, 1), 0, s, args![tab, rb, ty, tpp, cat, ni, one])?;
+            let (w0, w1) = (nw(0), nw(1));
+            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![cat, w0, cat, ni, eps])?;
+            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![hin, w1, cat_h, ni, eps])?;
+        }
+        chk("embed+norms")?;
+        // eh_proj: Q8_0 on the k5 q8 + gemv8 pair (the trunk's KDA / head projection
+        // kernels; g5f_gemv faulted on this 4096x8192 Q8_0 matrix, not diagnosed), else g5f_gemv
+        if self.eh.w.ty == 8 {
+            let (cq, xp) = (self.cq.ptr, self.x.ptr);
+            let n2 = (2 * n) as u32;
+            unsafe {
+                launch(hd.k5.q8, ((2 * n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![cat, cq, n2, 1u32])?;
+                launch(
+                    hd.k5.gemv8,
+                    (n.div_ceil(K5_WARPS) as u32, 1, 1),
+                    (128, 1, 1),
+                    (K5_WARPS * ((self.eh.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                    s,
+                    args![self.eh.w, 0u32, cq, cq + 2 * n as u64, xp, n as u32, 1u32, n as u32, n2],
+                )?;
+            }
+        } else {
+            let quant = self.eh.w.ty > 1;
+            if quant {
+                self.k5.fast.q8(s, cat, self.cq.ptr, self.cq2.ptr, self.cd.ptr, 2 * n, 1)?;
+            }
+            let a = super::super::moe::gpu::Act {
+                xf: cat,
+                xq: if quant { self.cq.ptr } else { 0 },
+                xq2: if quant { self.cq2.ptr } else { 0 },
+                xd: if quant { self.cd.ptr } else { 0 },
+                xs: 2 * n,
+            };
+            self.k5.fast.gemv(s, self.eh.w, 0, a, self.x.ptr, n, 1, n, 2 * n)?;
+        }
+        chk("eh_proj")?;
+        let (xp, xa, w2) = (self.x.ptr, p.x_ptr(1)?, nw(2));
+        unsafe { launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w2, xa, ni, eps])? };
+        cu.set_seq(0);
+        let y = p.window_dev_pos(cu, w, tpp + 4, sparse, s)?;
+        chk("dsa")?;
+        let (fx, fy, w3, w4, ho) = (self.fx.ptr, self.fy.ptr, nw(3), nw(4), self.hout.ptr);
+        unsafe {
+            launch(ad, addg, (256, 1, 1), 0, s, args![xp, y, ni2])?;
+            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w3, fx, ni, eps])?;
+        }
+        super::super::moe::gpu::ffn_async(&g.devs[0].1, s, moe, fx, fy, 1)?;
+        chk("ffn")?;
+        let hq = self.hq8.ptr;
+        let lg = self.logits.ptr;
+        unsafe {
+            launch(ad, addg, (256, 1, 1), 0, s, args![xp, fy, ni2])?;
+            launch(nf, (1, 1, 1), (1024, 1, 1), 0, s, args![xp, w4, ho, ni, eps])?;
+            launch(hd.k5.q8, ((n / 32) as u32, 1, 1), (32, 1, 1), 0, s, args![ho, hq, n as u32, 1u32])?;
+            launch(
+                hd.k5.gemv8,
+                (nv.div_ceil(K5_WARPS) as u32, 1, 1),
+                (128, 1, 1),
+                (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
+                s,
+                args![hd.dw.w, 0u32, hq, hq + n as u64, lg, nv as u32, 1u32, nv as u32, n as u32],
+            )?;
+            let (nvi, inc) = (nv as i32, 1i32);
+            launch(af, (1, 1, 1), (1024, 1, 1), 0, s, args![lg, nvi, tpp, inc])?;
+        }
+        tang_moe::gpu::copy_d2d_async(hin, ho, n * 4, s).map_err(ge)?;
+        Ok(())
+    }
+
+    /// Run one cell at the drafter cache position `pos` (`c`'s rows): when `tok_h` is given
+    /// the token / `h` row are uploaded first (a teacher-forced cell), else the chain
+    /// continues from the device (`tp[0]`, `hin`). Async (no sync). `false`: the cell can't
+    /// run here (cache capacity); nothing was enqueued.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run(
+        &mut self,
+        e: &Glm5Engine,
+        cu: &super::super::mla::cuda::MlaCuda,
+        p: &super::super::mla_dev::MlaProj,
+        w: &MlaWeights,
+        moe: &super::super::moe::gpu::DevMoe,
+        c: &mut DsaCache,
+        tok_h: Option<(u32, &[f32])>,
+    ) -> Result<bool> {
+        let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft cell: {er}");
+        let g = e.gpu.as_ref().context("draft cell: no GPU")?;
+        let (n, nv) = (e.m.hp.n_embd, e.m.hp.n_vocab);
+        let (dl, idd) = (w.kv_lora, w.idx_dim);
+        let pos = c.valid.len();
+        if c.lat16.len() != pos * dl {
+            return Ok(false);
+        }
+        let kv_len = pos + 1;
+        cu.set_seq(0);
+        let gen = GRAPH_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        if gen != self.gen || self.cap < kv_len {
+            self.graphs = [None, None];
+            self.gen = gen;
+            let cap = cu.row_cap();
+            if cap < kv_len {
+                return Ok(false);
+            }
+            cu.reserve_pool(cap / w.kpool + 1).map_err(ge)?;
+            cu.stage_ape(&w.i_ape).map_err(ge)?;
+            self.cap = cap;
+        }
+        let sparse = !super::super::mla::indexer_is_dense(kv_len, w.topk);
+        let sp = usize::from(sparse);
+        let eager = std::env::var("TANG_GLM5_MTP_CELL_EAGER").is_ok_and(|v| v == "1");
+        if self.graphs[sp].is_none() && !eager {
+            let me: &Self = self;
+            let gr = tang_moe::gpu::Graph::capture(&me.s, |cs| {
+                me.enqueue(g, cu, p, w, moe, n, nv, sparse, cs).map_err(|er| tang_moe::gpu::Error(format!("{er:#}")))
+            })
+            .map_err(|er| anyhow::anyhow!("draft cell capture: {er}"))?;
+            self.graphs[sp] = Some(gr);
+        }
+        let s = &self.s;
+        match tok_h {
+            Some((tok, h)) => {
+                self.tp.write_async(0, &[tok, pos as u32], s).map_err(ge)?;
+                self.hin.write_async(0, h, s).map_err(ge)?;
+            }
+            None => {
+                // the chain: tp[1] was advanced by the last cell; keep it honest anyway
+                self.tp.write_async(4, &[pos as u32], s).map_err(ge)?;
+            }
+        }
+        if sparse {
+            let np = pos / w.kpool;
+            if cu.pool_upto() < np {
+                cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, pos, 0, np, &mut [], s).map_err(ge)?;
+            }
+        }
+        if eager {
+            self.enqueue(g, cu, p, w, moe, n, nv, sparse, s)?;
+            s.sync().map_err(|er| anyhow::anyhow!("draft cell (eager, pos {pos}, sparse {sparse}): {er}"))?;
+        } else {
+            self.graphs[sp].as_ref().unwrap().launch(s).map_err(ge)?;
+        }
+        self.replays += 1;
+        c.lat16.resize(kv_len * dl, 0);
+        c.idx_k.resize(kv_len * idd, 0.0);
+        c.idx_g.resize(kv_len * idd, 0.0);
+        c.valid.resize(kv_len, 0);
+        c.stale_from = Some(c.stale_from.map_or(pos, |f| f.min(pos)));
+        cu.append_done(pos, 1);
+        if sparse {
+            cu.set_pool_upto(kv_len / w.kpool);
+        }
+        Ok(true)
+    }
+}
+
+/// Before a host-staged drafter cell: pull the rows the device cells left only on the
+/// device into the drafter cache's mirrors.
+pub(crate) fn refresh_cell_mirrors(cu: &super::super::mla::cuda::MlaCuda, c: &mut DsaCache) -> Result<()> {
+    let Some(from) = c.stale_from else { return Ok(()) };
+    let rows = c.valid.len();
+    cu.set_seq(0);
+    if rows > from {
+        cu.refresh_mirrors(from, rows - from, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid)
+            .map_err(|er| anyhow::anyhow!("mtp mirror refresh: {er}"))?;
+    }
+    c.stale_from = None;
     Ok(())
 }
