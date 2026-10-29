@@ -4,6 +4,51 @@ Checkpoint log for GPU-path findings. Newest first. Each entry: what was wrong, 
 evidence that pinned it, the fix, and how it was verified. Only things read back from
 logs, not inferred.
 
+## 2026-10-28 — fused mHC round 3: part 4.2 -> 2.5 µs (bit-identical), fast finish 9.0 -> 6.9 µs (env), fold measured slower (branch claude/glm5-mhc3)
+
+Evidence: nsys `--cuda-graph-trace=node`, B300, B flags, haiku -n 32, avg µs per launch
+(90 pre + 1 end per token).
+
+| variant | finish | part (91/tok) | fold | mHC ms/token |
+|---|---|---|---|---|
+| base dc2e8964 | 9.0 | 4.2 | — | 1.19 |
+| fn loads hoisted in mhcf_part (exact) | 9.0 | 2.5 | — | 1.04 |
+| + `TANG_GLM5_MHC_EXACT=0` | 6.9 | 2.5 | — | 0.85 |
+| `TANG_GLM5_MHC_FOLD=1`, 1024-thread blocks, exact / fast | — | — | 15.8 / 13.4 | 1.42 / 1.21 |
+| fold, 288-thread blocks, exact / fast | — | — | 22.0 / 18.6 | worse |
+
+What worked:
+1. `mhcf_part` loads the warp's (≤ 4 m × 4 streams) fn values into registers before the r load and
+   post: they no longer wait behind the dependent r -> post chain. Same values and fmaf order, so
+   ids are bit-identical (tier A).
+2. The finish runs the Sinkhorn on the last warp right after the mixes, and the collapse and norm
+   go on named barrier 1 (`bar.sync 1, bd-32`). The f64 owners are now warps 0..7 (same owner
+   index o, same order). On its own this did not move the exact finish (9.0): the ordered f64
+   chain (256 owners × 24 adds on one SM, slow FP64) is the floor.
+3. `TANG_GLM5_MHC_EXACT=0` (fast finish): a tree reduction of the part partials read straight
+   from global (no smem copy), `__fdividef` in the Sinkhorn, and an f32 sum of squares from
+   registers. 9.0 -> 6.9 µs.
+
+What did not work: (a) folding the finish into the part kernel's last-arriving block
+(`mhcf_fold`, atomic counter reset by the last block, so it can be captured in a graph). The tail
+has to re-read r from L2 after the arrival, with no prefetch overlap, on one SM. 1024-thread
+blocks also do not fit 192 blocks in one wave. Kept behind `TANG_GLM5_MHC_FOLD=1` (default off).
+(b) merging post l with pre l+1 is already the case: `mhcf_part` applies the pending post. The
+only standalone post is the one `end_dev` per token.
+
+Defaults: fold off, EXACT (bit-identical). Gates (B300, bin built from this tree):
+- exact: -n 128 83.41 tok/s ids md5 7174cdd6, GLM5_N=512 83.26 tok/s md5 1453cf0e: tier A.
+  (Baseline dc2e8964 per the brief: 82.38 / 81.55. Not re-measured on this pod state.)
+- fast: -n 128 83.58 tok/s, ids identical to exact (7174cdd6: first divergence ≥ 128, 100% agree),
+  so tier B (in fact tier A at 128). GLM5_N=512 85.06 tok/s, md5 a8a5131b, first divergence at 165,
+  33% agreement after the greedy cascade. Haiku oracle OK on every run.
+- mew tiny `flash::glm5`: 84 passed / 0 failed. One earlier run had
+  `gpu_resident_layers_are_constructed` fail. It passed alone and on the full rerun.
+Target ≤ 0.5 ms/token NOT reached (1.04 exact, 0.85 fast). What remains is launch + latency
+chains: two launches per pass at ~2.5 + ~7-9 µs. Next: PDL (programmatic dependent launch) so
+the finish's prologue and r prefetch overlap the part. Or a co-resident grid barrier so every
+block collapses its own 32 features (a fast-only option; the exact f64 order needs one owner set).
+
 ## 2026-10-28 — MTP draft on the device (6.6 s -> ~10 ms/pass); verify windows made exact; MTP still 4x slower than plain (branch claude/glm5-mtp-dev)
 
 What was wrong: (1) the NextN block (blk.45) ran entirely on the host: ~6.6 s per draft pass
