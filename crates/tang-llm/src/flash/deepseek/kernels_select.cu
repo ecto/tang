@@ -245,6 +245,37 @@ extern "C" __global__ void ds_route(const int* ids, const float* wts, int* count
     route_body(ids, wts, counts, off, rows, rw, t, k, ne);
 }
 
+// ds_moe_plan's list for one block of any size: the live local experts (counts > 0, mask) in
+// ascending id into elist[0..cap), then -1. Each thread owns a run of consecutive experts; a
+// block scan of the run counts gives the positions (the old one-thread loop over ne global
+// reads was serial).
+__device__ __forceinline__ void plan_body(const int* counts, const int* mask, int* elist, int ne, int cap) {
+    __shared__ int pw[32];
+    int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, nt = blockDim.x;
+    int per = (ne + nt - 1) / nt, e0 = tid * per, loc = 0;
+    for (int j = 0; j < per; j++) {
+        int e = e0 + j;
+        loc += e < ne && counts[e] > 0 && mask[e];
+    }
+    int inc = loc;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int u = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += u;
+    }
+    if (lane == 31) pw[wid] = inc;
+    __syncthreads();
+    int base = 0;
+    for (int q = 0; q < wid; q++) base += pw[q];
+    int pos = base + inc - loc, tot = 0;
+    for (int q = 0; q < (nt + 31) / 32; q++) tot += pw[q];
+    for (int j = 0; j < per && pos < cap; j++) {
+        int e = e0 + j;
+        if (e < ne && counts[e] > 0 && mask[e]) elist[pos++] = e;
+    }
+    for (int j = tot + tid; j < cap; j += nt) elist[j] = -1;
+}
+
 // ds_route, then ds_moe_plan, in block 0; blocks 1.. are ds_ks_quant of x's ng 32-groups (the
 // grouped K-split GU's activation, independent of the routing): three launches in one.
 extern "C" __global__ void ds_route_plan_q(const int* ids, const float* wts, int* counts, int* off, int* rows,
@@ -253,12 +284,7 @@ extern "C" __global__ void ds_route_plan_q(const int* ids, const float* wts, int
     if (blockIdx.x == 0) {
         route_body(ids, wts, counts, off, rows, rw, t, k, ne);
         __syncthreads();
-        if (threadIdx.x == 0) {
-            int j = 0;
-            for (int e = 0; e < ne && j < cap; e++)
-                if (counts[e] > 0 && mask[e]) elist[j++] = e;
-            for (; j < cap; j++) elist[j] = -1;
-        }
+        plan_body(counts, mask, elist, ne, cap);
         return;
     }
     int gw = ((blockIdx.x - 1) * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
@@ -306,14 +332,11 @@ extern "C" __global__ void ds_linear_csr(DsW w, const float* x, float* y, int t,
     if (lane == 0) y[(long long)ti * w.rows + n] = round ? bf(s) : s;
 }
 
-// Grouped MoE plan, one thread: elist[0..cap) = the experts with rows that this rank owns
+// Grouped MoE plan (plan_body, any block size): elist[0..cap) = the experts with rows that this rank owns
 // (mask[e] != 0), ascending, then -1.
 extern "C" __global__ void ds_moe_plan(const int* counts, const int* mask, int* elist, int ne, int cap) {
-    if (threadIdx.x || blockIdx.x) return;
-    int j = 0;
-    for (int e = 0; e < ne && j < cap; e++)
-        if (counts[e] > 0 && mask[e]) elist[j++] = e;
-    for (; j < cap; j++) elist[j] = -1;
+    if (blockIdx.x) return;
+    plan_body(counts, mask, elist, ne, cap);
 }
 
 // The 8-row tiles of the elist experts' CSR segments, one thread: tiles[0..cap) = e | c << 16

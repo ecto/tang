@@ -346,7 +346,18 @@ pub(crate) fn blocks(n: usize, per: usize) -> (u32, u32, u32) {
 
 impl Kernels {
     pub fn new(g: &Gpu) -> Result<Self> {
-        let m = g.module(SRC)?;
+        // DS_KS_DEFS="NAME=v,...": extra #defines ahead of the source (kernel sweeps)
+        let m = match std::env::var("DS_KS_DEFS") {
+            Ok(v) => {
+                let defs: String = v
+                    .split(',')
+                    .filter_map(|d| d.split_once('='))
+                    .map(|(n, x)| format!("#define {n} {x}\n"))
+                    .collect();
+                g.module(&format!("{defs}{SRC}"))?
+            }
+            Err(_) => g.module(SRC)?,
+        };
         Ok(Kernels {
             linear: m.func("ds_linear")?,
             fp8_qdq: m.func("ds_fp8_qdq")?,
@@ -4515,6 +4526,38 @@ mod tests {
         });
         let mask = DevBuf::from_slice(&vec![1i32; ne]).unwrap();
         let elist = DevBuf::alloc(t * topk * 4).unwrap();
+        time("ds_moe_plan", &|| unsafe {
+            let (nei, ci) = (ne as i32, (t * topk) as i32);
+            k.go(
+                "ds_moe_plan",
+                (1, 1, 1),
+                (32, 1, 1),
+                0,
+                &s,
+                tang_moe::args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+            )
+            .unwrap();
+        });
+        let rpq = || {
+            k.route_plan_q(
+                &s,
+                (ids.ptr, wts.ptr),
+                (counts.ptr, off.ptr, rows.ptr, rw.ptr),
+                (mask.ptr, elist.ptr, t * topk),
+                x.ptr,
+                (t, topk, ne, d),
+            )
+            .unwrap();
+        };
+        time("route_plan_q", &rpq);
+        time("gemv + router + route_plan_q (default path)", &|| {
+            k.gemv_bf16(&s, &w, x.ptr, raw.ptr, t).unwrap();
+            k.router(
+                &s, raw.ptr, bias.ptr, ids.ptr, wts.ptr, t, ne, topk, true, 1.5,
+            )
+            .unwrap();
+            rpq();
+        });
         time("ds_moe_gate (fused, + plan)", &|| {
             k.moe_gate(
                 &s,
