@@ -345,3 +345,198 @@ extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tail(
         if (lane == 0) ((float*)(XQ + (size_t)MAXT * DI))[TI * (DI / 32) + (h * D + x) / 32] = d;
     }
 }
+
+// k5d_tailt: k5d_tail over the T rows of one window in ONE launch (NOTES 2026-10-29
+// kda4 round 4): the weights are staged once, the state column stays in registers across
+// rows (S written once, after the last row); per row the body is k5d_tail verbatim (same
+// expressions, same order: bit-equal to T t=1 steps). CK != 0: after each row but the
+// last, that row's conv history and state go to CK + row*CKSTRIDE (h0 region, H0N floats)
+// and the state region after it - the per-row path's checkpoint layout.
+extern "C" __global__ void __launch_bounds__(KDA_D) k5d_tailt(
+    const G5W fb, const G5W gb, const G5W bp, const float* __restrict__ X_,
+    const float* __restrict__ G1_, const float* __restrict__ G2A_, const float* __restrict__ DT,
+    const float* __restrict__ RATE, float LB, const float* __restrict__ QKV_,
+    float* __restrict__ H0, const float* __restrict__ W, float* __restrict__ S,
+    const float* __restrict__ ON, float EPS, float* __restrict__ BETA_, float* __restrict__ G_,
+    float* __restrict__ G2_, float* __restrict__ O_, float* __restrict__ Y_,
+    unsigned char* __restrict__ XQ, unsigned MAXT, unsigned HID, unsigned T,
+    float* __restrict__ CK, unsigned long long CKSTRIDE, unsigned long long H0N) {
+    const unsigned h = blockIdx.x, x = threadIdx.x, D = KDA_D, DI = KDA_H * KDA_D;
+    const unsigned lane = x & 31, warp = x >> 5;
+    __shared__ __align__(16) unsigned char wf[KDA_D * K5D_RB + 16], wg[KDA_D * K5D_RB + 16];
+    __shared__ __align__(16) unsigned char wb[K5D_HIDMAX / 32 * 34 + 16];
+    __shared__ float g1s[KDA_D], g2s[KDA_D], q[KDA_D], k[KDA_D], eg[KDA_D], os[KDA_D];
+    __shared__ float bs;
+    __shared__ double sq[KDA_D];
+    // x for beta, staged with the weights (dynamic: HID * 4 + 16 B, the host sets the
+    // attribute) — warp 0's 16 serial L2 round trips for x were ~4 us of the critical path
+    extern __shared__ __align__(16) unsigned char xs[];
+    int df, dg, db, dx;
+    k5d_stage(wf, (const unsigned char*)(fb.base + (unsigned long long)h * D * fb.row_bytes), D * K5D_RB, x, D, &df);
+    k5d_stage(wg, (const unsigned char*)(gb.base + (unsigned long long)h * D * gb.row_bytes), D * K5D_RB, x, D, &dg);
+    k5d_stage(wb, (const unsigned char*)(bp.base + (unsigned long long)h * bp.row_bytes), HID / 32 * 34, x, D, &db);
+    // the state column this thread owns, read once for all T rows
+    float sr[KDA_D];
+#pragma unroll
+    for (unsigned a = 0; a < KDA_D; a++) sr[a] = S[((unsigned long long)h * D + a) * D + x];
+    for (unsigned TI = 0; TI < T; TI++) {
+    if (TI) __syncthreads(); // the previous row is done with xs / g1s / q / k / eg / os / sq
+    const float* X = X_ + (size_t)TI * HID; const float* G1 = G1_ + TI * D; const float* G2A = G2A_ + TI * D;
+    const float* QKV = QKV_ + (size_t)TI * 3 * DI; float* BETA = BETA_ + TI * KDA_H;
+    float* G = G_ + (size_t)TI * DI; float* G2 = G2_ + (size_t)TI * DI; float* O = O_ + (size_t)TI * DI; float* Y = Y_ + (size_t)TI * DI;
+    const bool ck = CK && TI + 1 < T;
+    float* CKH = CK + TI * CKSTRIDE; float* CKS = CKH + H0N;
+    k5d_stage(xs, (const unsigned char*)X, HID * 4, x, D, &dx);
+    g1s[x] = G1[x]; // f_a / g_a outputs are hd wide, shared by every head
+    g2s[x] = G2A[x];
+    // the state column this thread owns, read once (independent loads, all in flight)
+    // conv (k5d_step verbatim) + the T=1 commit of the thread's 3 channels
+    float qv, kv, vv;
+    const unsigned int qc = h * D + x, kch = KDA_H * D + h * D + x, vch = 2 * KDA_H * D + h * D + x;
+    {
+        float acc = 0.0f;
+        for (unsigned int i = 0; i < KDA_KC; i++) {
+            float e = i < KDA_KC - 1 ? H0[qc * (KDA_KC - 1) + i] : QKV[qc];
+            acc = __fmaf_rn(W[qc * KDA_KC + i], e, acc);
+        }
+        qv = acc / (1.0f + expf(-acc));
+        acc = 0.0f;
+        for (unsigned int i = 0; i < KDA_KC; i++) {
+            float e = i < KDA_KC - 1 ? H0[kch * (KDA_KC - 1) + i] : QKV[kch];
+            acc = __fmaf_rn(W[kch * KDA_KC + i], e, acc);
+        }
+        kv = acc / (1.0f + expf(-acc));
+        acc = 0.0f;
+        for (unsigned int i = 0; i < KDA_KC; i++) {
+            float e = i < KDA_KC - 1 ? H0[vch * (KDA_KC - 1) + i] : QKV[vch];
+            acc = __fmaf_rn(W[vch * KDA_KC + i], e, acc);
+        }
+        vv = acc / (1.0f + expf(-acc));
+        const unsigned int chs[3] = {qc, kch, vch};
+        for (unsigned int c = 0; c < 3; c++) {
+            float* hp = H0 + chs[c] * (KDA_KC - 1);
+            for (unsigned int s = 0; s < KDA_KC - 1; s++)
+                hp[s] = s + 1 < KDA_KC - 1 ? hp[s + 1] : QKV[chs[c]];
+            if (ck)
+                for (unsigned int s = 0; s < KDA_KC - 1; s++) CKH[chs[c] * (KDA_KC - 1) + s] = hp[s];
+        }
+    }
+    q[x] = qv; k[x] = kv;
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+    // gate rows (k5d_gate2: g5_dot's j-ascending acc += deq * x, deq = d * q)
+    float gv, g2v;
+    {
+        const unsigned char* rf = wf + df + x * K5D_RB;
+        const unsigned char* rg = wg + dg + x * K5D_RB;
+        float af = 0.f, ag = 0.f;
+        for (unsigned b = 0; b < D / 32; b++) {
+            const float dfw = g5_h2f(g5_u16(rf + 34 * b)), dgw = g5_h2f(g5_u16(rg + 34 * b));
+#pragma unroll
+            for (unsigned i = 0; i < 32; i++) {
+                af = fmaf(dfw * (float)(signed char)rf[34 * b + 2 + i], g1s[32 * b + i], af);
+                ag = fmaf(dgw * (float)(signed char)rg[34 * b + 2 + i], g2s[32 * b + i], ag);
+            }
+        }
+        float pre = af + DT[h * D + x];
+        if (LB == LB) {
+            gv = LB / (1.f + expf(-RATE[h] * pre));
+        } else {
+            float v = RATE[h] * pre;
+            gv = -(v > 20.f ? v : logf(1.f + expf(v)));
+        }
+        g2v = ag;
+        G[h * D + x] = gv;
+        G2[h * D + x] = g2v;
+        eg[x] = expf(gv);
+    }
+    // beta (k5_beta: lane chain e0 = lane*8 + 256i, 8 a step, xor reduce, sigmoid)
+    if (warp == 0) {
+        const unsigned char* row = wb + db;
+        float a = 0.f;
+        for (int e0 = lane * 8; e0 < (int)HID; e0 += 256) {
+            const unsigned char* bb = row + (e0 / 32) * 34;
+            const float dw = g5_h2f(g5_u16(bb));
+            const float* xp = (const float*)(xs + dx) + e0;
+            const float xv[8] = {xp[0], xp[1], xp[2], xp[3], xp[4], xp[5], xp[6], xp[7]};
+#pragma unroll
+            for (int qq = 0; qq < 8; qq++) a = fmaf(dw * (float)(signed char)bb[2 + (e0 + qq) % 32], xv[qq], a);
+        }
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0) { float bt = 1.f / (1.f + expf(-a)); BETA[h] = bt; bs = bt; }
+    }
+    float qs = 0.0f, ks = 0.0f;
+    for (unsigned int a = 0; a < D; a++) { qs += q[a] * q[a]; ks += k[a] * k[a]; }
+    qs = rsqrtf(qs + 1e-6f); ks = rsqrtf(ks + 1e-6f);
+    float scale = rsqrtf((float)D);
+    __syncthreads(); // q/k read raw by all, eg / bs written
+    q[x] *= qs * scale; k[x] *= ks;
+    __syncthreads();
+    float p = 0.0f;
+#pragma unroll
+    for (unsigned int a = 0; a < KDA_D; a++) {
+        float s = sr[a] * eg[a];
+        sr[a] = s;
+        p = __fmaf_rn(k[a], s, p);
+    }
+    float delta = bs * (vv - p);
+    float o = 0.0f;
+#pragma unroll
+    for (unsigned int a = 0; a < KDA_D; a++) {
+        float s = __fmaf_rn(k[a], delta, sr[a]);
+        sr[a] = s;
+        if (TI + 1 == T) S[((unsigned long long)h * D + a) * D + x] = s;
+        else if (ck) CKS[((unsigned long long)h * D + a) * D + x] = s;
+        o = __fmaf_rn(q[a], s, o);
+    }
+    O[h * D + x] = o;
+    os[x] = o;
+    // (double)o * (double)o is exact (24-bit mantissas), so ss + v*v rounds once either
+    // way: the squares are formed in parallel and thread 0 runs only the DADD chain
+#ifdef K5D_NORM_EXACT
+    sq[x] = (double)o * (double)o;
+    __syncthreads();
+    // the f64 norm once per head (thread 0) and broadcast: every thread used to run the
+    // same 128-long f64 chain, and FP64 is scarce on the B300 (~65 cycles a dependent
+    // DADD): same sums in the same order, bit-equal
+    if (x == 0) {
+        double ss = 0.0;
+#pragma unroll
+        for (unsigned int d = 0; d < KDA_D; d++) ss += sq[d];
+        g1s[0] = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
+    }
+    __syncthreads();
+#else
+    // default (NOTES 2026-10-28 kda4): the same f64 squares summed as a tree (xor shuffle
+    // within each warp, then the KDA_D/32 warp partials in order by thread 0): depth
+    // 5 + KDA_D/32 dependent DADDs instead of KDA_D. A summation-order change in f64, so
+    // the f32 r almost always rounds the same. TANG_GLM5_KDA_NORM=exact: the serial chain.
+    {
+        double v = (double)o * (double)o;
+        for (int o2 = 16; o2 > 0; o2 >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o2);
+        if (lane == 0) sq[warp] = v;
+    }
+    __syncthreads();
+    if (x == 0) {
+        double ss = 0.0;
+#pragma unroll
+        for (unsigned int d = 0; d < KDA_D / 32; d++) ss += sq[d];
+        g1s[0] = (float)(1.0 / sqrt((ss / (double)D) + (double)EPS));
+    }
+    __syncthreads();
+#endif
+    const float r = g1s[0];
+    const float yv = os[x] * r * ON[x] / (1.f + expf(-g2v));
+    Y[h * D + x] = yv;
+    // o_proj's k5_q8 over yb (COLS = DI, t = 0): this warp's 32 lanes are one Q8 block
+    if (XQ) {
+        float amax = fabsf(yv);
+        for (int o2 = 16; o2 > 0; o2 >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o2));
+        const float d = amax / 127.0f;
+        const int qi = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(yv / d), -127.f), 127.f);
+        // TI = this row's index in the window's k5_q8 layout (0 for a decode step)
+        XQ[(size_t)TI * DI + h * D + x] = (unsigned char)(signed char)qi;
+        if (lane == 0) ((float*)(XQ + (size_t)MAXT * DI))[TI * (DI / 32) + (h * D + x) / 32] = d;
+    }
+    } // rows
+}
