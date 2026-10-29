@@ -221,6 +221,60 @@ context to pass).
 | `deepseek.syncs` | counter | `kind`, `path` | Host syncs in observed forwards. |
 | `deepseek.arena.bytes` | gauge | | The step arena's capacity. |
 
+## GLM-5 engine traces (`TANG_GLM5_TRACE=1`)
+
+The GLM-5.3 engine's twin of `TANG_CODER_PROF` plus the spans above
+(`src/flash/glm5/trace.rs`). Every window builds a span tree: `glm5.window` → `embed`,
+`layer` (one per layer) → `mhc_pre.attn` | `kda` (`proj`, `gates`, `core`, `out_gate`,
+`o_proj`, `sync+read`) or `dsa` (`q_a.host`, `kv_append`, `idx_append`, `idx_select`,
+`q_b.host`, `attend.gather`, `attend`, `o_proj.host`) | `mhc_post.attn` | `mhc_pre.ffn` |
+`ffn` (`moe.shared`, `moe.router`, `moe.experts`, `moe.combine`, or `dense`; `moe.cpu` /
+`dense.cpu` off the GPU) | `mhc_post.ffn`, then `head` → `head.mean`, `head.norm`, `lm_head`.
+
+Each span carries host wall time and, from `tang_moe::gpu::trace`, the GPU time of the
+kernels launched inside it (two timing events per launch outside graph capture, resolved at
+window end), launch count, H2D/D2H bytes and calls, the host time inside synchronous copies
+(the transfer plus the wait it implies) and `cuMemAlloc`/`cuMemFree` calls and time. The
+weight GEMVs, the experts and MLA's attend declare the bytes they stream
+(`gpu::trace::bytes`), which gives GB/s and %-of-SOL per kernel; SOL is the datasheet
+bandwidth for known cards (H200 4800 GB/s) or `TANG_SOL_GBS`.
+
+- **Table:** `flash-generate` prints the end-of-run bottleneck table on stderr: decode per
+  token, prefill as totals; every stage, the kernels by GPU time, and the top-level stages
+  ranked by wall with host = wall − GPU. Kernels run async, so a stage that only launches
+  shows little wall and its GPU time; the wait lands where the stream drains (`sync+read`,
+  `moe.combine`'s `sync`).
+- **otel:** with `--features otel` the trees go out through `telemetry::glm5_tree`
+  (`tang-otel`, OTLP/JSON lines to `OTEL_FILE`), one trace per window, and every stage's GPU
+  ms feeds the `tang_llm.glm5.stage.gpu` histogram (`stage`, `phase`).
+- **Off** (the default): one relaxed atomic load per hook.
+
+Overhead (`engine_gpu_trace_is_transparent`, the tiny 3-layer f32 fixture where a decode
+window is almost all launches — 10.3 ms of host for ~0.1 ms of GPU): traced logits are
+bit-identical to untraced, and the window goes 10.342 → 10.371 ms traced, **+0.3%** — the
+cost is one event record + a queue push per launch, no per-launch sync (the previous end
+event is the next launch's start; `drain` syncs one event per stream).
+
+Real model (GLM-5.3-Flash UD-Q4_K_XL, 1×H200, `TANG_GLM5_GEMV8=1 TANG_GLM5_KDA_PF2=1
+TANG_GLM5_MHC_FUSED=1 TANG_GLM5_GPU_FFN=0 TANG_GLM5_KDA_MAXT=64`, `-n 16`, Oct 26): ids
+traced equal untraced and the CPU oracle; decode 382 s traced vs 403 / 409 s for the
+untraced runs before and after it (the box ran other jobs, so the traced run is inside the
+run-to-run noise). Excerpt of the decode table:
+
+```text
+-- decode, per token: 15 windows, 15 tokens, wall 25477.8 ms (0.04 tok/s), GPU 155.7 ms (1% of wall), 724 launches, ...
+stage                       calls    wall ms  %wall    gpu ms  launch    H2D MB    D2H MB  copy ms alloc ms     GB/s   %SOL
+ffn                            45   23816.52  93.5%      0.00       0     0.000     0.000     0.00     0.00        -      -
+  moe.cpu                      42   23028.63  90.4%      0.00       0     0.000     0.000     0.00     0.00        -      -
+dsa                            11    1552.48   6.1%     96.85      33     1.081     0.743     2.13     2.13        9    0.2
+  attend.gather                11     898.23   3.5%      0.00       0     0.000     0.000     0.00     0.00        -      -
+kda                            34      57.20   0.2%     53.66     510     0.557     0.557     1.14     0.00       97    2.0
+kernels by GPU time (decode, per token):
+mla_attn_naive           dsa/attend                      11     74.27   6752.2  47.7%       10    0.2
+k5_beta                  kda/gates                       34     43.54   1280.6  28.0%        0    0.0
+k5_gemv8                 kda/proj                       102      2.85     27.9   1.8%     1277   26.6
+```
+
 ## The OpenCL runtime and `qwen_session` (the K1)
 
 `tang-bench --features opencl,otel` (pulls `tang-gpu/otel`) writes the same file format
