@@ -280,12 +280,14 @@ __device__ __forceinline__ unsigned short g5f_rd16(const unsigned char* p) {
     return (unsigned short)p[0] | ((unsigned short)p[1] << 8);
 }
 // 8 bytes at any alignment: three aligned 32-bit loads + two funnel shifts (kernels.rs rd64).
-// Reads up to 4 bytes past p + 8 (staging pads one uint4; global rows sit in larger pages).
+// The third word only when p is unaligned (sh == 0 ignores it): an aligned read of a row's
+// last 8 bytes used to load 4 bytes past the allocation (compute-sanitizer, g5f_gemv on the
+// last Q8_0 row; NOTES 2026-10-29 kda4 round 6). Same value either way.
 __device__ __forceinline__ unsigned long long g5f_rd64(const unsigned char* p) {
     const unsigned long long a = (unsigned long long)p;
     const unsigned* q = (const unsigned*)(a & ~3ull);
     const unsigned sh = (unsigned)(a & 3) * 8;
-    const unsigned w0 = q[0], w1 = q[1], w2 = q[2];
+    const unsigned w0 = q[0], w1 = q[1], w2 = sh ? q[2] : 0u;
     const unsigned lo = __funnelshift_r(w0, w1, sh), hi = __funnelshift_r(w1, w2, sh);
     return (unsigned long long)lo | ((unsigned long long)hi << 32);
 }
