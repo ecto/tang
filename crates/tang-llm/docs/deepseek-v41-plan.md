@@ -478,6 +478,51 @@ activation first), so there is little to overlap with a wait at entry. Stays off
 make PDL pay is per-kernel restructuring (weights first, activation after the wait) inside
 the big projections, which belongs with the kernel lanes' bandwidth work above.
 
+### Wave 8c: where the graph's verify step goes (nsys node trace, 8× H100, b83fde7d)
+
+`nsys launch -t cuda --cuda-graph-trace=node` around `deepseek-serve` (DS_PDL off, greedy,
+draft n = 6, so verify windows are t = 7), one 40-token request captured with `nsys start`/`stop`
+after warm-up: /workspace/attn3-prof.sh, report /workspace/prof-attn3.nsys-rep, analysis
+/workspace/attn3-an.py and attn3-an2.py (kernels grouped by the graph launch's correlation id,
+device 0, the 9 verify replays of 908 nodes; ranks look alike).
+
+- Verify graph: **22.43 ms** span, 21.97 ms of kernels, **0.45 ms of idle gaps** between its 908
+  nodes. The draft graph (129 nodes) adds 4.2 ms with 0.07 ms of gaps.
+- Step period (verify start to next verify start): **30.0 ms**, of which device 0 runs kernels
+  26.6 ms. So ~3.4 ms a step sits **between** graphs (host: acceptance, sampling, the next
+  draft's setup), more than all in-graph gaps together.
+- wo_b **is** on `ds_ks` in serve: the `ds_ks_f2_g0` with 64,736 B smem (t = 7 × 8192 columns)
+  right after `ds_wo_ks_f2` (wo_a) and its `ds_ks_quant`, 38.1 µs (40 MB: 1.05 TB/s, 31%).
+  wq_b is the 10,304 B one (1280 columns), 25.6 µs.
+
+Top kernels of one verify step (device 0, mean of 9 replays; 40 layers, so 40 launches is one a layer):
+
+| kernel (what) | launches | µs each | ms / step | % of kernel time |
+|---|---|---|---|---|
+| `ds_hc_fused_ks` (mHC pre/post, two a layer) | 80 | 36.2 | 2.90 | 13.1% |
+| `ds_moe_ks_gu_f3_s2` (expert gate/up) | 40 | 63.3 | 2.53 | 11.4% |
+| `ds_attn_fdm` (split-K attention) | 38 | 64.6 | 2.46 | 11.1% |
+| `ds_route_plan_q` (routing plan) | 40 | 41.4 | 1.66 | 7.5% |
+| `ds_moe_ks_down_f3_s2` (expert down) | 40 | 40.6 | 1.62 | 7.3% |
+| `ds_linear_t8` 48 blocks (router gate, bf16 384 × 5120) | 40 | 39.7 | 1.59 | 7.2% |
+| `ds_ks_f2_g0` wo_b (5120 × 8192) | 40 | 38.1 | 1.53 | 6.9% |
+| NCCL AllReduce (f32 ring LL) | 40 | 35.1 | 1.40 | 6.3% |
+| `ds_wo_ks_f2` (wo_a) | 40 | 26.9 | 1.08 | 4.8% |
+| `ds_ks_f2_g0` wq_b (32768 × 1280) | 40 | 25.6 | 1.03 | 4.6% |
+| `ds_ks2_f2` (wq_a + wkv) | 40 | 17.4 | 0.69 | 3.1% |
+| `ds_head_bf16` (vocab head) | 1 | 578.3 | 0.58 | 2.6% |
+| `ds_linear_t8` 4 blocks (compressor / indexer bf16) | 8 | 51.8 | 0.42 | 1.9% |
+| `ds_router` | 40 | 8.8 | 0.35 | 1.6% |
+| `ds_attn_fd_comb` (split-K combine) | 40 | 7.4 | 0.30 | 1.3% |
+| everything else | | | 2.04 | 9.2% |
+| **total** | 908 | | **22.18** | |
+
+Read: the step is kernels, not launch gaps (0.45 ms in the graph). Besides the projections,
+the biggest non-GEMV items are mHC (2.9 ms), the routing plan (1.7 ms, which is longer than the
+router GEMV it follows) and the bf16 router gate on `ds_linear_t8` (1.6 ms at 39.7 µs for
+3.8 MB, the ~31 µs floor of Wave 8b). Outside the graph, the ~3.4 ms between graphs is the
+largest single lever.
+
 ## How to profile a step
 
 The step timeline (`flash/deepseek/obs.rs`, [observability.md](observability.md#deepseek-v41-flash-the-step-timeline-flashdeepseekobsrs))
