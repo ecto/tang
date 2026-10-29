@@ -190,6 +190,15 @@ impl Mtp {
         false
     }
 
+    /// Device draft-cell graph replays so far (0: no device cell, tests).
+    pub fn cell_replays(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.dev.as_ref().and_then(|d| d.cell.as_ref()) {
+            return c.replays;
+        }
+        0
+    }
+
     /// Cells in the cache (= the next cell's position).
     pub fn len(&self) -> usize {
         #[cfg(feature = "cuda")]
@@ -411,6 +420,23 @@ impl Mtp {
 pub trait Drafter {
     fn observe(&mut self, e: &Glm5Engine, h: &[f32], next_toks: &[u32]) -> Result<()>;
     fn draft(&mut self, e: &Glm5Engine, k: usize) -> Result<Vec<u32>>;
+    /// The drafts enqueued on the device without waiting: (ids ptr, count, event fired when
+    /// they are written). `None`: use [`Self::draft`].
+    #[cfg(feature = "cuda")]
+    fn draft_async(&mut self, _e: &Glm5Engine, _k: usize) -> Result<Option<(u64, usize, tang_moe::gpu::Event)>> {
+        Ok(None)
+    }
+    /// [`Self::observe`] of the last resident window's first `rows` rows, read from the device
+    /// (`h` / `toks` are the same rows on the host, for a drafter that needs them).
+    #[cfg(feature = "cuda")]
+    fn observe_window(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<()> {
+        self.observe(e, h, toks)
+    }
+    /// After [`Self::draft_async`]: wait for and read its `n` ids (the host-window fallback).
+    #[cfg(feature = "cuda")]
+    fn async_ids(&mut self, _n: usize) -> Result<Vec<u32>> {
+        anyhow::bail!("no async drafts")
+    }
 }
 
 /// The MTP drafter: teacher-forced cells for committed positions, chained cells for drafts.
@@ -436,7 +462,7 @@ impl MtpDrafter {
         let Some(cell) = d.cell.as_mut() else { return Ok(0) };
         e.gpu.as_ref().context("mtp: no GPU")?.dev0().0.bind().map_err(|er| anyhow::anyhow!("bind: {er}"))?;
         for (i, &tk) in toks.iter().enumerate() {
-            if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, Some((tk, &h[i * n..(i + 1) * n])))? {
+            if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, Some((tk, &h[i * n..(i + 1) * n])), None)? {
                 return Ok(i);
             }
         }
@@ -452,14 +478,18 @@ impl MtpDrafter {
         let cell = d.cell.as_mut().context("mtp: no device cell")?;
         let k = k.min(16);
         let mut got = 0usize;
+        let tr = ProfT::new("draft.chain_enqueue");
         while got < k {
-            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None)? {
+            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None)? {
                 break;
             }
             tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
             got += 1;
         }
+        drop(tr);
+        let tr = ProfT::new("draft.sync");
         cell.stream().sync().map_err(ge)?;
+        drop(tr);
         let ids = cell.ids.read::<u32>(0, got).map_err(ge)?;
         self.mtp.truncate(keep);
         Ok(ids)
@@ -489,6 +519,63 @@ impl Drafter for MtpDrafter {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    fn draft_async(&mut self, e: &Glm5Engine, k: usize) -> Result<Option<(u64, usize, tang_moe::gpu::Event)>> {
+        if !self.dev_last || !std::env::var("TANG_GLM5_MTP_CHAIN").is_ok_and(|v| v == "1") {
+            return Ok(None);
+        }
+        let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft: {er}");
+        let keep = self.mtp.len();
+        let d = self.mtp.dev.as_mut().context("mtp: no device block")?;
+        let cell = d.cell.as_mut().context("mtp: no device cell")?;
+        let k = k.min(16);
+        let mut got = 0usize;
+        while got < k {
+            if got > 0 && !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, None)? {
+                break;
+            }
+            tang_moe::gpu::copy_d2d_async(cell.ids.ptr + 4 * got as u64, cell.tp.ptr, 4, cell.stream()).map_err(ge)?;
+            got += 1;
+        }
+        let ev = tang_moe::gpu::Event::new(false).map_err(ge)?;
+        ev.record(cell.stream()).map_err(ge)?;
+        let ids = cell.ids.ptr;
+        self.mtp.truncate(keep);
+        Ok(Some((ids, got, ev)))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn observe_window(&mut self, e: &Glm5Engine, h: &[f32], toks: &[u32]) -> Result<()> {
+        let n = self.mtp.n;
+        let ptrs = e.window_out_ptrs();
+        let on = !std::env::var("TANG_GLM5_MTP_OBS_DEV").is_ok_and(|v| v == "0");
+        if let (Some((ip, hp)), true, Some(d)) = (ptrs, on, self.mtp.dev.as_mut()) {
+            if let Some(cell) = d.cell.as_mut() {
+                let _t = ProfT::new("draft.observe_window");
+                for i in 0..toks.len() {
+                    let src = (ip + 4 * i as u64, hp + (i * n * 4) as u64);
+                    if !cell.run(e, &d.cu, &d.p, &self.mtp.mla, &d.moe, &mut d.c, None, Some(src))? {
+                        self.dev_last = false;
+                        return self.observe(e, &h[i * n..], &toks[i..]);
+                    }
+                }
+                self.dev_last = true;
+                self.last = None;
+                return Ok(());
+            }
+        }
+        self.observe(e, h, toks)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn async_ids(&mut self, n: usize) -> Result<Vec<u32>> {
+        let ge = |er: tang_moe::gpu::Error| anyhow::anyhow!("mtp draft: {er}");
+        let d = self.mtp.dev.as_mut().context("mtp: no device block")?;
+        let cell = d.cell.as_mut().context("mtp: no device cell")?;
+        cell.stream().sync().map_err(ge)?;
+        cell.ids.read::<u32>(0, n).map_err(ge)
+    }
+
     fn draft(&mut self, e: &Glm5Engine, k: usize) -> Result<Vec<u32>> {
         #[cfg(feature = "cuda")]
         if self.dev_last {
@@ -507,6 +594,24 @@ impl Drafter for MtpDrafter {
         }
         self.mtp.truncate(keep);
         Ok(out)
+    }
+}
+
+/// `TANG_GLM5_WIN_PROF=1`: time a scope into the resident profile.
+struct ProfT(&'static str, Instant);
+
+impl ProfT {
+    fn new(k: &'static str) -> Self {
+        Self(k, Instant::now())
+    }
+}
+
+impl Drop for ProfT {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        if super::engine::resident::prof_on() {
+            super::engine::resident::prof_add(self.0, self.1.elapsed().as_secs_f64());
+        }
     }
 }
 
@@ -529,6 +634,10 @@ pub struct Stats {
     /// the device rewinds after a partial accept, and their time (inside `trunk_s`)
     pub res_windows: usize,
     pub res_rewinds: usize,
+    /// passes whose draft cells and verify window ran chained (one host wake)
+    pub chained: usize,
+    /// the prompt's teacher-forced draft cells (once, after the prefill)
+    pub observe0_s: f64,
     pub rewind_s: f64,
 }
 
@@ -557,12 +666,14 @@ impl Stats {
         );
         if self.res_windows > 0 {
             s += &format!(
-                "mtp: resident verify: {} windows, {} device rewinds ({:.3} ms each); trunk {:.2} ms/pass, draft {:.2} ms/pass\n",
+                "mtp: resident verify: {} windows ({} chained), {} device rewinds ({:.3} ms each); trunk {:.2} ms/pass, draft {:.2} ms/pass; prompt cells {:.1} ms (prefill, not in draft)\n",
                 self.res_windows,
+                self.chained,
                 self.res_rewinds,
                 1e3 * self.rewind_s / self.res_rewinds.max(1) as f64,
                 1e3 * self.trunk_s / passes.max(1) as f64,
-                1e3 * self.draft_s / passes.max(1) as f64
+                1e3 * self.draft_s / passes.max(1) as f64,
+                1e3 * self.observe0_s
             );
         }
         s
@@ -603,20 +714,56 @@ pub fn generate(
     nexts.push(cur);
     let td = Instant::now();
     dr.observe(e, &hs, &nexts)?;
-    st.draft_s += td.elapsed().as_secs_f64();
+    // the prompt's teacher-forced cells are prefill work: reported apart, not in draft_s
+    st.observe0_s = td.elapsed().as_secs_f64();
     while gen.len() < n {
         let td = Instant::now();
         // never draft past n: the window is cur + drafts
         let kk = k.min(n - gen.len());
-        let mut drafts = dr.draft(e, kk)?;
-        drafts.truncate(kk);
-        st.draft_s += td.elapsed().as_secs_f64();
+        // chained: the draft cells and the verify window enqueued back to back, one host wake
+        #[cfg(feature = "cuda")]
+        let mut pre: Option<(Vec<u32>, Vec<f32>)> = None;
+        #[cfg(feature = "cuda")]
+        let drafts = match dr.draft_async(e, kk)? {
+            Some((ids, got, ev)) => {
+                st.draft_s += td.elapsed().as_secs_f64();
+                let tw = Instant::now();
+                let r = e.window_resident_dev(cur, ids, got, &ev)?;
+                st.trunk_s += tw.elapsed().as_secs_f64();
+                match r {
+                    Some((all, g, h)) => {
+                        st.chained += 1;
+                        pre = Some((g, h));
+                        all[1..].to_vec()
+                    }
+                    None => dr.async_ids(got)?,
+                }
+            }
+            None => {
+                let mut d = dr.draft(e, kk)?;
+                d.truncate(kk);
+                st.draft_s += td.elapsed().as_secs_f64();
+                d
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let drafts = {
+            let mut d = dr.draft(e, kk)?;
+            d.truncate(kk);
+            st.draft_s += td.elapsed().as_secs_f64();
+            d
+        };
         let tt = Instant::now();
         let mut win = vec![cur];
         win.extend_from_slice(&drafts);
         // the resident verify window: one device pass, per-row ids + h, device rewind
         #[cfg(feature = "cuda")]
-        if let Some((g, hrows)) = e.window_resident(&win)? {
+        let rw = match pre.take() {
+            Some(x) => Some(x),
+            None => e.window_resident(&win)?,
+        };
+        #[cfg(feature = "cuda")]
+        if let Some((g, hrows)) = rw {
             st.verify += 1;
             st.res_windows += 1;
             let mut a = 0;
@@ -639,7 +786,7 @@ pub fn generate(
             let h = &hrows[..(a + 1) * e.m.hp.n_embd];
             st.trunk_s += tt.elapsed().as_secs_f64();
             let td = Instant::now();
-            dr.observe(e, h, &new)?;
+            dr.observe_window(e, h, &new)?;
             st.draft_s += td.elapsed().as_secs_f64();
             cur = *new.last().unwrap();
             gen.extend_from_slice(&new);
