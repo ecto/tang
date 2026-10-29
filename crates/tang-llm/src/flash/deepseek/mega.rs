@@ -636,6 +636,159 @@ mod tests {
         }
     }
 
+    /// One EP rank's grouped MoE launches at the decode shape (t = 7, top-6, 384 experts of
+    /// which `live` routed fp4 experts land here, one token each, plus the fp8 shared expert
+    /// folded in): `moe_gu_sh` and `moe_down_sh` (with its h quant) timed apart, CUDA graph
+    /// replay, weight copies rotated past L2. `--ignored --nocapture mega_moe_slots`.
+    #[test]
+    #[ignore]
+    fn mega_moe_slots() -> Result<()> {
+        use super::super::gpu::Kernels;
+        let Some(g) = Gpu::for_test() else {
+            return Ok(());
+        };
+        g.bind()?;
+        let k = Kernels::new(&g)?;
+        let s = Stream::new()?;
+        let (t, topk, ne, d, inter) = (7usize, 6usize, 384usize, 5120usize, 2304usize);
+        let x = DevBuf::from_slice(&rnd(t * d, 3, unif))?;
+        let (xc, xs) = k.ks_x_ptrs();
+        println!("| live | gu µs | gu GB/s | down µs | down GB/s | gu+down % of 3350 |");
+        println!("|---|---|---|---|---|---|");
+        for live in [1usize, 5, 8] {
+            let copies = 4usize;
+            let mut keep = vec![];
+            let mut tabs = vec![];
+            for c in 0..copies {
+                let (mut w1, mut w3, mut w2) = (
+                    vec![DsW::default(); ne],
+                    vec![DsW::default(); ne],
+                    vec![DsW::default(); ne],
+                );
+                for i in 0..live {
+                    let e = i * 7 + 1;
+                    let sd = (c * 100 + i * 3) as u64;
+                    let (a, b, cc) = (
+                        bytes_w(inter, d, 3, sd + 1),
+                        bytes_w(inter, d, 3, sd + 2),
+                        bytes_w(d, inter, 3, sd + 3),
+                    );
+                    (w1[e], w3[e], w2[e]) = (a.1, b.1, cc.1);
+                    keep.extend(a.0.into_iter().chain(b.0).chain(cc.0));
+                }
+                let (s1, s3, s2) = (
+                    bytes_w(inter, d, 2, c as u64 * 7 + 50),
+                    bytes_w(inter, d, 2, c as u64 * 7 + 51),
+                    bytes_w(d, inter, 2, c as u64 * 7 + 52),
+                );
+                tabs.push((
+                    DevBuf::from_slice(&w1)?,
+                    DevBuf::from_slice(&w3)?,
+                    DevBuf::from_slice(&w2)?,
+                    (s1.1, s3.1, s2.1),
+                ));
+                keep.extend(s1.0.into_iter().chain(s3.0).chain(s2.0));
+            }
+            // routes: token i's first pick -> expert i * 7 + 1 (i < live); every other pick
+            // to an expert off this rank (mask 0)
+            let ids: Vec<i32> = (0..t * topk)
+                .map(|j| {
+                    if j % topk == 0 && j / topk < live {
+                        ((j / topk) * 7 + 1) as i32
+                    } else {
+                        (200 + j % 150) as i32
+                    }
+                })
+                .collect();
+            let ids = DevBuf::from_slice(&ids)?;
+            let wts = DevBuf::from_slice(&vec![0.2f32; t * topk])?;
+            let (counts, off) = (DevBuf::zeroed(ne * 4)?, DevBuf::zeroed((ne + 1) * 4)?);
+            let (rows, rw) = (DevBuf::zeroed(t * topk * 4)?, DevBuf::zeroed(t * topk * 4)?);
+            k.route(
+                &s, ids.ptr, wts.ptr, counts.ptr, off.ptr, rows.ptr, rw.ptr, t, topk, ne,
+            )?;
+            let mask: Vec<i32> = (0..ne).map(|e| (e < 200) as i32).collect();
+            let mask = DevBuf::from_slice(&mask)?;
+            let elist = DevBuf::zeroed(live * 4)?;
+            let (nei, ci) = (ne as i32, live as i32);
+            unsafe {
+                k.go(
+                    "ds_moe_plan",
+                    (1, 1, 1),
+                    (32, 1, 1),
+                    0,
+                    &s,
+                    args![counts.ptr, mask.ptr, elist.ptr, nei, ci],
+                )?
+            };
+            let nall = t * topk;
+            let h = DevBuf::zeroed((nall + t) * inter * 4)?;
+            let part = DevBuf::zeroed((nall + t) * d * 4)?;
+            let gu = |s: &Stream, i: usize| -> Result<()> {
+                let tb = &tabs[i % copies];
+                k.moe_gu_sh(
+                    s,
+                    3,
+                    (tb.0.ptr, tb.1.ptr, elist.ptr),
+                    (off.ptr, rows.ptr, rw.ptr),
+                    (&tb.3 .0, &tb.3 .1, true),
+                    0,
+                    h.ptr,
+                    (t, nall, live, inter, d),
+                    10.0,
+                )
+            };
+            let down = |s: &Stream, i: usize| -> Result<()> {
+                let tb = &tabs[i % copies];
+                k.moe_down_sh(
+                    s,
+                    3,
+                    (tb.2.ptr, elist.ptr, off.ptr),
+                    (&tb.3 .2, true),
+                    h.ptr,
+                    part.ptr,
+                    (t, nall, live, d, inter),
+                )
+            };
+            k.ks_quant_to(&s, x.ptr, xc, xs, t * d)?;
+            let sh = &tabs[0].3;
+            ensure!(
+                k.moe_sh_ok([&sh.0, &sh.1, &sh.2], 3, t, topk, d, inter),
+                "not on the folded K-split path"
+            );
+            let reps = 20usize;
+            let mut us = [0f32; 2];
+            let fs: [&dyn Fn(&Stream, usize) -> Result<()>; 2] = [&gu, &down];
+            for (j, f) in fs.into_iter().enumerate() {
+                f(&s, 0)?;
+                s.sync()?;
+                let gr = Graph::capture(&s, |s| {
+                    for i in 0..reps {
+                        f(s, i).map_err(|e| gpu::Error(e.to_string()))?;
+                    }
+                    Ok(())
+                })?;
+                us[j] = time(&s, 10, || Ok(gr.launch(&s)?))? / reps as f32;
+            }
+            let slot = |r: usize, c: usize, fmt: i32| {
+                let mut v = DsW::default();
+                (v.rows, v.cols, v.fmt) = (r as i32, c as i32, fmt);
+                wbytes(&v)
+            };
+            let bgu = live * 2 * slot(inter, d, 3) + 2 * slot(inter, d, 2);
+            let bdn = live * slot(d, inter, 3) + slot(d, inter, 2);
+            let (g1, g2) = (bgu as f32 / us[0] / 1e3, bdn as f32 / us[1] / 1e3);
+            println!(
+                "| {live} | {:.1} | {g1:.0} | {:.1} | {g2:.0} | {:.0}% |",
+                us[0],
+                us[1],
+                (bgu + bdn) as f32 / (us[0] + us[1]) / 1e3 / 33.5
+            );
+            drop(keep);
+        }
+        Ok(())
+    }
+
     /// Achieved weight bandwidth of every weight-streaming projection of a verify step
     /// (t = 6) at the real shapes, through the launcher the engine uses; copies rotated so
     /// nothing stays in L2. `--ignored --nocapture`.
@@ -658,7 +811,7 @@ mod tests {
         let y2 = DevBuf::zeroed(4 * t * 129280)?;
         let (xc, xs) = k.ks_x_ptrs();
         // (name, rows, cols, fmt, kind): kind 0 ks_gemv, 1 ks_gemv gu (w1 + w3), 2 wo_ks,
-        // 3 linear, 4 head, 5 ks_gemv2 (w and a 512-row wkv on one activation)
+        // 3 linear, 4 head, 5 ks_gemv2 (w and a 512-row wkv on one activation), 6 gemv_bf16
         let rows: &[(&str, usize, usize, i32, u8)] = &[
             ("wq_a (fp8, ds_ks)", 1280, 5120, 2, 0),
             ("wkv (fp8, ds_ks)", 512, 5120, 2, 0),
@@ -671,6 +824,7 @@ mod tests {
             ("compressor wgate (bf16, ds_linear_t8)", 512, 5120, 1, 3),
             ("indexer weights_proj (bf16, ds_linear_t8)", 32, 5120, 1, 3),
             ("router gate (bf16, ds_linear_t8)", 384, 5120, 1, 3),
+            ("router gate (bf16, ds_gemv_bf16_r1)", 384, 5120, 1, 6),
             ("hc mixes (f32, ds_linear_t8)", 24, 20480, 0, 3),
             ("expert gu, one slot (fp4, ds_ks gu)", 2304, 5120, 3, 1),
             ("expert down, one slot (fp4, ds_ks)", 5120, 2304, 3, 0),
@@ -715,9 +869,10 @@ mod tests {
                     2 => k.wo_ks(s, w, x.ptr, y.ptr, t, 8, 1024)?,
                     3 => k.linear(s, w, x.ptr, y.ptr, t, false)?,
                     4 => k.head(s, w, x.ptr, y.ptr, t)?,
-                    _ => {
+                    5 => {
                         k.ks_gemv2(s, w, &b.as_ref().unwrap().1, xc, xs, y.ptr, y2.ptr, t, true)?
                     }
+                    _ => k.gemv_bf16(s, w, x.ptr, y.ptr, t)?,
                 }
                 Ok(())
             };

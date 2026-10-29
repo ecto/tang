@@ -256,6 +256,12 @@ per warp, bit-exact; d14b36ea), 1017 weights, 8× H100, 200 tokens: greedy **160
 direct greedy 122.4. The moe3 lane's grouped-kernel occupancy work measured 176 greedy on its
 own branch and is being merged next.
 
+Wave 8d merged (+ moe3: grouped K-split MoE at 4 blocks/SM with 4 groups in flight per warp,
+parallel routing plan, router gate on `ds_gemv_bf16_r1`; one shared `UG` mechanism with attn3's
+ds_ks; 6e597f68), 1017 weights, 8× H100, 200 tokens: greedy **177.8 / 179.0** (42 steps,
+159/246), sampled T=0.6 153.5 / 175.3, T=1.0 177.4, direct greedy 133.9, prefill ~455.
+Mew: `engine::tests::gpu_tiny` 14/0 and `gpu::` 21/0 on 47586ccb (6e597f68 adds docs only).
+
 Newer weights: `deepseek-ai/DeepSeek-V4.1-Flash-1017` (HF 1bae0e10, 2026-10-17) is a
 continued-training checkpoint of the snapshot on the pod (314113f8, 2026-10-16): config.json
 byte-identical, same 96,085 tensors in 48 shards, 510 GB, so tang loads it unmodified and the
