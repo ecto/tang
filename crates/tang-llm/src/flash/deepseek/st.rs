@@ -179,6 +179,18 @@ impl St {
                 unsafe {
                     v.set_len(src.len())
                 };
+                // 2 MB pages for the copy (THP is often `madvise`-only): Engram's per-step gather
+                // reads a few hundred random rows of these 100 GB tables, a TLB miss each on 4 KB
+                // pages
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    let (a, n) = (v.as_mut_ptr() as usize, v.len());
+                    let lo = a.next_multiple_of(2 << 20);
+                    let hi = (a + n) & !((2 << 20) - 1);
+                    if hi > lo {
+                        libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_HUGEPAGE);
+                    }
+                }
                 let threads = std::thread::available_parallelism().map_or(16, |n| n.get().min(64));
                 let chunk = src
                     .len()

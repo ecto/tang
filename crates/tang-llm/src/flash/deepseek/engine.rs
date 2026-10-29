@@ -267,6 +267,8 @@ pub struct GpuModel {
     /// Whether the device draft's logits come back (`decode_spec` clears it when its verify
     /// never reads them: 3 MB of the per-step read)
     draft_logits: bool,
+    /// `copy_many`'s entry tables (snapshot, rewind)
+    cm: [Option<DevBuf>; 2],
     /// Capture decode steps as CUDA graphs (`DS_GRAPH=0` turns it off; see the module doc).
     pub graph: bool,
     pub graph_stats: GraphStats,
@@ -471,6 +473,7 @@ impl GpuModel {
             },
             fast: std::env::var_os("DS_SLOW").is_none(),
             draft_logits: true,
+            cm: [None, None],
             graph: std::env::var("DS_GRAPH").map_or(true, |v| v != "0"),
             graph_stats: GraphStats::default(),
             tabs,
@@ -686,6 +689,44 @@ impl GpuModel {
         self.sync()?;
         super::obs::d2h(n * 4);
         Ok(b.dev().read::<f32>(0, n)?)
+    }
+
+    /// `ds_copy_many` over `lists` (each one launch, in order; a list's copies must not
+    /// overlap) through entry table `which`, written synchronously after draining the stream
+    /// (snapshot and rewind run right after a read-back, so the drain is free).
+    fn copy_many(&mut self, which: usize, lists: &[&[(u64, u64, usize)]]) -> Result<()> {
+        let tot: usize = lists.iter().map(|l| l.len()).sum();
+        if self.cm[which].as_ref().map_or(true, |b| b.len < tot * 24) {
+            self.cm[which] = Some(DevBuf::alloc((tot * 24).next_power_of_two().max(4096))?);
+        }
+        let flat: Vec<i64> = lists
+            .iter()
+            .flat_map(|l| l.iter())
+            .flat_map(|&(d, s, n)| [d as i64, s as i64, n as i64])
+            .collect();
+        // the table may still be read by this stream's last launch from it
+        self.sync()?;
+        let tb = self.cm[which].as_ref().unwrap();
+        tb.write(0, &flat)?;
+        let mut off = 0u64;
+        for l in lists {
+            if l.is_empty() {
+                continue;
+            }
+            let (d, n) = (tb.ptr + off * 24, l.len() as i32);
+            unsafe {
+                self.k.go(
+                    "ds_copy_many",
+                    (8, l.len() as u32, 1),
+                    B256,
+                    0,
+                    &self.s,
+                    args![d, n],
+                )?
+            };
+            off += l.len() as u64;
+        }
+        Ok(())
     }
 
     fn copy(&self, dst: u64, src: u64, n: usize) -> Result<()> {
@@ -3789,14 +3830,16 @@ impl GpuModel {
             sw.iter().map(b).collect(),
             sc.iter().map(|(&l, (a, bb))| (l, (b(a), b(bb)))).collect(),
         );
+        let mut cl = Vec::new();
         for (l, dst) in sw.iter().enumerate() {
-            self.copy(dst.ptr, self.win[l].ptr, c.window_size * hd)?;
+            cl.push((dst.ptr, self.win[l].ptr, c.window_size * hd));
         }
         for (l, (a, bb)) in &sc {
             let n = c.compress_ratios[*l] * hd;
-            self.copy(a.ptr, self.cst[l].0.ptr, n)?;
-            self.copy(bb.ptr, self.cst[l].1.ptr, n)?;
+            cl.push((a.ptr, self.cst[l].0.ptr, n));
+            cl.push((bb.ptr, self.cst[l].1.ptr, n));
         }
+        self.copy_many(0, &[&cl])?;
         self.journal_on = true;
         self.journal_steps = 0;
         self.journal.clear();
@@ -3811,27 +3854,40 @@ impl GpuModel {
         }
         let c = self.cpu.cfg.clone();
         let (win, hd) = (c.window_size, c.head_dim);
+        // the window rows and whole compressor states (disjoint), then the journal's replays
+        // over those states; replays of one slot keep their order (one launch per repeat)
+        let mut first = Vec::new();
         for (l, old) in snap.win.iter().enumerate() {
             for pos in from..end.min(from + win) {
                 let o = ((pos % win) * hd * 4) as u64;
-                self.copy(self.win[l].ptr + o, old.ptr + o, hd)?;
+                first.push((self.win[l].ptr + o, old.ptr + o, hd));
             }
         }
         for (l, (a, bb)) in &snap.cst {
             let n = c.compress_ratios[*l] * hd;
             let (ka, kb) = (self.cst[l].0.ptr, self.cst[l].1.ptr);
-            self.copy(ka, a.ptr, n)?;
-            self.copy(kb, bb.ptr, n)?;
+            first.push((ka, a.ptr, n));
+            first.push((kb, bb.ptr, n));
         }
         let journal = std::mem::take(&mut self.journal);
+        let mut reps: Vec<Vec<(u64, u64, usize)>> = Vec::new();
+        let mut seen: HashMap<u64, usize> = HashMap::new();
         for (lid, pos, kv, sc) in &journal {
             if *pos < from {
                 let o = ((pos % c.compress_ratios[*lid]) * hd * 4) as u64;
                 let (ka, kb) = (self.cst[lid].0.ptr, self.cst[lid].1.ptr);
-                self.copy(ka + o, kv.ptr, hd)?;
-                self.copy(kb + o, sc.ptr, hd)?;
+                let k = seen.entry(ka + o).or_insert(0);
+                if reps.len() <= *k {
+                    reps.push(Vec::new());
+                }
+                reps[*k].push((ka + o, kv.ptr, hd));
+                reps[*k].push((kb + o, sc.ptr, hd));
+                *k += 1;
             }
         }
+        let mut lists: Vec<&[(u64, u64, usize)]> = vec![&first];
+        lists.extend(reps.iter().map(|v| v.as_slice()));
+        self.copy_many(1, &lists)?;
         self.journal_on = false;
         Ok(())
     }

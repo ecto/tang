@@ -482,6 +482,18 @@ extern "C" __global__ void ds_copy(float* dst, const float* src, long long n) { 
     if (i < n) dst[i] = src[i];
 }
 
+// Many f32 copies in one launch: entry j = blockIdx.y of d [n][3] (dst, src, floats);
+// entries must not overlap one another (a later launch orders dependent ones).
+extern "C" __global__ void ds_copy_many(const long long* __restrict__ d, int n) { DS_PDL_ENTRY
+    int j = blockIdx.y;
+    if (j >= n) return;
+    float* dst = (float*)d[3 * j];
+    const float* src = (const float*)d[3 * j + 1];
+    long long c = d[3 * j + 2];
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < c; i += (long long)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
 // mixes[t][m] *= rsqrt(mean(x[t]^2) + eps), x rows of n. Block per row.
 extern "C" __global__ void ds_hc_scale(const float* x, float* mixes, int n, int mix, float eps) { DS_PDL_ENTRY
     __shared__ float red[32];

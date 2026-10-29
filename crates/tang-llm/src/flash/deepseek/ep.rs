@@ -117,8 +117,14 @@ impl EpGroup {
             Backend::Nccl => Some(tang_moe::nccl::unique_id().map_err(|e| anyhow!("{e}"))?),
             Backend::Host => None,
         };
+        // each rank's load stage (1 model open, 2 NCCL init, 3 ready), for the load deadline's
+        // error: one stuck rank otherwise hangs the server (its peers wait in NCCL init)
+        let stage: Arc<Vec<std::sync::atomic::AtomicU8>> =
+            Arc::new((0..world).map(|_| Default::default()).collect());
+        let t_load = std::time::Instant::now();
         let mut ranks = Vec::new();
         for (rank, &dev) in devices.iter().enumerate() {
+            let stage = stage.clone();
             let (tx, crx) = channel::<(u64, Cmd)>();
             let (rtx, rx) = channel::<Result<Reply>>();
             let dir: PathBuf = dir.to_path_buf();
@@ -129,7 +135,15 @@ impl EpGroup {
                 .name(format!("ep-rank{rank}"))
                 .spawn(move || {
                     let init = || -> Result<GpuModel> {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        stage[rank].store(1, Relaxed);
+                        let t0 = std::time::Instant::now();
                         let mut m = GpuModel::open_on(&dir, dev)?;
+                        eprintln!(
+                            "deepseek: ep rank {rank} (device {dev}) open in {:.1} s",
+                            t0.elapsed().as_secs_f64()
+                        );
+                        stage[rank].store(2, Relaxed);
                         m.obs.rank.set(rank);
                         m.owns_expert = Box::new(move |e| owner(e, world) == rank);
                         m.moe_reduce = match backend {
@@ -147,6 +161,7 @@ impl EpGroup {
                                 }))
                             }
                         };
+                        stage[rank].store(3, Relaxed);
                         Ok(m)
                     };
                     let mut m = match init() {
@@ -208,8 +223,59 @@ impl EpGroup {
             seq: std::cell::Cell::new(0),
             cfg,
         };
-        g.collect()?;
+        g.collect_load(&stage, devices, t_load)?;
         Ok(g)
+    }
+
+    /// The ranks' load replies, within `DS_LOAD_TIMEOUT` seconds (default 1200) of the load's
+    /// start; past it, an error naming each rank's device and stage.
+    fn collect_load(
+        &self,
+        stage: &[std::sync::atomic::AtomicU8],
+        devices: &[usize],
+        t0: std::time::Instant,
+    ) -> Result<()> {
+        let limit = std::time::Duration::from_secs(
+            std::env::var("DS_LOAD_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1200),
+        );
+        let mut err = None;
+        for (i, r) in self.ranks.iter().enumerate() {
+            let left = limit.saturating_sub(t0.elapsed());
+            match r.rx.recv_timeout(left) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    err.get_or_insert(e.context(format!("ep rank {i}")));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let what = |s: u8| match s {
+                        0 => "not started",
+                        1 => "opening the model (CUDA context, weights, Engram pin)",
+                        2 => "in NCCL init (waiting on its peers)",
+                        _ => "ready",
+                    };
+                    let st: Vec<String> = stage
+                        .iter()
+                        .enumerate()
+                        .map(|(j, s)| {
+                            let s = s.load(std::sync::atomic::Ordering::Relaxed);
+                            format!("rank {j} (device {}): {}", devices[j], what(s))
+                        })
+                        .collect();
+                    anyhow::bail!(
+                        "deepseek ep load timed out after {:.0} s (DS_LOAD_TIMEOUT): {}",
+                        t0.elapsed().as_secs_f64(),
+                        st.join("; ")
+                    );
+                }
+                Err(_) => {
+                    err.get_or_insert(anyhow!("ep rank {i} exited"));
+                }
+            }
+        }
+        err.map_or(Ok(()), Err)
     }
 
     pub fn config(&self) -> &super::Config {
