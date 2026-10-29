@@ -838,10 +838,9 @@ impl GpuModel {
         let (xc, xs) = self.k.ks_x_ptrs();
         self.k.ks_quant_to(&self.s, x.ptr, xc, xs, t * d)?;
         let (qr, kv) = (self.fbuf(t * ql)?, self.fbuf(t * hd)?);
+        // wq_a and wkv in one launch (ds_ks2), each bit for bit its own ks_gemv
         self.k
-            .ks_gemv(&self.s, &wqa, None, xc, xs, qr.ptr, t, true, 0, 0.0)?;
-        self.k
-            .ks_gemv(&self.s, &wkv, None, xc, xs, kv.ptr, t, true, 0, 0.0)?;
+            .ks_gemv2(&self.s, &wqa, &wkv, xc, xs, qr.ptr, kv.ptr, t, true)?;
         self.end(sp);
         let sp = self.span("window_kv");
         let ring = b(&self.win[lid]);

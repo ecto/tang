@@ -1576,7 +1576,7 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
                                         const float* __restrict__ xsc, float* __restrict__ y, int t, int round,
                                         const float* __restrict__ rw, float lim, int S, int SB, int nbr, float* part,
                                         int* cnt, const int* __restrict__ xi, int xst = 0, int yst = 0,
-                                        int it0 = -1) {
+                                        int it0 = -1, bool staged = false) {
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ float red[8][4][32];
     __shared__ int last;
@@ -1585,12 +1585,13 @@ __device__ __forceinline__ void lin_mma(DsW w, DsW w3, const unsigned char* __re
     unsigned char* xs = smem;           // [t][P]
     float* sx = (float*)(smem + t * P);  // [t][nch], scale × 2^8 (code -> f16) × weight POW
     const float POW = (FMT == 3 ? 16384.f : 256.f) * 256.f;
-    for (int e = threadIdx.x; e < t * cols / 16; e += blockDim.x) {
+    // staged: this block already holds the same x (ds_ks2's later items)
+    for (int e = threadIdx.x; e < (staged ? 0 : t * cols / 16); e += blockDim.x) {
         int ti = e / (cols / 16), c = e % (cols / 16);
         long long xr = xi ? __ldg(xi + ti) : ti;
         *(uint4*)(xs + ti * P + c * 16) = __ldg((const uint4*)(xc + xr * xrs) + c);
     }
-    for (int e = threadIdx.x; e < t * nch; e += blockDim.x) {
+    for (int e = threadIdx.x; e < (staged ? 0 : t * nch); e += blockDim.x) {
         int ti = e / nch, c = e % nch;
         long long xr = xi ? __ldg(xi + ti) : ti;
         sx[e] = __ldg(xsc + xr * srs + c) * POW;
@@ -1743,6 +1744,25 @@ DS_KST(2, 0)
 DS_KST(3, 0)
 DS_KST(2, 1)
 DS_KST(3, 1)
+// Two K-split GEMVs on the same quantized x in one launch (wq_a and wkv): items 0 .. na - 1 are
+// w's (S, SB, nbr, part, cnt), the rest wb's; x staged once per block. Each output as its own
+// ds_ks_f*_g0 launch, bit for bit.
+#define DS_KS2(F)                                                                                               \
+    extern "C" __global__ void __launch_bounds__(256) ds_ks2_f##F(                                              \
+        DsW w, DsW wb, const unsigned char* xc, const float* xsc, float* y, float* yb, int t, int round, int S,  \
+        int SB, int nbr, int Sb, int SBb, int nbrb, float* part, float* partb, int* cnt, int* cntb) {           \
+        int na = nbr * SB, nt = na + nbrb * SBb;                                                                \
+        for (int item = blockIdx.x; item < nt; item += gridDim.x) {                                            \
+            bool st = item != blockIdx.x;                                                                       \
+            if (item < na)                                                                                      \
+                lin_mma<F, 0>(w, w, xc, xsc, y, t, round, 0, 0.f, S, SB, nbr, part, cnt, 0, 0, 0, item, st);    \
+            else                                                                                                \
+                lin_mma<F, 0>(wb, wb, xc, xsc, yb, t, round, 0, 0.f, Sb, SBb, nbrb, partb, cntb, 0, 0, 0,       \
+                              item - na, st);                                                                   \
+        }                                                                                                       \
+    }
+DS_KS2(2)
+DS_KS2(3)
 DS_KS(2, 0)
 DS_KS(3, 0)
 DS_KS(2, 1)
