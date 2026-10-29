@@ -1147,4 +1147,95 @@ mod tests {
             before = d.state;
         }
     }
+
+    /// The chip window inside a Coder engine (`TANG_LLM_TEST_GGUF`: any `qwen3next` GGUF; its
+    /// base layers only host the window). On a slot with a prompt: put/get/list through
+    /// `chip_op` give the trace's tokens, the slot's tokens are unchanged, and its greedy
+    /// continuation equals a twin slot's that never ran the chip (base layers, KV and GDN
+    /// state untouched). `store_op_at` with a table codec returns the ops' results.
+    #[test]
+    fn chip_gpu_in_coder() {
+        let Ok(path) = std::env::var("TANG_LLM_TEST_GGUF") else {
+            assert!(
+                std::env::var("TANG_REQUIRE_CUDA").is_err(),
+                "TANG_REQUIRE_CUDA=1 needs TANG_LLM_TEST_GGUF"
+            );
+            eprintln!("================ chip_gpu_in_coder: no TANG_LLM_TEST_GGUF, SKIPPED ================");
+            return;
+        };
+        let mut e = super::super::coder::Coder::load(
+            std::path::Path::new(&path),
+            super::super::coder::CoderOpts {
+                max_ctx: 1024,
+                mtp: None,
+            },
+        )
+        .unwrap();
+        let fxt = RetargetFixture::new().unwrap();
+        let pack = ChipPack::new(&fxt.model, &fxt.dec, &fxt.row_tokens).unwrap();
+        let call = |i: usize| fxt.ops[i].1[..fxt.ops[i].2].to_vec();
+        let name = b"a.txt".to_vec();
+        let codec = TableCodec {
+            calls: vec![
+                (("put".into(), name.clone()), call(0)),
+                (("get".into(), name.clone()), call(1)),
+                (("list".into(), vec![]), call(2)),
+            ],
+            open: 248066,
+            close: 248067,
+            sep: 198,
+            vocab: [(64, b"a".to_vec()), (3778, b".txt".to_vec())].into(),
+        };
+        e.load_chip(&pack, Some(Box::new(codec))).unwrap();
+        let (a, b, c) = (
+            e.alloc_slot().unwrap(),
+            e.alloc_slot().unwrap(),
+            e.alloc_slot().unwrap(),
+        );
+        let prompt: Vec<u32> = (1000..1040).collect();
+        let na = e.prefill_slot(a, &prompt).unwrap();
+        let nb = e.prefill_slot(b, &prompt).unwrap();
+        assert_eq!(na, nb);
+        let toks = e.slot_tokens(a).to_vec();
+        for (label, want, nf) in &fxt.ops {
+            let t = Instant::now();
+            let out = e.chip_op(a, &want[..*nf]).unwrap();
+            assert_eq!(&out.fed, want, "{label}");
+            eprintln!(
+                "coder chip_op {label}: {} tokens in {:?}, printed {:?}",
+                out.fed.len(),
+                t.elapsed(),
+                out.printed()
+            );
+        }
+        assert_eq!(
+            e.slot_tokens(a),
+            &toks[..],
+            "chip_op changed the slot's tokens"
+        );
+        let (mut xa, mut xb) = (na, nb);
+        for i in 0..8 {
+            xa = e.prefill_slot(a, &[xa]).unwrap();
+            xb = e.prefill_slot(b, &[xb]).unwrap();
+            assert_eq!(xa, xb, "continuation step {i} differs after chip ops");
+        }
+        let ops = [
+            StoreOp::Put {
+                name: name.clone(),
+                ids: vec![],
+            },
+            StoreOp::Get { name: name.clone() },
+            StoreOp::List,
+        ];
+        let got: Vec<OpOut> = ops.iter().map(|op| e.store_op_at(c, op).unwrap()).collect();
+        assert_eq!(
+            got,
+            vec![
+                OpOut::Put,
+                OpOut::Got(Some(vec![8029, 13053, 20956, 9197, 30183])),
+                OpOut::Listed(vec![(name.clone(), 0)]),
+            ]
+        );
+        eprintln!("coder store_op_at through the chip window: {got:?}");
+    }
 }

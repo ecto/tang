@@ -110,6 +110,82 @@ Left for engine/CUDA integration: text rows for the host vocabulary in the widen
 its own GDN/conv state, the decoder on the residual after the chip stack, compacted (CSR or
 block) GEMVs with bf16 rounding at the HF points, and the RV tables' injection for `calc`.
 
+## Engine (milestone 3): the chip window on CUDA
+
+`crates/tang-llm/src/flash/chip_gpu.rs` (cuda), its packing in `chip.rs` (`ChipPack`,
+`PackedCsr`, `PackedDecoder`, `pick_next`, `RetargetFixture`).
+
+**What's on the device.** Per layer: the four input projections as one stacked CSR
+(`qkv | z | a | b`), out, gate|up stacked, down. The conv weights, dt_bias, −exp(A_log), the
+norm gains, the embedding rows of the tokens the window is fed (with a token → row map), and
+the decoder table (families as `[kind, a, b]`, printable, code / id-code dims). The blocks are
+~0.05% dense, so each row is a CSR row summed by one thread. Dense or block GEMVs would read
+2.4 G weights per token for ~0.33 M nonzeros. Kernels: `chip_rmsnorm`,
+`chip_csr` (optionally fused `x = bf(x + bf(Wy))`), `chip_conv` (conv, SiLU, history shift),
+`chip_l2`, `chip_gdn` (recurrence + gated norm, one block per v head), `chip_act`,
+`chip_pick` (decoder + next-token rule on the device), `chip_embed`.
+
+**Why not `gdn_step_body`.** Its state is interleaved across heads (`[r][GDN_HV][128]`), it
+uses FMA and split reductions, and tang-compute's generic device `gdn_step` is hard-wired to
+16 k / 48 v. chip.rs's math is `reference::gdn_head_step` (sequential sums, separate
+roundings). `chip_gdn` runs that loop per value column in the CPU's order, with
+`__fmul_rn`/`__fadd_rn` (no contraction) and exp/log in double. The circuit's arithmetic is
+exact, so this is bitwise by construction rather than "close". The Coder engine's own GDN path
+uses its runtime `Geometry` (`gdn_hv` from the GGUF, grouped `h / r`); the `GDN_HV = 48`
+constants are defaults only.
+
+**bf16 rounding points** (chip.rs `Layer::step`, Numerics::Bf16, the same on the device):
+both RMSNorm outputs; every projection output; the conv sum and its SiLU; β; the GDN core
+output; the gated norm's normed value, its gain product and the SiLU(z) product; the out
+projection and the residual after it; gate, up, SiLU(gate) and the product; down and the
+residual after it. CSR rows sum in column order from −0.0 (Rust's f32 `Sum`). The one
+reordered reduction is the RMSNorm sum of squares (a block tree). On every chip-window token
+it is `m · 2^80` plus terms below its half-ulp, so the order cannot change it.
+
+**Window mechanics.** `ChipGpu::op(slot, forced)` writes a control block (cur token, queue of
+forced tokens, fed log). A window is 8 tokens of `embed → 12 layers → pick`, captured once per
+slot as a CUDA graph. Every kernel returns at once when the op is done or flagged, and the host
+reads the control block between windows. `pick` is `Driver::op`'s rule: a chip token is
+followed by the circuit's; a text token by the circuit's when it owns the position, else by the
+next forced token; an empty queue ends the op. Errors (no row, no token for a code, runaway)
+are flagged in the block and raised on the host.
+
+**Kept out of the host paths.** `Coder::chip_op(slot, tokens)` (coder.rs, next to
+`store_op_at`) only calls `ChipGpu::op`. It never enqueues the Coder window (`window_mode`,
+`prefill_slot`, `decode_batch`), so chip tokens never reach the base layers, the head's
+sampling, the KV cache, the MTP layer or `slot_tokens`. `store_op_at` takes the chip path when
+`load_chip` was given a `ChipCodec`; otherwise it keeps the memstore windows.
+
+**State per slot.** `ChipGpu` keeps per-slot conv history `[3][conv_dim]` and recurrent state
+`[v_heads][128][128]` per layer (chip.rs `ChipState` layout), allocated zeroed on first use.
+`free_slot` drops a slot's state; `reset` zeroes all of it, as it zeroes the memstore heads.
+
+**Memory at Coder-Next width** (hidden 3968, 12 layers): weights = CSR (ptr + idx + val) +
+vectors; per slot 12 × (3 · 8192 + 32 · 128²) floats = 25.5 MB. Measured numbers below.
+
+**Verification** (`chip_gpu_put_get_list_matches_cpu`, `TANG_REQUIRE_CUDA=1`):
+1. *Shadow + poison.* Before each token the scratch is filled with NaN. After each layer the
+   residual, conv history and recurrent state are compared bitwise with chip.rs's layer step
+   from the same input. A mismatch is reported as op / token / layer and resynced. The
+   decoded token is checked against `Decoder::token`.
+2. *Production.* Graph windows on a fresh slot: every fed token equals the trace's. After each
+   op, every layer's full state is bitwise equal to the CPU `Driver`'s, and the store heads to
+   the trace's.
+3. *In the Coder* (`chip_gpu_in_coder`, `TANG_LLM_TEST_GGUF`, any qwen3next GGUF as the host).
+   chip_op on a slot with a prompt leaves its tokens unchanged, and its greedy continuation
+   equals a twin slot's. `store_op_at` with a table codec returns Put / Got(ids) / Listed.
+
+**Measured numbers.** RESULTS_PENDING
+
+**What remains.** Real Coder-Next weights and a tokenizer re-export: the IR from
+`core.build` with Coder-Next's tokenizer, and text rows for the host vocabulary in the widened
+embedding. A real `ChipCodec`: tool-call text → tokens, printed answer → `OpOut`; the test's
+`TableCodec` is the fixture's. The serve route (`/v1/memory/op` → `store_op_at`, and Sessions
+export/import of the chip state, which `store_heads` does not cover). The sampler handoff: when
+the model emits a tool call, the decode loop must switch the slot to the chip window and feed
+the printed answer back through the base layers as ordinary text. The RV `calc` tables'
+injection.
+
 ## Qwen3.5-4B support
 
 `reference.rs` targets GGUF Qwen3-Next. Qwen3.5's GDN is the same math (grouped k heads,
