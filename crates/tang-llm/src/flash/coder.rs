@@ -1067,8 +1067,9 @@ impl Coder {
         // ---- the optional second GPU (`TANG_GPUS=2`): layers [split_at, L), head, out_norm
         // and rope loaded on device 1, with their own kernels/scratch/staging.
         let (peer, peer_report) = if super::split::gpus() == 2 && hp.n_layer > 1 {
-            let (peer, report) =
-                build_peer(&g, &gpu, &hp, &geo, &sh, max_ctx, &mtp_path, split_at, &ba_perm)?;
+            let (peer, report) = build_peer(
+                &g, &gpu, &hp, &geo, &sh, max_ctx, &mtp_path, split_at, &ba_perm,
+            )?;
             (Some(peer), report)
         } else {
             (None, String::new())
@@ -1188,7 +1189,6 @@ impl Coder {
         self.dev.sync();
     }
 
-
     /// [`write_slot_tables`](Self::write_slot_tables) for stage `w`'s layers only.
     fn write_slot_tables_on(&mut self, w: usize) {
         let nl = self.stage_view(w).layers.len();
@@ -1215,11 +1215,7 @@ impl Coder {
                     let (a, b) = p.slots[i].as_ref().expect("peer slot");
                     (a, b)
                 };
-                let pair = if layer.gdn.is_some() {
-                    &gdn[l]
-                } else {
-                    &kv[l]
-                };
+                let pair = if layer.gdn.is_some() { &gdn[l] } else { &kv[l] };
                 if let Some((a, b)) = pair {
                     ta[i] = self.a_on(w, a);
                     tb[i] = self.a_on(w, b);
@@ -1308,12 +1304,12 @@ impl Coder {
             let mut gdn = Vec::with_capacity(p.layers.len());
             let mut kvv = Vec::with_capacity(p.layers.len());
             for layer in &p.layers {
-                gdn.push(layer.gdn.as_ref().map(|_| {
-                    (
-                        p.dev.alloc_f32(hv * 128 * 128),
-                        p.dev.alloc_f32(3 * conv),
-                    )
-                }));
+                gdn.push(
+                    layer
+                        .gdn
+                        .as_ref()
+                        .map(|_| (p.dev.alloc_f32(hv * 128 * 128), p.dev.alloc_f32(3 * conv))),
+                );
                 kvv.push(
                     layer
                         .attn
@@ -1780,7 +1776,15 @@ impl Coder {
                 .module(&src)
                 .map_err(|e| anyhow!("coder kernels ({rows} rows, GPU 1): {e}"))?;
             let pk = p.k.with_coder_module(cm)?;
-            let ps = Scratch::new(&p.dev, &self.hp, &self.geo, n, self.max_ctx, rows, WIDE_ATTN_ROWS);
+            let ps = Scratch::new(
+                &p.dev,
+                &self.hp,
+                &self.geo,
+                n,
+                self.max_ctx,
+                rows,
+                WIDE_ATTN_ROWS,
+            );
             let mut pio = Io {
                 arena: HostArena::new(
                     Io::bytes(n, rows),
@@ -1829,12 +1833,7 @@ impl Coder {
             for l in 0..st.layers.len() {
                 let layer = &st.layers[l];
                 self.enqueue_mixer(w, l, t, false, 0, 1);
-                self.norm_q8(
-                    w,
-                    Some(st.dev.buffer_addr(&st.s.mix)),
-                    &layer.post_norm,
-                    t,
-                );
+                self.norm_q8(w, Some(st.dev.buffer_addr(&st.s.mix)), &layer.post_norm, t);
                 let next = if l + 1 < st.layers.len() {
                     &st.layers[l + 1].attn_norm
                 } else if w + 1 < self.n_stages() {
@@ -1871,18 +1870,22 @@ impl Coder {
         let xq_bytes = t * (n + n / 32 * 4);
         let tw = self.tw();
         for (dst, src, bytes) in [
-            (b.dev.buffer_addr(&b.s.x), a.dev.buffer_addr(&a.s.x), t * n * 4),
-            (b.dev.buffer_addr(&b.s.r), a.dev.buffer_addr(&a.s.r), t * n * 4),
+            (
+                b.dev.buffer_addr(&b.s.x),
+                a.dev.buffer_addr(&a.s.x),
+                t * n * 4,
+            ),
+            (
+                b.dev.buffer_addr(&b.s.r),
+                a.dev.buffer_addr(&a.s.r),
+                t * n * 4,
+            ),
             (
                 b.dev.buffer_addr(&b.s.mxq),
                 a.dev.buffer_addr(&a.s.mxq),
                 xq_bytes,
             ),
-            (
-                b.dev.buffer_addr(&b.s.ctl),
-                a.dev.buffer_addr(&a.s.ctl),
-                32,
-            ),
+            (b.dev.buffer_addr(&b.s.ctl), a.dev.buffer_addr(&a.s.ctl), 32),
             (
                 b.dev.buffer_addr(&b.s.rows),
                 a.dev.buffer_addr(&a.s.rows),
@@ -2230,17 +2233,10 @@ impl Coder {
     fn io_dev_on(&self, w: usize, off: usize) -> u64 {
         let st = self.stage_view(w);
         if w == 0 {
-            return st
-                .io
-                .arena
-                .device_ptr(off)
-                .expect("io arena is mapped");
+            return st.io.arena.device_ptr(off).expect("io arena is mapped");
         }
         // The peer's own registered arena (registered from its context in `build_peer`).
-        st.io
-            .arena
-            .device_ptr(off)
-            .expect("io arena is mapped")
+        st.io.arena.device_ptr(off).expect("io arena is mapped")
     }
 
     /// `bytes` (a multiple of 4) from `src` to `dst` with the copy kernel on stage `w`'s
@@ -2536,7 +2532,12 @@ impl Coder {
         self.mark("start");
         let n_rows = ROWS_PER_T * self.tw();
         let s = self.stage_view(0).s;
-        self.kcopy_on(0, self.dev.buffer_addr(&s.ctl), self.io_dev_on(0, Io::CTL), 32);
+        self.kcopy_on(
+            0,
+            self.dev.buffer_addr(&s.ctl),
+            self.io_dev_on(0, Io::CTL),
+            32,
+        );
         self.kcopy_on(
             0,
             self.dev.buffer_addr(&s.rows),
@@ -2572,15 +2573,21 @@ impl Coder {
     ) {
         let layer = self.lay(w, l);
         let s = self.sc_on(w);
-        let (x, xq) = (
-            self.a_on(w, &s.x),
-            Some(self.a_on(w, &s.mxq)),
-        );
+        let (x, xq) = (self.a_on(w, &s.x), Some(self.a_on(w, &s.mxq)));
         let eps = self.eps;
         let n = self.hp.n_embd;
         if let Some(g) = &layer.gdn {
             let stride = layer.w_in.rows;
-            self.gemv(w, "gdn_in", &layer.w_in, x, xq, self.proj_on(w, &g.proj), t, stride);
+            self.gemv(
+                w,
+                "gdn_in",
+                &layer.w_in,
+                x,
+                xq,
+                self.proj_on(w, &g.proj),
+                t,
+                stride,
+            );
             self.gdn_step_seg(w, g, stride, nseg, !verify);
             if !verify {
                 self.gdn_commit_seg(w, g, stride, nseg);
@@ -2661,7 +2668,16 @@ impl Coder {
                         tang_moe::args![part, ns as i32, proj, st, attn],
                     );
                 }
-                self.gemv(w, "attn_out", &layer.w_out, attn, None, self.a_on(w, &s.mix), t, n);
+                self.gemv(
+                    w,
+                    "attn_out",
+                    &layer.w_out,
+                    attn,
+                    None,
+                    self.a_on(w, &s.mix),
+                    t,
+                    n,
+                );
                 return;
             }
             for r0 in (0..t).step_by(slice) {
@@ -2696,7 +2712,16 @@ impl Coder {
                     );
                 }
             }
-            self.gemv(w, "attn_out", &layer.w_out, attn, None, self.a_on(w, &s.mix), t, n);
+            self.gemv(
+                w,
+                "attn_out",
+                &layer.w_out,
+                attn,
+                None,
+                self.a_on(w, &s.mix),
+                t,
+                n,
+            );
         }
     }
 
@@ -2813,10 +2838,7 @@ impl Coder {
         let v = self.stage_view(wi);
         let (s, hp) = (&v.s, &self.hp);
         let (ne, kk) = (hp.n_expert, hp.n_expert_used);
-        let (x, mxq) = (
-            v.dev.buffer_addr(&s.x),
-            v.dev.buffer_addr(&s.mxq),
-        );
+        let (x, mxq) = (v.dev.buffer_addr(&s.x), v.dev.buffer_addr(&s.mxq));
         let ls = ne + 1;
         let (lg, lsi, ids, w, scale) = (
             v.dev.buffer_addr(&s.lg),
@@ -2885,15 +2907,7 @@ impl Coder {
 
     /// Expert pairs `pbase..pbase + n` (routed pairs first, then the shared expert per token):
     /// gate|up rows, SiLU+int8, down rows, on `stream`.
-    fn experts(
-        &self,
-        wi: usize,
-        layer: &Layer,
-        t: usize,
-        pbase: usize,
-        n: usize,
-        stream: &Stream,
-    ) {
+    fn experts(&self, wi: usize, layer: &Layer, t: usize, pbase: usize, n: usize, stream: &Stream) {
         if n == 0 {
             return;
         }
@@ -3194,10 +3208,9 @@ impl Coder {
         self.norm_q8(0, None, &self.layers[0].attn_norm, t);
         for w in 0..self.n_stages() {
             let v = self.stage_view(w);
-            let last =
-                |dev: &CudaComputeDevice, b: &B| -> Vec<f32> {
-                    dev.download(b)[(t - 1) * n..t * n].to_vec()
-                };
+            let last = |dev: &CudaComputeDevice, b: &B| -> Vec<f32> {
+                dev.download(b)[(t - 1) * n..t * n].to_vec()
+            };
             let nl = v.layers.len();
             for l in 0..nl {
                 let layer = &v.layers[l];
@@ -3256,7 +3269,12 @@ impl Coder {
             self.io_dev_on(0, Io::rows(n, MAX_T)),
             ROWS_U32 * 4,
         );
-        self.kcopy_on(0, self.dev.buffer_addr(&m.emb), self.io_dev_on(0, Io::EMB), t * n * 4);
+        self.kcopy_on(
+            0,
+            self.dev.buffer_addr(&m.emb),
+            self.io_dev_on(0, Io::EMB),
+            t * n * 4,
+        );
         // The MTP layer stays on GPU 0: its buffers were allocated there at load, its input
         // `m.mh` was copied from the last stage's `x`, its output ids go to the shared staging.
         let (emb, mh, we, wh, eps, ni, cat) = (
@@ -3278,7 +3296,16 @@ impl Coder {
                 tang_moe::args![emb, mh, we, wh, eps, ni, cat],
             )
         };
-        self.gemv(0, "mtp_fc", &m.fc, cat, None, self.dev.buffer_addr(&s.r), t, n);
+        self.gemv(
+            0,
+            "mtp_fc",
+            &m.fc,
+            cat,
+            None,
+            self.dev.buffer_addr(&s.r),
+            t,
+            n,
+        );
         self.norm_q8(0, None, &m.layer.attn_norm, t);
         self.enqueue_mixer(0, MTP_L, t, true, nchunk, 1);
         self.norm_q8(0, Some(self.dev.buffer_addr(&s.mix)), &m.layer.post_norm, t);
@@ -3666,13 +3693,7 @@ impl Coder {
     /// Capture each stage's half of the window by (temporarily) masking the other stage out:
     /// `enqueue_window` with `only_stage` set enqueues just that stage's layers (the
     /// boundary event/copy between the stages stays outside the graphs).
-    fn capture_stages(
-        &mut self,
-        t: usize,
-        verify: bool,
-        nchunk: usize,
-        nseg: usize,
-    ) -> Result<()> {
+    fn capture_stages(&mut self, t: usize, verify: bool, nchunk: usize, nseg: usize) -> Result<()> {
         let key = (t, verify, nchunk, nseg, self.greedy.get());
         let me = self as *const Self;
         {
@@ -3862,7 +3883,12 @@ impl Coder {
     /// Stage `w`'s half of a commit (graph capture): CCTL in, then its GDN layers' replay.
     fn enqueue_commit_stage(&self, w: usize, t: usize) {
         let v = self.stage_view(w);
-        self.kcopy_on(w, v.dev.buffer_addr(&v.s.ctl), self.io_dev_on(w, Io::CCTL), 32);
+        self.kcopy_on(
+            w,
+            v.dev.buffer_addr(&v.s.ctl),
+            self.io_dev_on(w, Io::CCTL),
+            32,
+        );
         for layer in v.layers {
             if let Some(g) = &layer.gdn {
                 self.gdn_step(w, g, layer.w_in.rows, t, true);
@@ -3968,7 +3994,10 @@ impl Coder {
     /// (stage, µs a step, bytes a step), the whole window first. Run after a decode (the
     /// routing buffers then hold real expert ids).
     pub fn stage_sweep(&mut self) -> Result<Vec<(&'static str, f64, f64)>> {
-        ensure!(self.peer.is_none(), "stage_sweep is single-GPU (TANG_GPUS=1)");
+        ensure!(
+            self.peer.is_none(),
+            "stage_sweep is single-GPU (TANG_GPUS=1)"
+        );
         ensure!(!self.tokens.is_empty(), "decode something first");
         let pos0 = self.tokens.len() - 1;
         self.stage(pos0, 1)?;
@@ -4154,10 +4183,13 @@ fn layer_vram(g: &Gguf, hp: &Hparams) -> Vec<usize> {
 fn split_point(g: &Gguf, hp: &Hparams) -> usize {
     let cap = hp.n_layer.saturating_sub(1);
     if let Ok(k) = std::env::var("TANG_SPLIT_AT") {
-        return k.parse::<usize>().unwrap_or_else(|_| {
-            eprintln!("TANG_SPLIT_AT: a layer index; using the balanced split");
-            balanced(g, hp)
-        }).min(cap);
+        return k
+            .parse::<usize>()
+            .unwrap_or_else(|_| {
+                eprintln!("TANG_SPLIT_AT: a layer index; using the balanced split");
+                balanced(g, hp)
+            })
+            .min(cap);
     }
     balanced(g, hp).min(cap)
 }
@@ -4201,10 +4233,7 @@ fn build_peer(
     if !peer_ok {
         eprintln!("coder: GPU 1 has no peer access; boundary copies stage through host");
     }
-    let (free0, _) = ctx
-        .gpu
-        .mem_info()
-        .map_err(|e| anyhow!("GPU 1: {e}"))?;
+    let (free0, _) = ctx.gpu.mem_info().map_err(|e| anyhow!("GPU 1: {e}"))?;
     let dev = CudaComputeDevice::on(1).map_err(|e| anyhow!("GPU 1: {e:?}"))?;
     let mut layers = Vec::with_capacity(hp.n_layer - split_at);
     for l in split_at..hp.n_layer {
@@ -4246,15 +4275,16 @@ fn build_peer(
             },
         )?,
     };
-    io.arena.register(&ctx.gpu.ctx, &[]).map_err(|e| anyhow!("{e}"))?;
+    io.arena
+        .register(&ctx.gpu.ctx, &[])
+        .map_err(|e| anyhow!("{e}"))?;
     dev.sync();
     let (free1, _) = ctx.gpu.mem_info()?;
     let spent = (free0 - free1) as f64 / 1e9;
     let _ = mtp_path; // the MTP layer stays on GPU 0 (it reads GPU 0's pinned staging)
     let report = format!(
         "; GPU 1: layers {split_at}..{} ({:.1} GB), peer split at {split_at}",
-        hp.n_layer,
-        spent,
+        hp.n_layer, spent,
     );
     let peer = Peer {
         dev,
@@ -4667,9 +4697,10 @@ impl Coder {
             .collect();
         // A saved state covers both stages' GDN layers (GPU 0's first, GPU 1's after).
         let total_gdn = bufs.len()
-            + self.peer.as_ref().map_or(0, |p| {
-                p.layers.iter().filter(|l| l.gdn.is_some()).count()
-            });
+            + self
+                .peer
+                .as_ref()
+                .map_or(0, |p| p.layers.iter().filter(|l| l.gdn.is_some()).count());
         ensure!(
             s.gdn_layers() == total_gdn && parts.len() == 2 * total_gdn + 1,
             "state is for another model"
@@ -4700,10 +4731,7 @@ impl Coder {
             };
             for (i, (st, hist)) in bufs1.into_iter().enumerate() {
                 let (a, b) = (p.dev.buffer_addr(st), p.dev.buffer_addr(hist));
-                for (addr, host) in [
-                    (a, parts[2 * (n0 + i)]),
-                    (b, parts[2 * (n0 + i) + 1]),
-                ] {
+                for (addr, host) in [(a, parts[2 * (n0 + i)]), (b, parts[2 * (n0 + i) + 1])] {
                     htod(addr, bytemuck_f32(host))?;
                 }
             }

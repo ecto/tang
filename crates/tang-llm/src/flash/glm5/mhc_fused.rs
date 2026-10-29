@@ -524,7 +524,13 @@ fn cpu_post(mixes: &[Mix], y: &[f32], r_in: &[f32], n: usize) -> Result<Vec<f32>
 }
 
 /// The CPU pre + weighted RMSNorm (`norm_all`'s `rms_norm_mul`) of every token.
-fn cpu_pre(w: &MhcWeights, r: &[f32], nw: &[f32], eps: f32, n: usize) -> Result<(Vec<f32>, Vec<Mix>)> {
+fn cpu_pre(
+    w: &MhcWeights,
+    r: &[f32],
+    nw: &[f32],
+    eps: f32,
+    n: usize,
+) -> Result<(Vec<f32>, Vec<Mix>)> {
     let t = r.len() / (4 * n);
     let mut x = Vec::with_capacity(t * n);
     let mut mixes = Vec::with_capacity(t);
@@ -583,8 +589,15 @@ pub struct MhcFused {
 impl MhcFused {
     /// `norms[l] = [attn_norm, ffn_norm]` (each `[n]`); `norm_eps` the model's RMS eps.
     /// `Gpu::bind` first.
-    pub fn new(gpu: &Gpu, n: usize, max_t: usize, norms: Vec<[Vec<f32>; 2]>, norm_eps: f32) -> Result<Self> {
-        let ge = |what: &'static str| move |e: tang_moe::gpu::Error| anyhow!("mhc fused {what}: {e}");
+    pub fn new(
+        gpu: &Gpu,
+        n: usize,
+        max_t: usize,
+        norms: Vec<[Vec<f32>; 2]>,
+        norm_eps: f32,
+    ) -> Result<Self> {
+        let ge =
+            |what: &'static str| move |e: tang_moe::gpu::Error| anyhow!("mhc fused {what}: {e}");
         if norms.iter().flatten().any(|v| v.len() != n) {
             bail!("mhc fused: norm weights not {n} wide");
         }
@@ -598,18 +611,20 @@ impl MhcFused {
             .map(|[a, f]| Ok([DevBuf::from_slice(a)?, DevBuf::from_slice(f)?]))
             .collect::<std::result::Result<Vec<_>, tang_moe::gpu::Error>>()
             .map_err(ge("norm upload"))?;
-        let dbg = std::env::var("TANG_GLM5_MHC_DEBUG").is_ok_and(|v| v == "1").then(|| Dbg {
-            tol: std::env::var("TANG_GLM5_MHC_DEBUG_TOL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1e-3),
-            last: None,
-            y: None,
-            checks: 0,
-            failed: 0,
-            first: String::new(),
-            worst: (0.0, String::new()),
-        });
+        let dbg = std::env::var("TANG_GLM5_MHC_DEBUG")
+            .is_ok_and(|v| v == "1")
+            .then(|| Dbg {
+                tol: std::env::var("TANG_GLM5_MHC_DEBUG_TOL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1e-3),
+                last: None,
+                y: None,
+                checks: 0,
+                failed: 0,
+                first: String::new(),
+                worst: (0.0, String::new()),
+            });
         Ok(Self {
             module: gpu.module(SRC).map_err(ge("compile"))?,
             s: Stream::blocking().map_err(ge("stream"))?,
@@ -650,7 +665,8 @@ impl MhcFused {
     /// Fill `buf`'s first `k` f32 with NaN (synchronous: the legacy-stream copy waits for
     /// the blocking stream's earlier kernels and the next launch waits for it).
     fn nan(buf: &DevBuf, k: usize) -> Result<()> {
-        buf.write(0, &vec![f32::NAN; k]).map_err(|e| anyhow!("mhc fused poison: {e}"))
+        buf.write(0, &vec![f32::NAN; k])
+            .map_err(|e| anyhow!("mhc fused poison: {e}"))
     }
 
     /// Windows completed so far.
@@ -661,9 +677,15 @@ impl MhcFused {
     /// Start a window: upload the embedded streams `r` `[t][4][n]`.
     pub fn begin(&mut self, r: &[f32], t: usize) -> Result<()> {
         if t == 0 || t > self.max_t || r.len() != t * 4 * self.n {
-            bail!("mhc fused begin: t {t} (max {}), {} values", self.max_t, r.len());
+            bail!(
+                "mhc fused begin: t {t} (max {}), {} values",
+                self.max_t,
+                r.len()
+            );
         }
-        self.r.write(0, r).map_err(|e| anyhow!("mhc fused begin: {e}"))?;
+        self.r
+            .write(0, r)
+            .map_err(|e| anyhow!("mhc fused begin: {e}"))?;
         self.t = t;
         self.pending = false;
         if let Some(d) = self.dbg.as_mut() {
@@ -676,8 +698,17 @@ impl MhcFused {
     /// `mhcf_part` over the window: the pending post (if any) and, with `fn_ != 0`, this
     /// half's partial dots; `h != 0` also writes the head mean.
     fn part(&self, fn_: u64, h: u64) -> Result<()> {
-        let f = self.module.func("mhcf_part").map_err(|e| anyhow!("mhcf_part: {e}"))?;
-        let (r, y, post, comb, part) = (self.r.ptr, self.y_src, self.post.ptr, self.comb.ptr, self.part.ptr);
+        let f = self
+            .module
+            .func("mhcf_part")
+            .map_err(|e| anyhow!("mhcf_part: {e}"))?;
+        let (r, y, post, comb, part) = (
+            self.r.ptr,
+            self.y_src,
+            self.post.ptr,
+            self.comb.ptr,
+            self.part.ptr,
+        );
         let n = self.n as i32;
         let do_post = i32::from(self.pending);
         let do_part = i32::from(fn_ != 0);
@@ -709,13 +740,22 @@ impl MhcFused {
             Self::nan(&self.part, t * self.ch * 25)?;
             Self::nan(&self.x, t * n)?;
         }
-        let (r, part, nw, x, post, comb) =
-            (self.r.ptr, self.part.ptr, self.norm[l][block].ptr, x_dst, self.post.ptr, self.comb.ptr);
+        let (r, part, nw, x, post, comb) = (
+            self.r.ptr,
+            self.part.ptr,
+            self.norm[l][block].ptr,
+            x_dst,
+            self.post.ptr,
+            self.comb.ptr,
+        );
         let (ch, n, it, ne) = (self.ch as i32, self.n as i32, iters as i32, self.norm_eps);
         let fast = i32::from(self.fast);
         let smem = (self.n.max(self.ch * 25) * 4) as u32;
         if self.fold {
-            let f = self.module.func("mhcf_fold").map_err(|e| anyhow!("mhcf_fold: {e}"))?;
+            let f = self
+                .module
+                .func("mhcf_fold")
+                .map_err(|e| anyhow!("mhcf_fold: {e}"))?;
             let (y, cnt, do_post) = (self.y_src, self.cnt.ptr, i32::from(self.pending));
             self.pending = false;
             unsafe {
@@ -725,8 +765,10 @@ impl MhcFused {
                     (1024, 1, 1),
                     smem,
                     &self.s,
-                    tang_moe::args![r, y, post, comb, fn_, part, n, do_post, base, scale, nw, x, it,
-                        hc_eps, rms_eps, ne, fast, cnt],
+                    tang_moe::args![
+                        r, y, post, comb, fn_, part, n, do_post, base, scale, nw, x, it, hc_eps,
+                        rms_eps, ne, fast, cnt
+                    ],
                 )
             }
             .map_err(|e| anyhow!("mhcf_fold launch: {e}"))?;
@@ -740,7 +782,10 @@ impl MhcFused {
             Self::nan(&self.post, t * 4)?;
             Self::nan(&self.comb, t * 16)?;
         }
-        let f = self.module.func("mhcf_finish").map_err(|e| anyhow!("mhcf_finish: {e}"))?;
+        let f = self
+            .module
+            .func("mhcf_finish")
+            .map_err(|e| anyhow!("mhcf_finish: {e}"))?;
         unsafe {
             tang_moe::gpu::launch(
                 f,
@@ -748,14 +793,22 @@ impl MhcFused {
                 (1024, 1, 1),
                 smem,
                 &self.s,
-                tang_moe::args![r, part, ch, base, scale, nw, x, post, comb, n, it, hc_eps, rms_eps, ne, fast],
+                tang_moe::args![
+                    r, part, ch, base, scale, nw, x, post, comb, n, it, hc_eps, rms_eps, ne, fast
+                ],
             )
         }
         .map_err(|e| anyhow!("mhcf_finish launch: {e}"))?;
         Ok(())
     }
 
-    pub fn pre(&mut self, mh: &MhcGpu, l: usize, block: usize, cpu_w: Option<&MhcWeights>) -> Result<Vec<f32>> {
+    pub fn pre(
+        &mut self,
+        mh: &MhcGpu,
+        l: usize,
+        block: usize,
+        cpu_w: Option<&MhcWeights>,
+    ) -> Result<Vec<f32>> {
         let x_dst = self.x.ptr;
         self.pre_launch(mh, l, block, x_dst)?;
         let ge = |e: tang_moe::gpu::Error| anyhow!("mhc fused pre: {e}");
@@ -767,7 +820,13 @@ impl MhcFused {
         Ok(x)
     }
 
-    fn shadow_pre(&mut self, l: usize, block: usize, cpu_w: Option<&MhcWeights>, x: &[f32]) -> Result<()> {
+    fn shadow_pre(
+        &mut self,
+        l: usize,
+        block: usize,
+        cpu_w: Option<&MhcWeights>,
+        x: &[f32],
+    ) -> Result<()> {
         let (t, n) = (self.t, self.n);
         let ge = |e: tang_moe::gpu::Error| anyhow!("mhcdbg read: {e}");
         let r_dev: Vec<f32> = self.r.read(0, t * 4 * n).map_err(ge)?;
@@ -786,7 +845,10 @@ impl MhcFused {
         let (x_cpu, mixes) = cpu_pre(w, &r_dev, &nw, self.norm_eps, n)?;
         d.note(&format!("l{l} pre({half}) x"), &stat(x, &x_cpu));
         let pc: Vec<f32> = mixes.iter().flat_map(|m| m.post).collect();
-        let cc: Vec<f32> = mixes.iter().flat_map(|m| m.comb.into_iter().flatten()).collect();
+        let cc: Vec<f32> = mixes
+            .iter()
+            .flat_map(|m| m.comb.into_iter().flatten())
+            .collect();
         d.note(&format!("l{l} pre({half}) post"), &stat(&post, &pc));
         d.note(&format!("l{l} pre({half}) comb"), &stat(&comb, &cc));
         d.last = Some((mixes, r_dev));
@@ -797,9 +859,16 @@ impl MhcFused {
     /// the next `pre` (or `end`).
     pub fn post(&mut self, y: &[f32]) -> Result<()> {
         if y.len() != self.t * self.n || self.pending {
-            bail!("mhc fused post: {} values (t {}), pending {}", y.len(), self.t, self.pending);
+            bail!(
+                "mhc fused post: {} values (t {}), pending {}",
+                y.len(),
+                self.t,
+                self.pending
+            );
         }
-        self.y.write(0, y).map_err(|e| anyhow!("mhc fused post: {e}"))?;
+        self.y
+            .write(0, y)
+            .map_err(|e| anyhow!("mhc fused post: {e}"))?;
         self.y_src = self.y.ptr;
         self.pending = true;
         if let Some(d) = self.dbg.as_mut() {
@@ -818,7 +887,9 @@ impl MhcFused {
         if t > self.max_t {
             bail!("mhc fused begin_async: t {t} > max {}", self.max_t);
         }
-        self.r.write_async(0, r, &self.s).map_err(|e| anyhow!("mhc fused begin_async: {e}"))?;
+        self.r
+            .write_async(0, r, &self.s)
+            .map_err(|e| anyhow!("mhc fused begin_async: {e}"))?;
         self.set_window(t)
     }
 
@@ -869,7 +940,11 @@ impl MhcFused {
     /// `h` buffer; returns its pointer (`[t][n]` f32, before `output_norm`). No sync.
     pub fn end_dev(&mut self) -> Result<u64> {
         if !self.pending || self.dbg.is_some() {
-            bail!("mhc fused end_dev: pending {}, shadow {}", self.pending, self.dbg.is_some());
+            bail!(
+                "mhc fused end_dev: pending {}, shadow {}",
+                self.pending,
+                self.dbg.is_some()
+            );
         }
         self.part(0, self.h.ptr)?;
         self.pending = false;
@@ -928,7 +1003,11 @@ impl Drop for MhcFused {
                 "mhcdbg SUMMARY: {} checks, {} failed{}; worst rel {:.3e} ({})",
                 d.checks,
                 d.failed,
-                if d.first.is_empty() { String::new() } else { format!("; first: {}", d.first) },
+                if d.first.is_empty() {
+                    String::new()
+                } else {
+                    format!("; first: {}", d.first)
+                },
                 d.worst.0,
                 d.worst.1
             );
@@ -987,9 +1066,17 @@ mod tests {
             };
             let ws = [[mk(&mut st), mk(&mut st)], [mk(&mut st), mk(&mut st)]];
             let norms: Vec<[Vec<f32>; 2]> = (0..2)
-                .map(|_| [(0..n).map(|_| 1.0 + rnd(&mut st)).collect(), (0..n).map(|_| 1.0 + rnd(&mut st)).collect()])
+                .map(|_| {
+                    [
+                        (0..n).map(|_| 1.0 + rnd(&mut st)).collect(),
+                        (0..n).map(|_| 1.0 + rnd(&mut st)).collect(),
+                    ]
+                })
                 .collect();
-            let mhs: Vec<MhcGpu> = ws.iter().map(|[a, f]| MhcGpu::new(&g, [a, f], 64).unwrap()).collect();
+            let mhs: Vec<MhcGpu> = ws
+                .iter()
+                .map(|[a, f]| MhcGpu::new(&g, [a, f], 64).unwrap())
+                .collect();
             let mut fz = MhcFused::new(&g, n, 64, norms.clone(), 1e-5).unwrap();
             fz.set_poison(true);
             for (fold, fast, &t) in [(true, false), (false, false), (true, true), (false, true)]
@@ -999,7 +1086,9 @@ mod tests {
                 (fz.fold, fz.fast) = (fold, fast);
                 eprintln!("fused config fold={fold} fast={fast}");
                 let r0: Vec<f32> = (0..t * 4 * n).map(|_| rnd(&mut st)).collect();
-                let ys: Vec<Vec<f32>> = (0..3).map(|_| (0..t * n).map(|_| rnd(&mut st) * 0.5).collect()).collect();
+                let ys: Vec<Vec<f32>> = (0..3)
+                    .map(|_| (0..t * n).map(|_| rnd(&mut st) * 0.5).collect())
+                    .collect();
                 // CPU chain
                 let mut r = r0.clone();
                 let mut cx = Vec::new();
@@ -1020,20 +1109,33 @@ mod tests {
                 for (k, (l, b)) in [(0usize, 0usize), (0, 1), (1, 0)].into_iter().enumerate() {
                     let x = fz.pre(&mhs[l], l, b, Some(&ws[l][b])).unwrap();
                     let s = stat(&x, &cx[k]);
-                    eprintln!("fused n={n} t={t} step {k} (l{l} b{b}): x rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
-                    assert!(!s.bad(1e-4), "fused pre step {k} (layer {l} block {b}) diverges: {s:?}");
+                    eprintln!(
+                        "fused n={n} t={t} step {k} (l{l} b{b}): x rel {:.3e} max {:.3e}",
+                        s.rel_l2, s.max_abs
+                    );
+                    assert!(
+                        !s.bad(1e-4),
+                        "fused pre step {k} (layer {l} block {b}) diverges: {s:?}"
+                    );
                     worst = worst.max(s.rel_l2);
                     fz.post(&ys[k]).unwrap();
                 }
                 let h = fz.end().unwrap();
                 let s = stat(&h, &h_cpu);
-                eprintln!("fused n={n} t={t} head: rel {:.3e} max {:.3e}", s.rel_l2, s.max_abs);
+                eprintln!(
+                    "fused n={n} t={t} head: rel {:.3e} max {:.3e}",
+                    s.rel_l2, s.max_abs
+                );
                 assert!(!s.bad(1e-4), "fused head diverges: {s:?}");
                 // the wrong block's weights must be visibly wrong (guards a constant index)
                 fz.begin(&r0, t).unwrap();
                 let x1 = fz.pre(&mhs[0], 0, 1, Some(&ws[0][1])).unwrap();
                 let s = stat(&x1, &cx[0]);
-                assert!(s.rel_l2 > 1e-2, "block 1 reproduced block 0's x (rel {:.3e})", s.rel_l2);
+                assert!(
+                    s.rel_l2 > 1e-2,
+                    "block 1 reproduced block 0's x (rel {:.3e})",
+                    s.rel_l2
+                );
                 fz.post(&ys[0]).unwrap();
                 fz.end().unwrap();
             }

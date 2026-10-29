@@ -87,7 +87,8 @@ impl MlaProj {
     /// Upload layer `l`'s projections from the GGUF (bound to the layer's device).
     pub fn new(g: &Gpu, gguf: &crate::gguf::Gguf, l: usize, w: &MlaWeights) -> Result<Self> {
         let t = |s: &str| super::t(l, s);
-        let up = |v: &[f32]| DevBuf::from_slice(v).map_err(|e| anyhow::anyhow!("mla_dev upload: {e}"));
+        let up =
+            |v: &[f32]| DevBuf::from_slice(v).map_err(|e| anyhow::anyhow!("mla_dev upload: {e}"));
         let p = MlaProj {
             k: Kernels5::new(g)?,
             q_a: dev_w(gguf, &t("attn_q_a.weight"))?,
@@ -126,7 +127,10 @@ impl MlaProj {
             // g5f_gemv's activation stride must be a multiple of 32; every row length here
             // is one (real model and the tiny fixtures alike)
             let _ = dw;
-            ensure!(cols % 32 == 0, "mla_dev {n}: cols {cols} not a multiple of 32");
+            ensure!(
+                cols % 32 == 0,
+                "mla_dev {n}: cols {cols} not a multiple of 32"
+            );
         }
         Ok(p)
     }
@@ -135,8 +139,11 @@ impl MlaProj {
         let mut s = self.sc.borrow_mut();
         if s.as_ref().is_none_or(|s| s.cap < t) {
             let cap = t.max(8);
-            let f = |n: usize| DevBuf::zeroed(n * 4).map_err(|e| anyhow::anyhow!("mla_dev scratch: {e}"));
-            let b = |n: usize| DevBuf::zeroed(n).map_err(|e| anyhow::anyhow!("mla_dev scratch: {e}"));
+            let f = |n: usize| {
+                DevBuf::zeroed(n * 4).map_err(|e| anyhow::anyhow!("mla_dev scratch: {e}"))
+            };
+            let b =
+                |n: usize| DevBuf::zeroed(n).map_err(|e| anyhow::anyhow!("mla_dev scratch: {e}"));
             let (h, ql, ov) = (self.hid, self.ql, self.nhdv);
             *s = Some(Scratch {
                 cap,
@@ -165,7 +172,17 @@ impl MlaProj {
 
     /// int8 codes of `x [t][cols]` when any of `ws` is quantised (F32/F16 rows read `xf`).
     #[allow(clippy::too_many_arguments)]
-    fn act(&self, s: &Stream, ws: &[&DevW], xf: u64, xq: u64, xq2: u64, xd: u64, cols: usize, t: usize) -> Result<Act> {
+    fn act(
+        &self,
+        s: &Stream,
+        ws: &[&DevW],
+        xf: u64,
+        xq: u64,
+        xq2: u64,
+        xd: u64,
+        cols: usize,
+        t: usize,
+    ) -> Result<Act> {
         let quant = ws.iter().any(|w| w.w.ty > 1);
         if quant {
             self.k.fast.q8(s, xf, xq, xq2, xd, cols, t)?;
@@ -207,25 +224,49 @@ impl MlaProj {
         let xw = [&self.q_a, &self.ip, &self.kv_a, &self.i_wk, &self.i_gate];
         let ax = self.act(s, &xw, sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, t)?;
         // q_resid = rms_norm(q_a x) * q_a_norm
-        self.k.fast.gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, t, ql, h)?;
-        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, t, self.eps, s).map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, t, ql, h)?;
+        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, t, self.eps, s)
+            .map_err(gerr)?;
         drop(tr);
         let tr = span("q_b");
-        let aq = self.act(s, &[&self.q_b, &self.iq_b], sc.qr.ptr, sc.qrq.ptr, sc.qrq2.ptr, sc.qrd.ptr, ql, t)?;
-        self.k.fast.gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, t, self.nhdk, ql)?;
+        let aq = self.act(
+            s,
+            &[&self.q_b, &self.iq_b],
+            sc.qr.ptr,
+            sc.qrq.ptr,
+            sc.qrq2.ptr,
+            sc.qrd.ptr,
+            ql,
+            t,
+        )?;
+        self.k
+            .fast
+            .gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, t, self.nhdk, ql)?;
         drop(tr);
 
         // the cache appends, on the device: GEMVs straight into the resident rows (the
         // latent through an f32 scratch + norm/bf16), no host staging, no sync
         let tr = span("kv_append");
-        let (lp, kp, gp, vp) = cu.append_rows(pos0, t, c_lat, c_k, c_g, c_valid).map_err(gerr)?;
-        self.k.fast.gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, t, self.dl, h)?;
-        cu.lat_norm_dev(sc.ylat.ptr, self.kvan.ptr, lp, t, s).map_err(gerr)?;
+        let (lp, kp, gp, vp) = cu
+            .append_rows(pos0, t, c_lat, c_k, c_g, c_valid)
+            .map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, t, self.dl, h)?;
+        cu.lat_norm_dev(sc.ylat.ptr, self.kvan.ptr, lp, t, s)
+            .map_err(gerr)?;
         drop(tr);
         let tr = span("idx_append");
-        self.k.fast.gemv(s, self.i_wk.w, 0, ax, kp, self.hd, t, self.hd, h)?;
-        self.k.fast.gemv(s, self.i_gate.w, 0, ax, gp, self.hd, t, self.hd, h)?;
-        cu.idx_ln_dev(kp, self.iknw.ptr, self.iknb.ptr, vp, t, s).map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.i_wk.w, 0, ax, kp, self.hd, t, self.hd, h)?;
+        self.k
+            .fast
+            .gemv(s, self.i_gate.w, 0, ax, gp, self.hd, t, self.hd, h)?;
+        cu.idx_ln_dev(kp, self.iknw.ptr, self.iknb.ptr, vp, t, s)
+            .map_err(gerr)?;
         cu.append_done(pos0, t);
         drop(tr);
         let tr = span("idx_select");
@@ -234,12 +275,24 @@ impl MlaProj {
         } else {
             let n_pool = kv_len / w.kpool;
             // pools stay on the device; the host copy only for the shadow
-            let mut pool_keys = if pool_keys_out.is_some() { vec![0f32; n_pool * w.idx_dim] } else { Vec::new() };
-            cu.idx_pool(c_k, c_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, s).map_err(gerr)?;
-            self.k.fast.gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, t, self.iqr, ql)?;
-            self.k.fast.gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, t, self.ih, h)?;
+            let mut pool_keys = if pool_keys_out.is_some() {
+                vec![0f32; n_pool * w.idx_dim]
+            } else {
+                Vec::new()
+            };
+            cu.idx_pool(c_k, c_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, s)
+                .map_err(gerr)?;
+            self.k
+                .fast
+                .gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, t, self.iqr, ql)?;
+            self.k
+                .fast
+                .gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, t, self.ih, h)?;
             let mut sel = vec![-1i32; t * w.select_width()];
-            cu.idx_run_dev(sc.iq.ptr, sc.hw.ptr, kv_len, 0, n_pool, t, pos0, &mut sel, s).map_err(gerr)?;
+            cu.idx_run_dev(
+                sc.iq.ptr, sc.hw.ptr, kv_len, 0, n_pool, t, pos0, &mut sel, s,
+            )
+            .map_err(gerr)?;
             if let Some(o) = pool_keys_out {
                 *o = pool_keys;
             }
@@ -247,17 +300,31 @@ impl MlaProj {
         };
         drop(tr);
         let tr = span("attend");
-        let ov = cu.attend_dev(sc.q.ptr, kv_len, t, pos0, sel.as_deref(), s).map_err(gerr)?;
+        let ov = cu
+            .attend_dev(sc.q.ptr, kv_len, t, pos0, sel.as_deref(), s)
+            .map_err(gerr)?;
         drop(tr);
         let tr = span("o_proj");
         // o_proj straight off the attention output ([t][nh*dv])
-        let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, t)?;
-        self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
+        let ao = self.act(
+            s,
+            &[&self.o],
+            ov,
+            sc.oq.ptr,
+            sc.oq2.ptr,
+            sc.od.ptr,
+            self.nhdv,
+            t,
+        )?;
+        self.k
+            .fast
+            .gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
         s.sync().map_err(gerr)?;
         let y = sc.y.read::<f32>(0, t * h).map_err(gerr)?;
         drop(tr);
         let tr = span("mirrors");
-        cu.refresh_mirrors(pos0, t, c_lat, c_k, c_g, c_valid).map_err(gerr)?;
+        cu.refresh_mirrors(pos0, t, c_lat, c_k, c_g, c_valid)
+            .map_err(gerr)?;
         drop(tr);
         let (q_resid, q) = if debug {
             (
@@ -308,22 +375,46 @@ impl MlaProj {
         let tr = span("q_a");
         let xw = [&self.q_a, &self.ip, &self.kv_a, &self.i_wk, &self.i_gate];
         let ax = self.act(s, &xw, sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, t)?;
-        self.k.fast.gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, t, ql, h)?;
-        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, t, self.eps, s).map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, t, ql, h)?;
+        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, t, self.eps, s)
+            .map_err(gerr)?;
         drop(tr);
         let tr = span("q_b");
-        let aq = self.act(s, &[&self.q_b, &self.iq_b], sc.qr.ptr, sc.qrq.ptr, sc.qrq2.ptr, sc.qrd.ptr, ql, t)?;
-        self.k.fast.gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, t, self.nhdk, ql)?;
+        let aq = self.act(
+            s,
+            &[&self.q_b, &self.iq_b],
+            sc.qr.ptr,
+            sc.qrq.ptr,
+            sc.qrq2.ptr,
+            sc.qrd.ptr,
+            ql,
+            t,
+        )?;
+        self.k
+            .fast
+            .gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, t, self.nhdk, ql)?;
         drop(tr);
         let tr = span("kv_append");
-        let (lp, kp, gp, vp) = cu.append_rows(pos0, t, c_lat, c_k, c_g, c_valid).map_err(gerr)?;
-        self.k.fast.gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, t, self.dl, h)?;
-        cu.lat_norm_dev(sc.ylat.ptr, self.kvan.ptr, lp, t, s).map_err(gerr)?;
+        let (lp, kp, gp, vp) = cu
+            .append_rows(pos0, t, c_lat, c_k, c_g, c_valid)
+            .map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, t, self.dl, h)?;
+        cu.lat_norm_dev(sc.ylat.ptr, self.kvan.ptr, lp, t, s)
+            .map_err(gerr)?;
         drop(tr);
         let tr = span("idx_append");
-        self.k.fast.gemv(s, self.i_wk.w, 0, ax, kp, self.hd, t, self.hd, h)?;
-        self.k.fast.gemv(s, self.i_gate.w, 0, ax, gp, self.hd, t, self.hd, h)?;
-        cu.idx_ln_dev(kp, self.iknw.ptr, self.iknb.ptr, vp, t, s).map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.i_wk.w, 0, ax, kp, self.hd, t, self.hd, h)?;
+        self.k
+            .fast
+            .gemv(s, self.i_gate.w, 0, ax, gp, self.hd, t, self.hd, h)?;
+        cu.idx_ln_dev(kp, self.iknw.ptr, self.iknb.ptr, vp, t, s)
+            .map_err(gerr)?;
         cu.append_done(pos0, t);
         drop(tr);
         let tr = span("idx_select");
@@ -331,19 +422,39 @@ impl MlaProj {
             (0u64, kv_len)
         } else {
             let n_pool = kv_len / w.kpool;
-            cu.idx_pool(c_k, c_g, &w.i_ape, kv_len, 0, n_pool, &mut [], s).map_err(gerr)?;
-            self.k.fast.gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, t, self.iqr, ql)?;
-            self.k.fast.gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, t, self.ih, h)?;
-            let p = cu.idx_run_dev_resident(sc.iq.ptr, sc.hw.ptr, kv_len, 0, n_pool, t, pos0, s).map_err(gerr)?;
+            cu.idx_pool(c_k, c_g, &w.i_ape, kv_len, 0, n_pool, &mut [], s)
+                .map_err(gerr)?;
+            self.k
+                .fast
+                .gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, t, self.iqr, ql)?;
+            self.k
+                .fast
+                .gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, t, self.ih, h)?;
+            let p = cu
+                .idx_run_dev_resident(sc.iq.ptr, sc.hw.ptr, kv_len, 0, n_pool, t, pos0, s)
+                .map_err(gerr)?;
             (p, w.select_width())
         };
         drop(tr);
         let tr = span("attend");
-        let ov = cu.attend_dev_sel(sc.q.ptr, kv_len, t, pos0, sel_ptr, width, s).map_err(gerr)?;
+        let ov = cu
+            .attend_dev_sel(sc.q.ptr, kv_len, t, pos0, sel_ptr, width, s)
+            .map_err(gerr)?;
         drop(tr);
         let tr = span("o_proj");
-        let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, t)?;
-        self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
+        let ao = self.act(
+            s,
+            &[&self.o],
+            ov,
+            sc.oq.ptr,
+            sc.oq2.ptr,
+            sc.od.ptr,
+            self.nhdv,
+            t,
+        )?;
+        self.k
+            .fast
+            .gemv(s, self.o.w, 0, ao, sc.y.ptr, h, t, h, self.nhdv)?;
         drop(tr);
         Ok(sc.y.ptr)
     }
@@ -353,32 +464,77 @@ impl MlaProj {
     /// and the launches can be captured once. `sparse` picks the indexer branch (the caller
     /// keeps one graph per branch). Device work only: the host watermarks
     /// ([`MlaCuda::append_done`], [`MlaCuda::set_pool_upto`]) and mirrors are the caller's.
-    pub fn window_dev_pos(&self, cu: &MlaCuda, w: &MlaWeights, posp: u64, sparse: bool, s: &Stream) -> Result<u64> {
+    pub fn window_dev_pos(
+        &self,
+        cu: &MlaCuda,
+        w: &MlaWeights,
+        posp: u64,
+        sparse: bool,
+        s: &Stream,
+    ) -> Result<u64> {
         let gerr = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 mla_dev: {e}");
         let sc = self.scratch(1)?;
         let (h, ql) = (self.hid, self.ql);
         let xw = [&self.q_a, &self.ip, &self.kv_a, &self.i_wk, &self.i_gate];
         let ax = self.act(s, &xw, sc.x.ptr, sc.xq.ptr, sc.xq2.ptr, sc.xd.ptr, h, 1)?;
-        self.k.fast.gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, 1, ql, h)?;
-        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, 1, self.eps, s).map_err(gerr)?;
-        let aq = self.act(s, &[&self.q_b, &self.iq_b], sc.qr.ptr, sc.qrq.ptr, sc.qrq2.ptr, sc.qrd.ptr, ql, 1)?;
-        self.k.fast.gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, 1, self.nhdk, ql)?;
-        self.k.fast.gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, 1, self.dl, h)?;
-        cu.lat_norm_pos(sc.ylat.ptr, self.kvan.ptr, posp, s).map_err(gerr)?;
-        self.k.fast.gemv(s, self.i_wk.w, 0, ax, sc.yk.ptr, self.hd, 1, self.hd, h)?;
-        self.k.fast.gemv(s, self.i_gate.w, 0, ax, sc.yg.ptr, self.hd, 1, self.hd, h)?;
-        cu.idx_ln_pos(sc.yk.ptr, sc.yg.ptr, self.iknw.ptr, self.iknb.ptr, posp, s).map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.q_a.w, 0, ax, sc.qr.ptr, ql, 1, ql, h)?;
+        cu.rms_norm_dev(sc.qr.ptr, self.qan.ptr, ql, 1, self.eps, s)
+            .map_err(gerr)?;
+        let aq = self.act(
+            s,
+            &[&self.q_b, &self.iq_b],
+            sc.qr.ptr,
+            sc.qrq.ptr,
+            sc.qrq2.ptr,
+            sc.qrd.ptr,
+            ql,
+            1,
+        )?;
+        self.k
+            .fast
+            .gemv(s, self.q_b.w, 0, aq, sc.q.ptr, self.nhdk, 1, self.nhdk, ql)?;
+        self.k
+            .fast
+            .gemv(s, self.kv_a.w, 0, ax, sc.ylat.ptr, self.dl, 1, self.dl, h)?;
+        cu.lat_norm_pos(sc.ylat.ptr, self.kvan.ptr, posp, s)
+            .map_err(gerr)?;
+        self.k
+            .fast
+            .gemv(s, self.i_wk.w, 0, ax, sc.yk.ptr, self.hd, 1, self.hd, h)?;
+        self.k
+            .fast
+            .gemv(s, self.i_gate.w, 0, ax, sc.yg.ptr, self.hd, 1, self.hd, h)?;
+        cu.idx_ln_pos(sc.yk.ptr, sc.yg.ptr, self.iknw.ptr, self.iknb.ptr, posp, s)
+            .map_err(gerr)?;
         let sel = if sparse {
             cu.idx_pool_pos(&w.i_ape, posp, s).map_err(gerr)?;
-            self.k.fast.gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, 1, self.iqr, ql)?;
-            self.k.fast.gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, 1, self.ih, h)?;
-            cu.idx_select_pos(sc.iq.ptr, sc.hw.ptr, posp, s).map_err(gerr)?
+            self.k
+                .fast
+                .gemv(s, self.iq_b.w, 0, aq, sc.iq.ptr, self.iqr, 1, self.iqr, ql)?;
+            self.k
+                .fast
+                .gemv(s, self.ip.w, 0, ax, sc.hw.ptr, self.ih, 1, self.ih, h)?;
+            cu.idx_select_pos(sc.iq.ptr, sc.hw.ptr, posp, s)
+                .map_err(gerr)?
         } else {
             0
         };
         let ov = cu.attend_pos(sc.q.ptr, posp, sel, s).map_err(gerr)?;
-        let ao = self.act(s, &[&self.o], ov, sc.oq.ptr, sc.oq2.ptr, sc.od.ptr, self.nhdv, 1)?;
-        self.k.fast.gemv(s, self.o.w, 0, ao, sc.y.ptr, h, 1, h, self.nhdv)?;
+        let ao = self.act(
+            s,
+            &[&self.o],
+            ov,
+            sc.oq.ptr,
+            sc.oq2.ptr,
+            sc.od.ptr,
+            self.nhdv,
+            1,
+        )?;
+        self.k
+            .fast
+            .gemv(s, self.o.w, 0, ao, sc.y.ptr, h, 1, h, self.nhdv)?;
         Ok(sc.y.ptr)
     }
 }

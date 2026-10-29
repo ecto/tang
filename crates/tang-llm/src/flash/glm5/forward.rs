@@ -99,7 +99,10 @@ impl Glm5Ref {
     /// One KDA layer's weights as W4's [`super::kda::KdaLayerW`] (dequantised f32, HF layout:
     /// GGUF `[cols, rows]` row-major is HF `[out][in]`; the three depthwise convs, GGUF
     /// `[d_conv, 1, d_inner, 1]` = flat `[chan][tap]`, are stacked q|k|v).
-    pub(crate) fn kda_weights(&self, l: usize) -> Result<(super::kda::KdaLayerW, super::kda::KdaConfig)> {
+    pub(crate) fn kda_weights(
+        &self,
+        l: usize,
+    ) -> Result<(super::kda::KdaLayerW, super::kda::KdaConfig)> {
         let hp = &self.hp;
         let t = |s: &str| super::t(l, s);
         let v = |s: &str| self.vec(&t(s));
@@ -112,9 +115,17 @@ impl Glm5Ref {
         };
         let d_inner = hp.n_head * hp.kda_head_dim;
         let mut conv = Vec::with_capacity(3 * d_inner * hp.ssm_d_conv);
-        for name in ["ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"] {
+        for name in [
+            "ssm_conv1d_q.weight",
+            "ssm_conv1d_k.weight",
+            "ssm_conv1d_v.weight",
+        ] {
             let c = v(name)?;
-            ensure!(c.len() == d_inner * hp.ssm_d_conv, "blk.{l}.{name}: {} floats", c.len());
+            ensure!(
+                c.len() == d_inner * hp.ssm_d_conv,
+                "blk.{l}.{name}: {} floats",
+                c.len()
+            );
             conv.extend_from_slice(&c);
         }
         let w = super::kda::KdaLayerW {
@@ -223,8 +234,7 @@ impl Glm5Ref {
         ensure!(t_len > 0, "no tokens");
         let last = t_len - 1;
         let start = std::time::Instant::now();
-        let mut dump: Option<Vec<DumpEntry>> =
-            (self.dump.is_some()).then(|| Vec::new());
+        let mut dump: Option<Vec<DumpEntry>> = (self.dump.is_some()).then(Vec::new);
         let mut dput = |name: &str, shape: &[usize], data: &[f32]| {
             if let Some(d) = dump.as_mut() {
                 d.push(DumpEntry {
@@ -239,10 +249,7 @@ impl Glm5Ref {
         let embd = self.g.info("token_embd.weight")?;
         let mut r = vec![0f32; t_len * hc * n];
         for (t, &tok) in tokens.iter().enumerate() {
-            ensure!(
-                (tok as usize) < hp.n_vocab,
-                "token {tok} out of range"
-            );
+            ensure!((tok as usize) < hp.n_vocab, "token {tok} out of range");
             let e = self.g.rows(embd, tok as usize, 1)?;
             for c in 0..hc {
                 r[(t * hc + c) * n..(t * hc + c + 1) * n].copy_from_slice(&e);
@@ -265,8 +272,7 @@ impl Glm5Ref {
                 hc_eps: hp.hc_eps,
                 rms_eps: hp.eps,
             };
-            let w_attn =
-                super::mhc::MhcWeights::from_gguf(&self.g, l, "hc_attn", n, &mhp)?;
+            let w_attn = super::mhc::MhcWeights::from_gguf(&self.g, l, "hc_attn", n, &mhp)?;
             let mut mixes: Vec<super::mhc::Mix> = Vec::with_capacity(t_len);
             let mut x = vec![0f32; t_len * n];
             for t in 0..t_len {
@@ -433,7 +439,11 @@ impl Glm5Ref {
             }
             if c0 <= last && last < c1 {
                 let j = last - c0;
-                dput("logits", &[n_vocab], &logits[j * n_vocab..(j + 1) * n_vocab]);
+                dput(
+                    "logits",
+                    &[n_vocab],
+                    &logits[j * n_vocab..(j + 1) * n_vocab],
+                );
             }
             all.extend_from_slice(&logits);
         }
@@ -489,7 +499,6 @@ impl Glm5Ref {
             act: crate::flash::reference::Act::F32,
         })
     }
-
 }
 
 /// The top-k next-token log-probs of one position's logits (f64, ties to the lower id).
@@ -521,9 +530,7 @@ pub fn cli(args: &[String]) -> Result<()> {
             "--ids-file" => {
                 let f = it.next().context("--ids-file F")?;
                 let s = std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?;
-                for w in s
-                    .split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']')
-                {
+                for w in s.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']') {
                     if !w.is_empty() {
                         ids.push(
                             w.parse()
@@ -561,10 +568,7 @@ pub fn cli(args: &[String]) -> Result<()> {
             continue;
         }
         let t = top_logprobs(lg, top);
-        let top_s: Vec<String> = t
-            .iter()
-            .map(|(id, lp)| format!("[{id},{lp:.6}]"))
-            .collect();
+        let top_s: Vec<String> = t.iter().map(|(id, lp)| format!("[{id},{lp:.6}]")).collect();
         writeln!(out, "{{\"pos\":{},\"top\":[{}]}}", i, top_s.join(","))?;
     }
     let mut stdout = std::io::stdout().lock();
@@ -632,15 +636,13 @@ mod tests {
             ("glm5-next.embedding_length", Value::U32(hp.n_embd as u32)),
             ("glm5-next.vocab_size", Value::U32(hp.n_vocab as u32)),
             ("glm5-next.feed_forward_length", Value::U32(hp.n_ff as u32)),
-            ("glm5-next.attention.head_count", Value::U32(hp.n_head as u32)),
+            (
+                "glm5-next.attention.head_count",
+                Value::U32(hp.n_head as u32),
+            ),
             (
                 "glm5-next.attention.head_count_kv",
-                Value::Array(
-                    hp.is_kda
-                        .iter()
-                        .map(|&k| Value::U32(!k as u32))
-                        .collect(),
-                ),
+                Value::Array(hp.is_kda.iter().map(|&k| Value::U32(!k as u32)).collect()),
             ),
             (
                 "glm5-next.attention.layer_norm_rms_epsilon",
@@ -663,7 +665,10 @@ mod tests {
                 Value::U32(hp.d_v as u32),
             ),
             ("glm5-next.kda.head_dim", Value::U32(hp.kda_head_dim as u32)),
-            ("glm5-next.ssm.conv_kernel", Value::U32(hp.ssm_d_conv as u32)),
+            (
+                "glm5-next.ssm.conv_kernel",
+                Value::U32(hp.ssm_d_conv as u32),
+            ),
             (
                 "glm5-next.kda.gate_lower_bound",
                 Value::F32(hp.kda_gate_lower_bound.unwrap_or(-5.0)),
@@ -688,18 +693,12 @@ mod tests {
                 "glm5-next.attention.indexer.kpool_select_tail",
                 Value::Bool(hp.kpool_select_tail),
             ),
-            (
-                "glm5-next.hyper_connection.count",
-                Value::U32(hp.hc as u32),
-            ),
+            ("glm5-next.hyper_connection.count", Value::U32(hp.hc as u32)),
             (
                 "glm5-next.hyper_connection.sinkhorn_iterations",
                 Value::U32(hp.hc_sinkhorn_iters as u32),
             ),
-            (
-                "glm5-next.hyper_connection.epsilon",
-                Value::F32(hp.hc_eps),
-            ),
+            ("glm5-next.hyper_connection.epsilon", Value::F32(hp.hc_eps)),
             ("glm5-next.expert_count", Value::U32(hp.n_expert as u32)),
             (
                 "glm5-next.expert_used_count",
@@ -768,7 +767,11 @@ mod tests {
             vec![hp.n_embd as u64, hp.n_vocab as u64],
             &mut tensors,
         );
-        push("output_norm.weight".into(), vec![hp.n_embd as u64], &mut tensors);
+        push(
+            "output_norm.weight".into(),
+            vec![hp.n_embd as u64],
+            &mut tensors,
+        );
         push(
             "output.weight".into(),
             vec![hp.n_embd as u64, hp.n_vocab as u64],

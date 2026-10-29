@@ -285,9 +285,33 @@ impl MlaWeights {
             }
         }
         Self::new(
-            hidden, q_lora, kv_lora, n_head, qk_nope, v_head, idx_heads, idx_dim, topk, kpool,
-            select_tail, eps, q_a, q_a_norm, q_b, kv_a, kv_a_norm, k_b, v_b, o, i_wk, i_k_norm_w,
-            i_k_norm_b, i_wq_b, i_proj, i_gate, i_ape_hf,
+            hidden,
+            q_lora,
+            kv_lora,
+            n_head,
+            qk_nope,
+            v_head,
+            idx_heads,
+            idx_dim,
+            topk,
+            kpool,
+            select_tail,
+            eps,
+            q_a,
+            q_a_norm,
+            q_b,
+            kv_a,
+            kv_a_norm,
+            k_b,
+            v_b,
+            o,
+            i_wk,
+            i_k_norm_w,
+            i_k_norm_b,
+            i_wq_b,
+            i_proj,
+            i_gate,
+            i_ape_hf,
         )
     }
 
@@ -329,7 +353,13 @@ impl MlaWeights {
 
     /// `q_b_proj`: [t][q_lora] -> [t][n_head·qk_nope] (head-major).
     pub fn gemv_q_b(&self, q_resid: &[f32], t: usize) -> Vec<f32> {
-        gemv(&self.q_b, self.n_head * self.qk_nope, self.q_lora, q_resid, t)
+        gemv(
+            &self.q_b,
+            self.n_head * self.qk_nope,
+            self.q_lora,
+            q_resid,
+            t,
+        )
     }
 }
 
@@ -456,7 +486,9 @@ pub fn indexer_select(
         }
         let qpos = pos0 + qi;
         // keys visible to this query: causal (k <= qpos) and valid
-        let visible: Vec<bool> = (0..kv_len).map(|k| k <= qpos && cache_valid[k] == 1).collect();
+        let visible: Vec<bool> = (0..kv_len)
+            .map(|k| k <= qpos && cache_valid[k] == 1)
+            .collect();
         let visible_count = visible.iter().filter(|&&v| v).count();
         // the query's own incomplete pool: the last visible_count % kpool visible
         // tokens (append_visible_tail)
@@ -615,7 +647,7 @@ pub fn mla_forward(
             let qh = &q[q0..q0 + dk];
             let wk = w.k_nope(h); // [dl][dk]
             let wv = w.v_b_head(h); // [dv][dl]
-            // per-key nope key k = latent @ wk  ([dk]) and score
+                                    // per-key nope key k = latent @ wk  ([dk]) and score
             let mut sc = vec![0f32; ks.len()];
             let mut mx = if uni { 0.0 } else { f32::NEG_INFINITY };
             if uni {
@@ -1735,7 +1767,10 @@ extern "C" __global__ void mla_attn_acc_p(float* __restrict__ qa, const unsigned
 pub fn cuda_prelude(hidden: usize, q_lora: usize, kv_lora: usize, n_head: usize) -> String {
     format!(
         "#define HID {hid}\n#define QL {ql}\n#define DL {dl}\n#define NH {nh}\n",
-        hid = hidden, ql = q_lora, dl = kv_lora, nh = n_head
+        hid = hidden,
+        ql = q_lora,
+        dl = kv_lora,
+        nh = n_head
     )
 }
 
@@ -1773,14 +1808,22 @@ pub mod cuda {
     /// is the bit-identical split (`mla_hgemv` + `mla_attn_lat` + `mla_hgemv`).
     fn mla_split() -> bool {
         static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *S.get_or_init(|| std::env::var("TANG_GLM5_MLA_SPLIT").map(|v| v != "0").unwrap_or(true))
+        *S.get_or_init(|| {
+            std::env::var("TANG_GLM5_MLA_SPLIT")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
     }
 
     /// `TANG_GLM5_ATTN_SPLITK=0` restores the one-block-per-head `mla_attn_lat_p` on the
     /// device-position decode path; the default splits keys/columns over blocks (bit-identical).
     fn attn_splitk() -> bool {
         static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *S.get_or_init(|| std::env::var("TANG_GLM5_ATTN_SPLITK").map(|v| v != "0").unwrap_or(true))
+        *S.get_or_init(|| {
+            std::env::var("TANG_GLM5_ATTN_SPLITK")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
     }
 
     /// Loaded kernels for one geometry (feature "cuda"; NVRTC at construction).
@@ -1795,8 +1838,8 @@ pub mod cuda {
         dv: usize,
         eps: f32,
         // indexer geometry
-        idxd: usize,  // idx_dim
-        idxh: usize,  // idx_heads
+        idxd: usize, // idx_dim
+        idxh: usize, // idx_heads
         kpool: usize,
         topk: usize,
         tail: bool,
@@ -1895,7 +1938,11 @@ pub mod cuda {
         }
 
         fn active_idx(&mut self) -> usize {
-            let i = self.entries.iter().position(|e| e.id == self.active).unwrap();
+            let i = self
+                .entries
+                .iter()
+                .position(|e| e.id == self.active)
+                .unwrap();
             self.tick += 1;
             self.entries[i].tick = self.tick;
             i
@@ -2055,7 +2102,9 @@ pub mod cuda {
         /// regrow (a regrow re-uploads rows `[0, pos0)` from the caller's host mirrors).
         pub fn rows_fit(&self, rows: usize) -> bool {
             let lru = self.seqs.borrow();
-            let Some(e) = lru.entries.iter().find(|e| e.id == lru.active) else { return false };
+            let Some(e) = lru.entries.iter().find(|e| e.id == lru.active) else {
+                return false;
+            };
             let fits = |b: &Option<DevBuf>, need: usize| b.as_ref().is_some_and(|b| b.len >= need);
             fits(&e.lat_d, rows * self.dl * 2)
                 && fits(&e.idk_d, rows * self.idxd * 4)
@@ -2067,10 +2116,7 @@ pub mod cuda {
             let mut lru = self.seqs.borrow_mut();
             let i = lru.active_idx();
             let need = rows * self.dl * 2;
-            let grow = lru.entries[i]
-                .lat_d
-                .as_ref()
-                .is_none_or(|b| b.len < need);
+            let grow = lru.entries[i].lat_d.as_ref().is_none_or(|b| b.len < need);
             if grow {
                 lru.entries[i].lat_d = Some(DevBuf::alloc(need * 2 + 64 * self.dl * 2)?);
                 lru.entries[i].lat_rows = 0;
@@ -2083,26 +2129,17 @@ pub mod cuda {
             let mut lru = self.seqs.borrow_mut();
             let i = lru.active_idx();
             let need = rows * hd * std::mem::size_of::<f32>();
-            let grow_k = lru.entries[i]
-                .idk_d
-                .as_ref()
-                .is_none_or(|b| b.len < need);
+            let grow_k = lru.entries[i].idk_d.as_ref().is_none_or(|b| b.len < need);
             if grow_k {
                 lru.entries[i].idk_d = Some(DevBuf::alloc(need * 2 + 64 * hd * 4)?);
                 lru.entries[i].idx_rows = 0;
             }
-            let grow_g = lru.entries[i]
-                .idg_d
-                .as_ref()
-                .is_none_or(|b| b.len < need);
+            let grow_g = lru.entries[i].idg_d.as_ref().is_none_or(|b| b.len < need);
             if grow_g {
                 lru.entries[i].idg_d = Some(DevBuf::alloc(need * 2 + 64 * hd * 4)?);
                 lru.entries[i].idx_rows = 0;
             }
-            let grow_v = lru.entries[i]
-                .val_d
-                .as_ref()
-                .is_none_or(|b| b.len < rows);
+            let grow_v = lru.entries[i].val_d.as_ref().is_none_or(|b| b.len < rows);
             if grow_v {
                 lru.entries[i].val_d = Some(DevBuf::alloc(rows * 2 + 64)?);
                 lru.entries[i].idx_rows = 0;
@@ -2114,10 +2151,7 @@ pub mod cuda {
             let mut lru = self.seqs.borrow_mut();
             let i = lru.active_idx();
             let need = n_pool * self.idxd * std::mem::size_of::<f32>();
-            let grow = lru.entries[i]
-                .pool_d
-                .as_ref()
-                .is_none_or(|b| b.len < need);
+            let grow = lru.entries[i].pool_d.as_ref().is_none_or(|b| b.len < need);
             if grow {
                 lru.entries[i].pool_d = Some(DevBuf::alloc(need * 2 + 64 * self.idxd * 4)?);
                 lru.entries[i].pool_upto = 0;
@@ -2150,7 +2184,10 @@ pub mod cuda {
                 }
             }
             // + [nh][width.max(topk)] f32 scores for the split-key decode attention
-            grow!(self.qa_d, t * self.nh * (self.dl + 1) + self.nh * width.max(self.topk));
+            grow!(
+                self.qa_d,
+                t * self.nh * (self.dl + 1) + self.nh * width.max(self.topk)
+            );
             grow!(self.hw_d, t * self.idxh);
             grow!(self.iq_d, t * self.idxh * self.idxd);
             {
@@ -2167,9 +2204,9 @@ pub mod cuda {
         /// [t][dl] u16 rows back. `cache` must have room for `pos0 + t` rows.
         pub fn kv_append(
             &self,
-            kv_a: &[f32],     // [dl*hid]
-            kv_a_norm: &[f32],// [dl]
-            x: &[f32],        // [t][hid]
+            kv_a: &[f32],      // [dl*hid]
+            kv_a_norm: &[f32], // [dl]
+            x: &[f32],         // [t][hid]
             t: usize,
             pos0: usize,
             cache: &mut [u16], // [cap][dl] (host mirror; rows [0..pos0) may be stale here)
@@ -2239,7 +2276,11 @@ pub mod cuda {
                 // (Was `pos0 * dl`, an element count: every decode / later-window row's
                 // mirror held row pos0/2's bytes, and any re-upload from the mirror — a
                 // cache realloc, a sequence switch-back after eviction — served them.)
-                lru.entries[i].lat_d.as_ref().unwrap().read(pos0 * self.dl * 2, t * self.dl)?
+                lru.entries[i]
+                    .lat_d
+                    .as_ref()
+                    .unwrap()
+                    .read(pos0 * self.dl * 2, t * self.dl)?
             };
             cache[pos0 * self.dl..(pos0 + t) * self.dl].copy_from_slice(&rows);
             {
@@ -2251,453 +2292,514 @@ pub mod cuda {
         }
 
         /// Compute the `n_pool` pooled keys from the token-level cache: `pool_keys`
-    /// [n_pool][idx_dim] f32, pool `p` covering cache rows `first_key + p*kpool ..`.
-    /// `i_ape`: [kpool][idx_dim] slot-major (HF layout). One block per pool.
-    pub fn idx_pool(
-        &self,
-        cache_k: &[f32],
-        cache_gate: &[f32],
-        i_ape: &[f32],
-        kv_len: usize,
-        first_key: usize,
-        n_pool: usize,
-        pool_keys: &mut [f32],
-        stream: &Stream,
-    ) -> Result<(), gpu::Error> {
-        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
-        let hd = self.idxd;
-        let kp = self.kpool;
-        assert_eq!(i_ape.len(), kp * hd);
-        // empty `pool_keys`: leave the pools on the device (no sync, no host copy)
-        assert!(pool_keys.is_empty() || pool_keys.len() == n_pool * hd);
-        self.ensure_pool(n_pool)?;
-        // resident idk/idg are authoritative only when idx_append wrote every row of the
-        // current sequence contiguously; else fall back to uploading the caller's mirrors
-        {
-            let mut lru = self.seqs.borrow_mut();
-            let i = lru.active_idx();
-            if lru.entries[i].idx_rows != kv_len {
-                drop(lru);
-                self.ensure_idx(kv_len)?;
+        /// [n_pool][idx_dim] f32, pool `p` covering cache rows `first_key + p*kpool ..`.
+        /// `i_ape`: [kpool][idx_dim] slot-major (HF layout). One block per pool.
+        pub fn idx_pool(
+            &self,
+            cache_k: &[f32],
+            cache_gate: &[f32],
+            i_ape: &[f32],
+            kv_len: usize,
+            first_key: usize,
+            n_pool: usize,
+            pool_keys: &mut [f32],
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            let hd = self.idxd;
+            let kp = self.kpool;
+            assert_eq!(i_ape.len(), kp * hd);
+            // empty `pool_keys`: leave the pools on the device (no sync, no host copy)
+            assert!(pool_keys.is_empty() || pool_keys.len() == n_pool * hd);
+            self.ensure_pool(n_pool)?;
+            // resident idk/idg are authoritative only when idx_append wrote every row of the
+            // current sequence contiguously; else fall back to uploading the caller's mirrors
+            {
                 let mut lru = self.seqs.borrow_mut();
                 let i = lru.active_idx();
-                let hd0 = self.idxd;
-                lru.entries[i]
-                    .idk_d
-                    .as_ref()
-                    .unwrap()
-                    .write(0, &cache_k[..kv_len * hd0])?;
-                lru.entries[i]
-                    .idg_d
-                    .as_ref()
-                    .unwrap()
-                    .write(0, &cache_gate[..kv_len * hd0])?;
-                lru.entries[i]
-                    .val_d
-                    .as_ref()
-                    .unwrap()
-                    .write(0, &vec![1u8; kv_len])?;
-                lru.entries[i].idx_rows = kv_len;
-                lru.entries[i].pool_upto = 0; // pools must be recomputed for the new data
-            }
-        }
-        // INCREMENTAL: pools [0..watermark) are already computed in the resident pool_d
-        // (a pool key depends only on its own kpool cache rows, which are immutable once
-        // written), so only pools [watermark..n_pool) run the kernel. The kernel reads
-        // the RESIDENT idk_d/idg_d (staged by idx_append) — no cache re-upload per window.
-        {
-            let mut lru = self.seqs.borrow_mut();
-            let i = lru.active_idx();
-            if kv_len < lru.entries[i].pool_upto.saturating_sub(1) * kp + kp {
-                // cache shrank (new sequence): recompute everything
-                lru.entries[i].pool_upto = 0;
-            }
-        }
-        let from = {
-            let mut lru = self.seqs.borrow_mut();
-            let i = lru.active_idx();
-            let f = lru.entries[i].pool_upto.min(n_pool);
-            lru.entries[i].tick = {
-                lru.tick += 1;
-                lru.tick
-            };
-            f
-        };
-        if from < n_pool {
-            // i_ape is a per-layer constant; stage once
-            let apd = {
-                let mut a = self.ape_d.borrow_mut();
-                if a.is_none() {
-                    *a = Some(DevBuf::from_slice(i_ape)?);
+                if lru.entries[i].idx_rows != kv_len {
+                    drop(lru);
+                    self.ensure_idx(kv_len)?;
+                    let mut lru = self.seqs.borrow_mut();
+                    let i = lru.active_idx();
+                    let hd0 = self.idxd;
+                    lru.entries[i]
+                        .idk_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &cache_k[..kv_len * hd0])?;
+                    lru.entries[i]
+                        .idg_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &cache_gate[..kv_len * hd0])?;
+                    lru.entries[i]
+                        .val_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &vec![1u8; kv_len])?;
+                    lru.entries[i].idx_rows = kv_len;
+                    lru.entries[i].pool_upto = 0; // pools must be recomputed for the new data
                 }
-                a.as_ref().unwrap().ptr
+            }
+            // INCREMENTAL: pools [0..watermark) are already computed in the resident pool_d
+            // (a pool key depends only on its own kpool cache rows, which are immutable once
+            // written), so only pools [watermark..n_pool) run the kernel. The kernel reads
+            // the RESIDENT idk_d/idg_d (staged by idx_append) — no cache re-upload per window.
+            {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                if kv_len < lru.entries[i].pool_upto.saturating_sub(1) * kp + kp {
+                    // cache shrank (new sequence): recompute everything
+                    lru.entries[i].pool_upto = 0;
+                }
+            }
+            let from = {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                let f = lru.entries[i].pool_upto.min(n_pool);
+                lru.entries[i].tick = {
+                    lru.tick += 1;
+                    lru.tick
+                };
+                f
             };
-            let (ck_ptr, cg_ptr, vd_ptr) = {
+            if from < n_pool {
+                // i_ape is a per-layer constant; stage once
+                let apd = {
+                    let mut a = self.ape_d.borrow_mut();
+                    if a.is_none() {
+                        *a = Some(DevBuf::from_slice(i_ape)?);
+                    }
+                    a.as_ref().unwrap().ptr
+                };
+                let (ck_ptr, cg_ptr, vd_ptr) = {
+                    let lru = self.seqs.borrow();
+                    let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                    (
+                        lru.entries[i].idk_d.as_ref().unwrap().ptr + (first_key * hd * 4) as u64,
+                        lru.entries[i].idg_d.as_ref().unwrap().ptr + (first_key * hd * 4) as u64,
+                        lru.entries[i].val_d.as_ref().unwrap().ptr + first_key as u64,
+                    )
+                };
+                let pd_ptr = {
+                    let lru = self.seqs.borrow();
+                    let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                    // the BASE: the kernel indexes slots by the global pool id
+                    lru.entries[i].pool_d.as_ref().unwrap().ptr
+                };
+                let f = self.m.func("idx_pool_keys")?;
+                let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
+                let mut hd_ = hd as i32;
+                let mut kp_ = kp as i32;
+                let mut from_ = from as i32;
+                unsafe {
+                    gpu::launch(
+                        f,
+                        ((n_pool - from) as u32, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        stream,
+                        tang_moe::args![
+                            ck_ptr, cg_ptr, apd, vd_ptr, pd_ptr, kvlen, fk, npl, hd_, kp_, from_
+                        ],
+                    )?
+                };
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                lru.entries[i].pool_upto = n_pool;
+            }
+            if pool_keys.is_empty() {
+                return Ok(());
+            }
+            stream.sync()?;
+            // hand the engine its full host copy (256 KB at the real geometry — acceptable)
+            let full: Vec<f32> = {
                 let lru = self.seqs.borrow();
                 let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                lru.entries[i]
+                    .pool_d
+                    .as_ref()
+                    .unwrap()
+                    .read::<f32>(0, pool_keys.len())?
+            };
+            pool_keys.copy_from_slice(&full);
+            Ok(())
+        }
+
+        /// Append `t` tokens' indexer rows (key = LayerNorm(wk·x) with weight+bias eps
+        /// 1e-6, gate = i_gate·x) at `pos0`, and mark them valid. `x`: [t][hidden];
+        /// `cache_k`/`cache_gate`: [cap][idx_dim] f32; `valid`: [cap] u8.
+        pub fn idx_append(
+            &self,
+            i_wk: &[f32], // [idx_dim*hidden]
+            i_k_norm_w: &[f32],
+            i_k_norm_b: &[f32],
+            i_gate: &[f32], // [idx_dim*hidden]
+            x: &[f32],      // [t][hidden]
+            t: usize,
+            pos0: usize,
+            cache_k: &mut [f32],
+            cache_gate: &mut [f32],
+            valid: &mut [u8],
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            let hd = self.idxd;
+            assert_eq!(x.len(), t * self.hid);
+            assert_eq!(i_wk.len(), hd * self.hid);
+            assert_eq!(i_gate.len(), hd * self.hid);
+            assert!(cache_k.len() >= (pos0 + t) * hd);
+            assert!(cache_gate.len() >= (pos0 + t) * hd);
+            self.ensure_idx(pos0 + t)?;
+            let (ck_ptr, cg_ptr, vd_ptr, contiguous) = {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                let contiguous = lru.entries[i].idx_rows == pos0;
+                if !contiguous && pos0 > 0 {
+                    let hd0 = self.idxd;
+                    lru.entries[i]
+                        .idk_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &cache_k[..pos0 * hd0])?;
+                    lru.entries[i]
+                        .idg_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &cache_gate[..pos0 * hd0])?;
+                    lru.entries[i]
+                        .val_d
+                        .as_ref()
+                        .unwrap()
+                        .write(0, &valid[..pos0])?;
+                }
                 (
-                    lru.entries[i].idk_d.as_ref().unwrap().ptr + (first_key * hd * 4) as u64,
-                    lru.entries[i].idg_d.as_ref().unwrap().ptr + (first_key * hd * 4) as u64,
-                    lru.entries[i].val_d.as_ref().unwrap().ptr + first_key as u64,
+                    lru.entries[i].idk_d.as_ref().unwrap().ptr,
+                    lru.entries[i].idg_d.as_ref().unwrap().ptr,
+                    lru.entries[i].val_d.as_ref().unwrap().ptr,
+                    contiguous,
                 )
             };
-            let pd_ptr = {
-                let lru = self.seqs.borrow();
-                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-                // the BASE: the kernel indexes slots by the global pool id
-                lru.entries[i].pool_d.as_ref().unwrap().ptr
+            // resident indexer weights (per-layer constants) — i_wk and i_gate are big
+            // [idx_dim*hidden] f32; stage once, not per window
+            let wkd = {
+                let mut w = self.iwk_d.borrow_mut();
+                if w.is_none() {
+                    *w = Some(DevBuf::from_slice(i_wk)?);
+                }
+                w.as_ref().unwrap().ptr
             };
-            let f = self.m.func("idx_pool_keys")?;
-            let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
-            let mut hd_ = hd as i32;
-            let mut kp_ = kp as i32;
-            let mut from_ = from as i32;
+            let gwd = {
+                let mut g = self.igw_d.borrow_mut();
+                if g.is_none() {
+                    *g = Some(DevBuf::from_slice(i_gate)?);
+                }
+                g.as_ref().unwrap().ptr
+            };
+            let kwd = {
+                let mut w = self.ikn_d.borrow_mut();
+                if w.is_none() {
+                    *w = Some(DevBuf::from_slice(i_k_norm_w)?);
+                }
+                w.as_ref().unwrap().ptr
+            };
+            let kbd = {
+                let mut b = self.ikb_d.borrow_mut();
+                if b.is_none() {
+                    *b = Some(DevBuf::from_slice(i_k_norm_b)?);
+                }
+                b.as_ref().unwrap().ptr
+            };
+            let xd = DevBuf::from_slice(x)?;
+            let f = self.m.func("idx_key_append")?;
+            let (mut tt, mut p0) = (t as i32, pos0 as i32);
+            let (mut hid, mut hd_) = (self.hid as i32, hd as i32);
             unsafe {
                 gpu::launch(
                     f,
-                    ((n_pool - from) as u32, 1, 1),
+                    (t as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     stream,
-                    tang_moe::args![ck_ptr, cg_ptr, apd, vd_ptr, pd_ptr, kvlen, fk, npl, hd_, kp_, from_],
+                    tang_moe::args![
+                        wkd, kwd, kbd, gwd, xd.ptr, ck_ptr, cg_ptr, tt, p0, hid, hd_, vd_ptr
+                    ],
                 )?
             };
-            let mut lru = self.seqs.borrow_mut();
-            let i = lru.active_idx();
-            lru.entries[i].pool_upto = n_pool;
-        }
-        if pool_keys.is_empty() {
-            return Ok(());
-        }
-        stream.sync()?;
-        // hand the engine its full host copy (256 KB at the real geometry — acceptable)
-        let full: Vec<f32> = {
-            let lru = self.seqs.borrow();
-            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-            lru.entries[i].pool_d.as_ref().unwrap().read::<f32>(0, pool_keys.len())?
-        };
-        pool_keys.copy_from_slice(&full);
-        Ok(())
-    }
-
-    /// Append `t` tokens' indexer rows (key = LayerNorm(wk·x) with weight+bias eps
-    /// 1e-6, gate = i_gate·x) at `pos0`, and mark them valid. `x`: [t][hidden];
-    /// `cache_k`/`cache_gate`: [cap][idx_dim] f32; `valid`: [cap] u8.
-    pub fn idx_append(
-        &self,
-        i_wk: &[f32],     // [idx_dim*hidden]
-        i_k_norm_w: &[f32],
-        i_k_norm_b: &[f32],
-        i_gate: &[f32],   // [idx_dim*hidden]
-        x: &[f32],        // [t][hidden]
-        t: usize,
-        pos0: usize,
-        cache_k: &mut [f32],
-        cache_gate: &mut [f32],
-        valid: &mut [u8],
-        stream: &Stream,
-    ) -> Result<(), gpu::Error> {
-        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
-        let hd = self.idxd;
-        assert_eq!(x.len(), t * self.hid);
-        assert_eq!(i_wk.len(), hd * self.hid);
-        assert_eq!(i_gate.len(), hd * self.hid);
-        assert!(cache_k.len() >= (pos0 + t) * hd);
-        assert!(cache_gate.len() >= (pos0 + t) * hd);
-        self.ensure_idx(pos0 + t)?;
-        let (ck_ptr, cg_ptr, vd_ptr, contiguous) = {
-            let mut lru = self.seqs.borrow_mut();
-            let i = lru.active_idx();
-            let contiguous = lru.entries[i].idx_rows == pos0;
-            if !contiguous && pos0 > 0 {
-                let hd0 = self.idxd;
-                lru.entries[i]
-                    .idk_d
-                    .as_ref()
-                    .unwrap()
-                    .write(0, &cache_k[..pos0 * hd0])?;
-                lru.entries[i]
-                    .idg_d
-                    .as_ref()
-                    .unwrap()
-                    .write(0, &cache_gate[..pos0 * hd0])?;
-                lru.entries[i]
-                    .val_d
-                    .as_ref()
-                    .unwrap()
-                    .write(0, &valid[..pos0])?;
-            }
-            (
-                lru.entries[i].idk_d.as_ref().unwrap().ptr,
-                lru.entries[i].idg_d.as_ref().unwrap().ptr,
-                lru.entries[i].val_d.as_ref().unwrap().ptr,
-                contiguous,
-            )
-        };
-        // resident indexer weights (per-layer constants) — i_wk and i_gate are big
-        // [idx_dim*hidden] f32; stage once, not per window
-        let wkd = {
-            let mut w = self.iwk_d.borrow_mut();
-            if w.is_none() {
-                *w = Some(DevBuf::from_slice(i_wk)?);
-            }
-            w.as_ref().unwrap().ptr
-        };
-        let gwd = {
-            let mut g = self.igw_d.borrow_mut();
-            if g.is_none() {
-                *g = Some(DevBuf::from_slice(i_gate)?);
-            }
-            g.as_ref().unwrap().ptr
-        };
-        let kwd = {
-            let mut w = self.ikn_d.borrow_mut();
-            if w.is_none() {
-                *w = Some(DevBuf::from_slice(i_k_norm_w)?);
-            }
-            w.as_ref().unwrap().ptr
-        };
-        let kbd = {
-            let mut b = self.ikb_d.borrow_mut();
-            if b.is_none() {
-                *b = Some(DevBuf::from_slice(i_k_norm_b)?);
-            }
-            b.as_ref().unwrap().ptr
-        };
-        let xd = DevBuf::from_slice(x)?;
-        let f = self.m.func("idx_key_append")?;
-        let (mut tt, mut p0) = (t as i32, pos0 as i32);
-        let (mut hid, mut hd_) = (self.hid as i32, hd as i32);
-        unsafe {
-            gpu::launch(
-                f,
-                (t as u32, 1, 1),
-                (256, 1, 1),
-                0,
-                stream,
-                tang_moe::args![wkd, kwd, kbd, gwd, xd.ptr, ck_ptr, cg_ptr, tt, p0, hid, hd_, vd_ptr],
-            )?
-        };
-        stream.sync()?;
-        // refresh the engine's host mirror for just the new rows (512 B for t=1)
-        let (nk, ng, nv) = {
-            let lru = self.seqs.borrow();
-            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-            (
-                // byte offsets (f32 rows): was `pos0 * hd`, row pos0/4's bytes
-                lru.entries[i].idk_d.as_ref().unwrap().read(pos0 * hd * 4, t * hd)?,
-                lru.entries[i].idg_d.as_ref().unwrap().read(pos0 * hd * 4, t * hd)?,
-                lru.entries[i].val_d.as_ref().unwrap().read(pos0, t)?,
-            )
-        };
-        cache_k[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&nk);
-        cache_gate[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&ng);
-        valid[pos0..pos0 + t].copy_from_slice(&nv);
-        {
-            let mut lru = self.seqs.borrow_mut();
-            let i = lru.active_idx();
-            lru.entries[i].idx_rows = pos0 + t;
-        }
-        Ok(())
-    }
-
-    /// The pooled indexer for `t` queries at `pos0` over a cache of `kv_len` valid keys
-    /// (`n_pool` complete pools already computed by [`Self::idx_pool`]). Writes
-    /// `sel`: [t][select_width()] i32. `iq`: [t][idx_heads*idx_dim] (`wq_b(q_resid)`),
-    /// `hw`: [t][idx_heads] (raw `weights_proj(x)`, scaled inside).
-    #[allow(clippy::too_many_arguments)]
-    pub fn idx_run(
-        &self,
-        i_wq_b: &[f32], // [idx_heads*idx_dim, q_lora]
-        i_proj: &[f32], // [idx_heads, hidden]
-        q_resid: &[f32],
-        x: &[f32],
-        pool_keys: &[f32], // [n_pool][idx_dim]
-        valid: &[u8],
-        kv_len: usize,
-        first_key: usize,
-        n_pool: usize,
-        t: usize,
-        pos0: usize,
-        sel: &mut [i32],
-        stream: &Stream,
-    ) -> Result<(), gpu::Error> {
-        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
-        let (nh, hd) = (self.idxh, self.idxd);
-        assert_eq!(pool_keys.len(), n_pool * hd);
-        // iq = wq_b · q_resid, hw = proj · x (host GEMVs — small, [t][nh*hd])
-        let iq = {
-            let rows = nh * hd;
-            let mut y = vec![0f32; t * rows];
-            for qi in 0..t {
-                let qr = &q_resid[qi * self.ql..(qi + 1) * self.ql];
-                for (r, o) in y[qi * rows..(qi + 1) * rows].iter_mut().enumerate() {
-                    *o = crate::flash::reference::dot(&i_wq_b[r * self.ql..(r + 1) * self.ql], qr);
-                }
-            }
-            y
-        };
-        let hw = {
-            let mut y = vec![0f32; t * nh];
-            for qi in 0..t {
-                let xi = &x[qi * self.hid..(qi + 1) * self.hid];
-                for (r, o) in y[qi * nh..(qi + 1) * nh].iter_mut().enumerate() {
-                    *o = crate::flash::reference::dot(&i_proj[r * self.hid..(r + 1) * self.hid], xi);
-                }
-            }
-            y
-        };
-        self.ensure_scratch(t)?;
-        // persistent scratch: iq/hw staged (t rows, small); sel out reused
-        {
-            let q = self.iq_d.borrow_mut();
-            q.write(0, &iq)?;
-        }
-        {
-            let h = self.hw_d.borrow_mut();
-            h.write(0, &hw)?;
-        }
-        let iqd_ptr = self.iq_d.borrow().ptr;
-        let hwd_ptr = self.hw_d.borrow().ptr;
-        self.idx_select_at(iqd_ptr, hwd_ptr, pool_keys.len(), kv_len, first_key, n_pool, t, pos0, Some(sel), stream)
-    }
-
-    /// [`Self::idx_run`] with `iq` [t][idx_heads*idx_dim] and `hw` [t][idx_heads] already
-    /// on the device (the resident projection path computes them there).
-    #[allow(clippy::too_many_arguments)]
-    pub fn idx_run_dev(
-        &self,
-        iq: u64,
-        hw: u64,
-        kv_len: usize,
-        first_key: usize,
-        n_pool: usize,
-        t: usize,
-        pos0: usize,
-        sel: &mut [i32],
-        stream: &Stream,
-    ) -> Result<(), gpu::Error> {
-        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
-        self.ensure_scratch(t)?;
-        self.idx_select_at(iq, hw, n_pool * self.idxd, kv_len, first_key, n_pool, t, pos0, Some(sel), stream)
-    }
-
-    /// [`Self::idx_run_dev`] that leaves the selection on the device: returns the
-    /// `[t][select_width]` i32 pointer (this MlaCuda's `sd_out`, valid until the next
-    /// select) for [`Self::attend_dev_sel`]. Async on `stream` (no sync, no copy).
-    #[allow(clippy::too_many_arguments)]
-    pub fn idx_run_dev_resident(
-        &self,
-        iq: u64,
-        hw: u64,
-        kv_len: usize,
-        first_key: usize,
-        n_pool: usize,
-        t: usize,
-        pos0: usize,
-        stream: &Stream,
-    ) -> Result<u64, gpu::Error> {
-        assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
-        self.ensure_scratch(t)?;
-        self.idx_select_at(iq, hw, n_pool * self.idxd, kv_len, first_key, n_pool, t, pos0, None, stream)?;
-        Ok(self.sd_out.borrow().ptr)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn idx_select_at(
-        &self,
-        iqd_ptr: u64,
-        hwd_ptr: u64,
-        pool_len: usize,
-        kv_len: usize,
-        first_key: usize,
-        n_pool: usize,
-        t: usize,
-        pos0: usize,
-        sel: Option<&mut [i32]>,
-        stream: &Stream,
-    ) -> Result<(), gpu::Error> {
-        let (nh, hd) = (self.idxh, self.idxd);
-        // pool keys: always the RESIDENT pool_d. Every caller builds its slice from the
-        // immediately preceding idx_pool host copy (engine and tests both do), so pool_d
-        // holds exactly these values — reading it skips the 256 KB re-upload per window.
-        assert!(
-            pool_len * 4
-                <= self
-                    .seqs
-                    .borrow()
-                    .entries
-                    .iter()
-                    .find(|e| e.id == self.seqs.borrow().active)
-                    .and_then(|e| e.pool_d.as_ref())
-                    .map(|b| b.len)
-                    .unwrap_or(0),
-            "pool buffer sizing"
-        );
-        let pkd_ptr = {
-            let lru = self.seqs.borrow();
-            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-            lru.entries[i].pool_d.as_ref().unwrap().ptr
-        };
-        let vd_ptr = {
-            let lru = self.seqs.borrow();
-            let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
-            lru.entries[i].val_d.as_ref().unwrap().ptr
-        };
-        let sd_ptr = self.sd_out.borrow().ptr;
-        let f = self.m.func("idx_select")?;
-        let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
-        let (mut fk, mut npl) = (first_key as i32, n_pool as i32);
-        let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
-            nh as i32, hd as i32, self.kpool as i32, self.topk as i32,
-            (self.topk + if self.tail { self.kpool - 1 } else { 0 }) as i32,
-        );
-        let mut ssc = 1.0f32 / (hd as f32).sqrt();
-        let mut hsc = 1.0f32 / (nh as f32).sqrt();
-        let n_select = (self.topk / self.kpool).min(n_pool);
-        let smem = (n_select * 8) as u32; // [n_select] i32 + [n_select] f32
-        let dbg = std::env::var("TANG_MLA_DBG").is_ok() && sel.is_some();
-        let dbgd = if dbg {
-            Some(DevBuf::zeroed_elems::<f32>(t * n_pool * 2)?)
-        } else {
-            None
-        };
-        let dbg_ptr = dbgd.as_ref().map(|b| b.ptr).unwrap_or(0);
-        unsafe {
-            gpu::launch(
-                f,
-                (t as u32, 1, 1),
-                (256, 1, 1),
-                smem,
-                stream,
-                tang_moe::args![iqd_ptr, hwd_ptr, pkd_ptr, vd_ptr, sd_ptr, dbg_ptr, tt, kvlen, p0, fk, npl, nh_, hd_, kp_, tk_, wd_, ssc, hsc],
-            )?
-        };
-        let Some(sel) = sel else {
-            return Ok(());
-        };
-        stream.sync()?;
-        sel.copy_from_slice(&self.sd_out.borrow().read(0, sel.len())?);
-        if let Some(db) = &dbgd {
             stream.sync()?;
-            let d = db.read::<f32>(0, t * n_pool * 2)?;
-            if std::env::var("TANG_MLA_DBG").is_ok() {
+            // refresh the engine's host mirror for just the new rows (512 B for t=1)
+            let (nk, ng, nv) = {
+                let lru = self.seqs.borrow();
+                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                (
+                    // byte offsets (f32 rows): was `pos0 * hd`, row pos0/4's bytes
+                    lru.entries[i]
+                        .idk_d
+                        .as_ref()
+                        .unwrap()
+                        .read(pos0 * hd * 4, t * hd)?,
+                    lru.entries[i]
+                        .idg_d
+                        .as_ref()
+                        .unwrap()
+                        .read(pos0 * hd * 4, t * hd)?,
+                    lru.entries[i].val_d.as_ref().unwrap().read(pos0, t)?,
+                )
+            };
+            cache_k[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&nk);
+            cache_gate[pos0 * hd..(pos0 + t) * hd].copy_from_slice(&ng);
+            valid[pos0..pos0 + t].copy_from_slice(&nv);
+            {
+                let mut lru = self.seqs.borrow_mut();
+                let i = lru.active_idx();
+                lru.entries[i].idx_rows = pos0 + t;
+            }
+            Ok(())
+        }
+
+        /// The pooled indexer for `t` queries at `pos0` over a cache of `kv_len` valid keys
+        /// (`n_pool` complete pools already computed by [`Self::idx_pool`]). Writes
+        /// `sel`: [t][select_width()] i32. `iq`: [t][idx_heads*idx_dim] (`wq_b(q_resid)`),
+        /// `hw`: [t][idx_heads] (raw `weights_proj(x)`, scaled inside).
+        #[allow(clippy::too_many_arguments)]
+        pub fn idx_run(
+            &self,
+            i_wq_b: &[f32], // [idx_heads*idx_dim, q_lora]
+            i_proj: &[f32], // [idx_heads, hidden]
+            q_resid: &[f32],
+            x: &[f32],
+            pool_keys: &[f32], // [n_pool][idx_dim]
+            valid: &[u8],
+            kv_len: usize,
+            first_key: usize,
+            n_pool: usize,
+            t: usize,
+            pos0: usize,
+            sel: &mut [i32],
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            let (nh, hd) = (self.idxh, self.idxd);
+            assert_eq!(pool_keys.len(), n_pool * hd);
+            // iq = wq_b · q_resid, hw = proj · x (host GEMVs — small, [t][nh*hd])
+            let iq = {
+                let rows = nh * hd;
+                let mut y = vec![0f32; t * rows];
                 for qi in 0..t {
-                    let row: Vec<String> = (0..n_select)
-                        .map(|k| {
-                            let p = d[qi * n_pool * 2 + 2 * k] as i32;
-                            let sc = d[qi * n_pool * 2 + 2 * k + 1];
-                            format!("{}:{sc:.4}", p)
-                        })
-                        .collect();
-                    if qi < 16 {
-                        eprintln!("dbg qi={qi}: {}", row.join(" "));
+                    let qr = &q_resid[qi * self.ql..(qi + 1) * self.ql];
+                    for (r, o) in y[qi * rows..(qi + 1) * rows].iter_mut().enumerate() {
+                        *o = crate::flash::reference::dot(
+                            &i_wq_b[r * self.ql..(r + 1) * self.ql],
+                            qr,
+                        );
+                    }
+                }
+                y
+            };
+            let hw = {
+                let mut y = vec![0f32; t * nh];
+                for qi in 0..t {
+                    let xi = &x[qi * self.hid..(qi + 1) * self.hid];
+                    for (r, o) in y[qi * nh..(qi + 1) * nh].iter_mut().enumerate() {
+                        *o = crate::flash::reference::dot(
+                            &i_proj[r * self.hid..(r + 1) * self.hid],
+                            xi,
+                        );
+                    }
+                }
+                y
+            };
+            self.ensure_scratch(t)?;
+            // persistent scratch: iq/hw staged (t rows, small); sel out reused
+            {
+                let q = self.iq_d.borrow_mut();
+                q.write(0, &iq)?;
+            }
+            {
+                let h = self.hw_d.borrow_mut();
+                h.write(0, &hw)?;
+            }
+            let iqd_ptr = self.iq_d.borrow().ptr;
+            let hwd_ptr = self.hw_d.borrow().ptr;
+            self.idx_select_at(
+                iqd_ptr,
+                hwd_ptr,
+                pool_keys.len(),
+                kv_len,
+                first_key,
+                n_pool,
+                t,
+                pos0,
+                Some(sel),
+                stream,
+            )
+        }
+
+        /// [`Self::idx_run`] with `iq` [t][idx_heads*idx_dim] and `hw` [t][idx_heads] already
+        /// on the device (the resident projection path computes them there).
+        #[allow(clippy::too_many_arguments)]
+        pub fn idx_run_dev(
+            &self,
+            iq: u64,
+            hw: u64,
+            kv_len: usize,
+            first_key: usize,
+            n_pool: usize,
+            t: usize,
+            pos0: usize,
+            sel: &mut [i32],
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            self.ensure_scratch(t)?;
+            self.idx_select_at(
+                iq,
+                hw,
+                n_pool * self.idxd,
+                kv_len,
+                first_key,
+                n_pool,
+                t,
+                pos0,
+                Some(sel),
+                stream,
+            )
+        }
+
+        /// [`Self::idx_run_dev`] that leaves the selection on the device: returns the
+        /// `[t][select_width]` i32 pointer (this MlaCuda's `sd_out`, valid until the next
+        /// select) for [`Self::attend_dev_sel`]. Async on `stream` (no sync, no copy).
+        #[allow(clippy::too_many_arguments)]
+        pub fn idx_run_dev_resident(
+            &self,
+            iq: u64,
+            hw: u64,
+            kv_len: usize,
+            first_key: usize,
+            n_pool: usize,
+            t: usize,
+            pos0: usize,
+            stream: &Stream,
+        ) -> Result<u64, gpu::Error> {
+            assert!(stream.is_blocking(), "{}", NON_BLOCKING_STREAM);
+            self.ensure_scratch(t)?;
+            self.idx_select_at(
+                iq,
+                hw,
+                n_pool * self.idxd,
+                kv_len,
+                first_key,
+                n_pool,
+                t,
+                pos0,
+                None,
+                stream,
+            )?;
+            Ok(self.sd_out.borrow().ptr)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn idx_select_at(
+            &self,
+            iqd_ptr: u64,
+            hwd_ptr: u64,
+            pool_len: usize,
+            kv_len: usize,
+            first_key: usize,
+            n_pool: usize,
+            t: usize,
+            pos0: usize,
+            sel: Option<&mut [i32]>,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
+            let (nh, hd) = (self.idxh, self.idxd);
+            // pool keys: always the RESIDENT pool_d. Every caller builds its slice from the
+            // immediately preceding idx_pool host copy (engine and tests both do), so pool_d
+            // holds exactly these values — reading it skips the 256 KB re-upload per window.
+            assert!(
+                pool_len * 4
+                    <= self
+                        .seqs
+                        .borrow()
+                        .entries
+                        .iter()
+                        .find(|e| e.id == self.seqs.borrow().active)
+                        .and_then(|e| e.pool_d.as_ref())
+                        .map(|b| b.len)
+                        .unwrap_or(0),
+                "pool buffer sizing"
+            );
+            let pkd_ptr = {
+                let lru = self.seqs.borrow();
+                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                lru.entries[i].pool_d.as_ref().unwrap().ptr
+            };
+            let vd_ptr = {
+                let lru = self.seqs.borrow();
+                let i = lru.entries.iter().position(|e| e.id == lru.active).unwrap();
+                lru.entries[i].val_d.as_ref().unwrap().ptr
+            };
+            let sd_ptr = self.sd_out.borrow().ptr;
+            let f = self.m.func("idx_select")?;
+            let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
+            let (mut fk, mut npl) = (first_key as i32, n_pool as i32);
+            let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
+                nh as i32,
+                hd as i32,
+                self.kpool as i32,
+                self.topk as i32,
+                (self.topk + if self.tail { self.kpool - 1 } else { 0 }) as i32,
+            );
+            let mut ssc = 1.0f32 / (hd as f32).sqrt();
+            let mut hsc = 1.0f32 / (nh as f32).sqrt();
+            let n_select = (self.topk / self.kpool).min(n_pool);
+            let smem = (n_select * 8) as u32; // [n_select] i32 + [n_select] f32
+            let dbg = std::env::var("TANG_MLA_DBG").is_ok() && sel.is_some();
+            let dbgd = if dbg {
+                Some(DevBuf::zeroed_elems::<f32>(t * n_pool * 2)?)
+            } else {
+                None
+            };
+            let dbg_ptr = dbgd.as_ref().map(|b| b.ptr).unwrap_or(0);
+            unsafe {
+                gpu::launch(
+                    f,
+                    (t as u32, 1, 1),
+                    (256, 1, 1),
+                    smem,
+                    stream,
+                    tang_moe::args![
+                        iqd_ptr, hwd_ptr, pkd_ptr, vd_ptr, sd_ptr, dbg_ptr, tt, kvlen, p0, fk, npl,
+                        nh_, hd_, kp_, tk_, wd_, ssc, hsc
+                    ],
+                )?
+            };
+            let Some(sel) = sel else {
+                return Ok(());
+            };
+            stream.sync()?;
+            sel.copy_from_slice(&self.sd_out.borrow().read(0, sel.len())?);
+            if let Some(db) = &dbgd {
+                stream.sync()?;
+                let d = db.read::<f32>(0, t * n_pool * 2)?;
+                if std::env::var("TANG_MLA_DBG").is_ok() {
+                    for qi in 0..t {
+                        let row: Vec<String> = (0..n_select)
+                            .map(|k| {
+                                let p = d[qi * n_pool * 2 + 2 * k] as i32;
+                                let sc = d[qi * n_pool * 2 + 2 * k + 1];
+                                format!("{}:{sc:.4}", p)
+                            })
+                            .collect();
+                        if qi < 16 {
+                            eprintln!("dbg qi={qi}: {}", row.join(" "));
+                        }
                     }
                 }
             }
+            Ok(())
         }
-        Ok(())
-    }
 
         /// Naive attention ([`CUDA_SRC`]). `q`: [t][nh*dk] f32 (`gemv_q_b` output),
         /// `lat`: [n_kv][dl] u16 bf16, `sel`: [t][width] i32 (`width = select_width()`)
@@ -2706,10 +2808,10 @@ pub mod cuda {
         #[allow(clippy::too_many_arguments)]
         pub fn attend(
             &self,
-            wk: &[f32],   // [nh][dl*dk] flat, w.k_nope(h) concatenated
-            wv: &[f32],   // [nh][dv*dl] flat, w.v_b_head(h) concatenated
-            q: &[f32],    // [t][nh*dk]
-            lat: &[u16],  // [n_kv][dl]
+            wk: &[f32],  // [nh][dl*dk] flat, w.k_nope(h) concatenated
+            wv: &[f32],  // [nh][dv*dl] flat, w.v_b_head(h) concatenated
+            q: &[f32],   // [t][nh*dk]
+            lat: &[u16], // [n_kv][dl]
             n_kv: usize,
             t: usize,
             pos0: usize,
@@ -2778,7 +2880,9 @@ pub mod cuda {
             let smem = ((self.dk + self.dv) * 4) as u32;
             // TANG_GLM5_TRACE: the resident f32 K/V decompress weights + the bf16 latents
             // it attends over, once each (the ideal; the naive kernel re-reads per query)
-            gpu::trace::bytes((self.nh * self.dl * (self.dk + self.dv) * 4 + width * self.dl * 2) as u64);
+            gpu::trace::bytes(
+                (self.nh * self.dl * (self.dk + self.dv) * 4 + width * self.dl * 2) as u64,
+            );
             unsafe {
                 gpu::launch(
                     f,
@@ -2786,7 +2890,10 @@ pub mod cuda {
                     (256, 1, 1),
                     smem,
                     stream,
-                    tang_moe::args![qd.ptr, ld_ptr, wkd_ptr, wvd_ptr, sel_ptr, od_ptr, tt, nkv, p0, nh, dk, dv, dl, wd, scale],
+                    tang_moe::args![
+                        qd.ptr, ld_ptr, wkd_ptr, wvd_ptr, sel_ptr, od_ptr, tt, nkv, p0, nh, dk, dv,
+                        dl, wd, scale
+                    ],
                 )?
             };
             stream.sync()?;
@@ -2854,20 +2961,33 @@ pub mod cuda {
             };
             let od_ptr = self.o_d.borrow().ptr;
             let qa_ptr = self.qa_d.borrow().ptr;
-            let (nh, dk, dv, dl, wd) =
-                (self.nh as i32, self.dk as i32, self.dv as i32, self.dl as i32, width as i32);
+            let (nh, dk, dv, dl, wd) = (
+                self.nh as i32,
+                self.dk as i32,
+                self.dv as i32,
+                self.dl as i32,
+                width as i32,
+            );
             let (nkv, p0) = (n_kv as i32, pos0 as i32);
             let scale = 1.0f32 / (self.dk as f32).sqrt();
             let (wkp, wvp) = (self.wk_d.ptr, self.wv_d.ptr);
             if mla_split() {
-                gpu::trace::bytes((self.nh * self.dl * (self.dk + self.dv) * 4 + width * self.dl * 2) as u64);
+                gpu::trace::bytes(
+                    (self.nh * self.dl * (self.dk + self.dv) * 4 + width * self.dl * 2) as u64,
+                );
                 let dn = qa_ptr + (t * self.nh * self.dl * 4) as u64;
                 self.hgemv(wkp, q, qa_ptr, 0, self.dl, self.dk, t, stream)?;
                 let f = self.m.func("mla_attn_lat")?;
                 let smem = ((2 * self.dl + width) * 4) as u32;
                 unsafe {
-                    gpu::launch(f, (self.nh as u32, t as u32, 1), (256, 1, 1), smem, stream,
-                        tang_moe::args![qa_ptr, ld_ptr, sel_ptr, dn, nkv, p0, nh, dl, wd, scale])?
+                    gpu::launch(
+                        f,
+                        (self.nh as u32, t as u32, 1),
+                        (256, 1, 1),
+                        smem,
+                        stream,
+                        tang_moe::args![qa_ptr, ld_ptr, sel_ptr, dn, nkv, p0, nh, dl, wd, scale],
+                    )?
                 };
                 self.hgemv(wvp, qa_ptr, od_ptr, dn, self.dv, self.dl, t, stream)?;
                 return Ok(od_ptr);
@@ -2875,7 +2995,14 @@ pub mod cuda {
             let ff = self.m.func("mla_fold_q2")?;
             gpu::trace::bytes((self.nh * self.dl * self.dk * 4) as u64);
             unsafe {
-                gpu::launch(ff, (self.nh as u32, t as u32, 1), (256, 1, 1), 0, stream, tang_moe::args![q, wkp, qa_ptr, nh, dk, dl])?
+                gpu::launch(
+                    ff,
+                    (self.nh as u32, t as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![q, wkp, qa_ptr, nh, dk, dl],
+                )?
             };
             let f = self.m.func("mla_attn_abs2")?;
             let smem = ((2 * self.dl + width) * 4) as u32;
@@ -2887,7 +3014,9 @@ pub mod cuda {
                     (256, 1, 1),
                     smem,
                     stream,
-                    tang_moe::args![qa_ptr, ld_ptr, wvp, sel_ptr, od_ptr, nkv, p0, nh, dv, dl, wd, scale],
+                    tang_moe::args![
+                        qa_ptr, ld_ptr, wvp, sel_ptr, od_ptr, nkv, p0, nh, dv, dl, wd, scale
+                    ],
                 )?
             };
             Ok(od_ptr)
@@ -2960,26 +3089,76 @@ pub mod cuda {
         }
 
         /// Launch `mla_lat_norm_bf16` (`y` f32 [t][dl] -> bf16 rows at `lat`).
-        pub fn lat_norm_dev(&self, y: u64, an: u64, lat: u64, t: usize, stream: &Stream) -> Result<(), gpu::Error> {
+        pub fn lat_norm_dev(
+            &self,
+            y: u64,
+            an: u64,
+            lat: u64,
+            t: usize,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let f = self.m.func("mla_lat_norm_bf16")?;
             let (yp, ap, lp, dl, eps) = (y, an, lat, self.dl as i32, self.eps);
-            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![yp, ap, lp, dl, eps])? };
+            unsafe {
+                gpu::launch(
+                    f,
+                    (t as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![yp, ap, lp, dl, eps],
+                )?
+            };
             Ok(())
         }
 
         /// Launch `mla_idx_ln` (LayerNorm the k rows at `k` in place, mark `valid`).
-        pub fn idx_ln_dev(&self, k: u64, w: u64, b: u64, valid: u64, t: usize, stream: &Stream) -> Result<(), gpu::Error> {
+        pub fn idx_ln_dev(
+            &self,
+            k: u64,
+            w: u64,
+            b: u64,
+            valid: u64,
+            t: usize,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let f = self.m.func("mla_idx_ln")?;
             let (kp, wp, bp, vp, hd) = (k, w, b, valid, self.idxd as i32);
-            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![kp, wp, bp, vp, hd])? };
+            unsafe {
+                gpu::launch(
+                    f,
+                    (t as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![kp, wp, bp, vp, hd],
+                )?
+            };
             Ok(())
         }
 
         /// `x [t][n]` in place: `x * w / sqrt(mean(x^2) + eps)` per token (device pointers).
-        pub fn rms_norm_dev(&self, x: u64, w: u64, n: usize, t: usize, eps: f32, stream: &Stream) -> Result<(), gpu::Error> {
+        pub fn rms_norm_dev(
+            &self,
+            x: u64,
+            w: u64,
+            n: usize,
+            t: usize,
+            eps: f32,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let f = self.m.func("mla_rms_norm")?;
             let (mut xp, mut wp, mut ni, mut e) = (x, w, n as i32, eps);
-            unsafe { gpu::launch(f, (t as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![xp, wp, ni, e])? };
+            unsafe {
+                gpu::launch(
+                    f,
+                    (t as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![xp, wp, ni, e],
+                )?
+            };
             Ok(())
         }
 
@@ -2991,7 +3170,9 @@ pub mod cuda {
         /// Rows the active sequence's latent + indexer caches hold without a regrow.
         pub fn row_cap(&self) -> usize {
             let lru = self.seqs.borrow();
-            let Some(e) = lru.entries.iter().find(|e| e.id == lru.active) else { return 0 };
+            let Some(e) = lru.entries.iter().find(|e| e.id == lru.active) else {
+                return 0;
+            };
             let cap = |b: &Option<DevBuf>, per: usize| b.as_ref().map_or(0, |b| b.len / per);
             cap(&e.lat_d, self.dl * 2)
                 .min(cap(&e.idk_d, self.idxd * 4))
@@ -3004,18 +3185,28 @@ pub mod cuda {
         pub fn reserve_pool(&self, n_pool: usize) -> Result<bool, gpu::Error> {
             let before = {
                 let lru = self.seqs.borrow();
-                lru.entries.iter().find(|e| e.id == lru.active).and_then(|e| e.pool_d.as_ref().map(|b| b.ptr))
+                lru.entries
+                    .iter()
+                    .find(|e| e.id == lru.active)
+                    .and_then(|e| e.pool_d.as_ref().map(|b| b.ptr))
             };
             self.ensure_pool(n_pool)?;
             let lru = self.seqs.borrow();
-            let after = lru.entries.iter().find(|e| e.id == lru.active).and_then(|e| e.pool_d.as_ref().map(|b| b.ptr));
+            let after = lru
+                .entries
+                .iter()
+                .find(|e| e.id == lru.active)
+                .and_then(|e| e.pool_d.as_ref().map(|b| b.ptr));
             Ok(before != after)
         }
 
         /// The pooled-key watermark of the active sequence (pools `[0, n)` computed).
         pub fn pool_upto(&self) -> usize {
             let lru = self.seqs.borrow();
-            lru.entries.iter().find(|e| e.id == lru.active).map_or(0, |e| e.pool_upto)
+            lru.entries
+                .iter()
+                .find(|e| e.id == lru.active)
+                .map_or(0, |e| e.pool_upto)
         }
 
         /// A graph replay computed pools up to `n`: advance the watermark.
@@ -3032,25 +3223,67 @@ pub mod cuda {
                 .iter()
                 .find(|e| e.id == lru.active)
                 .ok_or_else(|| gpu::Error("mla pos: no active sequence".into()))?;
-            let p = |b: &Option<DevBuf>, n: &str| b.as_ref().map(|b| b.ptr).ok_or_else(|| gpu::Error(format!("mla pos: no {n} cache")));
-            Ok((p(&e.lat_d, "latent")?, p(&e.idk_d, "idx k")?, p(&e.idg_d, "idx gate")?, p(&e.val_d, "valid")?, e.pool_d.as_ref().map_or(0, |b| b.ptr)))
+            let p = |b: &Option<DevBuf>, n: &str| {
+                b.as_ref()
+                    .map(|b| b.ptr)
+                    .ok_or_else(|| gpu::Error(format!("mla pos: no {n} cache")))
+            };
+            Ok((
+                p(&e.lat_d, "latent")?,
+                p(&e.idk_d, "idx k")?,
+                p(&e.idg_d, "idx gate")?,
+                p(&e.val_d, "valid")?,
+                e.pool_d.as_ref().map_or(0, |b| b.ptr),
+            ))
         }
 
         /// `mla_lat_norm_bf16_p`: y [dl] f32 -> latent row `*posp`.
-        pub fn lat_norm_pos(&self, y: u64, an: u64, posp: u64, stream: &Stream) -> Result<(), gpu::Error> {
+        pub fn lat_norm_pos(
+            &self,
+            y: u64,
+            an: u64,
+            posp: u64,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let (lat, ..) = self.bases()?;
             let f = self.m.func("mla_lat_norm_bf16_p")?;
             let (dl, eps) = (self.dl as i32, self.eps);
-            unsafe { gpu::launch(f, (1, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![y, an, lat, dl, eps, posp])? };
+            unsafe {
+                gpu::launch(
+                    f,
+                    (1, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![y, an, lat, dl, eps, posp],
+                )?
+            };
             Ok(())
         }
 
         /// `mla_idx_ln_p`: the indexer rows `*posp` from the wk / gate GEMV scratch.
-        pub fn idx_ln_pos(&self, yk: u64, yg: u64, w: u64, b: u64, posp: u64, stream: &Stream) -> Result<(), gpu::Error> {
+        pub fn idx_ln_pos(
+            &self,
+            yk: u64,
+            yg: u64,
+            w: u64,
+            b: u64,
+            posp: u64,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let (_, k, g, v, _) = self.bases()?;
             let f = self.m.func("mla_idx_ln_p")?;
             let hd = self.idxd as i32;
-            unsafe { gpu::launch(f, (1, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![yk, yg, k, g, w, b, v, hd, posp])? };
+            unsafe {
+                gpu::launch(
+                    f,
+                    (1, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![yk, yg, k, g, w, b, v, hd, posp],
+                )?
+            };
             Ok(())
         }
 
@@ -3064,10 +3297,17 @@ pub mod cuda {
         }
 
         /// `idx_pool_keys_p`: the pool token `*posp` completes, if any.
-        pub fn idx_pool_pos(&self, i_ape: &[f32], posp: u64, stream: &Stream) -> Result<(), gpu::Error> {
+        pub fn idx_pool_pos(
+            &self,
+            i_ape: &[f32],
+            posp: u64,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let (_, k, g, _, pool) = self.bases()?;
             if pool == 0 {
-                return Err(gpu::Error("idx_pool_pos: no pool buffer (reserve_pool first)".into()));
+                return Err(gpu::Error(
+                    "idx_pool_pos: no pool buffer (reserve_pool first)".into(),
+                ));
             }
             let apd = {
                 let mut a = self.ape_d.borrow_mut();
@@ -3078,48 +3318,103 @@ pub mod cuda {
             };
             let f = self.m.func("idx_pool_keys_p")?;
             let (hd, kp) = (self.idxd as i32, self.kpool as i32);
-            unsafe { gpu::launch(f, (1, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![k, g, apd, pool, hd, kp, posp])? };
+            unsafe {
+                gpu::launch(
+                    f,
+                    (1, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![k, g, apd, pool, hd, kp, posp],
+                )?
+            };
             Ok(())
         }
 
         /// `idx_select_p`: the selection for the query at `*posp`, left on the device;
         /// returns its `[select_width]` i32 pointer.
-        pub fn idx_select_pos(&self, iq: u64, hw: u64, posp: u64, stream: &Stream) -> Result<u64, gpu::Error> {
+        pub fn idx_select_pos(
+            &self,
+            iq: u64,
+            hw: u64,
+            posp: u64,
+            stream: &Stream,
+        ) -> Result<u64, gpu::Error> {
             self.ensure_scratch(1)?;
             let (_, _, _, v, pool) = self.bases()?;
             let sd = self.sd_out.borrow().ptr;
             let f = self.m.func("idx_select_p")?;
-            let (nh, hd, kp, tk) = (self.idxh as i32, self.idxd as i32, self.kpool as i32, self.topk as i32);
+            let (nh, hd, kp, tk) = (
+                self.idxh as i32,
+                self.idxd as i32,
+                self.kpool as i32,
+                self.topk as i32,
+            );
             let wd = (self.topk + if self.tail { self.kpool - 1 } else { 0 }) as i32;
             let ssc = 1.0f32 / (self.idxd as f32).sqrt();
             let hsc = 1.0f32 / (self.idxh as f32).sqrt();
             let smem = ((self.topk / self.kpool) * 8) as u32;
             unsafe {
-                gpu::launch(f, (1, 1, 1), (256, 1, 1), smem, stream, tang_moe::args![iq, hw, pool, v, sd, nh, hd, kp, tk, wd, ssc, hsc, posp])?
+                gpu::launch(
+                    f,
+                    (1, 1, 1),
+                    (256, 1, 1),
+                    smem,
+                    stream,
+                    tang_moe::args![iq, hw, pool, v, sd, nh, hd, kp, tk, wd, ssc, hsc, posp],
+                )?
             };
             Ok(sd)
         }
 
         /// `mla_hgemv`: out [t][nh][rows] = W_h [rows][cols] . x [t][nh][cols] (/ dn when dn != 0).
         #[allow(clippy::too_many_arguments)]
-        fn hgemv(&self, w: u64, x: u64, out: u64, dn: u64, rows: usize, cols: usize, t: usize, stream: &Stream) -> Result<(), gpu::Error> {
+        fn hgemv(
+            &self,
+            w: u64,
+            x: u64,
+            out: u64,
+            dn: u64,
+            rows: usize,
+            cols: usize,
+            t: usize,
+            stream: &Stream,
+        ) -> Result<(), gpu::Error> {
             let f = self.m.func("mla_hgemv")?;
             let (nh, r, c) = (self.nh as i32, rows as i32, cols as i32);
             unsafe {
-                gpu::launch(f, (self.nh as u32, rows.div_ceil(32) as u32, t as u32), (256, 1, 1), 0, stream,
-                    tang_moe::args![w, x, out, dn, nh, r, c])?
+                gpu::launch(
+                    f,
+                    (self.nh as u32, rows.div_ceil(32) as u32, t as u32),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![w, x, out, dn, nh, r, c],
+                )?
             };
             Ok(())
         }
 
         /// [`Self::attend_dev_sel`] at `*posp` (t = 1): `sel_ptr` 0 = dense causal.
-        pub fn attend_pos(&self, q: u64, posp: u64, sel_ptr: u64, stream: &Stream) -> Result<u64, gpu::Error> {
+        pub fn attend_pos(
+            &self,
+            q: u64,
+            posp: u64,
+            sel_ptr: u64,
+            stream: &Stream,
+        ) -> Result<u64, gpu::Error> {
             self.ensure_scratch(1)?;
             let (lat, ..) = self.bases()?;
             let od_ptr = self.o_d.borrow().ptr;
             let qa_ptr = self.qa_d.borrow().ptr;
             let sw = self.topk + if self.tail { self.kpool - 1 } else { 0 };
-            let (nh, dk, dv, dl, wd) = (self.nh as i32, self.dk as i32, self.dv as i32, self.dl as i32, sw as i32);
+            let (nh, dk, dv, dl, wd) = (
+                self.nh as i32,
+                self.dk as i32,
+                self.dv as i32,
+                self.dl as i32,
+                sw as i32,
+            );
             let scale = 1.0f32 / (self.dk as f32).sqrt();
             let (wkp, wvp) = (self.wk_d.ptr, self.wv_d.ptr);
             // dense width <= topk (dense only while kv_len <= topk), sparse = sw
@@ -3134,29 +3429,65 @@ pub mod cuda {
                     let swd_i = swd as i32;
                     let fs = self.m.func("mla_attn_sc_p")?;
                     unsafe {
-                        gpu::launch(fs, (self.nh as u32, swd.div_ceil(64) as u32, 1), (256, 1, 1), (self.dl * 4) as u32, stream,
-                            tang_moe::args![qa_ptr, lat, sel_ptr, scp, nh, dl, wd, swd_i, scale, posp])?
+                        gpu::launch(
+                            fs,
+                            (self.nh as u32, swd.div_ceil(64) as u32, 1),
+                            (256, 1, 1),
+                            (self.dl * 4) as u32,
+                            stream,
+                            tang_moe::args![
+                                qa_ptr, lat, sel_ptr, scp, nh, dl, wd, swd_i, scale, posp
+                            ],
+                        )?
                     };
                     let fa = self.m.func("mla_attn_acc_p")?;
                     unsafe {
-                        gpu::launch(fa, (self.nh as u32, self.dl.div_ceil(32) as u32, 1), (256, 1, 1), (swd * 4) as u32, stream,
-                            tang_moe::args![qa_ptr, lat, sel_ptr, scp, dn, nh, dl, wd, swd_i, posp])?
+                        gpu::launch(
+                            fa,
+                            (self.nh as u32, self.dl.div_ceil(32) as u32, 1),
+                            (256, 1, 1),
+                            (swd * 4) as u32,
+                            stream,
+                            tang_moe::args![qa_ptr, lat, sel_ptr, scp, dn, nh, dl, wd, swd_i, posp],
+                        )?
                     };
                 } else {
                     let f = self.m.func("mla_attn_lat_p")?;
                     unsafe {
-                        gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream,
-                            tang_moe::args![qa_ptr, lat, sel_ptr, dn, nh, dl, wd, scale, posp])?
+                        gpu::launch(
+                            f,
+                            (self.nh as u32, 1, 1),
+                            (256, 1, 1),
+                            smem,
+                            stream,
+                            tang_moe::args![qa_ptr, lat, sel_ptr, dn, nh, dl, wd, scale, posp],
+                        )?
                     };
                 }
                 self.hgemv(wvp, qa_ptr, od_ptr, dn, self.dv, self.dl, 1, stream)?;
                 return Ok(od_ptr);
             }
             let ff = self.m.func("mla_fold_q2")?;
-            unsafe { gpu::launch(ff, (self.nh as u32, 1, 1), (256, 1, 1), 0, stream, tang_moe::args![q, wkp, qa_ptr, nh, dk, dl])? };
+            unsafe {
+                gpu::launch(
+                    ff,
+                    (self.nh as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    tang_moe::args![q, wkp, qa_ptr, nh, dk, dl],
+                )?
+            };
             let f = self.m.func("mla_attn_abs2_p")?;
             unsafe {
-                gpu::launch(f, (self.nh as u32, 1, 1), (256, 1, 1), smem, stream, tang_moe::args![qa_ptr, lat, wvp, sel_ptr, od_ptr, nh, dv, dl, wd, scale, posp])?
+                gpu::launch(
+                    f,
+                    (self.nh as u32, 1, 1),
+                    (256, 1, 1),
+                    smem,
+                    stream,
+                    tang_moe::args![qa_ptr, lat, wvp, sel_ptr, od_ptr, nh, dv, dl, wd, scale, posp],
+                )?
             };
             Ok(od_ptr)
         }
@@ -3169,10 +3500,10 @@ pub mod cuda {
         #[allow(clippy::too_many_arguments)]
         pub fn attend_absorbed(
             &self,
-            wk: &[f32],   // [nh][dl*dk] flat, w.k_nope(h) concatenated
-            wv: &[f32],   // [nh][dv*dl] flat, w.v_b_head(h) concatenated
-            q: &[f32],    // [t][nh*dk]
-            lat: &[u16],  // [n_kv][dl] bf16
+            wk: &[f32],  // [nh][dl*dk] flat, w.k_nope(h) concatenated
+            wv: &[f32],  // [nh][dv*dl] flat, w.v_b_head(h) concatenated
+            q: &[f32],   // [t][nh*dk]
+            lat: &[u16], // [n_kv][dl] bf16
             n_kv: usize,
             t: usize,
             pos0: usize,
@@ -3222,12 +3553,8 @@ pub mod cuda {
             let sd = sel.map(DevBuf::from_slice).transpose()?;
             // fold: q' = W_k^T q (one block per (query, head))
             let ff = self.m.func("mla_fold_q")?;
-            let (mut ftt, mut fnh, mut fdk, mut fdl) = (
-                t as i32,
-                self.nh as i32,
-                self.dk as i32,
-                self.dl as i32,
-            );
+            let (mut ftt, mut fnh, mut fdk, mut fdl) =
+                (t as i32, self.nh as i32, self.dk as i32, self.dl as i32);
             unsafe {
                 gpu::launch(
                     ff,
@@ -3241,12 +3568,8 @@ pub mod cuda {
             // absorbed attention
             let f2 = self.m.func("mla_attn_absorbed")?;
             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
-            let (mut nh, mut dv, mut dl, mut wd) = (
-                self.nh as i32,
-                self.dv as i32,
-                self.dl as i32,
-                width as i32,
-            );
+            let (mut nh, mut dv, mut dl, mut wd) =
+                (self.nh as i32, self.dv as i32, self.dl as i32, width as i32);
             let mut scale = 1.0f32 / (self.dk as f32).sqrt();
             let sel_ptr = sd.as_ref().map(|b| b.ptr).unwrap_or(0); // as_ref: a moved DevBuf frees before the launch
             let smem = (self.dl * 4) as u32;
@@ -3257,7 +3580,10 @@ pub mod cuda {
                     (256, 1, 1),
                     smem,
                     stream,
-                    tang_moe::args![qad_ptr, ld_ptr, wvd_ptr, sel_ptr, od_ptr, tt, nkv, p0, nh, dv, dl, wd, scale],
+                    tang_moe::args![
+                        qad_ptr, ld_ptr, wvd_ptr, sel_ptr, od_ptr, tt, nkv, p0, nh, dv, dl, wd,
+                        scale
+                    ],
                 )?
             };
             stream.sync()?;
@@ -3279,7 +3605,8 @@ pub mod cuda {
             let e = lru.entries.iter().find(|e| e.id == lru.active).unwrap();
             let (dl, hd) = (self.dl, self.idxd);
             fn get(b: &Option<DevBuf>) -> Result<&DevBuf, gpu::Error> {
-                b.as_ref().ok_or_else(|| gpu::Error("debug_rows: not allocated".into()))
+                b.as_ref()
+                    .ok_or_else(|| gpu::Error("debug_rows: not allocated".into()))
             }
             Ok((
                 get(&e.lat_d)?.read::<u16>(from * dl * 2, n * dl)?,
@@ -3423,15 +3750,23 @@ pub mod cuda {
                     acc += l / sum * cache_k[(base + j) * w.idx_dim + d];
                 }
                 let got = pool_keys[p * w.idx_dim + d];
-                assert!(
-                    (got - acc).abs() < 1e-5,
-                    "pool {p} dim {d}: {got} vs {acc}"
-                );
+                assert!((got - acc).abs() < 1e-5, "pool {p} dim {d}: {got} vs {acc}");
             }
         }
         // selection
         let mask = vec![1u8; t];
-        let sel_cpu = super::indexer_select(&w, &x, &q_resid, &cache_k, &cache_gate, &valid, &mask, t, t, 0);
+        let sel_cpu = super::indexer_select(
+            &w,
+            &x,
+            &q_resid,
+            &cache_k,
+            &cache_gate,
+            &valid,
+            &mask,
+            t,
+            t,
+            0,
+        );
         let mut sel_gpu = vec![-1i32; t * w.select_width()];
         cu.idx_run(
             &w.i_wq_b,
@@ -3497,7 +3832,10 @@ pub mod cuda {
                 }
             }
         }
-        assert!(set_err as f32 <= 0.15 * t as f32, "idx set mismatch {set_err}/{t}");
+        assert!(
+            set_err as f32 <= 0.15 * t as f32,
+            "idx set mismatch {set_err}/{t}"
+        );
 
         // attention parity, dense and sparse, on the bf16 cache
         let q = w.gemv_q_b(&q_resid, t);
@@ -3506,14 +3844,26 @@ pub mod cuda {
         let mut outv = vec![0f32; t * w.n_head * w.v_head];
         cu.attend(&wk, &wv, &q, &cache, t, t, 0, None, &mut outv, &stream)
             .unwrap();
-        let sel: Vec<i32> = std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let sel: Vec<i32> =
+            std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
         let mut outv2 = vec![0f32; t * w.n_head * w.v_head];
-        cu.attend(&wk, &wv, &q, &cache, t, t, 0, Some(&sel), &mut outv2, &stream)
-            .unwrap();
+        cu.attend(
+            &wk,
+            &wv,
+            &q,
+            &cache,
+            t,
+            t,
+            0,
+            Some(&sel),
+            &mut outv2,
+            &stream,
+        )
+        .unwrap();
         let d: f32 = outv
             .iter()
             .zip(&outv2)
@@ -3542,7 +3892,10 @@ pub mod cuda {
         eprintln!(
             "glm5 mla cuda: dense-vs-sparse gpu maxerr {d:.3e}; worst covered-row {worst_row}: {worst_dense_row:.3e}"
         );
-        assert!(worst_dense_row < 1e-3, "dense vs sparse gpu covered-row maxerr {worst_dense_row}");
+        assert!(
+            worst_dense_row < 1e-3,
+            "dense vs sparse gpu covered-row maxerr {worst_dense_row}"
+        );
 
         // GPU sparse attention vs the CPU reference end to end (bf16 latents, so a
         // looser bar than the f32 CPU-vs-HF 1.9e-8)
@@ -3570,19 +3923,8 @@ pub mod cuda {
         // absorbed GPU path vs the CPU absorbed reference (same bf16 latents, same bar)
         let mut out_ga = vec![0f32; t * w.hidden];
         let mut av = vec![0f32; t * w.n_head * w.v_head];
-        cu.attend_absorbed(
-            &wk,
-            &wv,
-            &q,
-            &cache,
-            t,
-            t,
-            0,
-            Some(&sel),
-            &mut av,
-            &stream,
-        )
-        .unwrap();
+        cu.attend_absorbed(&wk, &wv, &q, &cache, t, t, 0, Some(&sel), &mut av, &stream)
+            .unwrap();
         for qi in 0..t {
             for (r, o) in out_ga[qi * w.hidden..(qi + 1) * w.hidden]
                 .iter_mut()
@@ -3650,8 +3992,17 @@ pub mod cuda {
         cu.kv_append(&w.kv_a, &w.kv_a_norm, &x, t, 0, &mut lat_mirror, &stream)
             .unwrap();
         cu.idx_append(
-            &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, &x, t, 0,
-            &mut idx_k, &mut idx_g, &mut valid, &stream,
+            &w.i_wk,
+            &w.i_k_norm_w,
+            &w.i_k_norm_b,
+            &w.i_gate,
+            &x,
+            t,
+            0,
+            &mut idx_k,
+            &mut idx_g,
+            &mut valid,
+            &stream,
         )
         .unwrap();
         // window 2: a "decode" token reusing row 0's x (content irrelevant; the point is
@@ -3660,8 +4011,17 @@ pub mod cuda {
         cu.kv_append(&w.kv_a, &w.kv_a_norm, x2, 1, t, &mut lat_mirror, &stream)
             .unwrap();
         cu.idx_append(
-            &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, x2, 1, t,
-            &mut idx_k, &mut idx_g, &mut valid, &stream,
+            &w.i_wk,
+            &w.i_k_norm_w,
+            &w.i_k_norm_b,
+            &w.i_gate,
+            x2,
+            1,
+            t,
+            &mut idx_k,
+            &mut idx_g,
+            &mut valid,
+            &stream,
         )
         .unwrap();
         let kv2 = t + 1;
@@ -3680,24 +4040,50 @@ pub mod cuda {
         );
 
         // attend over the resident cache at kv2 (decode row)
-        let sel: Vec<i32> = std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        eprintln!("glm5 mla cuda: resident-flow sel row 0 = {:?} (t = {t})", &sel[..width]);
+        let sel: Vec<i32> =
+            std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+        eprintln!(
+            "glm5 mla cuda: resident-flow sel row 0 = {:?} (t = {t})",
+            &sel[..width]
+        );
         let q = w.gemv_q_b(&q_resid[..w.q_lora], 1); // q for token 0 as a stand-in decode query
         let wk: Vec<f32> = (0..w.n_head).flat_map(|h| w.k_nope(h).to_vec()).collect();
         let wv: Vec<f32> = (0..w.n_head).flat_map(|h| w.v_b_head(h).to_vec()).collect();
         let mut out_resident = vec![0f32; w.n_head * w.v_head];
-        cu.attend(&wk, &wv, &q, &lat_mirror, kv2, 1, t, Some(&sel[..width]), &mut out_resident, &stream)
-            .unwrap();
+        cu.attend(
+            &wk,
+            &wv,
+            &q,
+            &lat_mirror,
+            kv2,
+            1,
+            t,
+            Some(&sel[..width]),
+            &mut out_resident,
+            &stream,
+        )
+        .unwrap();
 
         // reference: a FRESH MlaCuda (no resident state) with a plain upload
         let cu2 = MlaCuda::new(&w).unwrap();
         let mut out_upload = vec![0f32; w.n_head * w.v_head];
-        cu2.attend(&wk, &wv, &q, &lat_mirror, kv2, 1, t, Some(&sel[..width]), &mut out_upload, &stream)
-            .unwrap();
+        cu2.attend(
+            &wk,
+            &wv,
+            &q,
+            &lat_mirror,
+            kv2,
+            1,
+            t,
+            Some(&sel[..width]),
+            &mut out_upload,
+            &stream,
+        )
+        .unwrap();
         let e: f32 = out_resident
             .iter()
             .zip(&out_upload)
@@ -3709,11 +4095,21 @@ pub mod cuda {
         {
             let (lat_dev, ..) = cu.debug_rows(0, kv2).unwrap();
             let bad_rows: Vec<usize> = (0..kv2)
-                .filter(|&r| lat_dev[r * w.kv_lora..(r + 1) * w.kv_lora] != lat_mirror[r * w.kv_lora..(r + 1) * w.kv_lora])
+                .filter(|&r| {
+                    lat_dev[r * w.kv_lora..(r + 1) * w.kv_lora]
+                        != lat_mirror[r * w.kv_lora..(r + 1) * w.kv_lora]
+                })
                 .collect();
-            let latf: Vec<f32> = lat_mirror.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+            let latf: Vec<f32> = lat_mirror
+                .iter()
+                .map(|&b| f32::from_bits((b as u32) << 16))
+                .collect();
             let (nh, dk, dv, dl) = (w.n_head, w.qk_nope, w.v_head, w.kv_lora);
-            let keys: Vec<usize> = sel[..width].iter().filter(|&&i| i >= 0).map(|&i| i as usize).collect();
+            let keys: Vec<usize> = sel[..width]
+                .iter()
+                .filter(|&&i| i >= 0)
+                .map(|&i| i as usize)
+                .collect();
             let mut cpu = vec![0f32; nh * dv];
             for h in 0..nh {
                 let (wkh, wvh) = (w.k_nope(h), w.v_b_head(h));
@@ -3722,7 +4118,9 @@ pub mod cuda {
                     .iter()
                     .map(|&k| {
                         let kl = &latf[k * dl..(k + 1) * dl];
-                        (0..dk).map(|d| qh[d] * (0..dl).map(|l| kl[l] * wkh[l * dk + d]).sum::<f32>()).sum::<f32>()
+                        (0..dk)
+                            .map(|d| qh[d] * (0..dl).map(|l| kl[l] * wkh[l * dk + d]).sum::<f32>())
+                            .sum::<f32>()
                             / (dk as f32).sqrt()
                     })
                     .collect();
@@ -3733,12 +4131,21 @@ pub mod cuda {
                     cpu[h * dv + d] = keys
                         .iter()
                         .zip(&p)
-                        .map(|(&k, &pi)| pi * (0..dl).map(|l| wvh[d * dl + l] * latf[k * dl + l]).sum::<f32>())
+                        .map(|(&k, &pi)| {
+                            pi * (0..dl)
+                                .map(|l| wvh[d * dl + l] * latf[k * dl + l])
+                                .sum::<f32>()
+                        })
                         .sum::<f32>()
                         / den;
                 }
             }
-            let mx = |a: &[f32]| a.iter().zip(&cpu).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let mx = |a: &[f32]| {
+                a.iter()
+                    .zip(&cpu)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max)
+            };
             eprintln!(
                 "glm5 mla cuda: resident-flow diag: keys {keys:?}; resident rows != mirror: {bad_rows:?}; \
                  resident vs CPU {:.3e}, upload vs CPU {:.3e}",
@@ -3746,20 +4153,47 @@ pub mod cuda {
                 mx(&out_upload)
             );
         }
-        assert!(row_eq(&lat_mirror, w.kv_lora), "lat mirror row t != device row (read-back offset)");
-        assert!(row_eq_f(&idx_k, w.idx_dim), "idx_k mirror row t != device row (read-back offset)");
-        assert!(row_eq_f(&idx_g, w.idx_dim), "idx_g mirror row t != device row (read-back offset)");
+        assert!(
+            row_eq(&lat_mirror, w.kv_lora),
+            "lat mirror row t != device row (read-back offset)"
+        );
+        assert!(
+            row_eq_f(&idx_k, w.idx_dim),
+            "idx_k mirror row t != device row (read-back offset)"
+        );
+        assert!(
+            row_eq_f(&idx_g, w.idx_dim),
+            "idx_g mirror row t != device row (read-back offset)"
+        );
         assert_eq!(valid[t], 1);
         assert!(e < 1e-5, "resident attend flow maxerr {e}");
 
         // indexer: resident pools vs upload pools
         let n_pool = kv2 / w.kpool;
         let mut pk_resident = vec![0f32; n_pool * w.idx_dim];
-        cu.idx_pool(&idx_k, &idx_g, &w.i_ape, kv2, 0, n_pool, &mut pk_resident, &stream)
-            .unwrap();
+        cu.idx_pool(
+            &idx_k,
+            &idx_g,
+            &w.i_ape,
+            kv2,
+            0,
+            n_pool,
+            &mut pk_resident,
+            &stream,
+        )
+        .unwrap();
         let mut pk_upload = vec![0f32; n_pool * w.idx_dim];
-        cu2.idx_pool(&idx_k, &idx_g, &w.i_ape, kv2, 0, n_pool, &mut pk_upload, &stream)
-            .unwrap();
+        cu2.idx_pool(
+            &idx_k,
+            &idx_g,
+            &w.i_ape,
+            kv2,
+            0,
+            n_pool,
+            &mut pk_upload,
+            &stream,
+        )
+        .unwrap();
         let e2: f32 = pk_resident
             .iter()
             .zip(&pk_upload)
@@ -3784,8 +4218,17 @@ pub mod cuda {
         cu.kv_append(&w.kv_a, &w.kv_a_norm, &x_b, t, 0, &mut lat_b, &stream)
             .unwrap();
         cu.idx_append(
-            &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, &x_b, t, 0,
-            &mut idx_k_b, &mut idx_g_b, &mut valid_b, &stream,
+            &w.i_wk,
+            &w.i_k_norm_w,
+            &w.i_k_norm_b,
+            &w.i_gate,
+            &x_b,
+            t,
+            0,
+            &mut idx_k_b,
+            &mut idx_g_b,
+            &mut valid_b,
+            &stream,
         )
         .unwrap();
         // the reset broke contiguity (lat_rows was t+1, pos0 is 0): the append must have
@@ -3799,12 +4242,30 @@ pub mod cuda {
         assert_eq!(idx_rows_b, t, "re-base after reset (idx)");
         let mut out_b_resident = vec![0f32; w.n_head * w.v_head];
         cu.attend(
-            &wk, &wv, &q, &lat_b, t, 1, t - 1, Some(&sel[..width]), &mut out_b_resident, &stream,
+            &wk,
+            &wv,
+            &q,
+            &lat_b,
+            t,
+            1,
+            t - 1,
+            Some(&sel[..width]),
+            &mut out_b_resident,
+            &stream,
         )
         .unwrap();
         let mut out_b_upload = vec![0f32; w.n_head * w.v_head];
         cu2.attend(
-            &wk, &wv, &q, &lat_b, t, 1, t - 1, Some(&sel[..width]), &mut out_b_upload, &stream,
+            &wk,
+            &wv,
+            &q,
+            &lat_b,
+            t,
+            1,
+            t - 1,
+            Some(&sel[..width]),
+            &mut out_b_upload,
+            &stream,
         )
         .unwrap();
         let e3: f32 = out_b_resident
@@ -3832,7 +4293,10 @@ pub mod cuda {
         eprintln!(
             "glm5 mla cuda: reset check — A vs B last-row latent maxdiff {diff_ab:.3e} (nonzero ⇒ the test actually exercises different data)"
         );
-        assert!(diff_ab > 1e-3, "sequences A and B must differ for this test to be meaningful");
+        assert!(
+            diff_ab > 1e-3,
+            "sequences A and B must differ for this test to be meaningful"
+        );
 
         // INTERLEAVE: switch back to A — its resident state must still be warm (same
         // rows, no re-upload), and an attend must match a fresh-MlaCuda reference.
@@ -3840,8 +4304,19 @@ pub mod cuda {
         cu.kv_append(&w.kv_a, &w.kv_a_norm, x2, 1, t, &mut lat_mirror, &stream)
             .unwrap(); // A's decode row t (contiguous again: lat_rows was t)
         let mut out_a2 = vec![0f32; w.n_head * w.v_head];
-        cu.attend(&wk, &wv, &q, &lat_mirror, kv2, 1, t, Some(&sel[..width]), &mut out_a2, &stream)
-            .unwrap();
+        cu.attend(
+            &wk,
+            &wv,
+            &q,
+            &lat_mirror,
+            kv2,
+            1,
+            t,
+            Some(&sel[..width]),
+            &mut out_a2,
+            &stream,
+        )
+        .unwrap();
         let e4: f32 = out_a2
             .iter()
             .zip(&out_upload)
@@ -3881,44 +4356,91 @@ pub mod cuda {
         let mut idx_k = vec![0f32; (t + 8) * w.idx_dim];
         let mut idx_g = vec![0f32; (t + 8) * w.idx_dim];
         let mut valid = vec![0u8; t + 8];
-        cu.kv_append(&w.kv_a, &w.kv_a_norm, &x, t, 0, &mut lat, &stream).unwrap();
+        cu.kv_append(&w.kv_a, &w.kv_a_norm, &x, t, 0, &mut lat, &stream)
+            .unwrap();
         cu.idx_append(
-            &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, &x, t, 0,
-            &mut idx_k, &mut idx_g, &mut valid, &stream,
+            &w.i_wk,
+            &w.i_k_norm_w,
+            &w.i_k_norm_b,
+            &w.i_gate,
+            &x,
+            t,
+            0,
+            &mut idx_k,
+            &mut idx_g,
+            &mut valid,
+            &stream,
         )
         .unwrap();
         // pools [0, t/kpool) resident first, so the call below is INCREMENTAL (from > 0).
         // (The first version of this test skipped this and passed with the bug half-fixed:
         // a single idx_pool call always has from = 0.)
         let mut pk0 = vec![0f32; (t / w.kpool) * w.idx_dim];
-        cu.idx_pool(&idx_k, &idx_g, &w.i_ape, t, 0, t / w.kpool, &mut pk0, &stream).unwrap();
+        cu.idx_pool(
+            &idx_k,
+            &idx_g,
+            &w.i_ape,
+            t,
+            0,
+            t / w.kpool,
+            &mut pk0,
+            &stream,
+        )
+        .unwrap();
         let upto0 = {
             let lru = cu.seqs.borrow();
-            lru.entries.iter().find(|e| e.id == lru.active).map(|e| e.pool_upto).unwrap()
+            lru.entries
+                .iter()
+                .find(|e| e.id == lru.active)
+                .map(|e| e.pool_upto)
+                .unwrap()
         };
         assert_eq!(upto0, t / w.kpool);
         for i in 0..4 {
             let r = &x[i * w.hidden..(i + 1) * w.hidden];
-            cu.kv_append(&w.kv_a, &w.kv_a_norm, r, 1, t + i, &mut lat, &stream).unwrap();
+            cu.kv_append(&w.kv_a, &w.kv_a_norm, r, 1, t + i, &mut lat, &stream)
+                .unwrap();
             cu.idx_append(
-                &w.i_wk, &w.i_k_norm_w, &w.i_k_norm_b, &w.i_gate, r, 1, t + i,
-                &mut idx_k, &mut idx_g, &mut valid, &stream,
+                &w.i_wk,
+                &w.i_k_norm_w,
+                &w.i_k_norm_b,
+                &w.i_gate,
+                r,
+                1,
+                t + i,
+                &mut idx_k,
+                &mut idx_g,
+                &mut valid,
+                &stream,
             )
             .unwrap();
         }
         let kv = t + 4;
         let n_pool = kv / w.kpool;
-        assert_eq!(n_pool, t / w.kpool + 1, "the incremental case: from = n_pool - 1");
+        assert_eq!(
+            n_pool,
+            t / w.kpool + 1,
+            "the incremental case: from = n_pool - 1"
+        );
         let mut pk = vec![0f32; n_pool * w.idx_dim];
-        cu.idx_pool(&idx_k, &idx_g, &w.i_ape, kv, 0, n_pool, &mut pk, &stream).unwrap();
+        cu.idx_pool(&idx_k, &idx_g, &w.i_ape, kv, 0, n_pool, &mut pk, &stream)
+            .unwrap();
 
         // reference: a FRESH MlaCuda, the mirrors uploaded whole (its own from == 0)
         let mut pk2 = vec![0f32; n_pool * w.idx_dim];
-        cu2.idx_pool(&idx_k, &idx_g, &w.i_ape, kv, 0, n_pool, &mut pk2, &stream).unwrap();
-        let e: f32 = pk.iter().zip(&pk2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        cu2.idx_pool(&idx_k, &idx_g, &w.i_ape, kv, 0, n_pool, &mut pk2, &stream)
+            .unwrap();
+        let e: f32 = pk
+            .iter()
+            .zip(&pk2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         let from = {
             let lru = cu.seqs.borrow();
-            lru.entries.iter().find(|e| e.id == lru.active).map(|e| e.pool_upto)
+            lru.entries
+                .iter()
+                .find(|e| e.id == lru.active)
+                .map(|e| e.pool_upto)
         };
         eprintln!("glm5 mla cuda: incremental (pool_upto {from:?}) pool vs fresh maxerr {e:.3e}");
         assert!(e < 1e-5, "incremental pool content {e}");
@@ -4016,7 +4538,10 @@ mod tests {
     }
 
     fn maxerr(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
     }
 
     /// LayerNorm of the indexer key: learned weight+bias, eps 1e-6, mean/var over dims.
@@ -4070,11 +4595,11 @@ mod tests {
         // exactly-tied relu-clamped scores is torch.topk's internal artifact; see the
         // indexer_select doc). Rows whose top-(n_select) boundary is not tied must
         // match element for element.
-        let hf_scores = load("hf_index_scores", &[t, 130 / 4.max(1)]);
+        let hf_scores = load("hf_index_scores", &[t, 130 / 4]);
         let n_pool = 130 / 4;
         for qi in 0..t {
-            let a = sel[qi * width..(qi + 1) * width].iter().copied().collect::<Vec<_>>();
-            let r = ref_sel[qi * width..(qi + 1) * width].iter().copied().collect::<Vec<_>>();
+            let a = sel[qi * width..(qi + 1) * width].to_vec();
+            let r = ref_sel[qi * width..(qi + 1) * width].to_vec();
             let mut as_ = a.iter().copied().filter(|&i| i >= 0).collect::<Vec<_>>();
             let mut rs = r.iter().copied().filter(|&i| i >= 0).collect::<Vec<_>>();
             as_.sort();
@@ -4093,8 +4618,7 @@ mod tests {
                     }
                 })
                 .collect();
-            vis_scores
-                .sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            vis_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             let boundary = vis_scores[n_sel_w - 1];
             let tied = vis_scores
                 .iter()
@@ -4126,9 +4650,7 @@ mod tests {
             // artifact); only require exact order when all n_sel selected scores are
             // pairwise distinct
             let sel_scores = &sv[..n_sel.min(sv.len())];
-            let distinct = sel_scores
-                .windows(2)
-                .all(|w| (w[0] - w[1]).abs() > 1e-9);
+            let distinct = sel_scores.windows(2).all(|w| (w[0] - w[1]).abs() > 1e-9);
             if distinct && a != r {
                 assert_eq!(a, r, "row {qi} exact order (no ties)");
             }
@@ -4140,7 +4662,10 @@ mod tests {
         let _env = crate::flash::glm5::env_read();
         let m = load_meta();
         let w = weights_from_fixtures();
-        let (b, s) = (m["B"].as_u64().unwrap() as usize, m["S"].as_u64().unwrap() as usize);
+        let (b, s) = (
+            m["B"].as_u64().unwrap() as usize,
+            m["S"].as_u64().unwrap() as usize,
+        );
         let t = b * s;
         let x = load("input_x", &[t, w.hidden]);
         let q_resid = load("ref_q_resid", &[t, w.q_lora]);
@@ -4154,9 +4679,20 @@ mod tests {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let width = w.select_width();
+        let _width = w.select_width();
         let mut out2 = vec![0f32; t * w.hidden];
-        mla_forward(&w, &x, &q_resid, &k_lat, t, t, 0, None, Some(&sel), &mut out2);
+        mla_forward(
+            &w,
+            &x,
+            &q_resid,
+            &k_lat,
+            t,
+            t,
+            0,
+            None,
+            Some(&sel),
+            &mut out2,
+        );
         let e2 = maxerr(&out2, &ref_out);
         eprintln!("glm5 mla: sparse attn out maxerr {e2:.3e}");
         assert!(e2 < 1e-4, "sparse attn out maxerr {e2}");
@@ -4169,7 +4705,10 @@ mod tests {
                 e = e.max((out[qi * w.hidden + c] - ref_out[qi * w.hidden + c]).abs());
             }
         }
-        assert!(e < 1e-4, "dense attn out maxerr (first {dense_rows} rows) {e}");
+        assert!(
+            e < 1e-4,
+            "dense attn out maxerr (first {dense_rows} rows) {e}"
+        );
         // beyond that the sparse selection drops tokens, so dense != ref there (sanity)
         if t > dense_rows + 1 {
             let mut e3 = 0f32;
@@ -4188,11 +4727,17 @@ mod tests {
         let m = load_meta();
         let w = weights_from_fixtures();
         let p = &m["padded"];
-        let (b, s) = (p["B"].as_u64().unwrap() as usize, p["S"].as_u64().unwrap() as usize);
+        let (b, s) = (
+            p["B"].as_u64().unwrap() as usize,
+            p["S"].as_u64().unwrap() as usize,
+        );
         let pad0 = p["pad0"].as_u64().unwrap() as usize;
         let x = load("p_input_x", &[b * s, w.hidden]);
         let mask_f = load("p_mask", &[b * s, 1]);
-        let mask: Vec<u8> = mask_f.iter().map(|&v| if v > 0.5 { 1 } else { 0 }).collect();
+        let mask: Vec<u8> = mask_f
+            .iter()
+            .map(|&v| if v > 0.5 { 1 } else { 0 })
+            .collect();
         let ref_out = load("p_ref_attn_out", &[b * s, w.hidden]);
         let ref_sel: Vec<i32> = fs::read(format!("{}/p_topk_indices.bin", fixdir()))
             .unwrap()
@@ -4219,9 +4764,7 @@ mod tests {
                 ln_idx(&mut kr, &w.i_k_norm_w, &w.i_k_norm_b);
                 cache_k[i * w.idx_dim..(i + 1) * w.idx_dim].copy_from_slice(&kr);
             }
-            let sel = indexer_select(
-                &w, xb, &qr, &cache_k, &gate, mb, mb, s, s, 0,
-            );
+            let sel = indexer_select(&w, xb, &qr, &cache_k, &gate, mb, mb, s, s, 0);
             // compare with HF's [B, S, width] flattened rows for this sequence
             for qi in 0..s {
                 let mut a: Vec<i32> = sel[qi * width..(qi + 1) * width]
@@ -4278,7 +4821,7 @@ mod tests {
         let mut d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("tests/fixtures/glm5/mla-long");
         let dir = d.to_str().unwrap().to_string();
-        let rd = |n: &str, shape: &[usize]| -> Vec<f32> {
+        let rd = |n: &str, _shape: &[usize]| -> Vec<f32> {
             let b = fs::read(format!("{dir}/{n}.bin")).unwrap();
             b.chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -4315,7 +4858,9 @@ mod tests {
         }
         let valid = vec![1u8; s_tot];
         let mask = vec![1u8; s_tot];
-        let sel = indexer_select(&w, &x, &q_resid, &cache_k, &gate, &valid, &mask, s_tot, s_tot, 0);
+        let sel = indexer_select(
+            &w, &x, &q_resid, &cache_k, &gate, &valid, &mask, s_tot, s_tot, 0,
+        );
         // compare sets per row (torch tie order can differ; we compare like the main test)
         let hf_scores = rd("long_index_scores", &[s_tot, 525]);
         let n_pool = 525;
@@ -4352,14 +4897,17 @@ mod tests {
                 .collect();
             sv.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
             let boundary = sv[n_sel_w - 1];
-            let tied = sv.iter().take(n_sel_w + 4).filter(|&&v| (v - boundary).abs() < 1e-9).count() > 1;
+            let tied = sv
+                .iter()
+                .take(n_sel_w + 4)
+                .filter(|&&v| (v - boundary).abs() < 1e-9)
+                .count()
+                > 1;
             assert!(tied, "row {qi}: set mismatch NOT explained by ties");
             mismatch += 1;
         }
-        eprintln!(
-            "glm5 mla long: {s_tot} rows, set mismatches only on tied rows: {mismatch}"
-        );
-        assert!(mismatch > 0 || true); // informational
+        eprintln!("glm5 mla long: {s_tot} rows, set mismatches only on tied rows: {mismatch}");
+        let _ = mismatch; // informational
     }
 
     /// The real-config finding, kept as a pinned regression note: at S=2048 the indexer
@@ -4370,8 +4918,12 @@ mod tests {
     fn real_indexer_saturation_is_recorded() {
         let _env = crate::flash::glm5::env_read();
         let m = load_meta();
-        assert!(m["real_indexer"]["2048"]["all_visible_up_to_2048+3"].as_bool().unwrap());
-        assert!(!m["real_indexer"]["2100"]["all_visible_up_to_2048+3"].as_bool().unwrap());
+        assert!(m["real_indexer"]["2048"]["all_visible_up_to_2048+3"]
+            .as_bool()
+            .unwrap());
+        assert!(!m["real_indexer"]["2100"]["all_visible_up_to_2048+3"]
+            .as_bool()
+            .unwrap());
     }
 }
 
@@ -4394,17 +4946,40 @@ mod absorbed_tests {
         let x = super::tests::load("input_x", &[t, w.hidden]);
         let q_resid = super::tests::load("ref_q_resid", &[t, w.q_lora]);
         let k_lat = super::tests::load("ref_k_pass", &[t, w.kv_lora]);
-        let sel: Vec<i32> = std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let sel: Vec<i32> =
+            std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
 
         // sparse selection path
         let mut naive = vec![0f32; t * w.hidden];
-        mla_forward(&w, &x, &q_resid, &k_lat, t, t, 0, None, Some(&sel), &mut naive);
+        mla_forward(
+            &w,
+            &x,
+            &q_resid,
+            &k_lat,
+            t,
+            t,
+            0,
+            None,
+            Some(&sel),
+            &mut naive,
+        );
         let mut absorbed = vec![0f32; t * w.hidden];
-        mla_forward_absorbed(&w, &x, &q_resid, &k_lat, t, t, 0, None, Some(&sel), &mut absorbed);
+        mla_forward_absorbed(
+            &w,
+            &x,
+            &q_resid,
+            &k_lat,
+            t,
+            t,
+            0,
+            None,
+            Some(&sel),
+            &mut absorbed,
+        );
         let e: f32 = naive
             .iter()
             .zip(&absorbed)
@@ -4451,14 +5026,37 @@ mod absorbed_tests {
         );
         let px = super::tests::load("p_input_x", &[pb * ps, w.hidden]);
         let pmask_f = super::tests::load("p_mask", &[pb * ps, 1]);
-        let pmask: Vec<u8> = pmask_f.iter().map(|&v| if v > 0.5 { 1 } else { 0 }).collect();
+        let pmask: Vec<u8> = pmask_f
+            .iter()
+            .map(|&v| if v > 0.5 { 1 } else { 0 })
+            .collect();
         let pq = w.gemv_q_a(&px, pb * ps);
         let pk = w.gemv_kv_a(&px, pb * ps);
         let mut naive_p = vec![0f32; pb * ps * w.hidden];
-        mla_forward(&w, &px, &pq, &pk, pb * ps, pb * ps, 0, Some(&pmask), None, &mut naive_p);
+        mla_forward(
+            &w,
+            &px,
+            &pq,
+            &pk,
+            pb * ps,
+            pb * ps,
+            0,
+            Some(&pmask),
+            None,
+            &mut naive_p,
+        );
         let mut absorbed_p = vec![0f32; pb * ps * w.hidden];
         mla_forward_absorbed(
-            &w, &px, &pq, &pk, pb * ps, pb * ps, 0, Some(&pmask), None, &mut absorbed_p,
+            &w,
+            &px,
+            &pq,
+            &pk,
+            pb * ps,
+            pb * ps,
+            0,
+            Some(&pmask),
+            None,
+            &mut absorbed_p,
         );
         let e3: f32 = naive_p
             .iter()
@@ -4481,13 +5079,25 @@ mod absorbed_tests {
         let q_resid = super::tests::load("ref_q_resid", &[t, w.q_lora]);
         let k_lat = super::tests::load("ref_k_pass", &[t, w.kv_lora]);
         let ref_out = super::tests::load("ref_attn_out", &[t, w.hidden]);
-        let sel: Vec<i32> = std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let sel: Vec<i32> =
+            std::fs::read(format!("{}/ref_topk_indices.bin", super::tests::fixdir()))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
         let mut out = vec![0f32; t * w.hidden];
-        mla_forward_absorbed(&w, &x, &q_resid, &k_lat, t, t, 0, None, Some(&sel), &mut out);
+        mla_forward_absorbed(
+            &w,
+            &x,
+            &q_resid,
+            &k_lat,
+            t,
+            t,
+            0,
+            None,
+            Some(&sel),
+            &mut out,
+        );
         let e: f32 = out
             .iter()
             .zip(&ref_out)

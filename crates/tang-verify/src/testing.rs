@@ -56,7 +56,10 @@ impl<S: Debug + Clone> Cases<S, ()> {
             kernel: kernel.into(),
             shapes: Vec::new(),
             dtypes: vec![()],
-            cfg: Config { dir, ..Config::default() },
+            cfg: Config {
+                dir,
+                ..Config::default()
+            },
         }
     }
 }
@@ -68,7 +71,12 @@ impl<S: Debug + Clone, D: Debug + Clone> Cases<S, D> {
     }
 
     pub fn dtypes<D2: Debug + Clone>(self, d: &[D2]) -> Cases<S, D2> {
-        Cases { kernel: self.kernel, shapes: self.shapes, dtypes: d.to_vec(), cfg: self.cfg }
+        Cases {
+            kernel: self.kernel,
+            shapes: self.shapes,
+            dtypes: d.to_vec(),
+            cfg: self.cfg,
+        }
     }
 
     pub fn tol(mut self, tol: f64) -> Self {

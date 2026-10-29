@@ -620,7 +620,7 @@ impl Model {
             if let Some(j) = &mut self.journal {
                 j.push((lid, sp, kv.clone(), sc.clone()));
             }
-            if (sp + 1) % r != 0 {
+            if !(sp + 1).is_multiple_of(r) {
                 return Ok(None);
             }
             out = pool(kst, sst, r);
@@ -2163,7 +2163,7 @@ pub(crate) mod tests {
                         rng = rng
                             .wrapping_mul(6364136223846793005)
                             .wrapping_add(1442695040888963407);
-                        if (rng >> 33) % 5 == 0 {
+                        if (rng >> 33).is_multiple_of(5) {
                             *x = (*x + 1 + (rng >> 40) as usize % (v - 1)) % v;
                         }
                     }

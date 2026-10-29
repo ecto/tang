@@ -504,8 +504,13 @@ mod imp {
                 .start_with_context(t, &cx);
             if sp.parent.is_some() {
                 if let Some(&(_, ms)) = sp.floats.iter().find(|(k, _)| *k == "gpu.ms") {
-                    inst.glm5_stage
-                        .record(ms, &[KeyValue::new("stage", sp.name), KeyValue::new("phase", phase)]);
+                    inst.glm5_stage.record(
+                        ms,
+                        &[
+                            KeyValue::new("stage", sp.name),
+                            KeyValue::new("phase", phase),
+                        ],
+                    );
                 }
             }
             live.push(s);

@@ -614,7 +614,10 @@ impl FlashServe {
         } else if super::glm5::engine::is_glm5(&s.gguf) {
             // GLM-5.3-Flash (W6's serve glue): greedy, N sequence slots
             // (TANG_GLM5_SLOTS, default 8) when --batch asks for them.
-            let slots = s.batch.max(1).max(super::glm5::serve_glue::slots_from_env());
+            let slots = s
+                .batch
+                .max(1)
+                .max(super::glm5::serve_glue::slots_from_env());
             let g = super::glm5::serve_glue::Glm5Serve::load_slots(&s.gguf, slots)?;
             Box::new(g)
         } else {

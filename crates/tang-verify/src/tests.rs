@@ -30,11 +30,19 @@ fn qkv_spec(di: usize) -> Spec {
     Spec::new("kda")
         .stacked(
             "qkv",
-            &[("qkv.q", di, "gemv attn_q"), ("qkv.k", di, "gemv attn_k"), ("qkv.v", di, "gemv attn_v")],
+            &[
+                ("qkv.q", di, "gemv attn_q"),
+                ("qkv.k", di, "gemv attn_k"),
+                ("qkv.v", di, "gemv attn_v"),
+            ],
             inner.clone(),
             &[],
         )
-        .tap(Tap::new("o", inner).after(&["qkv.q", "qkv.k", "qkv.v"]).what("core"))
+        .tap(
+            Tap::new("o", inner)
+                .after(&["qkv.q", "qkv.k", "qkv.v"])
+                .what("core"),
+        )
 }
 
 fn run(gpu_qkv: Vec<f32>, t: usize, di: usize) -> Report {
@@ -60,7 +68,13 @@ fn kv_byte_offset_bug_names_the_k_writer_not_q() {
     // block are k's, so k's writer is the suspect
     assert_eq!(v.suspect, "qkv.k", "{}", v.message());
     match &v.cause {
-        Cause::Misplaced { victim, actual_base, expected_base, hint, .. } => {
+        Cause::Misplaced {
+            victim,
+            actual_base,
+            expected_base,
+            hint,
+            ..
+        } => {
             assert_eq!(*victim, "qkv.q");
             assert_eq!(*actual_base, Some(16));
             assert_eq!(*expected_base, Some(64));
@@ -69,7 +83,10 @@ fn kv_byte_offset_bug_names_the_k_writer_not_q() {
         c => panic!("cause {c:?}"),
     }
     let ev = v.evidence.join("\n");
-    assert!(ev.contains("`qkv.v`"), "v's write into k is traced too:\n{ev}");
+    assert!(
+        ev.contains("`qkv.v`"),
+        "v's write into k is traced too:\n{ev}"
+    );
     // NaN counts match the offset arithmetic: k's tail [di/2+.., di) per token never
     // written, all of v
     let row = |n: &str| r.rows.iter().find(|x| x.name == n).unwrap().stat.clone();
@@ -108,14 +125,24 @@ fn unwritten_tail_is_unwritten() {
     let mut v = Verifier::new("kda", Config::default());
     let ver = v.check(0, "", &qkv_spec(di), &g, &c).verdict.unwrap();
     assert_eq!(ver.suspect, "qkv.v");
-    assert_eq!(ver.cause, Cause::Unwritten { count: t * di / 2, n: t * di });
+    assert_eq!(
+        ver.cause,
+        Cause::Unwritten {
+            count: t * di / 2,
+            n: t * di
+        }
+    );
 }
 
 #[test]
 fn wrong_values_fall_back_to_pipeline_order() {
     let (t, di) = (3, 32);
     let cpu = qkv_device(t, di, di, 2 * di);
-    let gpu: Vec<f32> = cpu.iter().enumerate().map(|(i, x)| if i % 96 >= 64 { x * 1.5 + 0.3 } else { *x }).collect();
+    let gpu: Vec<f32> = cpu
+        .iter()
+        .enumerate()
+        .map(|(i, x)| if i % 96 >= 64 { x * 1.5 + 0.3 } else { *x })
+        .collect();
     let (mut g, mut c) = (Taps::new(), Taps::new());
     g.put("qkv", gpu);
     c.put("qkv", cpu);
@@ -127,7 +154,9 @@ fn wrong_values_fall_back_to_pipeline_order() {
 #[test]
 fn zeroed_output_is_zeroed() {
     let lay = Layout::new().dim("i", 0);
-    let spec = Spec::new("k").tap(Tap::new("a", lay.clone()).what("ka")).tap(Tap::new("b", lay).what("kb"));
+    let spec = Spec::new("k")
+        .tap(Tap::new("a", lay.clone()).what("ka"))
+        .tap(Tap::new("b", lay).what("kb"));
     let (mut g, mut c) = (Taps::new(), Taps::new());
     let a: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
     g.put("a", a.clone());
@@ -145,7 +174,9 @@ fn row_mixup_is_traced_within_a_tensor() {
     // a stride bug: token 1's row written where token 2's belongs
     let lay = Layout::new().dim("tok", 0).dim("c", 64);
     let spec = Spec::new("k").tap(Tap::new("y", lay).what("ky"));
-    let cpu: Vec<f32> = (0..4 * 64).map(|i| ((i * 13) as f32 * 0.01).sin()).collect();
+    let cpu: Vec<f32> = (0..4 * 64)
+        .map(|i| ((i * 13) as f32 * 0.01).sin())
+        .collect();
     let mut gpu = cpu.clone();
     gpu.copy_within(64..128, 128);
     let (mut g, mut c) = (Taps::new(), Taps::new());
@@ -154,8 +185,17 @@ fn row_mixup_is_traced_within_a_tensor() {
     let mut v = Verifier::new("k", Config::default());
     let ver = v.check(0, "", &spec, &g, &c).verdict.unwrap();
     match &ver.cause {
-        Cause::Misplaced { victim, at, from, hint, .. } => {
-            assert_eq!((*victim, at.as_str(), from.as_str()), ("y", "tok2 c0", "tok1 c0"));
+        Cause::Misplaced {
+            victim,
+            at,
+            from,
+            hint,
+            ..
+        } => {
+            assert_eq!(
+                (*victim, at.as_str(), from.as_str()),
+                ("y", "tok2 c0", "tok1 c0")
+            );
             assert!(hint.contains("shifted by 64"), "{hint}");
         }
         c => panic!("{c:?}"),
@@ -165,7 +205,10 @@ fn row_mixup_is_traced_within_a_tensor() {
 #[test]
 fn dumps_and_counts() {
     let dir = std::env::temp_dir().join(format!("tang-verify-test-{}", std::process::id()));
-    let cfg = Config { dir: Some(dir.clone()), ..Config::default() };
+    let cfg = Config {
+        dir: Some(dir.clone()),
+        ..Config::default()
+    };
     let mut v = Verifier::new("k", cfg).with_unit("l");
     let spec = Spec::new("k").tap(Tap::new("y", Layout::flat()));
     let (mut g, mut c) = (Taps::new(), Taps::new());
@@ -182,7 +225,9 @@ fn dumps_and_counts() {
 
 #[test]
 fn cases_grid_reports_failures() {
-    let cases = Cases::new("toy").shapes(&[4usize, 9]).dtypes(&["good", "bad"]);
+    let cases = Cases::new("toy")
+        .shapes(&[4usize, 9])
+        .dtypes(&["good", "bad"]);
     let fails = cases.check(|&n, &dt, p| {
         let cpu: Vec<f32> = (0..n).map(|i| i as f32 + 1.0).collect();
         let mut gpu = vec![f32::NAN; n];
@@ -191,8 +236,14 @@ fn cases_grid_reports_failures() {
         p.put("y", gpu);
         let mut c = Taps::new();
         c.put("y", cpu);
-        Ok((Spec::new("toy").tap(Tap::new("y", Layout::flat()).what("toy kernel")), c))
+        Ok((
+            Spec::new("toy").tap(Tap::new("y", Layout::flat()).what("toy kernel")),
+            c,
+        ))
     });
     assert_eq!(fails.len(), 2, "{fails:?}");
-    assert!(fails[0].contains("dtype \"bad\"") && fails[0].contains("unwritten"), "{fails:?}");
+    assert!(
+        fails[0].contains("dtype \"bad\"") && fails[0].contains("unwritten"),
+        "{fails:?}"
+    );
 }

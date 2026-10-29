@@ -95,7 +95,9 @@ pub fn pool_keys(w: &MlaWeights, k: &[f32], g: &[f32], n_pool: usize) -> Vec<f32
     let mut out = vec![0f32; n_pool * hd];
     for p in 0..n_pool {
         for d in 0..hd {
-            let lg: Vec<f32> = (0..kp).map(|j| g[(p * kp + j) * hd + d] + w.i_ape[j * hd + d]).collect();
+            let lg: Vec<f32> = (0..kp)
+                .map(|j| g[(p * kp + j) * hd + d] + w.i_ape[j * hd + d])
+                .collect();
             let mx = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let e: Vec<f32> = lg.iter().map(|l| (l - mx).exp()).collect();
             let sum: f32 = e.iter().sum();
@@ -118,15 +120,24 @@ pub fn pool_scores_f64(
     pos0: usize,
 ) -> Vec<f64> {
     let (hd, nh, kp) = (w.idx_dim, w.idx_heads, w.kpool);
-    let dotd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>();
+    let dotd = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(&a, &b)| a as f64 * b as f64)
+            .sum::<f64>()
+    };
     let ss = 1.0 / (hd as f64).sqrt();
     let hs = 1.0 / (nh as f64).sqrt();
     let mut out = vec![f64::NEG_INFINITY; t * n_pool];
     for qi in 0..t {
         let qr = &q_resid[qi * w.q_lora..(qi + 1) * w.q_lora];
-        let iq: Vec<f64> = (0..nh * hd).map(|r| dotd(&w.i_wq_b[r * w.q_lora..(r + 1) * w.q_lora], qr)).collect();
+        let iq: Vec<f64> = (0..nh * hd)
+            .map(|r| dotd(&w.i_wq_b[r * w.q_lora..(r + 1) * w.q_lora], qr))
+            .collect();
         let xi = &x[qi * w.hidden..(qi + 1) * w.hidden];
-        let hw: Vec<f64> = (0..nh).map(|h| dotd(&w.i_proj[h * w.hidden..(h + 1) * w.hidden], xi)).collect();
+        let hw: Vec<f64> = (0..nh)
+            .map(|h| dotd(&w.i_proj[h * w.hidden..(h + 1) * w.hidden], xi))
+            .collect();
         for p in 0..n_pool {
             if p * kp + kp - 1 > pos0 + qi {
                 continue;
@@ -171,9 +182,15 @@ pub fn compare_sel(
         v.sort();
         v
     };
-    let mut c = SelCmp { queries: t, ..Default::default() };
+    let mut c = SelCmp {
+        queries: t,
+        ..Default::default()
+    };
     for qi in 0..t {
-        let (ra, rb) = (&a[qi * width..(qi + 1) * width], &b[qi * width..(qi + 1) * width]);
+        let (ra, rb) = (
+            &a[qi * width..(qi + 1) * width],
+            &b[qi * width..(qi + 1) * width],
+        );
         if set(ra) == set(rb) {
             continue;
         }
@@ -182,7 +199,11 @@ pub fn compare_sel(
         let only_a: Vec<usize> = pa.iter().copied().filter(|p| !pb.contains(p)).collect();
         let only_b: Vec<usize> = pb.iter().copied().filter(|p| !pa.contains(p)).collect();
         let row = &scores[qi * n_pool..(qi + 1) * n_pool];
-        let scale = row.iter().filter(|s| s.is_finite()).fold(0f64, |m, s| m.max(s.abs())).max(1e-30);
+        let scale = row
+            .iter()
+            .filter(|s| s.is_finite())
+            .fold(0f64, |m, s| m.max(s.abs()))
+            .max(1e-30);
         // the swap is justified iff every pool only one side took scores within the
         // bar of every pool only the other side took
         let mut gap = 0f64;
@@ -210,21 +231,35 @@ pub fn compare_sel(
 
 impl Shadow {
     pub fn from_env() -> Option<Self> {
-        let v = Verifier::from_env("mla", Some(LEGACY))?.with_tag("mladbg").with_unit("l");
+        let v = Verifier::from_env("mla", Some(LEGACY))?
+            .with_tag("mladbg")
+            .with_unit("l");
         let c = &v.cfg;
         v.log(format_args!(
             "ON: layers {:?} windows {:?} tol {:.1e} poison {} (selection near-tie bar {TIE_REL:.0e})",
             c.units, c.windows, c.tol, c.poison
         ));
-        Some(Self { v, caches: Vec::new(), sel: SelCmp::default(), sel_windows_bad: 0 })
+        Some(Self {
+            v,
+            caches: Vec::new(),
+            sel: SelCmp::default(),
+            sel_windows_bad: 0,
+        })
     }
 
     /// On regardless of the env (tests): default knobs, poison on, only failing windows'
     /// rows printed.
     pub fn always() -> Self {
-        let mut v = Verifier::new("mla", tang_verify::Config::default()).with_tag("mladbg").with_unit("l");
+        let mut v = Verifier::new("mla", tang_verify::Config::default())
+            .with_tag("mladbg")
+            .with_unit("l");
         v.verbose = false;
-        Self { v, caches: Vec::new(), sel: SelCmp::default(), sel_windows_bad: 0 }
+        Self {
+            v,
+            caches: Vec::new(),
+            sel: SelCmp::default(),
+            sel_windows_bad: 0,
+        }
     }
 
     pub fn wants(&self, l: usize) -> bool {
@@ -237,7 +272,11 @@ impl Shadow {
 
     /// Totals so far: (windows checked, windows failed incl. selection, selection totals).
     pub fn totals(&self) -> (usize, usize, SelCmp) {
-        (self.v.checked(), self.v.failed() + self.sel_windows_bad, self.sel.clone())
+        (
+            self.v.checked(),
+            self.v.failed() + self.sel_windows_bad,
+            self.sel.clone(),
+        )
     }
 
     /// Check one window; returns whether it passed.
@@ -261,7 +300,11 @@ impl Shadow {
         if let Some(q) = g.q_dev {
             gt.put("q", q.to_vec());
             ct.put("q", w.gemv_q_b(g.q_resid, t));
-            spec.push(Tap::new("q", tok(w.n_head * w.qk_nope)).after(&["q_resid"]).what("g5f_gemv q_b"));
+            spec.push(
+                Tap::new("q", tok(w.n_head * w.qk_nope))
+                    .after(&["q_resid"])
+                    .what("g5f_gemv q_b"),
+            );
         }
 
         // latents: kv_a + RMSNorm, bf16
@@ -271,7 +314,11 @@ impl Shadow {
         spec.push(Tap::new("lat", tok(dl)).what("mla_kv_append"));
         gt.put("lat.mirror", f(g.lat_mirror));
         ct.put("lat.mirror", lat_dev.clone());
-        spec.push(Tap::new("lat.mirror", tok(dl)).after(&["lat"]).what("kv_append read-back"));
+        spec.push(
+            Tap::new("lat.mirror", tok(dl))
+                .after(&["lat"])
+                .what("kv_append read-back"),
+        );
 
         // indexer rows
         let (mut ck, mut cg) = (vec![0f32; t * hd], vec![0f32; t * hd]);
@@ -311,21 +358,48 @@ impl Shadow {
         ct.put("idx_g", cg);
         spec.push(Tap::new("idx_k", tok(hd)).what("idx_key_append"));
         spec.push(Tap::new("idx_g", tok(hd)).what("idx_key_append"));
-        for (n, m, d) in [("idx_k.mirror", g.idk_mirror, &g.idk_dev), ("idx_g.mirror", g.idg_mirror, &g.idg_dev)] {
+        for (n, m, d) in [
+            ("idx_k.mirror", g.idk_mirror, &g.idk_dev),
+            ("idx_g.mirror", g.idg_mirror, &g.idg_dev),
+        ] {
             gt.put(n, m.to_vec());
             ct.put(n, d.clone());
         }
-        spec.push(Tap::new("idx_k.mirror", tok(hd)).after(&["idx_k"]).what("idx_append read-back"));
-        spec.push(Tap::new("idx_g.mirror", tok(hd)).after(&["idx_g"]).what("idx_append read-back"));
-        spec.push(Tap::new("lat.cache", tok(dl)).after(&["lat"]).what("resident latent cache (realloc / re-upload)"));
-        spec.push(Tap::new("idx_k.cache", tok(hd)).after(&["idx_k"]).what("resident indexer cache (realloc / re-upload)"));
-        spec.push(Tap::new("idx_g.cache", tok(hd)).after(&["idx_g"]).what("resident indexer cache (realloc / re-upload)"));
+        spec.push(
+            Tap::new("idx_k.mirror", tok(hd))
+                .after(&["idx_k"])
+                .what("idx_append read-back"),
+        );
+        spec.push(
+            Tap::new("idx_g.mirror", tok(hd))
+                .after(&["idx_g"])
+                .what("idx_append read-back"),
+        );
+        spec.push(
+            Tap::new("lat.cache", tok(dl))
+                .after(&["lat"])
+                .what("resident latent cache (realloc / re-upload)"),
+        );
+        spec.push(
+            Tap::new("idx_k.cache", tok(hd))
+                .after(&["idx_k"])
+                .what("resident indexer cache (realloc / re-upload)"),
+        );
+        spec.push(
+            Tap::new("idx_g.cache", tok(hd))
+                .after(&["idx_g"])
+                .what("resident indexer cache (realloc / re-upload)"),
+        );
         gt.put("valid", fb(&g.val_dev));
         ct.put("valid", vec![1.0; kv]);
         spec.push(Tap::new("valid", Layout::flat()).what("idx_key_append"));
         gt.put("valid.mirror", fb(g.val_mirror));
         ct.put("valid.mirror", fb(&g.val_dev));
-        spec.push(Tap::new("valid.mirror", Layout::flat()).after(&["valid"]).what("idx_append read-back"));
+        spec.push(
+            Tap::new("valid.mirror", Layout::flat())
+                .after(&["valid"])
+                .what("idx_append read-back"),
+        );
 
         // pool + selection (sparse windows only)
         let n_pool = kv / w.kpool;
@@ -335,9 +409,22 @@ impl Shadow {
             let pk = pool_keys(w, &g.idk_dev, &g.idg_dev, n_pool);
             gt.put("pool", pool.clone());
             ct.put("pool", pk.clone());
-            spec.push(Tap::new("pool", tok(hd)).after(&["idx_k", "idx_g"]).what("idx_pool_keys"));
+            spec.push(
+                Tap::new("pool", tok(hd))
+                    .after(&["idx_k", "idx_g"])
+                    .what("idx_pool_keys"),
+            );
             let cs = mla::indexer_select(
-                w, g.x, g.q_resid, &g.idk_dev, &g.idg_dev, &g.val_dev, &vec![1u8; t], t, kv, pos0,
+                w,
+                g.x,
+                g.q_resid,
+                &g.idk_dev,
+                &g.idg_dev,
+                &g.val_dev,
+                &vec![1u8; t],
+                t,
+                kv,
+                pos0,
             );
             // NaN-poisoned slots read back as 2143289344: an unwritten sel slot is a hard fail
             let unwritten = sel.iter().filter(|&&i| i >= kv as i32).count();
@@ -369,15 +456,43 @@ impl Shadow {
 
         // attention with the GPU's selection over the resident latents: the kernel alone
         let mut out = vec![0f32; t * w.hidden];
-        mla::mla_forward(w, g.x, g.q_resid, &lat_dev, kv, t, pos0, None, g.sel.as_deref(), &mut out);
+        mla::mla_forward(
+            w,
+            g.x,
+            g.q_resid,
+            &lat_dev,
+            kv,
+            t,
+            pos0,
+            None,
+            g.sel.as_deref(),
+            &mut out,
+        );
         gt.put("out", g.out.to_vec());
         ct.put("out", out);
-        spec.push(Tap::new("out", tok(w.hidden)).after(&["lat", "pool"]).what("mla_attn_naive"));
+        spec.push(
+            Tap::new("out", tok(w.hidden))
+                .after(&["lat", "pool"])
+                .what("mla_attn_naive"),
+        );
 
-        let r = self.v.check(l, &format!("t{t} pos0 {pos0}"), &spec, &gt, &ct);
+        let r = self
+            .v
+            .check(l, &format!("t{t} pos0 {pos0}"), &spec, &gt, &ct);
         if let Some(cs) = cpu_sel {
             let mut o2 = vec![0f32; t * w.hidden];
-            mla::mla_forward(w, g.x, g.q_resid, &lat_dev, kv, t, pos0, None, Some(&cs), &mut o2);
+            mla::mla_forward(
+                w,
+                g.x,
+                g.q_resid,
+                &lat_dev,
+                kv,
+                t,
+                pos0,
+                None,
+                Some(&cs),
+                &mut o2,
+            );
             let s = stat(g.out, &o2, self.v.cfg.tol);
             self.v.log(format_args!(
                 "l{l} t{t} pos0 {pos0} out.cpusel (info: GPU out vs CPU attention with the CPU's own selection) rel {:.3e} max {:.3e}",

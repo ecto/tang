@@ -21,13 +21,13 @@
 //! (`hidden ≤ 1024`, i.e. the tiny fixture), or with `TANG_GLM5_CACHE=1`, they are cached.
 
 use super::forward::Glm5Ref;
-#[cfg(feature = "cuda")]
-use tang_moe::{args, gpu::launch};
 use super::kda::{ConvState, KdaConfig, KdaLayerW, KdaState};
 use super::mla::MlaWeights;
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+#[cfg(feature = "cuda")]
+use tang_moe::{args, gpu::launch};
 
 /// One DSA layer's per-token caches: normed latent `[n][kv_lora]`, indexer key and gate
 /// rows `[n][idx_dim]`.
@@ -183,10 +183,13 @@ impl GpuFfn {
             return Ok(None);
         };
         let gpu = &self.devs[0].0;
-        gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+        gpu.bind()
+            .map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
         let row = &h[h.len() - n..];
         // synchronous legacy-stream copy; hd.s is blocking, so it orders after
-        hd.xf.write(0, row).map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
+        hd.xf
+            .write(0, row)
+            .map_err(|e| anyhow::anyhow!("head x write: {e}"))?;
         unsafe {
             // k5_q8: x [1][n] -> codes [1][n] + scales [1][n/32] (MAXT = 1)
             launch(
@@ -205,8 +208,17 @@ impl GpuFfn {
                 (128, 1, 1),
                 (K5_WARPS * ((hd.dw.w.row_bytes as usize).div_ceil(16) + 1) * 16) as u32,
                 &hd.s,
-                args![hd.dw.w, 0u32, hd.xq8.ptr, hd.xq8.ptr + n as u64, hd.out.ptr,
-                    nv as u32, 1u32, nv as u32, n as u32],
+                args![
+                    hd.dw.w,
+                    0u32,
+                    hd.xq8.ptr,
+                    hd.xq8.ptr + n as u64,
+                    hd.out.ptr,
+                    nv as u32,
+                    1u32,
+                    nv as u32,
+                    n as u32
+                ],
             )?;
         }
         hd.s.sync().map_err(|e| anyhow::anyhow!("head sync: {e}"))?;
@@ -221,8 +233,14 @@ impl GpuFfn {
         let Some(hd) = self.head_dev.as_ref() else {
             return Ok(None);
         };
-        self.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
-        hd.out.read::<f32>(0, nv).map(Some).map_err(|e| anyhow::anyhow!("head read: {e}"))
+        self.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind GPU (head): {e}"))?;
+        hd.out
+            .read::<f32>(0, nv)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("head read: {e}"))
     }
 
     /// The KDA layers resident (tests: the wiring regression guards).
@@ -294,7 +312,8 @@ impl GpuFfn {
                 }
                 Err(e) => bail!("TANG_GPUS={ngpu}: CUDA device {ord}: {e}"),
             };
-            gpu.bind().map_err(|e| anyhow::anyhow!("bind GPU {ord}: {e}"))?;
+            gpu.bind()
+                .map_err(|e| anyhow::anyhow!("bind GPU {ord}: {e}"))?;
             kda_kernels.push(if kda_on && hp.is_kda.iter().any(|&b| b) {
                 super::kda_cuda::cuda::load(&gpu, &kda_cfg)?
             } else {
@@ -340,7 +359,10 @@ impl GpuFfn {
                 // mHC resident: both blocks' weights (attn + ffn) on the layer's device
                 if mhc_on {
                     let d = usize::from(l >= split);
-                    devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+                    devs[d]
+                        .0
+                        .bind()
+                        .map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
                     let wa = super::mhc::MhcWeights::from_gguf(g, l, "hc_attn", hp.n_embd, &mhp)
                         .with_context(|| format!("mhc blk.{l}.hc_attn"))?;
                     let wf = super::mhc::MhcWeights::from_gguf(g, l, "hc_ffn", hp.n_embd, &mhp)
@@ -354,7 +376,10 @@ impl GpuFfn {
                 // MLA resident per DSA layer, from that layer's own weights
                 if mla_on && !hp.is_kda[l] {
                     let d = usize::from(l >= split);
-                    devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+                    devs[d]
+                        .0
+                        .bind()
+                        .map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
                     let w = mla_w(l).with_context(|| format!("mla weights blk.{l}"))?;
                     let cu = super::mla::cuda::MlaCuda::new_at(&w, d)
                         .map_err(|e| anyhow::anyhow!("MLA layer {l} on GPU {d}: {e}"))?;
@@ -381,7 +406,10 @@ impl GpuFfn {
                     continue;
                 }
                 let d = usize::from(l >= split);
-                devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+                devs[d]
+                    .0
+                    .bind()
+                    .map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
                 let layer = super::kda_dev::DevLayer::new_gguf(
                     &devs[d].0,
                     g,
@@ -418,8 +446,10 @@ impl GpuFfn {
                         let per = (kda_cfg.heads * kda_cfg.head_dim * kda_cfg.head_dim
                             + kda_cfg.conv_dim() * (kda_cfg.d_conv - 1))
                             * 4;
-                        per as f64 * kda_l.iter().filter(|x| x.is_some()).count() as f64
-                            * (slots as f64) / (1 << 30) as f64
+                        per as f64
+                            * kda_l.iter().filter(|x| x.is_some()).count() as f64
+                            * (slots as f64)
+                            / (1 << 30) as f64
                     })
                 } else {
                     String::new()
@@ -458,12 +488,15 @@ impl GpuFfn {
                 layers.push(None);
                 continue;
             }
-            devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            devs[d]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
             let p = super::moe::MoeParams::from_gguf(g, l)?;
-            layers.push(Some(
-                super::moe::gpu::DevMoe::new(&p)
-                    .with_context(|| format!("uploading layer {l}'s FFN to GPU {d}"))?,
-            ));
+            layers
+                .push(Some(super::moe::gpu::DevMoe::new(&p).with_context(
+                    || format!("uploading layer {l}'s FFN to GPU {d}"),
+                )?));
             if l % 8 == 7 || l + 1 == n_layer {
                 eprintln!(
                     "glm5: {} of {n_layer} FFNs on the GPU ({:.0} s)",
@@ -475,7 +508,11 @@ impl GpuFfn {
         eprintln!(
             "glm5: {} of {n_layer} FFNs resident on the GPU, MoE kernels: {}",
             layers.iter().filter(|x| x.is_some()).count(),
-            if devs.first().is_some_and(|d| d.1.fast) { "fast (TANG_GLM5_MOE=fast)" } else { "naive" }
+            if devs.first().is_some_and(|d| d.1.fast) {
+                "fast (TANG_GLM5_MOE=fast)"
+            } else {
+                "naive"
+            }
         );
         eprintln!(
             "glm5: FFNs on {} GPU(s), layers [0, {split}) on GPU 0{}",
@@ -493,7 +530,10 @@ impl GpuFfn {
             if !std::env::var("TANG_GLM5_GPU_HEAD").is_ok_and(|v| v == "1") {
                 break 'head None;
             }
-            devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
+            devs[0]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind GPU 0 (head): {e}"))?;
             let info = match g.get("output.weight") {
                 Some(t) => t,
                 None => g.info("token_embd.weight")?,
@@ -526,7 +566,14 @@ impl GpuFfn {
                 "glm5: LM head resident on the GPU ({} MB)",
                 dw.w.row_bytes as usize * rows / 1_000_000
             );
-            Some(HeadDev { dw, xf, xq8, out, k5, s: hs })
+            Some(HeadDev {
+                dw,
+                xf,
+                xq8,
+                out,
+                k5,
+                s: hs,
+            })
         };
         let mut f = Self {
             devs,
@@ -565,7 +612,10 @@ impl GpuFfn {
                 continue;
             }
             let d = self.dev_of[l];
-            self.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            self.devs[d]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
             let w = mla_w(l)?;
             self.mla_p[l] = Some(super::mla_dev::MlaProj::new(&self.devs[d].0, g, l, &w)?);
         }
@@ -574,9 +624,16 @@ impl GpuFfn {
 
     /// Build the fused mHC ([`Self::mhc_f`]; `load` does when `TANG_GLM5_MHC_FUSED=1`).
     /// Single device only; the windows it serves need every layer's `MhcGpu` resident.
-    pub(crate) fn enable_mhc_fused(&mut self, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
+    pub(crate) fn enable_mhc_fused(
+        &mut self,
+        g: &crate::gguf::Gguf,
+        hp: &super::Hparams,
+    ) -> Result<()> {
         ensure!(self.devs.len() == 1, "fused mHC: single device only");
-        self.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind GPU 0: {e}"))?;
+        self.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind GPU 0: {e}"))?;
         let norms = (0..hp.n_layer)
             .map(|l| -> Result<[Vec<f32>; 2]> {
                 Ok([
@@ -592,7 +649,10 @@ impl GpuFfn {
             norms,
             hp.eps,
         )?);
-        eprintln!("glm5: mHC fused (device-resident streams, {} layers)", hp.n_layer);
+        eprintln!(
+            "glm5: mHC fused (device-resident streams, {} layers)",
+            hp.n_layer
+        );
         Ok(())
     }
 
@@ -667,7 +727,12 @@ impl GpuFfn {
     /// any window). `mhc_f` is dropped: its captured streams are slot-agnostic (they are
     /// re-uploaded per window) but its `begin` holds a pointer set sized to one window,
     /// not per slot — it re-enables through `enable_mhc_fused` if the caller wants it.
-    fn resize_slots(&mut self, slots: usize, g: &crate::gguf::Gguf, hp: &super::Hparams) -> Result<()> {
+    fn resize_slots(
+        &mut self,
+        slots: usize,
+        g: &crate::gguf::Gguf,
+        hp: &super::Hparams,
+    ) -> Result<()> {
         self.resident = None; // its step graph points at the KDA layers rebuilt below
         use tang_moe::gpu::Gpu;
         let kda_cfg = KdaConfig {
@@ -684,7 +749,10 @@ impl GpuFfn {
                 continue;
             }
             let d = self.dev_of[l];
-            self.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
+            self.devs[d]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind GPU {d}: {e}"))?;
             let layer = super::kda_dev::DevLayer::new_gguf(
                 &self.devs[d].0,
                 g,
@@ -699,7 +767,9 @@ impl GpuFfn {
             .with_context(|| format!("KDA layer {l} resident on GPU {d} ({slots} slots)"))?;
             self.kda_l[l] = Some(layer);
         }
-        self.kda_dev_fresh.iter_mut().for_each(|row| row.fill(false));
+        self.kda_dev_fresh
+            .iter_mut()
+            .for_each(|row| row.fill(false));
         for cu in self.mla_k.iter().flatten() {
             cu.set_slots(slots);
         }
@@ -757,6 +827,7 @@ pub struct Glm5Engine {
     mla_w: Vec<Option<std::sync::Arc<MlaWeights>>>,
     /// Per DSA layer: `mla_w`'s per-head `k_nope` / `v_b` concatenated (the
     /// `MlaCuda::attend` host arguments), built once with the weights.
+    #[allow(dead_code)]
     mla_wkv: Vec<Option<std::sync::Arc<(Vec<f32>, Vec<f32>)>>>,
     head: Option<crate::flash::reference::Mat>,
     /// Print per-window timings to stderr.
@@ -799,7 +870,10 @@ pub(crate) struct Snap {
 
 impl Snap {
     pub(crate) fn clone_snap(&self) -> Snap {
-        Snap { pos: self.pos, kda: self.kda.clone() }
+        Snap {
+            pos: self.pos,
+            kda: self.kda.clone(),
+        }
     }
 }
 
@@ -857,7 +931,9 @@ impl Glm5Engine {
         self.n_slots = slots;
         let nl = m.hp.n_layer;
         self.slot_tokens = (0..slots).map(|_| Vec::new()).collect();
-        self.kda = (0..slots).map(|_| (0..nl).map(|_| None).collect()).collect();
+        self.kda = (0..slots)
+            .map(|_| (0..nl).map(|_| None).collect())
+            .collect();
         self.dsa = (0..slots).map(|_| vec![DsaCache::default(); nl]).collect();
         if let Some(g) = self.gpu.as_mut() {
             g.resize_slots(slots, &m.g, &m.hp)?;
@@ -874,7 +950,9 @@ impl Glm5Engine {
         let nl = self.m.hp.n_layer;
         self.n_slots = slots;
         self.slot_tokens = (0..slots).map(|_| Vec::new()).collect();
-        self.kda = (0..slots).map(|_| (0..nl).map(|_| None).collect()).collect();
+        self.kda = (0..slots)
+            .map(|_| (0..nl).map(|_| None).collect())
+            .collect();
         self.dsa = (0..slots).map(|_| vec![DsaCache::default(); nl]).collect();
     }
 
@@ -904,11 +982,7 @@ impl Glm5Engine {
     /// Slot `s`'s KDA layer `l` state: `(conv, recurrent)` f32 vectors, read off the
     /// device when it holds the live copy. `None` when the layer has no state yet.
     #[cfg(feature = "cuda")]
-    pub fn kda_state_at(
-        &mut self,
-        slot: usize,
-        l: usize,
-    ) -> Option<(ConvState, KdaState)> {
+    pub fn kda_state_at(&mut self, slot: usize, l: usize) -> Option<(ConvState, KdaState)> {
         let hp = self.m.hp.clone();
         let cfg = KdaConfig {
             heads: hp.n_head,
@@ -976,7 +1050,10 @@ impl Glm5Engine {
                 continue;
             }
             let (conv, state) = (it.next().unwrap(), it.next().unwrap());
-            ensure!(conv.len() == cn && state.len() == sn, "kda state part shape at layer {l}");
+            ensure!(
+                conv.len() == cn && state.len() == sn,
+                "kda state part shape at layer {l}"
+            );
             self.kda[slot][l] = Some((ConvState(conv.clone()), KdaState(state.clone())));
         }
         #[cfg(feature = "cuda")]
@@ -1051,7 +1128,11 @@ impl Glm5Engine {
                 let y = g.ffn(l, x, t)?;
                 if let Some(d) = self.moe_dbg.as_mut().filter(|d| d.wants(l)) {
                     let p = super::moe::MoeParams::from_gguf(&self.m.g, l)?;
-                    let route = if p.is_dense() { None } else { g.last_routing(l, t, p.top_k)? };
+                    let route = if p.is_dense() {
+                        None
+                    } else {
+                        g.last_routing(l, t, p.top_k)?
+                    };
                     let m = &self.m;
                     d.check(l, &p, x, t, &y, route, &|| m.dense_ffn(l, x, t))?;
                 }
@@ -1116,12 +1197,18 @@ impl Glm5Engine {
                     continue;
                 }
                 if let (Some(dev), Some(st)) = (g.kda_l[l].as_mut(), self.kda[0][l].as_mut()) {
-                    g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                    g.devs[g.dev_of[l]]
+                        .0
+                        .bind()
+                        .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                     dev.read_back_at(0, &mut st.0, &mut st.1)?;
                 }
             }
         }
-        Ok(Snap { pos: self.tokens.len(), kda: self.kda[0].clone() })
+        Ok(Snap {
+            pos: self.tokens.len(),
+            kda: self.kda[0].clone(),
+        })
     }
 
     /// Rewind to `s`: KDA states back to the snapshot (resident layers re-seed from the host
@@ -1220,7 +1307,10 @@ impl Glm5Engine {
         if let Some(g) = self.gpu.as_mut() {
             if let Some(dev) = &mut g.kda_l[l] {
                 let d = g.dev_of[l];
-                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                g.devs[d]
+                    .0
+                    .bind()
+                    .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 let fresh = g.kda_dev_fresh[slot][l];
                 if t > g.max_t {
                     // past the resident scratch: sync the state to the host and run the
@@ -1234,7 +1324,16 @@ impl Glm5Engine {
                         g.kda_dev_fresh[slot][l] = false;
                     }
                     let _tr = super::trace::span("staged");
-                    return kda_gpu(x, t, w, cfg, &g.kda_kernels[d], &g.devs[d].0, &mut st.0, &mut st.1);
+                    return kda_gpu(
+                        x,
+                        t,
+                        w,
+                        cfg,
+                        &g.kda_kernels[d],
+                        &g.devs[d].0,
+                        &mut st.0,
+                        &mut st.1,
+                    );
                 }
                 if !fresh {
                     if std::env::var("TANG_GLM5_KDA_DUMP").is_ok_and(|v| v == "1") {
@@ -1297,7 +1396,10 @@ impl Glm5Engine {
         if let Some(g) = &self.gpu {
             let d = g.dev_of[l];
             if let Some(cu) = &g.mla_k[l] {
-                g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                g.devs[d]
+                    .0
+                    .bind()
+                    .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                 cu.set_seq(slot as u64);
                 let dbg = self.mla_dbg.as_mut().filter(|d| d.wants(l));
                 if let Some(p) = &g.mla_p[l] {
@@ -1331,50 +1433,52 @@ impl Glm5Engine {
         let hp = self.m.hp.clone();
         let n = hp.n_embd;
         let kv_len = pos0 + t;
-                let q_resid = w.gemv_q_a(x, t);
-                let latent = w.gemv_kv_a(x, t);
-                let idx_dim = hp.idx_dim;
-                let cache = &mut self.dsa[slot][l];
-                if self.bf16_latents {
-                    cache.latent.extend(latent.iter().map(|&v| super::mla::bf16_round(v)));
-                } else {
-                    cache.latent.extend_from_slice(&latent);
-                }
-                for i in 0..t {
-                    let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
-                    super::mla::indexer_key(w, &x[i * n..(i + 1) * n], &mut k, &mut g);
-                    cache.idx_k.extend_from_slice(&k);
-                    cache.idx_g.extend_from_slice(&g);
-                }
-                let sel = if super::mla::indexer_is_dense(kv_len, hp.idx_top_k) {
-                    None
-                } else {
-                    Some(super::mla::indexer_select(
-                        &w,
-                        x,
-                        &q_resid,
-                        &cache.idx_k,
-                        &cache.idx_g,
-                        &vec![1u8; kv_len],
-                        &vec![1u8; t],
-                        t,
-                        kv_len,
-                        pos0,
-                    ))
-                };
-                let mut out = vec![0f32; t * n];
-                super::mla::mla_forward(
-                    &w,
-                    x,
-                    &q_resid,
-                    &cache.latent,
-                    kv_len,
-                    t,
-                    pos0,
-                    None,
-                    sel.as_deref(),
-                    &mut out,
-                );
+        let q_resid = w.gemv_q_a(x, t);
+        let latent = w.gemv_kv_a(x, t);
+        let idx_dim = hp.idx_dim;
+        let cache = &mut self.dsa[slot][l];
+        if self.bf16_latents {
+            cache
+                .latent
+                .extend(latent.iter().map(|&v| super::mla::bf16_round(v)));
+        } else {
+            cache.latent.extend_from_slice(&latent);
+        }
+        for i in 0..t {
+            let (mut k, mut g) = (vec![0f32; idx_dim], vec![0f32; idx_dim]);
+            super::mla::indexer_key(w, &x[i * n..(i + 1) * n], &mut k, &mut g);
+            cache.idx_k.extend_from_slice(&k);
+            cache.idx_g.extend_from_slice(&g);
+        }
+        let sel = if super::mla::indexer_is_dense(kv_len, hp.idx_top_k) {
+            None
+        } else {
+            Some(super::mla::indexer_select(
+                w,
+                x,
+                &q_resid,
+                &cache.idx_k,
+                &cache.idx_g,
+                &vec![1u8; kv_len],
+                &vec![1u8; t],
+                t,
+                kv_len,
+                pos0,
+            ))
+        };
+        let mut out = vec![0f32; t * n];
+        super::mla::mla_forward(
+            w,
+            x,
+            &q_resid,
+            &cache.latent,
+            kv_len,
+            t,
+            pos0,
+            None,
+            sel.as_deref(),
+            &mut out,
+        );
         Ok(out)
     }
 
@@ -1384,7 +1488,7 @@ impl Glm5Engine {
     fn mhc_pre(
         &self,
         l: usize,
-        block: usize,
+        _block: usize,
         w: &super::mhc::MhcWeights,
         r: &[f32],
         t: usize,
@@ -1393,30 +1497,34 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
             if t <= g.max_t {
-            if let Some(m) = &g.mhc_g[l] {
-                g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                // the block index, NOT a constant: `pre(0, ..)` ran the FFN half's mix
-                // with the attention half's hc weights (the GLM-5.3 all-GPU divergence)
-                let mix = m.pre(block, r, t)?;
-                // MixSet -> Vec<Mix> (the CPU post path's input shape; the resident post
-                // keeps the MixSet and avoids the repack below)
-                let mixes = (0..t)
-                    .map(|i| {
-                        let mut m2 = super::mhc::Mix {
-                            x: mix.x[i * n..(i + 1) * n].to_vec(),
-                            post: [0f32; 4],
-                            comb: [[0f32; 4]; 4],
-                        };
-                        m2.post.copy_from_slice(&mix.post[i * 4..(i + 1) * 4]);
-                        for src in 0..4 {
-                            m2.comb[src]
-                                .copy_from_slice(&mix.comb[i * 16 + src * 4..i * 16 + src * 4 + 4]);
-                        }
-                        m2
-                    })
-                    .collect();
-                return Ok((mix.x, mixes));
-            }
+                if let Some(m) = &g.mhc_g[l] {
+                    g.devs[g.dev_of[l]]
+                        .0
+                        .bind()
+                        .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                    // the block index, NOT a constant: `pre(0, ..)` ran the FFN half's mix
+                    // with the attention half's hc weights (the GLM-5.3 all-GPU divergence)
+                    let mix = m.pre(block, r, t)?;
+                    // MixSet -> Vec<Mix> (the CPU post path's input shape; the resident post
+                    // keeps the MixSet and avoids the repack below)
+                    let mixes = (0..t)
+                        .map(|i| {
+                            let mut m2 = super::mhc::Mix {
+                                x: mix.x[i * n..(i + 1) * n].to_vec(),
+                                post: [0f32; 4],
+                                comb: [[0f32; 4]; 4],
+                            };
+                            m2.post.copy_from_slice(&mix.post[i * 4..(i + 1) * 4]);
+                            for src in 0..4 {
+                                m2.comb[src].copy_from_slice(
+                                    &mix.comb[i * 16 + src * 4..i * 16 + src * 4 + 4],
+                                );
+                            }
+                            m2
+                        })
+                        .collect();
+                    return Ok((mix.x, mixes));
+                }
             }
         }
         let _ = l;
@@ -1436,12 +1544,15 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if let Some(g) = &self.gpu {
             if t <= g.max_t {
-            if let Some(m) = &g.mhc_g[l] {
-                g.devs[g.dev_of[l]].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-                let out = m.post_mixes(mixes, y, r, t)?;
-                r.copy_from_slice(&out);
-                return Ok(());
-            }
+                if let Some(m) = &g.mhc_g[l] {
+                    g.devs[g.dev_of[l]]
+                        .0
+                        .bind()
+                        .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                    let out = m.post_mixes(mixes, y, r, t)?;
+                    r.copy_from_slice(&out);
+                    return Ok(());
+                }
             }
         }
         let _ = l;
@@ -1458,7 +1569,10 @@ impl Glm5Engine {
                 let all = g.mhc_g.iter().all(|m| m.is_some());
                 if let (true, Some(f)) = (all, g.mhc_f.as_mut()) {
                     if t <= f.max_t() {
-                        g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                        g.devs[0]
+                            .0
+                            .bind()
+                            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                         f.begin(r, t)?;
                         return Ok(true);
                     }
@@ -1485,15 +1599,24 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if fused {
             let g = self.gpu.as_mut().context("fused mHC without a GPU")?;
-            g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-            let mh = g.mhc_g[l].as_ref().context("fused mHC: layer not resident")?;
+            g.devs[0]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            let mh = g.mhc_g[l]
+                .as_ref()
+                .context("fused mHC: layer not resident")?;
             let f = g.mhc_f.as_mut().context("fused mHC: no instance")?;
             // `block`, not a constant: it picks hc_attn/hc_ffn AND attn_norm/ffn_norm
             return Ok((f.pre(mh, l, block, Some(w))?, Vec::new()));
         }
         let _ = fused;
         let (mut x, mixes) = self.mhc_pre(l, block, w, r, t)?;
-        let norm = if block == 0 { "attn_norm.weight" } else { "ffn_norm.weight" };
+        let norm = if block == 0 {
+            "attn_norm.weight"
+        } else {
+            "ffn_norm.weight"
+        };
         let _tr = super::trace::span("norm");
         self.m.norm_all(&mut x, l, norm)?;
         Ok((x, mixes))
@@ -1512,7 +1635,10 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if fused {
             let g = self.gpu.as_mut().context("fused mHC without a GPU")?;
-            g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            g.devs[0]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
             return g.mhc_f.as_mut().context("fused mHC: no instance")?.post(y);
         }
         let _ = fused;
@@ -1524,7 +1650,10 @@ impl Glm5Engine {
         #[cfg(feature = "cuda")]
         if fused {
             let g = self.gpu.as_mut().context("fused mHC without a GPU")?;
-            g.devs[0].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+            g.devs[0]
+                .0
+                .bind()
+                .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
             return g.mhc_f.as_mut().context("fused mHC: no instance")?.end();
         }
         let _ = fused;
@@ -1554,14 +1683,21 @@ impl Glm5Engine {
     /// window runs at a time, so the shared per-window scratch needs no partitioning.
     pub fn window_slot(&mut self, slot: usize, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "empty window");
-        ensure!(slot < self.n_slots, "slot {slot} >= {n} (use_gpu_slots?)", n = self.n_slots);
+        ensure!(
+            slot < self.n_slots,
+            "slot {slot} >= {n} (use_gpu_slots?)",
+            n = self.n_slots
+        );
         let w0 = Instant::now();
         #[cfg(feature = "cuda")]
         self.drop_step_graph();
         let prof = std::env::var("TANG_GLM5_PROF").is_ok_and(|v| v == "1");
-        let mut stage = |name: &str, t0: &std::time::Instant| {
+        let stage = |name: &str, t0: &std::time::Instant| {
             if prof {
-                eprintln!("glm5: prof {name}: {:.1} ms", t0.elapsed().as_secs_f32() * 1e3);
+                eprintln!(
+                    "glm5: prof {name}: {:.1} ms",
+                    t0.elapsed().as_secs_f32() * 1e3
+                );
             }
         };
         let hp = self.m.hp.clone();
@@ -1592,7 +1728,7 @@ impl Glm5Engine {
 
         let fused = self.mhc_fused_begin(&r, t)?;
         drop(tr);
-        let mut t_embd = Instant::now();
+        let t_embd = Instant::now();
         for l in 0..hp.n_layer {
             let _tr_l = span_l("layer", l);
             // ---- attention half
@@ -1603,9 +1739,9 @@ impl Glm5Engine {
             drop(tr);
             stage("mhc_pre+norm(attn)", &t0);
             if let Some(w) = self.wintap.as_mut() {
-                w[l * 4 + 0].extend_from_slice(&x);
+                w[l * 4].extend_from_slice(&x);
             }
-            let t1 = Instant::now();
+            let _t1 = Instant::now();
             let y = if hp.is_kda[l] {
                 let _tr = span("kda");
                 let t_w = Instant::now();
@@ -1756,7 +1892,10 @@ impl Glm5Engine {
         ensure!(t > 0, "empty batch");
         for (i, &(s, _)) in rows.iter().enumerate() {
             ensure!(s < self.n_slots, "slot {s} >= {n}", n = self.n_slots);
-            ensure!(rows[..i].iter().all(|r| r.0 != s), "slot {s} twice in one batch");
+            ensure!(
+                rows[..i].iter().all(|r| r.0 != s),
+                "slot {s} twice in one batch"
+            );
         }
         if t == 1 {
             return self.window_slot(rows[0].0, &[rows[0].1]);
@@ -1854,7 +1993,10 @@ impl Glm5Engine {
                 if let Some(dev) = &mut g.kda_l[l] {
                     if dev.pf2_on() && t <= g.max_t {
                         let d = g.dev_of[l];
-                        g.devs[d].0.bind().map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+                        g.devs[d]
+                            .0
+                            .bind()
+                            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
                         // every row's slot slice must be the live device copy
                         for &s in slots {
                             if !g.kda_dev_fresh[s][l] {
@@ -2142,26 +2284,24 @@ fn dsa_gpu(
     } else {
         let n_pool = kv_len / w.kpool;
         let mut pool_keys = vec![0f32; n_pool * idd];
-        cu.idx_pool(&c.idx_k, &c.idx_g, &w.i_ape, kv_len, 0, n_pool, &mut pool_keys, &s)
-            .map_err(gerr)?;
+        cu.idx_pool(
+            &c.idx_k,
+            &c.idx_g,
+            &w.i_ape,
+            kv_len,
+            0,
+            n_pool,
+            &mut pool_keys,
+            &s,
+        )
+        .map_err(gerr)?;
         if dbg.is_some() {
             pool_dbg = Some(pool_keys.clone());
         }
         let mut sel = vec![-1i32; t * w.select_width()];
         cu.idx_run(
-            &w.i_wq_b,
-            &w.i_proj,
-            &q_resid,
-            x,
-            &pool_keys,
-            &c.valid,
-            kv_len,
-            0,
-            n_pool,
-            t,
-            pos0,
-            &mut sel,
-            &s,
+            &w.i_wq_b, &w.i_proj, &q_resid, x, &pool_keys, &c.valid, kv_len, 0, n_pool, t, pos0,
+            &mut sel, &s,
         )
         .map_err(gerr)?;
         Some(sel)
@@ -2179,8 +2319,19 @@ fn dsa_gpu(
     let tr = span("attend");
     let hv = w.n_head * w.v_head;
     let mut out_v = vec![0f32; t * hv];
-    cu.attend(wk, wv, &q, &c.lat16, kv_len, t, pos0, sel.as_deref(), &mut out_v, &s)
-        .map_err(gerr)?;
+    cu.attend(
+        wk,
+        wv,
+        &q,
+        &c.lat16,
+        kv_len,
+        t,
+        pos0,
+        sel.as_deref(),
+        &mut out_v,
+        &s,
+    )
+    .map_err(gerr)?;
     drop(tr);
     // o_proj on the host
     let _tr = span("o_proj.host");
@@ -2250,8 +2401,18 @@ pub(crate) fn dsa_gpu_resident(
     c.valid.resize(kv_len, 0);
     let mut pool = Vec::new();
     let o = p.window(
-        cu, w, x, t, pos0, &mut c.lat16, &mut c.idx_k, &mut c.idx_g, &mut c.valid,
-        dbg.is_some().then_some(&mut pool), dbg.is_some(), &s,
+        cu,
+        w,
+        x,
+        t,
+        pos0,
+        &mut c.lat16,
+        &mut c.idx_k,
+        &mut c.idx_g,
+        &mut c.valid,
+        dbg.is_some().then_some(&mut pool),
+        dbg.is_some(),
+        &s,
     )?;
     if let Some(d) = dbg {
         let (lat_dev, idk_dev, idg_dev, val_dev) = cu.debug_rows(0, kv_len).map_err(gerr)?;
@@ -2297,7 +2458,11 @@ pub(crate) fn argmax(v: &[f32]) -> u32 {
 pub fn is_glm5(path: &Path) -> bool {
     crate::gguf::Gguf::open(path)
         .ok()
-        .and_then(|g| g.meta_str("general.architecture").ok().map(|a| a == "glm5-next"))
+        .and_then(|g| {
+            g.meta_str("general.architecture")
+                .ok()
+                .map(|a| a == "glm5-next")
+        })
         .unwrap_or(false)
 }
 
@@ -2315,7 +2480,10 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     let mut rr = false;
     let mut diverse = false;
     // --mtp K: draft K tokens per trunk pass with the NextN layer (super::mtp); 0 = plain
-    let mut mtp_k = std::env::var("TANG_GLM5_MTP").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    let mut mtp_k = std::env::var("TANG_GLM5_MTP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0usize);
     if std::env::var("TANG_GLM5_MTP").is_ok_and(|v| v == "auto") {
         super::mtp::AUTO.store(true, std::sync::atomic::Ordering::Relaxed);
         mtp_k = 3;
@@ -2373,13 +2541,20 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     if let Some(p) = &prompt {
         ids = crate::flash::tokenize::encode_chat(&path, p, None)?;
     }
-    ensure!(!ids.is_empty(), "no prompt (--prompt-ids, --ids-file or --prompt)");
+    ensure!(
+        !ids.is_empty(),
+        "no prompt (--prompt-ids, --ids-file or --prompt)"
+    );
     ensure!(n >= 1, "-n must be at least 1");
 
     // TANG_GLM5_TRACE=1: span tree + bottleneck table (trace.rs), otel export with the
     // `otel` feature. Before the GPU loads, so kernel names are recorded.
     let traced = super::trace::init();
-    let _otel = if traced { crate::telemetry::init() } else { None };
+    let _otel = if traced {
+        crate::telemetry::init()
+    } else {
+        None
+    };
     let t0 = Instant::now();
     let mut e = Glm5Engine::open(&path)?;
     e.verbose = verbose;
@@ -2415,7 +2590,15 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         return slots_bench(&mut e, &ids, n, chunk, slots, rr, diverse, out.as_deref());
     }
     if mtp_k > 0 {
-        return super::mtp::cli_run(&mut e, &ids, n, chunk, mtp_k, out.as_deref(), quiet || bench);
+        return super::mtp::cli_run(
+            &mut e,
+            &ids,
+            n,
+            chunk,
+            mtp_k,
+            out.as_deref(),
+            quiet || bench,
+        );
     }
     let t1 = Instant::now();
     let mut cur = e.prefill(&ids, chunk)?;
@@ -2424,14 +2607,14 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
     // TANG_GLM5_WINDIFF=S,T: bisect window-vs-step numerics. Step-decode until S tokens
     // are generated, snapshot, then (A) T single steps vs (B) one T-token window over the
     // same tokens, comparing the per-layer taps and the logits (top-2 margins).
-    if let Some(spec) = std::env::var("TANG_GLM5_WINDIFF").ok() {
+    if let Ok(spec) = std::env::var("TANG_GLM5_WINDIFF") {
         let v: Vec<usize> = spec.split(',').filter_map(|x| x.parse().ok()).collect();
         ensure!(v.len() == 2, "TANG_GLM5_WINDIFF=S,T");
         return windiff(&mut e, gen, v[0], v[1]);
     }
     // TANG_GLM5_LOGITS_DUMP=path: the f32 logits of every decode step (device LM head,
     // TANG_GLM5_GPU_HEAD=1), n_vocab floats each, appended in order (numerics A/B)
-    let mut dump = match std::env::var("TANG_GLM5_LOGITS_DUMP") {
+    let dump = match std::env::var("TANG_GLM5_LOGITS_DUMP") {
         Ok(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
         Err(_) => None,
     };
@@ -2442,7 +2625,12 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         #[cfg(feature = "cuda")]
         if let Some(w) = dump.as_mut() {
             let nv = e.m.hp.n_vocab;
-            let l = e.gpu.as_ref().map(|g| g.last_head_logits(nv)).transpose()?.flatten();
+            let l = e
+                .gpu
+                .as_ref()
+                .map(|g| g.last_head_logits(nv))
+                .transpose()?
+                .flatten();
             let l = l.context("TANG_GLM5_LOGITS_DUMP needs TANG_GLM5_GPU_HEAD=1")?;
             use std::io::Write;
             w.write_all(&l.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
@@ -2456,7 +2644,11 @@ pub fn cli(args: &[String], bench: bool) -> Result<()> {
         prefill_s,
         ids.len() as f64 / prefill_s
     );
-    let line = gen.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+    let line = gen
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     println!("ids: {line}");
     if gen.len() > 1 {
         println!(
@@ -2490,24 +2682,29 @@ fn windiff(e: &mut Glm5Engine, mut gen: Vec<u32>, s: usize, t: usize) -> Result<
         gen.push(e.step(c)?);
     }
     // gen[s] is the next token to feed (gen[..s] are in the context)
-    eprintln!("windiff: context {} tokens, feeding gen[{s}..{}]", e.tokens.len(), s + t);
+    eprintln!(
+        "windiff: context {} tokens, feeding gen[{s}..{}]",
+        e.tokens.len(),
+        s + t
+    );
     let snap = e.snapshot()?;
-    let run = |e: &mut Glm5Engine, gen: &mut Vec<u32>, win: bool| -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
-        e.wintap = Some(vec![Vec::new(); nl * 4]);
-        let mut lg = Vec::new();
-        if win {
-            lg = e.window(&gen[s..s + t])?;
-        } else {
-            for i in 0..t {
-                let l = e.window(&[gen[s + i]])?;
-                if gen.len() <= s + i + 1 {
-                    gen.push(argmax(&l));
+    let run =
+        |e: &mut Glm5Engine, gen: &mut Vec<u32>, win: bool| -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+            e.wintap = Some(vec![Vec::new(); nl * 4]);
+            let mut lg = Vec::new();
+            if win {
+                lg = e.window(&gen[s..s + t])?;
+            } else {
+                for i in 0..t {
+                    let l = e.window(&[gen[s + i]])?;
+                    if gen.len() <= s + i + 1 {
+                        gen.push(argmax(&l));
+                    }
+                    lg.extend(l);
                 }
-                lg.extend(l);
             }
-        }
-        Ok((e.wintap.take().unwrap(), lg))
-    };
+            Ok((e.wintap.take().unwrap(), lg))
+        };
     let (ta, la) = run(e, &mut gen, false)?;
     e.restore(snap.clone_snap());
     let (ta2, la2) = run(e, &mut gen, false)?;
@@ -2536,10 +2733,22 @@ fn windiff(e: &mut Glm5Engine, mut gen: Vec<u32>, s: usize, t: usize) -> Result<
             let (r1, m1) = rel(a, b);
             // per token row: the first differing row tells window position effects
             let n = a.len() / t;
-            let rows: Vec<String> = (0..t).map(|i| format!("{:.1e}", rel(&a[i * n..(i + 1) * n], &b[i * n..(i + 1) * n]).0)).collect();
+            let rows: Vec<String> = (0..t)
+                .map(|i| {
+                    format!(
+                        "{:.1e}",
+                        rel(&a[i * n..(i + 1) * n], &b[i * n..(i + 1) * n]).0
+                    )
+                })
+                .collect();
             eprintln!(
                 "windiff: l{l:02} {:8} kda={} ss {:.2e} ws {:.2e} max {:.2e} rows [{}]",
-                names[st], e.m.hp.is_kda[l], r0, r1, m1, rows.join(" ")
+                names[st],
+                e.m.hp.is_kda[l],
+                r0,
+                r1,
+                m1,
+                rows.join(" ")
             );
         }
     }
@@ -2556,7 +2765,10 @@ fn windiff(e: &mut Glm5Engine, mut gen: Vec<u32>, s: usize, t: usize) -> Result<
     for i in 0..t {
         for (nm, l) in [("step", &la), ("step2", &la2), ("window", &lb)] {
             let (a, va, b, vb) = top2(&l[i * nv..(i + 1) * nv]);
-            eprintln!("windiff: row {i} {nm:6} top1 {a} ({va:.4}) top2 {b} ({vb:.4}) margin {:.4}", va - vb);
+            eprintln!(
+                "windiff: row {i} {nm:6} top1 {a} ({va:.4}) top2 {b} ({vb:.4}) margin {:.4}",
+                va - vb
+            );
         }
         let (r, m) = rel(&la[i * nv..(i + 1) * nv], &lb[i * nv..(i + 1) * nv]);
         eprintln!("windiff: row {i} logits window-vs-step rel {r:.2e} max abs {m:.3e}");
@@ -2571,7 +2783,10 @@ fn windiff(e: &mut Glm5Engine, mut gen: Vec<u32>, s: usize, t: usize) -> Result<
 fn sol_gbs(g: &tang_moe::gpu::Gpu) -> (f64, String) {
     use cudarc::driver::sys::CUdevice_attribute as A;
     let name = g.ctx.name().unwrap_or_default();
-    if let Some(v) = std::env::var("TANG_SOL_GBS").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(v) = std::env::var("TANG_SOL_GBS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
         return (v, format!("{name}, TANG_SOL_GBS"));
     }
     const KNOWN: &[(&str, f64)] = &[
@@ -2588,9 +2803,16 @@ fn sol_gbs(g: &tang_moe::gpu::Gpu) -> (f64, String) {
     if let Some(&(_, v)) = KNOWN.iter().find(|(k, _)| name.contains(k)) {
         return (v, format!("{name}, datasheet"));
     }
-    let clk = g.attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE).unwrap_or(0) as f64; // kHz
-    let bus = g.attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH).unwrap_or(0) as f64; // bits
-    (clk * 1e3 * 2.0 * bus / 8.0 / 1e9, format!("{name}, driver clock × bus"))
+    let clk = g
+        .attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)
+        .unwrap_or(0) as f64; // kHz
+    let bus = g
+        .attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)
+        .unwrap_or(0) as f64; // bits
+    (
+        clk * 1e3 * 2.0 * bus / 8.0 / 1e9,
+        format!("{name}, driver clock × bus"),
+    )
 }
 
 /// `--slots N`: prefill `ids` into each of `slots` sequence slots, then decode `n - 1`
@@ -2630,7 +2852,9 @@ fn slots_bench(
         let rows: Vec<(usize, u32)> = (0..slots).map(|s| (s, prompts[s][j])).collect();
         lg = e.window_batch(&rows)?;
     }
-    let mut cur: Vec<u32> = (0..slots).map(|s| argmax(&lg[s * nv..(s + 1) * nv])).collect();
+    let mut cur: Vec<u32> = (0..slots)
+        .map(|s| argmax(&lg[s * nv..(s + 1) * nv]))
+        .collect();
     let prefill_s = t1.elapsed().as_secs_f64();
     let mut gen: Vec<Vec<u32>> = cur.iter().map(|&c| vec![c]).collect();
     let mut step_ms = Vec::new();
@@ -2659,7 +2883,12 @@ fn slots_bench(
         ids.len(),
         prefill_s
     );
-    let line = |g: &[u32]| g.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+    let line = |g: &[u32]| {
+        g.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     for (s, g) in gen.iter().enumerate() {
         println!("ids slot {s}: {}", line(g));
     }
@@ -2668,9 +2897,19 @@ fn slots_bench(
     let same = diverse || gen.iter().all(|g| g == &gen[0]);
     if diverse {
         let distinct = gen.iter().skip(1).filter(|g| *g != &gen[0]).count();
-        println!("diverse prompts: {distinct} of {} other slots decode differently from slot 0", slots - 1);
+        println!(
+            "diverse prompts: {distinct} of {} other slots decode differently from slot 0",
+            slots - 1
+        );
     } else {
-        println!("slots agree: {}", if same { "yes" } else { "NO — slot state bleeds" });
+        println!(
+            "slots agree: {}",
+            if same {
+                "yes"
+            } else {
+                "NO — slot state bleeds"
+            }
+        );
     }
     if !step_ms.is_empty() {
         let mut v = step_ms.clone();
@@ -2715,6 +2954,7 @@ mod tests {
     /// `TANG_REQUIRE_CUDA=1` a skip is a FAILURE instead; without it, the skip prints a
     /// loud banner. `reason` says what's missing.
     /// (Now [`tang_verify::skip_or_fail`], shared by every kernel test.)
+    #[allow(dead_code)]
     fn skip_or_fail(reason: &str) {
         tang_verify::skip_or_fail(reason)
     }
@@ -2749,10 +2989,10 @@ mod tests {
             return;
         }
         let ids: Vec<u32> = (1000..1008).collect(); // 8 arbitrary in-vocab tokens
-        // CPU outputs FIRST, engine dropped before the GPU engine opens: two resident
-        // engines (2 × ~250 GB) exceed the 274 GB card. The CPU engine holds no resident
-        // experts (mmap dequant per layer), so it's cheap — but dropping it keeps the
-        // peak at one resident set.
+                                                    // CPU outputs FIRST, engine dropped before the GPU engine opens: two resident
+                                                    // engines (2 × ~250 GB) exceed the 274 GB card. The CPU engine holds no resident
+                                                    // experts (mmap dequant per layer), so it's cheap — but dropping it keeps the
+                                                    // peak at one resident set.
         std::env::set_var("TANG_GLM5_GPU", "0");
         let cpu_out = {
             let mut cpu2 = Glm5Engine::open(p).unwrap();
@@ -2777,15 +3017,25 @@ mod tests {
         for p in 0..ids.len() {
             let c = &cpu_out[p * nv..(p + 1) * nv];
             let g = &gpu_out[p * nv..(p + 1) * nv];
-            let w: f32 = c.iter().zip(g).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let w: f32 = c
+                .iter()
+                .zip(g)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             worst = worst.max(w);
             if argmax(c) != argmax(g) {
                 bad += 1;
                 eprintln!("position {p}: top-1 differs, max abs {w}");
             }
         }
-        eprintln!("real-weights bisector: max abs {worst}, top-1 mismatches {bad}/{}", ids.len());
-        assert_eq!(bad, 0, "the wired GPU path diverges from CPU on the real model");
+        eprintln!(
+            "real-weights bisector: max abs {worst}, top-1 mismatches {bad}/{}",
+            ids.len()
+        );
+        assert_eq!(
+            bad, 0,
+            "the wired GPU path diverges from CPU on the real model"
+        );
     }
 
     /// Chunked prefill + token-by-token decode equals one full reference forward.
@@ -2890,16 +3140,25 @@ mod tests {
             .collect();
         let _ = &ids;
         let mut flips = Vec::new();
-        for (wi, w) in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]]
-            .into_iter()
-            .enumerate()
+        for (wi, w) in [
+            &ids2[..150],
+            &ids2[150..151],
+            &ids2[151..152],
+            &ids2[152..160],
+        ]
+        .into_iter()
+        .enumerate()
         {
             let a = cpu.window(w).unwrap();
             let b = gpu.window(w).unwrap();
             for p in 0..w.len() {
                 let (ra, rb) = (&a[p * nv..(p + 1) * nv], &b[p * nv..(p + 1) * nv]);
                 let (ta, tb) = (argmax(ra), argmax(rb));
-                let row: f32 = ra.iter().zip(rb).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+                let row: f32 = ra
+                    .iter()
+                    .zip(rb)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0, f32::max);
                 if ta != tb {
                     // a near-tie flip (|cpu margin| ≲ the row's max abs diff) is numerics; a
                     // wide margin is a real divergence — print both so the log says which
@@ -2917,7 +3176,11 @@ mod tests {
             }
         }
         eprintln!("GPU vs CPU: {} top-1 flips {flips:?}", flips.len());
-        assert!(flips.is_empty(), "top-1 differs at {} positions", flips.len());
+        assert!(
+            flips.is_empty(),
+            "top-1 differs at {} positions",
+            flips.len()
+        );
         eprintln!("GPU (FFN + KDA + mHC) vs CPU: logits max abs {worst:.3e}");
         assert!(worst <= 1e-3, "logits max abs {worst}");
     }
@@ -2959,14 +3222,23 @@ mod tests {
             .collect();
         let nv = cpu.m.hp.n_vocab;
         let (mut worst, mut flips) = (0f32, 0usize);
-        for w in [&ids2[..150], &ids2[150..151], &ids2[151..152], &ids2[152..160]] {
+        for w in [
+            &ids2[..150],
+            &ids2[150..151],
+            &ids2[151..152],
+            &ids2[152..160],
+        ] {
             let a = cpu.window(w).unwrap();
             let b = gpu.window(w).unwrap();
             for p in 0..w.len() {
                 let (ra, rb) = (&a[p * nv..(p + 1) * nv], &b[p * nv..(p + 1) * nv]);
                 if argmax(ra) != argmax(rb) {
                     flips += 1;
-                    eprintln!("fused mHC: pos {p}: top-1 cpu {} gpu {}", argmax(ra), argmax(rb));
+                    eprintln!(
+                        "fused mHC: pos {p}: top-1 cpu {} gpu {}",
+                        argmax(ra),
+                        argmax(rb)
+                    );
                 }
             }
             for (x, y) in a.iter().zip(&b) {
@@ -3003,8 +3275,12 @@ mod tests {
             hc_eps: r.hp.hc_eps,
             rms_eps: r.hp.eps,
         };
-        let wa = crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp).unwrap();
-        let wf = crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp).unwrap();
+        let wa =
+            crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_attn", r.hp.n_embd, &mhp)
+                .unwrap();
+        let wf =
+            crate::flash::glm5::mhc::MhcWeights::from_gguf(&r.g, 0, "hc_ffn", r.hp.n_embd, &mhp)
+                .unwrap();
         let mut g = tang_moe::gpu::Gpu::for_test().unwrap();
         g.bind().unwrap();
         let mh = crate::flash::glm5::mhc::MhcGpu::new(&g, [&wa, &wf], 8).unwrap();
@@ -3031,25 +3307,39 @@ mod tests {
                 .iter()
                 .zip(0..)
                 .flat_map(|(m, i)| {
-                    m.post.iter().zip(&set.post[i * 4..(i + 1) * 4]).map(|(a, b)| (a - b).abs())
+                    m.post
+                        .iter()
+                        .zip(&set.post[i * 4..(i + 1) * 4])
+                        .map(|(a, b)| (a - b).abs())
                 })
                 .fold(0.0, f32::max);
             let dcomb: f32 = mixes_cpu
                 .iter()
                 .zip(0..)
                 .flat_map(|(m, i)| {
-                    m.comb.iter().flatten().zip(&set.comb[i * 16..(i + 1) * 16]).map(|(a, b)| (a - b).abs())
+                    m.comb
+                        .iter()
+                        .flatten()
+                        .zip(&set.comb[i * 16..(i + 1) * 16])
+                        .map(|(a, b)| (a - b).abs())
                 })
                 .fold(0.0, f32::max);
             eprintln!("block {block}: x {dx:.3e} post {dpost:.3e} comb {dcomb:.3e}");
             // the bug's signature: block 1's mixes would equal block 0's GPU mixes here
-            assert!(dx < 1e-4 && dpost < 1e-4 && dcomb < 1e-4, "block {block} mHC pre diverges");
+            assert!(
+                dx < 1e-4 && dpost < 1e-4 && dcomb < 1e-4,
+                "block {block} mHC pre diverges"
+            );
         }
         // and the two blocks must NOT produce the same mixes (guards a future revert to
         // a constant block index passing this test trivially)
         let x0 = mh.pre(0, &r_in, t).unwrap().x;
         let x1 = mh.pre(1, &r_in, t).unwrap().x;
-        let d: f32 = x0.iter().zip(&x1).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let d: f32 = x0
+            .iter()
+            .zip(&x1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
         eprintln!("block0 vs block1 x diff {d:.3e}");
         assert!(d > 1e-3, "hc_attn and hc_ffn pre produced identical mixes");
     }
@@ -3069,9 +3359,8 @@ mod tests {
         // "N DSA layers resident (MLA, one per layer)" is the real-model proof; this test
         // pins the invariant so a future per-device revert fails construction-time asserts.
         // (Hparams has no Default; the layer-kind mask is all the invariant needs)
-        let dsa_layers = |is_kda: &[bool]| -> Vec<usize> {
-            (0..is_kda.len()).filter(|&l| !is_kda[l]).collect()
-        };
+        let dsa_layers =
+            |is_kda: &[bool]| -> Vec<usize> { (0..is_kda.len()).filter(|&l| !is_kda[l]).collect() };
         // the real GLM-5.3 geometry: 11 DSA layers, first at layer 3
         let mut is_kda = vec![true; 45];
         for l in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43] {
@@ -3081,7 +3370,10 @@ mod tests {
 
         assert_eq!(dsa.len(), 11, "GLM-5.3 DSA layer count");
         assert_eq!(dsa[0], 3, "first DSA layer (the sample-layer bug's source)");
-        assert!(dsa.len() > 1, "a single-DSA-layer geometry cannot see this bug class");
+        assert!(
+            dsa.len() > 1,
+            "a single-DSA-layer geometry cannot see this bug class"
+        );
     }
 
     /// R3 (all of it): FFN + KDA + MLA/indexer on the GPU vs the CPU engine. W3's GPU
@@ -3127,14 +3419,23 @@ mod tests {
         let mut cpu16 = Glm5Engine::open(Path::new(TINY)).unwrap();
         cpu16.bf16_latents = true;
         let nv = cpu.m.hp.n_vocab;
-        let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let maxd =
+            |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
         let flips = |a: &[f32], b: &[f32], n: usize| {
-            (0..n).filter(|&p| argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])).count()
+            (0..n)
+                .filter(|&p| argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv]))
+                .count()
         };
         let (mut w_gpu16, mut w_gpu32, mut w_fmt, mut scale) = (0f32, 0f32, 0f32, 0f32);
         let (mut f_gpu16, mut f_gpu32, mut f_fmt, mut total) = (0usize, 0usize, 0usize, 0usize);
         // dense (≤ top-k) then sparse windows, then decode steps
-        for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
+        for w in [
+            &ids2[..12],
+            &ids2[12..150],
+            &ids2[150..151],
+            &ids2[151..152],
+            &ids2[152..170],
+        ] {
             let a = cpu.window(w).unwrap();
             let a16 = cpu16.window(w).unwrap();
             let b = gpu.window(w).unwrap();
@@ -3161,14 +3462,26 @@ mod tests {
             "MLA shadow: {checked} windows, {failed} failed; selection {}/{} queries differ ({} near ties, {} real)",
             sel.differ, sel.queries, sel.ties, sel.real
         );
-        assert!(checked == 5 && failed == 0, "MLA shadow: {failed}/{checked} windows failed");
+        assert!(
+            checked == 5 && failed == 0,
+            "MLA shadow: {failed}/{checked} windows failed"
+        );
         // the GPU path IS the bf16-latent model: tight against its CPU twin
         assert_eq!(f_gpu16, 0, "top-1 flips vs the CPU-bf16 engine");
-        assert!(w_gpu16 <= 1e-2, "logits max abs vs the CPU-bf16 engine {w_gpu16}");
+        assert!(
+            w_gpu16 <= 1e-2,
+            "logits max abs vs the CPU-bf16 engine {w_gpu16}"
+        );
         // and the f32 gap is the format's: no larger than the CPU's own bf16-vs-f32 gap
         // (+ the f32-path noise of engine_gpu_matches_cpu, 1e-3)
-        assert!(w_gpu32 <= 1.25 * w_fmt + 1e-3, "GPU vs CPU-f32 {w_gpu32} exceeds the format gap {w_fmt}");
-        assert!(f_gpu32 as f32 <= 0.02 * total as f32, "top-1 vs CPU-f32 {f_gpu32}/{total}");
+        assert!(
+            w_gpu32 <= 1.25 * w_fmt + 1e-3,
+            "GPU vs CPU-f32 {w_gpu32} exceeds the format gap {w_fmt}"
+        );
+        assert!(
+            f_gpu32 as f32 <= 0.02 * total as f32,
+            "top-1 vs CPU-f32 {f_gpu32}/{total}"
+        );
     }
 
     /// The device-resident projections (`TANG_GLM5_MLA_RESIDENT=1`: q_a + norm, q_b,
@@ -3186,25 +3499,51 @@ mod tests {
         }
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
         let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
-        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let ids2: Vec<u32> = v["seq2_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
         let mut naive = Glm5Engine::open(Path::new(TINY)).unwrap();
         let mut res = Glm5Engine::open(Path::new(TINY)).unwrap();
-        assert!(naive.use_gpu().unwrap() && res.use_gpu().unwrap(), "GPU did not load");
+        assert!(
+            naive.use_gpu().unwrap() && res.use_gpu().unwrap(),
+            "GPU did not load"
+        );
         let n = {
             let m = &res.m;
-            res.gpu.as_mut().unwrap().enable_mla_resident(&m.g, &|l| m.mla_weights(l)).unwrap()
+            res.gpu
+                .as_mut()
+                .unwrap()
+                .enable_mla_resident(&m.g, &|l| m.mla_weights(l))
+                .unwrap()
         };
-        assert_eq!(n, res.m.hp.is_kda.iter().filter(|&&k| !k).count(), "one MlaProj per DSA layer");
+        assert_eq!(
+            n,
+            res.m.hp.is_kda.iter().filter(|&&k| !k).count(),
+            "one MlaProj per DSA layer"
+        );
         res.mla_dbg = Some(super::super::mla_debug::Shadow::always());
         let nv = res.m.hp.n_vocab;
         let (mut worst, mut flips) = (0f32, 0usize);
-        for w in [&ids2[..12], &ids2[12..150], &ids2[150..151], &ids2[151..152], &ids2[152..170]] {
+        for w in [
+            &ids2[..12],
+            &ids2[12..150],
+            &ids2[150..151],
+            &ids2[151..152],
+            &ids2[152..170],
+        ] {
             let a = naive.window(w).unwrap();
             let b = res.window(w).unwrap();
             for p in 0..w.len() {
-                flips += (argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])) as usize;
+                flips +=
+                    (argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])) as usize;
             }
-            worst = a.iter().zip(&b).fold(worst, |m, (x, y)| m.max((x - y).abs()));
+            worst = a
+                .iter()
+                .zip(&b)
+                .fold(worst, |m, (x, y)| m.max((x - y).abs()));
         }
         let (checked, failed, sel) = res.mla_dbg.as_ref().unwrap().totals();
         eprintln!(
@@ -3212,7 +3551,10 @@ mod tests {
              shadow {checked} windows, {failed} failed, selection {}/{} differ",
             sel.differ, sel.queries
         );
-        assert!(checked == 5 && failed == 0, "MLA shadow (resident): {failed}/{checked} windows failed");
+        assert!(
+            checked == 5 && failed == 0,
+            "MLA shadow (resident): {failed}/{checked} windows failed"
+        );
         assert_eq!(flips, 0, "resident vs naive top-1 flips");
         assert!(worst <= 1e-2, "resident vs naive logits max abs {worst}");
     }
@@ -3263,7 +3605,10 @@ mod tests {
                     let lg = e.window_batch(&[(1, cur[0]), (2, cur[1])]).unwrap();
                     vec![lg[..nv].to_vec(), lg[nv..].to_vec()]
                 } else {
-                    vec![e.window_slot(1, &[cur[0]]).unwrap(), e.window_slot(2, &[cur[1]]).unwrap()]
+                    vec![
+                        e.window_slot(1, &[cur[0]]).unwrap(),
+                        e.window_slot(2, &[cur[1]]).unwrap(),
+                    ]
                 };
                 for k in 0..2 {
                     let worst = got[k]
@@ -3271,9 +3616,16 @@ mod tests {
                         .zip(&want[k][step])
                         .map(|(a, b)| (a - b).abs())
                         .fold(0f32, f32::max);
-                    assert!(worst <= 1e-4, "batched {batched} slot {k} step {step}: max abs {worst}");
+                    assert!(
+                        worst <= 1e-4,
+                        "batched {batched} slot {k} step {step}: max abs {worst}"
+                    );
                     cur[k] = argmax(&got[k]);
-                    assert_eq!(cur[k], toks[k][step + 1], "batched {batched} slot {k} step {step}");
+                    assert_eq!(
+                        cur[k],
+                        toks[k][step + 1],
+                        "batched {batched} slot {k} step {step}"
+                    );
                 }
             }
             assert_eq!(e.slot_tokens(1).len(), prompts[0].len() + steps);
@@ -3313,12 +3665,20 @@ mod tests {
             std::env::set_var("TANG_GLM5_KDA_PF2", "1"); // the batched KDA rows need it
             std::env::set_var("TANG_GLM5_MOE", moe);
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
-            let ok = if slots > 1 { e.use_gpu_slots(slots) } else { e.use_gpu() }.unwrap();
+            let ok = if slots > 1 {
+                e.use_gpu_slots(slots)
+            } else {
+                e.use_gpu()
+            }
+            .unwrap();
             std::env::remove_var("TANG_GLM5_KDA_PF2");
             std::env::remove_var("TANG_GLM5_MOE");
             assert!(ok, "GPU did not load");
             let g = e.gpu.as_ref().unwrap();
-            assert!((0..e.m.hp.n_layer).all(|l| g.has_ffn(l)), "{moe}: every FFN on the GPU");
+            assert!(
+                (0..e.m.hp.n_layer).all(|l| g.has_ffn(l)),
+                "{moe}: every FFN on the GPU"
+            );
             assert_eq!(g.devs[0].1.fast, moe == "fast", "{moe}: MoE kernel path");
             e
         };
@@ -3348,19 +3708,29 @@ mod tests {
             let lg = e.window_slot(k + 1, p).unwrap();
             cur.push(argmax(&lg[(p.len() - 1) * nv..]));
         }
-        assert_eq!(cur, vec![toks[0][0], toks[1][0]], "{moe}: prefill next tokens");
+        assert_eq!(
+            cur,
+            vec![toks[0][0], toks[1][0]],
+            "{moe}: prefill next tokens"
+        );
         for step in 0..steps {
             let lg = e.window_batch(&[(1, cur[0]), (2, cur[1])]).unwrap();
             for k in 0..2 {
                 let got = &lg[k * nv..(k + 1) * nv];
-                let scale = want[k][step].iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+                let scale = want[k][step]
+                    .iter()
+                    .fold(0f32, |m, v| m.max(v.abs()))
+                    .max(1.0);
                 let worst = got
                     .iter()
                     .zip(&want[k][step])
                     .map(|(a, b)| (a - b).abs())
                     .fold(0f32, f32::max);
                 eprintln!("gpu slots ({moe}): slot {k} step {step}: max abs {worst:.3e} (scale {scale:.2})");
-                assert!(worst <= 1e-3 * scale, "{moe}: slot {k} step {step}: max abs {worst} vs scale {scale}");
+                assert!(
+                    worst <= 1e-3 * scale,
+                    "{moe}: slot {k} step {step}: max abs {worst} vs scale {scale}"
+                );
                 cur[k] = argmax(got);
             }
         }
@@ -3418,14 +3788,28 @@ mod tests {
             for r in 0..t {
                 let (g, w) = (&got[r * nv..(r + 1) * nv], &want[r * nv..(r + 1) * nv]);
                 let scale = w.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
-                let d = g.iter().zip(w).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let d = g
+                    .iter()
+                    .zip(w)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
                 eprintln!("win_step t={t} row {r}: max abs {d:.3e} (scale {scale:.2})");
-                assert!(d <= 1e-4 * scale, "t={t} row {r}: window vs steps max abs {d}");
+                assert!(
+                    d <= 1e-4 * scale,
+                    "t={t} row {r}: window vs steps max abs {d}"
+                );
                 assert_eq!(argmax(g), argmax(w), "t={t} row {r}: argmax");
             }
-            let d = got_next.iter().zip(&want_next).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let d = got_next
+                .iter()
+                .zip(&want_next)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
             eprintln!("win_step t={t} next step: max abs {d:.3e}");
-            assert!(d <= 1e-4 * want_next.iter().fold(1f32, |m, v| m.max(v.abs())), "t={t}: state after window");
+            assert!(
+                d <= 1e-4 * want_next.iter().fold(1f32, |m, v| m.max(v.abs())),
+                "t={t}: state after window"
+            );
         }
     }
 
@@ -3463,9 +3847,16 @@ mod tests {
         e.window(&ids[6..9]).unwrap();
         e.reset();
         let b = e.window(&ids[..6]).unwrap();
-        let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let d = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
         println!("engine_reset_gpu: max |a - b| {d:.3e}");
-        assert!(d < 1e-4, "after reset the GPU window differs from a fresh one: {d}");
+        assert!(
+            d < 1e-4,
+            "after reset the GPU window differs from a fresh one: {d}"
+        );
     }
 
     /// The device-resident decode step ([`resident`]) against the host-staged path on the
@@ -3481,12 +3872,22 @@ mod tests {
             skip_or_fail("fixture/GPU");
             return;
         }
-        for (k, v) in [("TANG_GLM5_MOE", "fast"), ("TANG_GLM5_KDA_PF2", "1"), ("TANG_GLM5_KDA_GRAPH", "1"), ("TANG_GLM5_GEMV8", "1")] {
+        for (k, v) in [
+            ("TANG_GLM5_MOE", "fast"),
+            ("TANG_GLM5_KDA_PF2", "1"),
+            ("TANG_GLM5_KDA_GRAPH", "1"),
+            ("TANG_GLM5_GEMV8", "1"),
+        ] {
             std::env::set_var(k, v);
         }
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
         let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
-        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let ids2: Vec<u32> = v["seq2_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
         let mk = || {
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
             assert!(e.use_gpu().unwrap(), "GPU did not load");
@@ -3521,9 +3922,23 @@ mod tests {
         std::env::set_var("TANG_GLM5_STEP_GRAPH", "1");
         let mut gr = mk();
         let c = run(&mut gr, true);
-        let segs = gr.gpu.as_ref().unwrap().resident.as_ref().and_then(|r| r.graphs.as_ref()).map_or(0, |g| g.len());
-        eprintln!("step graph: {segs} segments, ids {}", if c == a { "= host" } else { "DIFFER" });
-        assert_eq!(segs, gr.m.hp.is_kda.iter().filter(|&&k| !k).count() + 1, "step graph segments");
+        let segs = gr
+            .gpu
+            .as_ref()
+            .unwrap()
+            .resident
+            .as_ref()
+            .and_then(|r| r.graphs.as_ref())
+            .map_or(0, |g| g.len());
+        eprintln!(
+            "step graph: {segs} segments, ids {}",
+            if c == a { "= host" } else { "DIFFER" }
+        );
+        assert_eq!(
+            segs,
+            gr.m.hp.is_kda.iter().filter(|&&k| !k).count() + 1,
+            "step graph segments"
+        );
         assert_eq!(a, c, "step graph vs host greedy ids");
         // the whole-step graph (the default, = TANG_GLM5_STEP_GRAPH=2): one replay per token, the device
         // position counter / embed gather; dense and sparse graphs across the switch
@@ -3531,13 +3946,31 @@ mod tests {
         let mut gw = mk();
         let d = run(&mut gw, true);
         std::env::remove_var("TANG_GLM5_STEP_GRAPH");
-        let whole = gw.gpu.as_ref().unwrap().resident.as_ref().map_or([0, 0], |r| r.whole_replays);
-        eprintln!("whole step graph: replays [dense, sparse] {whole:?}, ids {}", if d == a { "= host" } else { "DIFFER" });
+        let whole = gw
+            .gpu
+            .as_ref()
+            .unwrap()
+            .resident
+            .as_ref()
+            .map_or([0, 0], |r| r.whole_replays);
+        eprintln!(
+            "whole step graph: replays [dense, sparse] {whole:?}, ids {}",
+            if d == a { "= host" } else { "DIFFER" }
+        );
         eprintln!("                  host  {a:?}\n                  whole {d:?}");
-        assert!(whole[0] > 0 && whole[1] > 0 && whole[0] + whole[1] == 39, "whole graph replays {whole:?}");
+        assert!(
+            whole[0] > 0 && whole[1] > 0 && whole[0] + whole[1] == 39,
+            "whole graph replays {whole:?}"
+        );
         assert_eq!(a, d, "whole step graph vs host greedy ids");
-        assert!(host.gpu.as_ref().unwrap().resident.is_none(), "the host run took the resident step");
-        assert!(res.gpu.as_ref().unwrap().resident.is_some(), "the resident step never ran");
+        assert!(
+            host.gpu.as_ref().unwrap().resident.is_none(),
+            "the host run took the resident step"
+        );
+        assert!(
+            res.gpu.as_ref().unwrap().resident.is_some(),
+            "the resident step never ran"
+        );
         eprintln!("resident step: host {a:?}\n               res  {b:?}");
         // a host window after the resident decode: reads the (refreshed) DSA mirrors
         std::env::set_var("TANG_GLM5_RESIDENT", "0");
@@ -3545,10 +3978,22 @@ mod tests {
         let la = host.window(&ids2[4..20]).unwrap();
         let lb = res.window(&ids2[4..20]).unwrap();
         std::env::remove_var("TANG_GLM5_RESIDENT");
-        let flips = (0..16).filter(|&p| argmax(&la[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv])).count();
-        let worst = la.iter().zip(&lb).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-        eprintln!("after resident decode, host window: {flips} flips / 16, logits max abs {worst:.3e}");
-        for k in ["TANG_GLM5_MOE", "TANG_GLM5_KDA_PF2", "TANG_GLM5_KDA_GRAPH", "TANG_GLM5_GEMV8"] {
+        let flips = (0..16)
+            .filter(|&p| argmax(&la[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv]))
+            .count();
+        let worst = la
+            .iter()
+            .zip(&lb)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!(
+            "after resident decode, host window: {flips} flips / 16, logits max abs {worst:.3e}"
+        );
+        for k in [
+            "TANG_GLM5_MOE",
+            "TANG_GLM5_KDA_PF2",
+            "TANG_GLM5_KDA_GRAPH",
+            "TANG_GLM5_GEMV8",
+        ] {
             std::env::remove_var(k);
         }
         assert_eq!(a, b, "resident vs host greedy ids");
@@ -3570,12 +4015,22 @@ mod tests {
             skip_or_fail("fixture/GPU");
             return;
         }
-        for (k, v) in [("TANG_GLM5_MOE", "fast"), ("TANG_GLM5_KDA_PF2", "1"), ("TANG_GLM5_KDA_GRAPH", "1"), ("TANG_GLM5_GEMV8", "1")] {
+        for (k, v) in [
+            ("TANG_GLM5_MOE", "fast"),
+            ("TANG_GLM5_KDA_PF2", "1"),
+            ("TANG_GLM5_KDA_GRAPH", "1"),
+            ("TANG_GLM5_GEMV8", "1"),
+        ] {
             std::env::set_var(k, v);
         }
         let meta = std::fs::read_to_string("/private/tmp/glm5-tiny/ref/meta.json").unwrap();
         let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
-        let ids2: Vec<u32> = v["seq2_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let ids2: Vec<u32> = v["seq2_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
         let mk = || {
             let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
             assert!(e.use_gpu().unwrap(), "GPU did not load");
@@ -3611,11 +4066,20 @@ mod tests {
         // resident
         let mut b = mk();
         b.prefill(pre, 64).unwrap();
-        let (gb, hb) = b.window_resident(win).unwrap().expect("resident window did not run");
+        let (gb, hb) = b
+            .window_resident(win)
+            .unwrap()
+            .expect("resident window did not run");
         let scale = ha.iter().fold(1f32, |m, x| m.max(x.abs()));
-        let dh = ha.iter().zip(&hb).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let dh = ha
+            .iter()
+            .zip(&hb)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
         eprintln!("resident window t=3: ids host {ga:?} res {gb:?}; h max abs {dh:.3e} (scale {scale:.2})");
-        let (gb2, _) = b.window_resident(rest).unwrap().expect("second resident window");
+        let (gb2, _) = b
+            .window_resident(rest)
+            .unwrap()
+            .expect("second resident window");
         eprintln!("resident window next t=3: ids host {gr:?} res {gb2:?}");
         // rewind: keep row 0, then the rest
         let mut c = mk();
@@ -3630,9 +4094,16 @@ mod tests {
         let lb = b.window(&ids2[10..14]).unwrap();
         let la2 = a.window(&ids2[10..14]).unwrap();
         std::env::remove_var("TANG_GLM5_RESIDENT");
-        let flips = (0..4).filter(|&p| argmax(&la2[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv])).count();
+        let flips = (0..4)
+            .filter(|&p| argmax(&la2[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv]))
+            .count();
         super::super::mtp::WIN_STEP_DEFAULT.store(ws, Ordering::Relaxed);
-        for k in ["TANG_GLM5_MOE", "TANG_GLM5_KDA_PF2", "TANG_GLM5_KDA_GRAPH", "TANG_GLM5_GEMV8"] {
+        for k in [
+            "TANG_GLM5_MOE",
+            "TANG_GLM5_KDA_PF2",
+            "TANG_GLM5_KDA_GRAPH",
+            "TANG_GLM5_GEMV8",
+        ] {
             std::env::remove_var(k);
         }
         assert_eq!(hb.len(), 3 * n);
@@ -3675,11 +4146,29 @@ mod tests {
         println!("{r}");
         // the same bound as engine_reset_gpu (a fresh sequence run twice): tracing adds
         // events and counters only, so anything past run-to-run noise is a bug
-        let d = traced.iter().zip(&plain).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        let same = traced.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits());
-        println!("engine_gpu_trace_is_transparent: max |traced - plain| {d:.3e}, bit-identical {same}");
+        let d = traced
+            .iter()
+            .zip(&plain)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let same = traced
+            .iter()
+            .zip(&plain)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        println!(
+            "engine_gpu_trace_is_transparent: max |traced - plain| {d:.3e}, bit-identical {same}"
+        );
         assert!(d < 1e-4, "tracing changed the logits: {d}");
-        for want in ["decode, per token", "prefill, totals", "kda", "mhc_pre.attn", "ffn", "lm_head", "kernels by GPU time", "k5_"] {
+        for want in [
+            "decode, per token",
+            "prefill, totals",
+            "kda",
+            "mhc_pre.attn",
+            "ffn",
+            "lm_head",
+            "kernels by GPU time",
+            "k5_",
+        ] {
             assert!(r.contains(want), "trace report lacks {want:?}:\n{r}");
         }
         // the hook's cost where it is largest: the tiny model's decode windows are almost

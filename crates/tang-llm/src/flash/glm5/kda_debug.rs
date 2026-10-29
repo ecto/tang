@@ -90,8 +90,14 @@ pub fn spec(kcfg: &KdaConfig, hidden: usize) -> Spec {
             &[],
         )
         .tap(Tap::new(tap::G, inner.clone()).what("k5_gemv f_a, f_b + k5_gate_finish (device)"))
-        .tap(Tap::new(tap::BETA, Layout::new().dim("tok", 0).dim("h", nh)).what("k5_beta (device)"));
-    for (sec, (name, input)) in ["conv.q", "conv.k", "conv.v"].into_iter().zip(qkv).enumerate() {
+        .tap(
+            Tap::new(tap::BETA, Layout::new().dim("tok", 0).dim("h", nh)).what("k5_beta (device)"),
+        );
+    for (sec, (name, input)) in ["conv.q", "conv.k", "conv.v"]
+        .into_iter()
+        .zip(qkv)
+        .enumerate()
+    {
         s.push(
             Tap::new(name, inner.clone())
                 .after(&[input])
@@ -105,15 +111,31 @@ pub fn spec(kcfg: &KdaConfig, hidden: usize) -> Spec {
             .what("core: kda_step (decode) / kda_prefill (64-chunks) / CPU kda_chunk (tail)"),
     )
     .tap(Tap::new(tap::G2, inner.clone()).what("k5_gemv g_a, g_b (device)"))
-    .tap(Tap::new(tap::Y_NORM, inner).after(&["o", "g2"]).what("k5_gated_norm (device)"))
+    .tap(
+        Tap::new(tap::Y_NORM, inner)
+            .after(&["o", "g2"])
+            .what("k5_gated_norm (device)"),
+    )
     .tap(
         Tap::new(tap::OUT, Layout::new().dim("tok", 0).dim("c", hidden))
             .after(&["y_norm"])
             .what("k5_gemv attn_output (device)"),
     )
-    .tap(Tap::new("state", state).after(&["o"]).what("core state update (device st / tail seed)"))
-    .tap(Tap::new("conv_state", conv.clone()).after(&qkv).what("conv commit (device h0) vs host shift"))
-    .tap(Tap::new("conv_host", conv).after(&qkv).what("host conv copy (decode side effect / tail)"))
+    .tap(
+        Tap::new("state", state)
+            .after(&["o"])
+            .what("core state update (device st / tail seed)"),
+    )
+    .tap(
+        Tap::new("conv_state", conv.clone())
+            .after(&qkv)
+            .what("conv commit (device h0) vs host shift"),
+    )
+    .tap(
+        Tap::new("conv_host", conv)
+            .after(&qkv)
+            .what("host conv copy (decode side effect / tail)"),
+    )
 }
 
 /// One shadow per KDA layer: the CPU's copy of its conv + recurrent state.
@@ -124,13 +146,18 @@ pub struct Shadow {
 
 impl Shadow {
     pub fn from_env(n_layer: usize) -> Option<Self> {
-        let v = Verifier::from_env("kda", Some(LEGACY))?.with_tag("kdadbg").with_unit("l");
+        let v = Verifier::from_env("kda", Some(LEGACY))?
+            .with_tag("kdadbg")
+            .with_unit("l");
         let c = &v.cfg;
         v.log(format_args!(
             "ON: layers {:?} windows {:?} tol {:.1e} resync {} poison {} dir {:?}",
             c.units, c.windows, c.tol, c.resync, c.poison, c.dir
         ));
-        Some(Self { v, states: (0..n_layer).map(|_| None).collect() })
+        Some(Self {
+            v,
+            states: (0..n_layer).map(|_| None).collect(),
+        })
     }
 
     /// Whether layer `l`'s next window is checked.
@@ -169,7 +196,9 @@ impl Shadow {
     ) -> Result<()> {
         let win = self.v.next_window(l);
         let Some((sc, ss)) = self.states[l].as_mut() else {
-            self.v.log(format_args!("w{win} l{l}: no shadow state (prime not called) — skipped"));
+            self.v.log(format_args!(
+                "w{win} l{l}: no shadow state (prime not called) — skipped"
+            ));
             return Ok(());
         };
         let mut cpu = Taps::new();
@@ -191,7 +220,8 @@ impl Shadow {
             xs.norm_cpu, xs.nonfinite_cpu
         ));
         gpu.put("x", x.to_vec());
-        self.v.check(l, &format!("t{t}"), &spec(kcfg, w.hidden), &gpu, &cpu);
+        self.v
+            .check(l, &format!("t{t}"), &spec(kcfg, w.hidden), &gpu, &cpu);
         if self.v.cfg.resync {
             // the next window tests one step from the device's own state
             *sc = dev_conv.clone();
@@ -207,7 +237,13 @@ mod tests {
 
     #[test]
     fn spec_sections_and_locate() {
-        let kcfg = KdaConfig { heads: 2, head_dim: 4, d_conv: 4, gate_lower_bound: None, eps: 1e-6 };
+        let kcfg = KdaConfig {
+            heads: 2,
+            head_dim: 4,
+            d_conv: 4,
+            gate_lower_bound: None,
+            eps: 1e-6,
+        };
         let s = spec(&kcfg, 8);
         // t=2, di=8: [q k v] per token
         let mut taps = Taps::new();
@@ -216,7 +252,16 @@ mod tests {
         assert_eq!(&k[..2], &[8.0, 9.0]);
         assert_eq!(k[8], 32.0);
         assert_eq!(s.get("o").unwrap().layout.locate(13), "tok1 h1 d1");
-        assert_eq!(s.get("state").unwrap().layout.locate(16 + 4 * 2 + 3), "h1 key2 val3");
-        assert_eq!(s.get("conv_state").unwrap().layout.locate(8 * 3 + 3 * 2 + 1), "k h0 d2 tap1");
+        assert_eq!(
+            s.get("state").unwrap().layout.locate(16 + 4 * 2 + 3),
+            "h1 key2 val3"
+        );
+        assert_eq!(
+            s.get("conv_state")
+                .unwrap()
+                .layout
+                .locate(8 * 3 + 3 * 2 + 1),
+            "k h0 d2 tap1"
+        );
     }
 }
