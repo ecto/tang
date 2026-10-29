@@ -355,6 +355,68 @@ glue stretch moves ~51 MB a layer (15 µs at HBM rate) in ~100 µs; MoE ~264 µs
 Code: `flash/deepseek/mega.rs` (benches, `Mega`), `kernels_mega.cu`, `mega_engine.rs` (the
 deferral hooks in `block_ks` / `qkv_fused`; flushes before any other reader of the stage).
 
+### Wave 8b: per-projection bandwidth and programmatic dependent launch (8× H100 pod, one GPU)
+
+**Bandwidth targets** (`mega::tests::mega_bw_table`, t = 6, real shapes, random weights,
+each through the launcher the engine uses, copies rotated past L2, graph replay; % of
+3.35 TB/s):
+
+| projection | rows × cols | MB | µs | GB/s | % HBM |
+|---|---|---|---|---|---|
+| wq_a (fp8, `ds_ks`) | 1280 × 5120 | 6.3 | 14.1 | 466 | 14% |
+| wkv (fp8, `ds_ks`) | 512 × 5120 | 2.5 | 9.5 | 275 | 8% |
+| wq_b (fp8, `ds_ks`) | 32768 × 1280 | 40.0 | 28.9 | 1450 | 43% |
+| wo_a (fp8, `ds_wo_ks`, 8 groups) | 8192 × 4096 | 32.0 | 25.6 | 1313 | 39% |
+| wo_b (fp8, `ds_ks`) | 5120 × 8192 | 40.0 | 41.5 | 1013 | 30% |
+| indexer wq_b (fp8, `ds_ks`) | 4096 × 1280 | 5.0 | 6.7 | 789 | 24% |
+| compressor wkv (bf16, `ds_linear_t8`) | 512 × 5120 | 5.0 | 33.3 | 157 | 5% |
+| compressor wgate (bf16, `ds_linear_t8`) | 512 × 5120 | 5.0 | 33.3 | 157 | 5% |
+| indexer weights_proj (bf16, `ds_linear_t8`) | 32 × 5120 | 0.3 | 30.8 | 11 | 0% |
+| router gate (bf16, `ds_linear_t8`) | 384 × 5120 | 3.8 | 33.0 | 119 | 4% |
+| hc mixes (f32, `ds_linear_t8`; the engine runs them inside `ds_hc_fused_ks`) | 24 × 20480 | 1.9 | 104.4 | 19 | 1% |
+| expert gu, one slot (fp4, `ds_ks` gu; a stand-in for the grouped launch) | 2 × 2304 × 5120 | 12.0 | 22.5 | 557 | 17% |
+| expert down, one slot (fp4, `ds_ks`; stand-in) | 5120 × 2304 | 6.0 | 13.9 | 451 | 13% |
+| head (bf16, `ds_head_bf16`) | 129280 × 5120 | 1262.5 | 516.9 | 2561 | 76% |
+
+Read: only the head streams well. `ds_linear_t8` has a ~31 µs floor whatever the size (the
+router, compressor and indexer weights; ~4 of them a compressing layer, ~2.5 ms a step): move
+the bf16 t ≤ 8 linears onto a K-split GEMV (bf16 `lin_mma` variant), the cheapest ms in the
+step. The small fp8 projections (wq_a, wkv) sit at 8–14%: they are a fixed ~9 µs of
+ramp/reduction; batching wq_a + wkv into one launch (same activation) and the K-split reduce
+in fewer rounds are the levers. The big ones (wq_b, wo_a, wo_b) are at 30–43%; target ≥ 70%
+(the head's kernel shows the hardware gives it at t ≤ 8).
+
+**Programmatic dependent launch** (`pdl.rs`: `cuLaunchKernelEx` +
+`CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`; `mg_pdl_step` triggers
+`griddepcontrol.launch_dependents` first, streams its own weights, then
+`griddepcontrol.wait`s and bumps the counters its predecessor bumped;
+`mega::tests::mega_pdl_floor`, chain of 400, 264 × 256 blocks). **The attribute survives graph
+capture** and the order holds (every counter exactly the expected count):
+
+| per-kernel weights | graph plain µs | graph PDL µs | stream plain | stream PDL | bytes at 3.35 TB/s |
+|---|---|---|---|---|---|
+| 0 | 1.19 | 0.82 | 2.05 | 1.43 | 0 |
+| 256 KB | 1.80 | 0.83 | 2.79 | 1.42 | 0.08 |
+| 1 MB | 2.40 | 0.86 | 3.57 | 1.43 | 0.31 |
+| 4 MB | 3.85 | 1.36 | 5.20 | 1.69 | 1.25 |
+| 16 MB | 9.65 | 5.26 | 11.01 | 5.27 | 5.0 |
+
+So PDL takes the node cost from 1.2 to 0.8 µs and, more usefully, **hides a kernel's
+independent weight stream under its predecessor** (4 MB: 3.85 → 1.36 µs, at the bandwidth
+line). At ~24 kernels a layer that is ≥ 0.4 µs × 960 ≈ 0.4 ms a step from the nodes alone, and
+up to each kernel's ramp (the ~9 µs floor of the small projections above) where the weight
+loads can move before the wait.
+
+Not wired into the engine yet: a PDL launch is only safe for a kernel that
+`griddepcontrol.wait`s before reading its predecessor's outputs, and the dense stretch's
+kernels (`ds_ks`/`lin_mma`, `ds_qkv_post`, `ds_hc_fused_ks`, `ds_wo_ks`) live in kernels.cu,
+owned by the kernel lanes. The change per kernel is two lines (`mg_pdl_trigger()` at entry,
+`mg_pdl_wait()` after the weight-only prologue; in `lin_mma` that is after the activation
+staging would move below the first weight loads, i.e. issue the first `KS_UG` groups' weight
+loads, wait, then stage x), plus launching through `pdl::launch` when `DS_PDL=1`. Scheduling it
+with the kernel lanes is the next step; the expected win on the dense stretch is ~1–2 µs per
+kernel boundary (~1 ms a step), more where a prologue is restructured to load weights first.
+
 ## How to profile a step
 
 The step timeline (`flash/deepseek/obs.rs`, [observability.md](observability.md#deepseek-v41-flash-the-step-timeline-flashdeepseekobsrs))

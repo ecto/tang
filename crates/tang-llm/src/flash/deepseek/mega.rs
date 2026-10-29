@@ -582,4 +582,229 @@ mod tests {
         }
         Ok(())
     }
+
+    fn bytes_w(rows: usize, cols: usize, fmt: i32, seed: u64) -> (Vec<DevBuf>, DsW) {
+        let r = |n: usize| -> Vec<u8> {
+            rnd(n.div_ceil(4), seed, |x| (x >> 32) as u32 as f32)
+                .iter()
+                .flat_map(|v| ((*v as u32) & 0x37373737).to_le_bytes())
+                .take(n)
+                .collect()
+        };
+        let mut v = DsW::default();
+        (v.rows, v.cols, v.fmt) = (rows as i32, cols as i32, fmt);
+        let (w, sc) = match fmt {
+            0 => (
+                DevBuf::from_slice(&rnd(rows * cols, seed, |x| 0.02 * unif(x))).unwrap(),
+                None,
+            ),
+            1 => {
+                let h: Vec<u16> = rnd(rows * cols, seed, |x| 0.02 * unif(x))
+                    .iter()
+                    .map(|f| (f.to_bits() >> 16) as u16)
+                    .collect();
+                (DevBuf::from_slice(&h).unwrap(), None)
+            }
+            2 => (
+                DevBuf::from_slice(&r(rows * cols)).unwrap(),
+                Some(vec![127u8; rows.div_ceil(32) * cols.div_ceil(32)]),
+            ),
+            _ => (
+                DevBuf::from_slice(&r(rows * cols / 2)).unwrap(),
+                Some(vec![127u8; rows * (cols / 32)]),
+            ),
+        };
+        v.w = w.ptr;
+        let mut keep = vec![w];
+        if let Some(sc) = sc {
+            let b = DevBuf::from_slice(&sc).unwrap();
+            v.s = b.ptr;
+            keep.push(b);
+        }
+        (keep, v)
+    }
+
+    fn wbytes(w: &DsW) -> usize {
+        let (r, c) = (w.rows as usize, w.cols as usize);
+        match w.fmt {
+            0 => r * c * 4,
+            1 => r * c * 2,
+            2 => r * c + r.div_ceil(32) * c.div_ceil(32),
+            _ => r * c / 2 + r * (c / 32),
+        }
+    }
+
+    /// Achieved weight bandwidth of every weight-streaming projection of a verify step
+    /// (t = 6) at the real shapes, through the launcher the engine uses; copies rotated so
+    /// nothing stays in L2. `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn mega_bw_table() -> Result<()> {
+        use super::super::gpu::Kernels;
+        let Some(g) = Gpu::for_test() else {
+            return Ok(());
+        };
+        g.bind()?;
+        let k = Kernels::new(&g)?;
+        let s = Stream::new()?;
+        let t = 6usize;
+        let x = DevBuf::from_slice(&rnd(t * 32768, 3, unif))?;
+        let y = DevBuf::zeroed(4 * t * 129280)?;
+        let (xc, xs) = k.ks_x_ptrs();
+        // (name, rows, cols, fmt, kind): kind 0 ks_gemv, 1 ks_gemv gu (w1 + w3), 2 wo_ks,
+        // 3 linear, 4 head
+        let rows: &[(&str, usize, usize, i32, u8)] = &[
+            ("wq_a (fp8, ds_ks)", 1280, 5120, 2, 0),
+            ("wkv (fp8, ds_ks)", 512, 5120, 2, 0),
+            ("wq_b (fp8, ds_ks)", 32768, 1280, 2, 0),
+            ("wo_a (fp8, ds_wo_ks, 8 groups)", 8192, 4096, 2, 2),
+            ("wo_b (fp8, ds_ks)", 5120, 8192, 2, 0),
+            ("indexer wq_b (fp8, ds_ks)", 4096, 1280, 2, 0),
+            ("compressor wkv (bf16, ds_linear_t8)", 512, 5120, 1, 3),
+            ("compressor wgate (bf16, ds_linear_t8)", 512, 5120, 1, 3),
+            ("indexer weights_proj (bf16, ds_linear_t8)", 32, 5120, 1, 3),
+            ("router gate (bf16, ds_linear_t8)", 384, 5120, 1, 3),
+            ("hc mixes (f32, ds_linear_t8)", 24, 20480, 0, 3),
+            ("expert gu, one slot (fp4, ds_ks gu)", 2304, 5120, 3, 1),
+            ("expert down, one slot (fp4, ds_ks)", 5120, 2304, 3, 0),
+            ("head (bf16, ds_head_bf16)", 129280, 5120, 1, 4),
+        ];
+        println!("| projection | rows x cols | MB | µs | GB/s | % of 3350 |");
+        println!("|---|---|---|---|---|---|");
+        for &(name, r, c, fmt, kind) in rows {
+            let one = wbytes(&bytes_w(r.min(64), c, fmt, 1).1) * r / r.min(64);
+            let copies = (200usize << 20).div_ceil(one).clamp(1, 32);
+            let ws: Vec<_> = (0..copies)
+                .map(|i| {
+                    let a = bytes_w(r, c, fmt, 10 + i as u64);
+                    let b = (kind == 1).then(|| bytes_w(r, c, fmt, 1000 + i as u64));
+                    (a, b)
+                })
+                .collect();
+            if kind <= 1 {
+                k.ks_quant_to(&s, x.ptr, xc, xs, t * c)?;
+            }
+            let run = |s: &Stream, i: usize| -> Result<()> {
+                let (a, b) = &ws[i % copies];
+                let w = &a.1;
+                match kind {
+                    0 => k.ks_gemv(s, w, None, xc, xs, y.ptr, t, true, 0, 0.0)?,
+                    1 => k.ks_gemv(
+                        s,
+                        w,
+                        Some(&b.as_ref().unwrap().1),
+                        xc,
+                        xs,
+                        y.ptr,
+                        t,
+                        true,
+                        0,
+                        10.0,
+                    )?,
+                    2 => k.wo_ks(s, w, x.ptr, y.ptr, t, 8, 1024)?,
+                    3 => k.linear(s, w, x.ptr, y.ptr, t, false)?,
+                    _ => k.head(s, w, x.ptr, y.ptr, t)?,
+                }
+                Ok(())
+            };
+            if kind <= 1 {
+                ensure!(k.ks_ok(&ws[0].0 .1), "{name}: not on the K-split path");
+            }
+            run(&s, 0)?;
+            s.sync()?;
+            let n = copies.max(20);
+            let gr = Graph::capture(&s, |s| {
+                for i in 0..n {
+                    run(s, i).map_err(|e| gpu::Error(e.to_string()))?;
+                }
+                Ok(())
+            })?;
+            let us = time(&s, 10, || Ok(gr.launch(&s)?))? / n as f32;
+            let bytes = one * if kind == 1 { 2 } else { 1 };
+            let gbs = bytes as f32 / us / 1e3;
+            println!(
+                "| {name} | {r} x {c} | {:.1} | {us:.1} | {gbs:.0} | {:.0}% |",
+                bytes as f32 / 1048576.0,
+                gbs / 33.5
+            );
+        }
+        Ok(())
+    }
+
+    /// Programmatic dependent launch: µs per kernel of a dependent chain whose kernels each
+    /// stream `mb` MB of their own weights before waiting on their predecessor, plain vs
+    /// `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`, captured in a graph and on
+    /// the stream; the counters check the order held. `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn mega_pdl_floor() -> Result<()> {
+        let Some(g) = Gpu::for_test() else {
+            return Ok(());
+        };
+        g.bind()?;
+        let m = g.module(SRC)?;
+        let f = m.func("mg_pdl_step")?;
+        let sms =
+            g.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+        let s = Stream::new()?;
+        let pool = DevBuf::zeroed(256 << 20)?;
+        let p = DevBuf::zeroed(4 * 4096)?;
+        let sink = DevBuf::zeroed(16)?;
+        println!("| per-kernel weights | graph plain µs | graph PDL µs | stream plain µs | stream PDL µs | ideal (bytes at 3.35 TB/s) µs |");
+        println!("|---|---|---|---|---|---|");
+        let n = 400usize;
+        let mut done = 0i32;
+        for kb in [0usize, 256, 1024, 4096, 16384] {
+            let bytes = kb << 10;
+            let slots = if bytes == 0 {
+                1
+            } else {
+                ((256usize << 20) / bytes).max(1)
+            };
+            let chain = |s: &Stream, pdl: bool| -> gpu::Result<()> {
+                for i in 0..n {
+                    let w = pool.ptr + ((i % slots) * bytes) as u64;
+                    let (n16, pp, sk) = ((bytes / 16) as i64, p.ptr, sink.ptr);
+                    unsafe {
+                        super::super::pdl::launch(
+                            f,
+                            (sms * 2, 1, 1),
+                            (256, 1, 1),
+                            0,
+                            s,
+                            args![w, n16, pp, sk],
+                            pdl,
+                        )?
+                    };
+                }
+                Ok(())
+            };
+            let mut row = vec![];
+            for pdl in [false, true] {
+                let gr = Graph::capture(&s, |s| chain(s, pdl))?;
+                row.push(time(&s, 10, || Ok(gr.launch(&s)?))? / n as f32);
+            }
+            for pdl in [false, true] {
+                row.push(time(&s, 5, || Ok(chain(&s, pdl)?))? / n as f32);
+            }
+            s.sync()?;
+            // order check: every block's counter advanced by the same total
+            let c = p.read::<i32>(0, 2 * sms as usize)?;
+            done += 34 * n as i32; // (1 + 10) graph and (1 + 5) stream runs, plain and PDL
+            ensure!(
+                c.iter().all(|&v| v == done),
+                "PDL lost increments: {:?} vs {done}",
+                &c[..4]
+            );
+            println!(
+                "| {kb} KB | {} | {:.2} |",
+                row.iter()
+                    .map(|v| format!("{v:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                bytes as f32 / 3.35e6
+            );
+        }
+        Ok(())
+    }
 }

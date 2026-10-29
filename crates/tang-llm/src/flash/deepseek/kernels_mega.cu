@@ -335,3 +335,30 @@ __device__ void mg_glue_body(const MgArgs& a) {
 
 extern "C" __global__ void __launch_bounds__(256) mg_glue_f2(MgArgs a) { mg_glue_body<2>(a); }
 extern "C" __global__ void __launch_bounds__(256) mg_glue_f3(MgArgs a) { mg_glue_body<3>(a); }
+
+// ---- programmatic dependent launch probes (DS_PDL) ----
+__device__ __forceinline__ void mg_pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void mg_pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+// A dependent step with an independent prologue: stream n16 uint4 of "weights" (the part a
+// PDL launch may run under its predecessor's tail), then wait on the predecessor and bump the
+// counters it bumped (the dependent part). sink keeps the loads alive.
+extern "C" __global__ void mg_pdl_step(const uint4* __restrict__ w, long long n16, int* p, unsigned int* sink) {
+    mg_pdl_trigger();
+    unsigned int acc = 0;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (long long)gridDim.x * blockDim.x) {
+        uint4 v = __ldg(w + i);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    mg_pdl_wait();
+    if (acc == 0x9e3779b9u) sink[0] = acc;
+    if (threadIdx.x == 0) p[blockIdx.x] += 1;
+}
